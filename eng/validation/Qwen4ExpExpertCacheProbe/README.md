@@ -53,6 +53,13 @@ covered reservations and allocations to zero, the scope detaches, and native
 shutdown completes. Failure to release physical ownership leaves the scope
 rooted and the report failed rather than refunding live memory.
 
+For comparisons that must consume an identical continuation, pass
+`--generation teacher-forced --forced-tokens-file continuation.ids`. The file
+contains whitespace- or comma-separated vocabulary IDs. If `--decode-tokens`
+is also supplied, it must equal the file's token count. The probe validates the
+IDs and total context length and writes the exact consumed sequence to
+`forced_tokens`. This is forced computation, not an answer-quality score.
+
 For pressure/reclamation checks, `--require-all-cache 1` requires every expert
 row of a 1..8-token prefill and every subsequent decode call to use the cache.
 This is stronger than `--require-cache 1`, which only proves that some rows used

@@ -64,3 +64,44 @@ mount reported an existing 99,999,997,952-byte container limit. The memory-cgrou
 directory failed the write-permission check despite the mount reporting `rw`;
 child creation was not attempted. No additional host-memory limit was installed.
 The generated report belongs under ignored `artifacts/`, not in source control.
+
+## GLM native observer and nested-limit canary
+
+This small CPU validation checks the TensorSharp-owned GLM available-memory
+observer under an actual cgroup-v2 ancestor limit. It does not load model weights
+or establish a model's whole-process memory requirement.
+
+```sh
+g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+  eng/validation/glm-host-allowance-canary.cpp \
+  -o artifacts/glm-host-allowance-canary
+sudo python3 eng/validation/run-glm-memory-canary.py \
+  --binary artifacts/glm-host-allowance-canary \
+  --cgroup-parent /sys/fs/cgroup \
+  --output artifacts/glm-memory-canary
+```
+
+The selected existing parent must already delegate the memory controller. The
+tool creates its own empty parent with a 128 MiB RAM limit and a child configured
+for 256 MiB; both disable swap. Only its disposable test process enters the child.
+First it checks the observer while touching 32 MiB. Then a separate process tries
+to touch 192 MiB and must be killed by the parent's limit. The report requires
+increased parent `memory.events.local` `max` and `oom`, increased child-local
+`oom_kill`, no child-local `max`/`oom`, and no swap usage. A kill from an unknown
+ancestor or global memory pressure alone cannot pass. Both exact newly created
+groups must be removed; existing groups and their limits are left unchanged.
+
+An available-memory result of zero is explicitly recorded as unknown, even if
+the enforcement canary passes. Unsupported environments exit 77, not zero.
+The evidence classifier has CPU-only negative cases:
+
+```sh
+python3 -m unittest discover -s eng/validation/tests -p test_glm_memory_canary.py
+```
+
+For the separate `glm_host_mapping_test.cpp` fixture on WSL, place temporary
+files on a Linux filesystem supporting sparse files (for example, a sufficiently
+large `/dev/shm`) while keeping the binary and logs in the chosen evidence
+directory. A sparse seek on `/mnt/c` or `/mnt/d` can materialize the fixture's
+4 GiB hole through drvfs and cause substantial I/O. WSL results are Linux-kernel
+coverage in a virtualized environment; they are not bare-metal or model-cap tests.

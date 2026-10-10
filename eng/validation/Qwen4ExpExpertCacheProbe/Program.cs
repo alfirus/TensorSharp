@@ -53,6 +53,20 @@ if (layerSplit > 1 && (synthetic || backend != BackendType.GgmlCuda))
 string generation = Value("generation", "teacher-forced");
 if (generation is not ("teacher-forced" or "greedy"))
     throw new ArgumentException("generation must be greedy or teacher-forced");
+int[]? explicitForced = null;
+if (options.TryGetValue("forced-tokens-file", out string? forcedTokenFile))
+{
+    if (generation != "teacher-forced")
+        throw new ArgumentException("--forced-tokens-file requires --generation teacher-forced.");
+    explicitForced = File.ReadAllText(forcedTokenFile)
+        .Split(new[] { ',', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
+        .Select(value => int.Parse(value, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+    if (explicitForced.Length == 0 || explicitForced.Any(token => token < 0))
+        throw new ArgumentException("Forced input must contain nonnegative vocabulary token IDs.");
+    if (options.ContainsKey("decode-tokens") && decode != explicitForced.Length)
+        throw new ArgumentException("--decode-tokens must equal the number of --forced-tokens-file IDs.");
+    decode = explicitForced.Length;
+}
 foreach (string name in TensorSharp.Runtime.Speculative.SpeculationEnvVars.RemovedNames.Select(pair => pair.Name)
     .Concat(new[] { "TS_SPEC", "TS_SPEC_TYPE", "TS_SPEC_DRAFT", "TS_SPEC_PMIN", "TS_SPEC_DRAFT_MODEL" }))
     Environment.SetEnvironmentVariable(name, null);
@@ -224,7 +238,7 @@ int[] tokenPool = synthetic ? Enumerable.Range(0, 251).ToArray() : model.Tokeniz
     "The history of computing spans many centuries, beginning with counting tools and algorithms. ", addSpecial: false).ToArray();
 if (tokenPool.Length == 0) throw new InvalidOperationException("Empty benchmark token pool.");
 int[] prompt = Enumerable.Range(0, prefill).Select(i => tokenPool[(i * 37 + 11) % tokenPool.Length]).ToArray();
-int[] forced = Enumerable.Range(0, decode).Select(i => tokenPool[(i * 53 + 17) % tokenPool.Length]).ToArray();
+int[] forced = explicitForced ?? Enumerable.Range(0, decode).Select(i => tokenPool[(i * 53 + 17) % tokenPool.Length]).ToArray();
 string? renderedPrompt = null;
 if (options.TryGetValue("tokens-file", out string? tokenFile))
     prompt = File.ReadAllText(tokenFile).Split(new[] { ',', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
@@ -246,6 +260,8 @@ else if (options.ContainsKey("prompt") || options.ContainsKey("prompt-file"))
 }
 if (prompt.Length == 0 || prompt.Any(token => token < 0 || token >= model.Tokenizer.VocabSize))
     throw new ArgumentException("Prompt must contain valid vocabulary token IDs.");
+if (forced.Any(token => token < 0 || token >= model.Tokenizer.VocabSize))
+    throw new ArgumentException("Forced input must contain valid vocabulary token IDs.");
 if (prompt.Length + decode > int.Parse(Environment.GetEnvironmentVariable("MAX_CONTEXT")!))
     throw new ArgumentException("Prompt plus generation exceeds --max-context.");
 bool requireAllCache = Number("require-all-cache", 0, 0) != 0;

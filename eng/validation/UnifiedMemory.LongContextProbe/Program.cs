@@ -24,12 +24,24 @@ int context = int.Parse(o.GetValueOrDefault("--context", "32768")), promptLength
     steps = int.Parse(o.GetValueOrDefault("--steps", "16")), width = int.Parse(o.GetValueOrDefault("--width", "2")),
     chunk = int.Parse(o.GetValueOrDefault("--chunk", "256")),
     maxRunning = int.Parse(o.GetValueOrDefault("--max-running", width.ToString()));
+MemoryCharge[]? requestedBudget = arm == "candidate" ? [
+    new(AdaptiveModelSession.HostPool, long.Parse(o.GetValueOrDefault("--host-bytes", (4L << 30).ToString()))),
+    new(AdaptiveModelSession.DevicePool, long.Parse(o.GetValueOrDefault("--device-bytes", (4L << 30).ToString()))),
+    new("probe/ssd", long.Parse(o.GetValueOrDefault("--ssd-bytes", (16L << 30).ToString())))] : null;
 if (arm is not ("reference" or "candidate") || context < 128 || context > 131072 || promptLength < 32 || promptLength + steps + 64 > context
     || steps < 2 || steps > 128 || width < 1 || width > 8 || maxRunning < 1 || maxRunning > width || chunk < 1 || chunk > Math.Min(context, 2048))
     throw new ArgumentException("Invalid context/request shape.");
 Directory.CreateDirectory(Path.GetDirectoryName(output)!);
 foreach (var (key, value) in new[] { ("MAX_CONTEXT", context.ToString()), ("KV_CACHE_DTYPE", "f16"),
     ("TS_SCHED_DISABLE_BATCHED", "1"), ("TS_SPEC", "0"), ("TS_MTP", "0") }) Environment.SetEnvironmentVariable(key, value);
+var startedUtc = DateTimeOffset.UtcNow;
+var executionEnvironment = Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>()
+    .Where(e => e.Key is string key && (key.StartsWith("TS_", StringComparison.Ordinal)
+        || key.StartsWith("TENSORSHARP_", StringComparison.Ordinal) || key.StartsWith("GGML_", StringComparison.Ordinal)
+        || key.StartsWith("OMP_", StringComparison.Ordinal) || key.StartsWith("GOMP_", StringComparison.Ordinal)
+        || key.StartsWith("NCCL_", StringComparison.Ordinal)
+        || key is "CUDA_VISIBLE_DEVICES" or "CUDA_MPS_PIPE_DIRECTORY" or "MAX_CONTEXT" or "KV_CACHE_DTYPE"))
+    .ToDictionary(e => (string)e.Key, e => (string?)e.Value, StringComparer.Ordinal);
 KvCacheDtypeConfig.ConfigureFromEnvironment();
 const int blockTokens = 256;
 var samples = new List<object>();
@@ -56,25 +68,35 @@ void Sample(string phase)
         WorkingSetBytes = process.WorkingSet64, PeakWorkingSetBytes = process.PeakWorkingSet64,
         CudaDeviceUsedBytes = DeviceUsed(), CudaAvailability = DeviceAvailability(),
         ManagedBytes = GC.GetTotalMemory(false), Budget = budget?.Snapshot(),
-        Physical = PhysicalMemory.Capture(path), NativeAllocation = session?.NativeAllocationUsage,
+        Physical = PhysicalMemory.Capture(path), PhysicalCapacityPlan = session?.LastPhysicalCapacityPlan,
+        CapacityTargets = budget?.CapacityTargets(), NativeAllocation = session?.NativeAllocationUsage,
         NativeRefusals = session == null ? null : (object)new { session.NativeAllocationRefusals.Count,
             session.NativeAllocationRefusals.First, session.NativeAllocationRefusals.Last },
         HostAllocation = session == null ? null : (object)new { session.HostAllocationUsage.Bytes, session.HostAllocationUsage.PeakBytes, session.HostAllocationUsage.Allocations } });
     Console.WriteLine($"PHASE {phase} {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
 }
-string Hash(string p) { using var file = File.OpenRead(p); return Convert.ToHexString(SHA256.HashData(file)); }
+string Hash(string p)
+{
+    // Hashes are outside the measured load/forward windows. Keep this scan
+    // sequential even on a busy HDD; thousands of small reads can starve there.
+    using var file = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.Read,
+        1 << 20, FileOptions.SequentialScan);
+    return Convert.ToHexString(SHA256.HashData(file));
+}
+Console.WriteLine("IDENTITY model hash started before load measurement");
 string modelHash = Hash(path); // Before load/measurement; no baseline in the candidate process.
+Console.WriteLine("IDENTITY model hash complete");
 try
 {
     Sample("before-load");
     var load = Stopwatch.StartNew();
     if (arm == "candidate")
     {
-        budget = new([new(AdaptiveModelSession.HostPool, long.Parse(o.GetValueOrDefault("--host-bytes", (4L << 30).ToString()))),
-            new(AdaptiveModelSession.DevicePool, long.Parse(o.GetValueOrDefault("--device-bytes", (4L << 30).ToString()))),
-            new("probe/ssd", long.Parse(o.GetValueOrDefault("--ssd-bytes", (16L << 30).ToString())))]);
+        budget = new(requestedBudget!);
         session = AdaptiveModelSession.Create(path, new(context, chunk), budget);
         model = session.Model;
+        if (!session.RefreshCapacity())
+            throw new MemoryPressureException("Fresh physical observations refuse request admission after model loading.");
     }
     else model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, null!, new ModelMemoryPolicy(context, chunk));
     loadSeconds = load.Elapsed.TotalSeconds;
@@ -206,6 +228,9 @@ finally
 var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>().Where(m => Path.GetFileName(m.FileName).Contains("GgmlOps", StringComparison.OrdinalIgnoreCase))
     .Select(m => new { m.FileName, Sha256 = Hash(m.FileName) }).ToArray();
 await File.WriteAllTextAsync(output, JsonSerializer.Serialize(new { Passed = error == null, Error = error, Arm = arm,
+    ProcessId = Environment.ProcessId, StartedUtc = startedUtc, FinishedUtc = DateTimeOffset.UtcNow,
+    ExecutionEnvironment = executionEnvironment, ProbeSha256 = Hash(typeof(Program).Assembly.Location),
+    RequestedBudget = requestedBudget,
     Model = path, ModelSha256 = modelHash, ContextTokens = context, MinimumPromptTokens = promptLength, Steps = steps, Width = width, ChunkTokens = chunk,
     MaximumRunningRequests = maxRunning, PrefillChunkLimitEnforced = true,
     BulkRestoreEnabled = Environment.GetEnvironmentVariable("TS_DISABLE_BULK_KV_RESTORE") != "1",

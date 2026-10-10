@@ -31,6 +31,32 @@ credit are also required. Failures return exit code 1 and include the error in
 JSON. Unsupported architectures/restoration windows are failures, not passes.
 This is storage/execution parity, not an independent semantic or llama.cpp oracle.
 
+After alternating process order (for example reference/candidate/candidate/reference),
+compare completed reports with the same loaded managed/native hashes and actual
+simultaneous admission. A smaller-budget run that serializes width=2 is deliberately
+rejected by this comparator; report its correctness and capacity separately.
+
+```sh
+python eng/validation/compare-long-context.py \
+  --before artifacts/long-context/reference1.json artifacts/long-context/reference2.json \
+  --after artifacts/long-context/candidate1.json artifacts/long-context/candidate2.json \
+  --output artifacts/long-context/comparison.json
+```
+
+The default 5% maximum latency regression applies separately to group wall,
+summed prefill compute and summed decode compute, taking process medians. It is
+an acceptance threshold for these samples, not a statistical confidence bound.
+Background I/O, CPU activity, thermal state and uncontrolled pages must still be
+reported. All token streams, prompt identities and candidate disposal ledgers
+must match, including when timing fails.
+
+New reports also retain process start/ID, the probe hash, execution controls and
+the candidate's original pool capacities. The comparator rejects changed controls,
+repeated process evidence and different candidate budgets across repetitions.
+Older evidence remains readable but reports these provenance checks as unchecked;
+do not mix old and new identity schemas. Recorded pool capacities are logical
+quotas, not physical hard limits; the unbudgeted reference has no such ledger.
+
 On Windows, an owned child can run inside a verified Job private-commit limit:
 
 ```powershell
