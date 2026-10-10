@@ -48,9 +48,12 @@
 #include "dsv4_file_warm.h"
 #include "ggml_ops_precision_policy.h"
 #include "glm_file_strip.h"
+#include "glm_joined_workers.h"
+#include "glm_metadata_owner.h"
 
 #include "gguf.h"
 #include "ggml-impl.h" // ggml_graph_view for segmented TP execution
+#include "glm_host_mapping.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -487,7 +490,7 @@ struct glm_model
     ggml_backend_buffer_t c_buf[MAX_GPUS + 1] = {};
 
     std::vector<void *> mmap_addrs;
-    std::vector<size_t> mmap_sizes;
+    std::vector<std::unique_ptr<tsg_glm_host::readonly_file_mapping>> mmap_owners;
     std::vector<ggml_backend_buffer_t> mmap_bufs;
     size_t mmap_weight_bytes = 0;
 
@@ -663,10 +666,8 @@ struct glm_model
         {
             for (ggml_backend_buffer_t b : mmap_bufs)
                 if (b) ggml_backend_buffer_free(b);
-#if !defined(_WIN32)
-            for (size_t i = 0; i < mmap_addrs.size(); i++)
-                if (mmap_addrs[i]) munmap(mmap_addrs[i], mmap_sizes[i]);
-#endif
+            // CPU buffer wrappers borrow the views; release the wrappers first.
+            mmap_owners.clear();
         }
         // A backend communicator refers to the backend instances, so release it
         // before the loop below destroys those instances.
@@ -976,25 +977,19 @@ struct weight_loader
     }
 };
 
-static size_t file_size_of(const char * path)
+static bool file_size_of(const char * path, size_t & bytes)
 {
-    FILE * f = fopen(path, "rb");
-    if (!f) return (size_t) -1;
-#if defined(_WIN32)
-    _fseeki64(f, 0, SEEK_END);
-    long long sz = _ftelli64(f);
-#else
-    fseeko(f, 0, SEEK_END);
-    off_t sz = ftello(f);
-#endif
-    fclose(f);
-    return sz < 0 ? (size_t) -1 : (size_t) sz;
+    unique_file file(ggml_fopen(path, "rb"));
+    return tsg_glm::read_file_size(file.get(), bytes);
 }
 
 static bool check_shard_complete(const char * path, gguf_context * g, ggml_context * meta)
 {
-    const size_t fsz = file_size_of(path);
-    if (fsz == (size_t) -1) return true;
+    size_t fsz = 0;
+    if (!file_size_of(path, fsz)) {
+        tsg::report_load_refusal("[glm] cannot open or determine the size of checkpoint shard %s\n", path);
+        return false;
+    }
 
     const size_t data_off = gguf_get_data_offset(g);
     const int64_t n_tensors = gguf_get_n_tensors(g);
@@ -1005,7 +1000,14 @@ static bool check_shard_complete(const char * path, gguf_context * g, ggml_conte
         const char * name = gguf_get_tensor_name(g, ti);
         ggml_tensor * mt = ggml_get_tensor(meta, name);
         if (!mt) continue;
-        const size_t end = data_off + gguf_get_tensor_offset(g, ti) + ggml_nbytes(mt);
+        const size_t offset = gguf_get_tensor_offset(g, ti);
+        const size_t bytes = ggml_nbytes(mt);
+        const size_t maximum = (std::numeric_limits<size_t>::max)();
+        if (offset > maximum - data_off || bytes > maximum - data_off - offset) {
+            tsg::report_load_refusal("[glm] invalid byte range for tensor %s in %s\n", name, path);
+            return false;
+        }
+        const size_t end = data_off + offset + bytes;
         if (end > needed) { needed = end; last = name; }
     }
     if (needed <= fsz) return true;
@@ -1018,29 +1020,24 @@ static bool check_shard_complete(const char * path, gguf_context * g, ggml_conte
 
 static ggml_backend_buffer_t mmap_shard(glm_model & m, const shard_files & shards, int si)
 {
-#if defined(_WIN32)
-    (void) m; (void) shards; (void) si;
-    return nullptr;
-#else
     if (si < 0 || si >= (int) shards.paths.size()) return nullptr;
     if (m.mmap_bufs.size() < shards.paths.size())
     {
         m.mmap_addrs.resize(shards.paths.size(), nullptr);
-        m.mmap_sizes.resize(shards.paths.size(), 0);
+        m.mmap_owners.resize(shards.paths.size());
         m.mmap_bufs.resize(shards.paths.size(), nullptr);
     }
     if (m.mmap_bufs[si]) return m.mmap_bufs[si];
 
-    const int fd = open(shards.paths[si].c_str(), O_RDONLY);
-    if (fd < 0) return nullptr;
-    struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return nullptr; }
-    void * addr = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (addr == MAP_FAILED) return nullptr;
-
-    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(addr, (size_t) st.st_size);
-    if (!buf) { munmap(addr, (size_t) st.st_size); return nullptr; }
+    auto owner = std::make_unique<tsg_glm_host::readonly_file_mapping>();
+    std::string error;
+    if (!owner->open(shards.paths[si], error)) {
+        tsg::report_load_refusal("[glm] cannot map host weights from %s: %s\n",
+                                 shards.paths[si].c_str(), error.c_str());
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(owner->data(), owner->size());
+    if (!buf) return nullptr;
     // WEIGHTS, not the default ANY: ggml_backend_sched only pins a node to the
     // backend that owns an input when that input's buffer is marked as weights
     // (ggml-backend.cpp, "assign nodes that use weights to the backend of the
@@ -1049,11 +1046,10 @@ static ggml_backend_buffer_t mmap_shard(glm_model & m, const shard_files & shard
     // block over the bus once per token — measured 33 s/token against 0.19 s
     // with the flag set.
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    m.mmap_addrs[si] = addr;
-    m.mmap_sizes[si] = (size_t) st.st_size;
+    m.mmap_addrs[si] = owner->data();
+    m.mmap_owners[si] = std::move(owner);
     m.mmap_bufs[si] = buf;
     return buf;
-#endif
 }
 
 struct load_job
@@ -1083,7 +1079,7 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
 
     auto worker = [&]()
     {
-        std::vector<FILE *> files(shards.paths.size(), nullptr);
+        std::vector<unique_file> files(shards.paths.size());
         std::vector<uint8_t> staging;
         std::vector<uint8_t> source_slab;
         while (!failed.load(std::memory_order_relaxed))
@@ -1092,28 +1088,24 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
             if (i >= jobs.size()) break;
             const load_job & j = jobs[i];
 
-            FILE *& f = files[j.shard];
-            if (!f)
+            auto & file = files[j.shard];
+            if (!file)
             {
-                f = fopen(shards.paths[j.shard].c_str(), "rb");
-                if (!f)
+                file.reset(ggml_fopen(shards.paths[j.shard].c_str(), "rb"));
+                if (!file)
                 {
                     fprintf(stderr, "[glm] cannot open %s\n", shards.paths[j.shard].c_str());
                     failed.store(true, std::memory_order_relaxed);
                     break;
                 }
             }
+            FILE * f = file.get();
             if (staging.size() < j.len) staging.resize(j.len);
 
             bool ok = true;
             if (j.src_row == 0)
             {
-#if defined(_WIN32)
-                _fseeki64(f, (long long) j.file_off, SEEK_SET);
-#else
-                fseeko(f, (off_t) j.file_off, SEEK_SET);
-#endif
-                ok = fread(staging.data(), 1, j.len, f) == j.len;
+                ok = read_file_range(f, j.file_off, j.len, staging.data());
             }
             else
             {
@@ -1122,20 +1114,16 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
             }
             if (!ok)
             {
-                fprintf(stderr, "[glm] short read for %s: %zu bytes at offset %zu of %s\n",
+                fprintf(stderr, "[glm] seek/read failed for %s: %zu bytes at offset %zu of %s\n",
                         j.t->name, j.len, j.file_off, shards.paths[j.shard].c_str());
                 failed.store(true, std::memory_order_relaxed);
                 break;
             }
             ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
         }
-        for (FILE * f : files) if (f) fclose(f);
     };
 
-    std::vector<std::thread> pool;
-    pool.reserve(n_threads);
-    for (int i = 0; i < n_threads; i++) pool.emplace_back(worker);
-    for (auto & th : pool) th.join();
+    run_joined_workers((size_t) n_threads, failed, worker);
     return !failed.load();
 }
 
@@ -1160,44 +1148,6 @@ static bool backend_matches(const char * reg_name, const char * want)
     if (ieq(want, "Metal"))
         return ieq(reg_name, "Metal") || ieq(reg_name, "MTL");
     return ieq(reg_name, want);
-}
-
-// Memory this process may actually keep resident (cgroup limit under a
-// container, MemTotal otherwise). 0 = unknown.
-static size_t host_mem_allowance()
-{
-    size_t limit = 0;
-#ifdef __linux__
-    if (FILE * f = fopen("/sys/fs/cgroup/memory.max", "r"))
-    {
-        char v[64] = { 0 };
-        if (fscanf(f, "%63s", v) == 1 && strcmp(v, "max") != 0) limit = (size_t) atoll(v);
-        fclose(f);
-    }
-    if (limit == 0)
-    {
-        if (FILE * f = fopen("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r"))
-        {
-            long long v = 0;
-            if (fscanf(f, "%lld", &v) == 1 && v > 0 && v < (1ll << 62)) limit = (size_t) v;
-            fclose(f);
-        }
-    }
-    if (limit == 0)
-    {
-        if (FILE * f = fopen("/proc/meminfo", "r"))
-        {
-            char line[256];
-            while (fgets(line, sizeof(line), f))
-            {
-                long long kb = 0;
-                if (sscanf(line, "MemTotal: %lld kB", &kb) == 1) { limit = (size_t) kb * 1024; break; }
-            }
-            fclose(f);
-        }
-    }
-#endif
-    return limit;
 }
 
 // llama.cpp's published GLM-5.2 indexer pattern: layers 0,1,2 are full, then
@@ -1634,9 +1584,9 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     const bool graph_cache_cap_explicit = getenv("TS_GLM_GRAPH_CACHE") != nullptr;
 
     // --- metadata ---------------------------------------------------------
-    ggml_context * meta0 = nullptr;
-    gguf_init_params ip = { true, &meta0 };
-    gguf_context * g0 = gguf_init_from_file(gguf_path, ip);
+    tsg_glm::metadata_owner<> root_metadata;
+    gguf_init_params ip = { true, &root_metadata.tensors };
+    gguf_context * g0 = root_metadata.file = gguf_init_from_file(gguf_path, ip);
     if (!g0) { tsg::report_load_refusal( "[glm] failed to open %s\n", gguf_path); return nullptr; }
 
     int32_t split_count = 1;
@@ -1734,8 +1684,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     }
 
     resolve_indexer_types(hp, g0);
-    gguf_free(g0);
-    if (meta0) { ggml_free(meta0); meta0 = nullptr; }
+    root_metadata.reset();
 
     if (!ok || hp.n_layer <= 0 || hp.n_nope <= 0 || hp.n_head <= 0)
     {
@@ -1774,11 +1723,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
     for (size_t si = 0; si < shards.paths.size(); si++)
     {
-        ggml_context * meta = nullptr;
-        gguf_init_params sp = { true, &meta };
-        gguf_context * g = gguf_init_from_file(shards.paths[si].c_str(), sp);
+        tsg_glm::metadata_owner<> shard_metadata;
+        gguf_init_params sp = { true, &shard_metadata.tensors };
+        gguf_context * g = shard_metadata.file = gguf_init_from_file(shards.paths[si].c_str(), sp);
+        ggml_context * meta = shard_metadata.tensors;
         if (!g) { tsg::report_load_refusal( "[glm] failed to open shard %s\n", shards.paths[si].c_str()); return nullptr; }
-        if (!check_shard_complete(shards.paths[si].c_str(), g, meta)) { gguf_free(g); ggml_free(meta); return nullptr; }
+        if (!check_shard_complete(shards.paths[si].c_str(), g, meta)) return nullptr;
 
         const size_t data_off = gguf_get_data_offset(g);
         const int64_t n_tensors = gguf_get_n_tensors(g);
@@ -1814,8 +1764,6 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 if (strstr(name, "nextn.eh_proj") != nullptr) mtp_present = true;
             }
         }
-        gguf_free(g);
-        ggml_free(meta);
     }
 
     size_t embd_bytes = 0;
@@ -2622,9 +2570,20 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 // Only a contiguous range can be served in place.
                 if (pw.src_row != 0 || ggml_nbytes(t) != pw.bytes) continue;
                 ggml_backend_buffer_t buf = mmap_shard(*m, shards, pw.shard);
-                if (!buf) continue;
+                if (!buf) {
+                    tsg::report_load_refusal("[glm] host weight mapping failed; refusing an unbounded private copy\n");
+                    return nullptr;
+                }
+                const size_t mapped_size = m->mmap_owners[pw.shard]->size();
+                if (pw.file_off > mapped_size || pw.bytes > mapped_size - pw.file_off) {
+                    tsg::report_load_refusal("[glm] host weight %s exceeds mapped shard bounds\n", t->name);
+                    return nullptr;
+                }
                 char * base = (char *) m->mmap_addrs[pw.shard];
-                if (ggml_backend_tensor_alloc(buf, t, base + pw.file_off) != GGML_STATUS_SUCCESS) continue;
+                if (ggml_backend_tensor_alloc(buf, t, base + pw.file_off) != GGML_STATUS_SUCCESS) {
+                    tsg::report_load_refusal("[glm] cannot bind mapped host weight %s\n", t->name);
+                    return nullptr;
+                }
                 mapped_ranges.push_back({ pw.shard, pw.file_off, ggml_nbytes(t), t->data });
             }
             // TP ranks can hold separate tensor views of the same mapped host
@@ -2714,9 +2673,9 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         // more than the allowance just evicts itself.
         if (m->mmap_weight_bytes > 0)
         {
-            const size_t allow = host_mem_allowance();
+            const uint64_t allow = tsg_glm_host::host_available_bytes();
             const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
-            if (allow == 0 || m->mmap_weight_bytes + headroom <= allow)
+            if (tsg_glm_host::can_prefault(m->mmap_weight_bytes, allow, headroom))
             {
                 const auto t_warm = std::chrono::steady_clock::now();
                 std::vector<tsg_dsv4::file_warm_range> ranges;
@@ -2735,6 +2694,22 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                     const pending_weight & pw = *pending->second;
                     ranges.push_back({ pw.shard, pw.file_off, ggml_nbytes(t), t->data });
                 }
+#if defined(_WIN32)
+                // The Unix pread warmer deliberately has no Windows reader.
+                // Only touch the mapped pages when the complete set fits the
+                // current available RAM plus headroom; large checkpoints remain
+                // demand mapped. This uses the existing OS cache and no copy.
+                SYSTEM_INFO system_info = {};
+                GetSystemInfo(&system_info);
+                const size_t page_size = system_info.dwPageSize ? system_info.dwPageSize : 4096;
+                size_t pages = 0;
+                for (const auto & range : tsg_dsv4::merge_file_warm_ranges(std::move(ranges)))
+                    pages += tsg_glm_host::prefault_pages(range.mapped, (size_t) range.bytes, page_size);
+                fprintf(stderr, "[glm] prefaulted %.1f GiB of mmapped host experts in %.1fs "
+                                "(Windows mapped pages, %zu touches; OS cache reused)\n",
+                        m->mmap_weight_bytes / 1073741824.0,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(), pages);
+#else
                 // Faulting one mapped page at a time serializes small reads on
                 // network filesystems. Reuse the bounded sequential reader;
                 // populate only after pread has brought each block into cache.
@@ -2752,11 +2727,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                         m->mmap_weight_bytes / 1073741824.0,
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
                         result.threads, result.bytes_read / 1073741824.0, result.bytes_resident / 1073741824.0);
+#endif
             }
             else
             {
                 fprintf(stderr, "[glm] skipping host-expert prefault: %.1f GiB mapped + 8 GiB headroom "
-                                "exceeds %.1f GiB memory allowance\n",
+                                "exceeds %.1f GiB current available memory (0 means unknown)\n",
                         m->mmap_weight_bytes / 1073741824.0, allow / 1073741824.0);
             }
         }
@@ -6226,6 +6202,11 @@ TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_c
     catch (const std::exception & e)
     {
         tsg::report_load_refusal("[glm] load failed: %s\n", e.what());
+        return nullptr;
+    }
+    catch (...)
+    {
+        tsg::report_load_refusal("[glm] load failed: unknown native exception\n");
         return nullptr;
     }
 }

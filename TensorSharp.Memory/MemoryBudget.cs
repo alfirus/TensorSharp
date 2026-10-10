@@ -10,6 +10,11 @@ public readonly record struct MemoryPoolSnapshot(string Pool, long Capacity, lon
     public long Available => Capacity - Reserved - Committed;
 }
 public readonly record struct MemoryPoolHighWatermark(string Pool, long Owned, long Committed);
+/// <summary>The configured ceiling is changed only by an explicit capacity setter.
+/// A physical refresh target may fall below existing owners; effective capacity
+/// follows those owners down as they release, without revoking their credit.</summary>
+public readonly record struct MemoryPoolCapacityTarget(
+    string Pool, long Ceiling, long Desired, long Effective, long OverTarget);
 
 public sealed class MemoryPressureException : InvalidOperationException
 {
@@ -24,6 +29,8 @@ public sealed class MemoryBudget
     private sealed class Pool(long capacity)
     {
         public long Capacity = capacity;
+        public long Ceiling = capacity;
+        public long? RefreshTarget;
         public long Reserved;
         public long Committed;
         public long PeakOwned, PeakCommitted;
@@ -78,11 +85,98 @@ public sealed class MemoryBudget
         lock (_gate) return normalized.All(c => c.Bytes <= _pools[c.Pool].Capacity);
     }
 
-    public BudgetReservation? TryReserve(IEnumerable<MemoryCharge> charges)
+    /// <summary>Validate a queued request against configured ceilings, ignoring
+    /// a previous physical refresh target. Only use when a fresh physical check
+    /// runs later at admission; this neither reserves nor authorizes allocation.</summary>
+    public bool CanEverFitConfiguredCeiling(IEnumerable<MemoryCharge> charges)
     {
         var normalized = Normalize(charges);
+        lock (_gate) return normalized.All(c => c.Bytes <= _pools[c.Pool].Ceiling);
+    }
+
+    /// <summary>Distinguish ordinary live-owner contention from a lower physical
+    /// refresh target. This ignores only the refresh target, never live owners.
+    /// It is a readiness hint for a fresh constrained admission attempt, not an
+    /// allocation permission; TryReserve still enforces the effective ledger.</summary>
+    public bool CanReserveConfiguredCeiling(IEnumerable<MemoryCharge> charges)
+    {
+        var normalized = Normalize(charges);
+        lock (_gate) return normalized.All(c => c.Bytes <=
+            _pools[c.Pool].Ceiling - _pools[c.Pool].Reserved - _pools[c.Pool].Committed);
+    }
+
+    /// <summary>Check whether a request could fit in isolation within the ledger
+    /// and per-call absolute constraints. Existing owners are deliberately ignored:
+    /// ordinary contention may wait, while an impossible peak must be refused.
+    /// This check does not reserve; TryReserve with the same fresh constraints
+    /// still checks all current owners atomically before admitting the request.</summary>
+    public bool CanEverFit(IEnumerable<MemoryCharge> charges,
+        IEnumerable<MemoryCharge> capacityConstraints)
+    {
+        var normalized = Normalize(charges);
+        var limits = NormalizeCapacityConstraints(capacityConstraints);
+        lock (_gate) return normalized.All(c => c.Bytes <= Math.Min(_pools[c.Pool].Capacity,
+            limits.GetValueOrDefault(c.Pool, long.MaxValue)));
+    }
+
+    public BudgetReservation? TryReserve(IEnumerable<MemoryCharge> charges)
+        => TryReserveCore(Normalize(charges), null);
+
+    /// <summary>Reserve against both the ledger and fresh per-call absolute
+    /// capacity constraints, without changing shared ceilings or refresh targets.
+    /// Repeated constraints on a pool use their minimum; charges still add.
+    /// Constraints include current reserved and committed owners, so callers
+    /// must not add those owners again to a physical planner's desired capacity.
+    /// Ordinary contention against configured ceilings returns null, including
+    /// when another caller reserved after the observation. If configured space
+    /// exists, a physical constraint violation throws MemoryPressureException.
+    /// Effective refresh targets still constrain successful reservations. All
+    /// checks and reservation are one transaction.
+    /// Physical observations remain forecasts, not OS allocation guarantees.</summary>
+    public BudgetReservation? TryReserve(IEnumerable<MemoryCharge> charges,
+        IEnumerable<MemoryCharge> capacityConstraints)
+    {
+        var normalized = Normalize(charges);
+        return TryReserveCore(normalized, NormalizeCapacityConstraints(capacityConstraints));
+    }
+
+    private Dictionary<string, long> NormalizeCapacityConstraints(IEnumerable<MemoryCharge> capacityConstraints)
+    {
+        ArgumentNullException.ThrowIfNull(capacityConstraints);
+        var limits = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var limit in capacityConstraints)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(limit.Pool);
+            ArgumentOutOfRangeException.ThrowIfNegative(limit.Bytes);
+            if (!_pools.ContainsKey(limit.Pool)) throw new ArgumentException($"Unknown pool: {limit.Pool}", nameof(capacityConstraints));
+            limits[limit.Pool] = limits.TryGetValue(limit.Pool, out long previous)
+                ? Math.Min(previous, limit.Bytes) : limit.Bytes;
+        }
+        return limits;
+    }
+
+    private BudgetReservation? TryReserveCore(MemoryCharge[] normalized, Dictionary<string, long>? limits)
+    {
         lock (_gate)
         {
+            // Readiness and sampling happen outside this lock. A competing
+            // engine or unrelated owner can consume configured credit before
+            // this call; that remains ordinary waitable ledger contention.
+            // Do not use effective Capacity here: a lowered physical target
+            // must still reach the constraint check and fail explicitly when
+            // configured credit is available, rather than wait for a nonexistent
+            // release signal from a permanent owner.
+            if (normalized.Any(c => c.Bytes > _pools[c.Pool].Ceiling - _pools[c.Pool].Reserved - _pools[c.Pool].Committed))
+                return null;
+            if (limits != null)
+                foreach (var (name, capacity) in limits)
+                {
+                    var pool = _pools[name];
+                    long requested = normalized.FirstOrDefault(c => c.Pool == name).Bytes;
+                    long available = capacity - pool.Reserved - pool.Committed;
+                    if (requested > available)
+                        throw new MemoryPressureException($"Pool '{name}' cannot admit {requested} bytes within the current physical capacity constraint of {capacity} bytes.");
+                }
             if (normalized.Any(c => c.Bytes > _pools[c.Pool].Capacity - _pools[c.Pool].Reserved - _pools[c.Pool].Committed))
                 return null;
             foreach (var c in normalized)
@@ -108,7 +202,7 @@ public sealed class MemoryBudget
     public bool TrySetCapacity(string pool, long capacity)
         => TrySetCapacities(new[] { new MemoryCharge(pool, capacity) });
 
-    /// <summary>Apply a hardware refresh as one transaction. A live owner in any
+    /// <summary>Explicitly replace configured ceilings as one transaction. A live owner in any
     /// pool prevents every change; unchanged capacities do not wake waiters.</summary>
     public bool TrySetCapacities(IEnumerable<MemoryCharge> capacities)
     {
@@ -126,10 +220,64 @@ public sealed class MemoryBudget
         {
             if (updates.Any(c => c.Bytes < _pools[c.Pool].Reserved + _pools[c.Pool].Committed)) return false;
             bool changed = updates.Any(c => c.Bytes != _pools[c.Pool].Capacity);
-            foreach (var c in updates) _pools[c.Pool].Capacity = c.Bytes;
+            foreach (var c in updates)
+            {
+                var pool = _pools[c.Pool];
+                pool.Capacity = pool.Ceiling = c.Bytes;
+                pool.RefreshTarget = null;
+            }
             if (changed) Pulse();
             return true;
         }
+    }
+
+    /// <summary>Refresh desired admission capacities atomically, clamped to each
+    /// configured ceiling. Existing owners remain valid, even below the target.
+    /// Unlike a one-shot max(target, owners), this target persists: each later
+    /// physical release lowers the effective capacity until the target is reached.
+    /// Recovery can grow back to the configured ceiling, never above it. Use an
+    /// explicit successful TrySetCapacities to replace ceilings or clear targets.
+    /// A plan is advisory; TryReserve remains the atomic allocation gate.</summary>
+    public IReadOnlyList<MemoryPoolCapacityTarget> RefreshCapacities(IEnumerable<MemoryCharge> desiredCapacities)
+    {
+        ArgumentNullException.ThrowIfNull(desiredCapacities);
+        var updates = desiredCapacities.ToArray();
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var c in updates)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(c.Pool);
+            ArgumentOutOfRangeException.ThrowIfNegative(c.Bytes);
+            if (!_pools.ContainsKey(c.Pool)) throw new ArgumentException($"Unknown pool: {c.Pool}");
+            if (!names.Add(c.Pool)) throw new ArgumentException("A refresh must name each pool at most once.", nameof(desiredCapacities));
+        }
+        lock (_gate)
+        {
+            bool changed = false;
+            foreach (var c in updates)
+            {
+                var pool = _pools[c.Pool];
+                long previous = pool.Capacity;
+                pool.RefreshTarget = Math.Min(c.Bytes, pool.Ceiling);
+                RecomputeCapacity(pool);
+                changed |= previous != pool.Capacity;
+            }
+            if (changed) Pulse();
+            return CapacityTargetsLocked();
+        }
+    }
+
+    public IReadOnlyList<MemoryPoolCapacityTarget> CapacityTargets()
+    { lock (_gate) return CapacityTargetsLocked(); }
+
+    private MemoryPoolCapacityTarget[] CapacityTargetsLocked() => _pools.Select(p =>
+        new MemoryPoolCapacityTarget(p.Key, p.Value.Ceiling, p.Value.RefreshTarget ?? p.Value.Ceiling,
+            p.Value.Capacity, Math.Max(0, p.Value.Reserved + p.Value.Committed -
+                (p.Value.RefreshTarget ?? p.Value.Ceiling)))).ToArray();
+
+    private static void RecomputeCapacity(Pool pool)
+    {
+        if (pool.RefreshTarget is long target)
+            pool.Capacity = Math.Max(target, pool.Reserved + pool.Committed);
     }
 
     /// <summary>Exact ledger high-water marks since construction, including
@@ -197,6 +345,7 @@ public sealed class MemoryBudget
                     _pools[c.Pool].Reserved += c.Bytes;
                 }
                 else if (c.Bytes > 0) releasedToPool = true;
+                RecomputeCapacity(_pools[c.Pool]);
             }
             reservation.State = 2;
             // Returning a page to its live request envelope changes no global

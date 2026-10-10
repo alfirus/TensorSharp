@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using TensorSharp.Memory;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -58,6 +59,30 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly ILogger _logger;
         private readonly Dictionary<string, MemoryCharge[]> _memoryPeaks = new(StringComparer.Ordinal);
         private readonly Dictionary<string, SequenceState> _memoryOwners = new(StringComparer.Ordinal);
+        private SharedBudgetReclamation.Registration? _sharedAdmission;
+        private readonly HashSet<SequenceState> _physicalAdmissionObserved = new();
+        private readonly Dictionary<SequenceState, Task> _physicalAdmissionWaitSignals = new(ReferenceEqualityComparer.Instance);
+        internal void AttachSharedAdmission(SharedBudgetReclamation.Registration registration) => _sharedAdmission = registration;
+        // After reclamation the worker captures a fresh change signal. A physical
+        // target can still refuse an otherwise ready request; schedule that check
+        // now rather than waiting for a second owner release that may never occur.
+        internal bool CanAdmitMemory(IReadOnlyList<MemoryCharge> peak) =>
+            _cfg.MemoryAdmission!.BeforeAdmission != null
+                ? _waiting.First is { } head && CanAttemptPhysicalAdmission(head.Value, peak)
+            : _sharedAdmission?.CanAdmit(peak) ?? _cfg.MemoryAdmission.Budget.CanReserve(peak);
+        private bool CanAttemptPhysicalAdmission(SequenceState request, IReadOnlyList<MemoryCharge> peak)
+        {
+            var budget = _cfg.MemoryAdmission!.Budget;
+            if (!(_sharedAdmission?.CanAttemptPhysicalAdmission(peak) ?? budget.CanReserveConfiguredCeiling(peak)))
+                return false;
+            // A caller-owned refreshed ledger target can be stricter than this
+            // model's fresh physical constraint. A real failed transaction then
+            // waits for global progress instead of repeatedly sampling hardware
+            // between token steps. New heads and FIFO-only waits have no record.
+            return budget.CanReserve(peak)
+                || !_physicalAdmissionWaitSignals.TryGetValue(request, out var attemptedSignal)
+                || !ReferenceEquals(attemptedSignal, budget.ChangeSignal);
+        }
 
         public ContinuousBatchScheduler(
             SchedulerConfig cfg,
@@ -225,7 +250,8 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_waiting.Count >= admission.MaxQueuedRequests)
                     throw new MemoryPressureException("The memory admission queue is full.");
                 var peak = admission.EstimatePeak(seq).ToArray();
-                if (!admission.Budget.CanEverFit(peak))
+                if (!(admission.BeforeAdmission == null ? admission.Budget.CanEverFit(peak)
+                    : admission.Budget.CanEverFitConfiguredCeiling(peak)))
                     throw new MemoryPressureException("Request peak exceeds a configured physical memory pool even in isolation.");
                 _memoryPeaks.Add(seq.RequestId, peak);
             }
@@ -399,22 +425,66 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_cfg.MemoryAdmission is { } admission && seq.MemoryEnvelope == null)
                 {
                     var peak = _memoryPeaks[seq.RequestId];
-                    // A budget can shrink while a request is queued. Waiting on its
-                    // change signal cannot help an envelope that no longer fits even
-                    // in isolation; reject just this request and visit the next one.
-                    if (!admission.Budget.CanEverFit(peak))
+                    BudgetReservation? envelope;
+                    Task? attemptedSignal = null;
+                    try
                     {
-                        NotifyError(seq, new MemoryPressureException(
-                            "Request peak exceeds a physical memory pool after its capacity changed."), output);
+                        IReadOnlyList<MemoryCharge>? constraints = null;
+                        IReadOnlyList<MemoryCharge> SamplePhysicalCapacity() =>
+                            admission.BeforeAdmission!(seq) ?? throw new InvalidOperationException(
+                                "The physical admission check returned no capacity constraints.");
+                        bool hasTurn = _sharedAdmission?.HasAdmissionTurn(peak) ?? true;
+                        // Sample a new eligible head once, even if a private stale
+                        // target or owner floor currently makes it wait. Recovery
+                        // does not necessarily pulse the ledger's change signal.
+                        if (admission.BeforeAdmission != null
+                            && ((!admission.Budget.CanEverFit(peak)) || (hasTurn
+                                && (!_physicalAdmissionObserved.Contains(seq) || CanAttemptPhysicalAdmission(seq, peak)))))
+                        {
+                            constraints = SamplePhysicalCapacity();
+                            _physicalAdmissionObserved.Add(seq);
+                        }
+                        if (!admission.Budget.CanEverFit(peak))
+                            throw new MemoryPressureException(
+                                "Request peak exceeds a physical memory pool after its capacity changed.");
+                        // A resource-blocked head may be revisited between other
+                        // requests' token steps. Only sample physical capacity when
+                        // this request is actually eligible to acquire an envelope.
+                        // Configured contention has a ledger release signal. A
+                        // lowered physical target may never pulse it: attempt the
+                        // constrained transaction and explicitly refuse that case.
+                        bool ready = admission.BeforeAdmission == null || CanAttemptPhysicalAdmission(seq, peak);
+                        if (admission.BeforeAdmission != null && ready && constraints == null)
+                            constraints = SamplePhysicalCapacity();
+                        if (constraints != null && !admission.Budget.CanEverFit(peak, constraints))
+                            throw new MemoryPressureException(
+                                "Request peak exceeds a freshly observed physical capacity even in isolation.");
+                        if (_sharedAdmission != null)
+                            envelope = _sharedAdmission.TryReserve(seq, peak, out attemptedSignal, constraints, waitOnly: !ready);
+                        else if (!ready) envelope = null;
+                        else
+                        {
+                            if (constraints != null) attemptedSignal = admission.Budget.ChangeSignal;
+                            envelope = constraints == null ? admission.Budget.TryReserve(peak)
+                                : admission.Budget.TryReserve(peak, constraints);
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        // No model state has been executed for this envelope.
+                        // A failed physical observation/refusal must not strand the
+                        // head forever or fail another already running sequence.
+                        NotifyError(seq, error, output);
                         continue;
                     }
-                    var envelope = admission.Budget.TryReserve(peak);
                     if (envelope == null)
                     {
+                        if (attemptedSignal != null) _physicalAdmissionWaitSignals[seq] = attemptedSignal;
                         MemoryAdmissionBlocked = true;
                         BlockedMemoryPeak = peak;
                         break;
                     }
+                    _physicalAdmissionWaitSignals.Remove(seq);
                     seq.MemoryEnvelope = envelope;
                     _memoryOwners.Add(seq.RequestId, seq);
                 }
@@ -616,6 +686,9 @@ namespace TensorSharp.Runtime.Scheduling
             Exception? error = null)
         {
             if (seq == null || seq.Status.IsFinished()) return false;
+            _physicalAdmissionObserved.Remove(seq);
+            _physicalAdmissionWaitSignals.Remove(seq);
+            _sharedAdmission?.Cancel(seq);
             // A finishing request frees a slot; let admission try again.
             _sequenceSlotCap = int.MaxValue;
 
@@ -662,6 +735,8 @@ namespace TensorSharp.Runtime.Scheduling
                     throw new InvalidOperationException("Cannot release a running request's memory envelope.");
                 seq.MemoryEnvelope!.Dispose();
                 seq.MemoryEnvelope = null;
+                _physicalAdmissionObserved.Remove(seq);
+                _physicalAdmissionWaitSignals.Remove(seq);
                 _memoryOwners.Remove(requestId);
             }
         }

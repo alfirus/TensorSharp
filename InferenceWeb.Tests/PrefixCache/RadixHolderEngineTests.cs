@@ -922,6 +922,51 @@ public class RadixHolderEngineTests
     }
 
     [Fact]
+    public void MemoryAdmission_ReclamationYieldsAfterEightRealCheckpointReleases()
+    {
+        using var environment = new ScopedEnvironment(new Dictionary<string, string>
+        {
+            // Keep all ten real public checkpoints until admission initiates bounded reclamation.
+            ["TS_PREFIX_CHECKPOINTS_MAX"] = "10",
+        });
+        var budget = new MemoryBudget([new("ram", 1000)]);
+        using var model = new BudgetedCheckpointModel(budget);
+        var pool = new BlockPool(32, 8, 64);
+        var scheduler = new ContinuousBatchScheduler(Configuration(), pool);
+        var cache = new PrefixCacheCoordinator(model, pool, scheduler,
+            model.GetPrefixCacheCapabilities(), NullLogger.Instance);
+        var sequences = new List<SequenceState>();
+        try
+        {
+            for (int i = 0; i < 10; i++)
+            {
+                var sequence = Request($"bounded-{i}", Tokens(16, i * 20 + 1), $"bounded-scope-{i}", shared: 16);
+                sequences.Add(sequence);
+                foreach (var block in pool.AllocateNew(2)!) sequence.BlockTable.AppendBlock(block);
+                model.ResetKVCache(); model.Forward(sequence.PromptTokens.ToArray());
+                sequence.SetComputedTokensForPrefixAdoption(16);
+                cache.CaptureCheckpoint(sequence);
+                cache.ReleaseRequest(sequence);
+            }
+            Assert.Equal(10, model.RetainedPayloadKeys.Count);
+            Assert.Equal(0, budget.Snapshot().Single().Available);
+            bool ready() => budget.CanReserve([new("ram", 1000)]);
+            Assert.True(cache.ReclaimForAdmission(ready, maximumVictims: 8));
+            Assert.Equal(2, model.RetainedPayloadKeys.Count);
+            Assert.Equal(800, budget.Snapshot().Single().Available);
+            Assert.False(cache.ReclaimForAdmission(ready, maximumVictims: 8));
+            Assert.Empty(model.RetainedPayloadKeys);
+            Assert.Equal(1000, budget.Snapshot().Single().Available);
+        }
+        finally
+        {
+            cache.Reset(); cache.Detach();
+            foreach (var sequence in sequences) pool.Free(sequence.BlockTable.Clear());
+            pool.Storage.Dispose();
+        }
+    }
+
+    [Fact]
     public void PublicCheckpoint_CannotRemainAboveHardResourceCap()
     {
         using var model = OracleFakes.R(8);

@@ -2690,11 +2690,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Called only when no sequence is running. Release parked model
         /// buffers first, then just enough unlocked prefix payloads to unblock work.
         /// A release failure is a lifecycle failure and must stop the worker.</summary>
-        internal void ReclaimForAdmission(Func<bool> canAdmit)
+        internal bool ReclaimForAdmission(Func<bool> canAdmit, int maximumVictims = int.MaxValue)
         {
-            if (canAdmit()) return;
+            if (canAdmit()) return false;
             _model.TrimIdleMemory();
-            RadixCache?.ReclaimForAdmission(canAdmit, () => _model.TrimIdleMemory());
+            return RadixCache?.ReclaimForAdmission(canAdmit, () => _model.TrimIdleMemory(), maximumVictims) ?? false;
         }
 
         /// <summary>Consume a token the batched greedy path sampled on-device

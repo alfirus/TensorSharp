@@ -34,6 +34,16 @@ public sealed class RequestMemoryAdmission
     public Func<SequenceState, IReadOnlyList<MemoryCharge>> EstimatePeak { get; }
     public int MaxQueuedRequests { get; }
 
+    /// <summary>Optional fresh physical-capacity check once for a new eligible
+    /// queue head, and again immediately before its reservation if it had to wait.
+    /// Returns absolute per-pool capacity ceilings, not additional charges.
+    /// Reservation atomically checks these ceilings without changing the shared
+    /// budget. Physical refusal fails this request rather than waiting for a signal
+    /// that an external physical-memory release need not provide.
+    /// The engine invokes this under its model compute lock with the compute gate
+    /// open; never on submission or for an already admitted token step.</summary>
+    public Func<SequenceState, IReadOnlyList<MemoryCharge>>? BeforeAdmission { get; init; }
+
     /// <summary>Optional allocation routing for a qualified serial execution
     /// adapter. Called under the model compute lock around one sequence's work.
     /// It must consume that sequence's envelope, dispose synchronously, and is

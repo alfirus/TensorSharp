@@ -593,10 +593,12 @@ namespace TensorSharp.Models
 
             if (preloadedCount > 0 || deferredCount > 0 || zeroCopyExpertCount > 0 || fallbackExpertCount > 0)
             {
-                var snapshot = mlxAllocator.GetMemorySnapshot();
+                string allocatorCounters = mlxAllocator.TryGetMemorySnapshot(out var snapshot, out var snapshotError)
+                    ? $"active {snapshot.ActiveBytes / 1024 / 1024} MB, cache {snapshot.CacheBytes / 1024 / 1024} MB, peak {snapshot.PeakBytes / 1024 / 1024} MB"
+                    : $"allocator counters unavailable: {snapshotError}";
                 Console.WriteLine(
                     $"  MLX resident quantized weights: {preloadedBytes / 1024 / 1024} MB across {preloadedCount} tensors " +
-                    $"(active {snapshot.ActiveBytes / 1024 / 1024} MB, cache {snapshot.CacheBytes / 1024 / 1024} MB, peak {snapshot.PeakBytes / 1024 / 1024} MB)");
+                    $"({allocatorCounters})");
                 if (deferredCount > 0 || zeroCopyExpertCount > 0 || fallbackExpertCount > 0)
                 {
                     long capMb = MoeExpertOffload.MaxCacheBytes / 1024 / 1024;

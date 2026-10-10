@@ -13,7 +13,7 @@ public static class InferenceMemoryPlanner
     {
         ArgumentNullException.ThrowIfNull(input);
         Validate(input);
-        var capacities = input.Pools.Select(Capacity).ToArray();
+        var capacities = input.Pools.Select(GetCapacity).ToArray();
         var rejections = new List<InferenceCandidateRejection>();
         foreach (var candidate in input.Candidates.OrderBy(c => c.Placement)
                      .ThenByDescending(c => c.PreservesExecutionGraph)
@@ -65,18 +65,36 @@ public static class InferenceMemoryPlanner
         { Capacities = Array.AsReadOnly(capacities), Rejections = rejections.AsReadOnly() };
     }
 
-    private static InferencePoolCapacity Capacity(InferenceMemoryPool pool)
+    /// <summary>Convert one observation into an absolute ledger target. Only the
+    /// explicitly certified overlap is added back to measured free space. Existing
+    /// owners are protected, but their floor is not permission for new admission.</summary>
+    public static InferencePoolCapacity GetCapacity(InferenceMemoryPool pool)
     {
+        ValidatePool(pool);
         var a = pool.Accounting;
         // decimal avoids overflow when a total-size counter is near Int64.MaxValue.
-        // Hardware free excludes committed; add it back once to derive an absolute
-        // budget. Reserved is not physically allocated and must not be added here.
+        // An unproven resident overlap must not become allocation permission.
         decimal physical = Math.Min((decimal)pool.TotalBytes,
-            (decimal)a.Committed + pool.AvailableBytes);
+            (decimal)(pool.IncludedCommittedBytes ?? 0) + pool.AvailableBytes);
         long desired = (long)Math.Max(0, Math.Min(pool.MaximumBudgetBytes, physical - pool.HeadroomBytes));
         long owners = checked(a.Reserved + a.Committed);
         return new(pool.Pool, desired, Math.Max(desired, owners), a.Reserved, a.Committed,
             Math.Max(0, desired - owners), Math.Max(0, owners - desired));
+    }
+
+    private static void ValidatePool(InferenceMemoryPool pool)
+    {
+        ArgumentNullException.ThrowIfNull(pool);
+        ArgumentException.ThrowIfNullOrWhiteSpace(pool.Pool);
+        var a = pool.Accounting;
+        long included = pool.IncludedCommittedBytes ?? 0;
+        if (a.Pool != pool.Pool || pool.TotalBytes < 0 || pool.AvailableBytes < 0
+            || pool.AvailableBytes > pool.TotalBytes || pool.HeadroomBytes < 0
+            || pool.MaximumBudgetBytes < 0 || a.Capacity < 0 || a.Reserved < 0
+            || a.Committed < 0 || a.Committed > a.Capacity
+            || a.Reserved > a.Capacity - a.Committed || included < 0 || included > a.Committed
+            || included > pool.TotalBytes - pool.AvailableBytes)
+            throw new ArgumentOutOfRangeException(nameof(pool), "Invalid capacity, accounting or certified overlap.");
     }
 
     private static List<InferenceMemoryComponent> Components(
@@ -167,16 +185,10 @@ public static class InferenceMemoryPlanner
         var pools = new Dictionary<string, InferenceMemoryPool>(StringComparer.Ordinal);
         foreach (var pool in input.Pools)
         {
-            ArgumentNullException.ThrowIfNull(pool);
-            ArgumentException.ThrowIfNullOrWhiteSpace(pool.Pool);
+            ValidatePool(pool);
             var a = pool.Accounting;
             if (!pools.TryAdd(pool.Pool, pool) || a.Pool != pool.Pool)
                 throw new ArgumentException("Pool names must be unique and match their accounting snapshots.", nameof(input));
-            if (pool.TotalBytes < 0 || pool.AvailableBytes < 0 || pool.AvailableBytes > pool.TotalBytes
-                || pool.HeadroomBytes < 0 || pool.MaximumBudgetBytes < 0 || a.Capacity < 0
-                || a.Reserved < 0 || a.Committed < 0 || a.Committed > a.Capacity
-                || a.Reserved > a.Capacity - a.Committed)
-                throw new ArgumentOutOfRangeException(nameof(input), "Invalid capacity or accounting observation.");
         }
         if (pools.Count == 0) throw new ArgumentException("At least one pool is required.", nameof(input));
         void Mapping(IReadOnlyList<string> names, bool required)

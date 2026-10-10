@@ -3125,13 +3125,30 @@ if (simd_id == 0) {
 
         public static MlxMemorySnapshot GetMemorySnapshot()
         {
-            return MlxWorker.Shared.Invoke(() =>
+            if (!TryGetMemorySnapshot(out var snapshot, out var error))
+                throw new InvalidOperationException(error);
+            return snapshot;
+        }
+
+        public static bool TryGetMemorySnapshot(out MlxMemorySnapshot snapshot, out string error)
+        {
+            MlxMemorySnapshotReader.Result result;
+            try
             {
-                ulong active = QueryMemory(mlx_get_active_memory);
-                ulong cache = QueryMemory(mlx_get_cache_memory);
-                ulong peak = QueryMemory(mlx_get_peak_memory);
-                return new MlxMemorySnapshot(active, cache, peak);
-            });
+                result = MlxWorker.Shared.Invoke(() =>
+                {
+                    EnsureErrorHandlerInstalled();
+                    return MlxMemorySnapshotReader.Read(mlx_get_active_memory, mlx_get_cache_memory,
+                        mlx_get_peak_memory, TakeCapturedError);
+                });
+            }
+            catch (Exception observationError) when (MlxMemorySnapshotReader.IsObservationError(observationError))
+            {
+                result = MlxMemorySnapshotReader.Unavailable(observationError);
+            }
+            snapshot = result.Snapshot;
+            error = result.Error;
+            return result.Success;
         }
 
         public static void ClearCache()
@@ -8257,12 +8274,6 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             }
         }
 
-        private static ulong QueryMemory(MemoryGetter getter)
-        {
-            nuint value = 0;
-            return getter(ref value) == 0 ? value : 0;
-        }
-
         private static void ConfigureCacheLimit()
         {
             if (cacheLimitConfigured)
@@ -8571,8 +8582,6 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             foreach (string part in value.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 yield return part;
         }
-
-        private delegate int MemoryGetter(ref nuint value);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void MlxErrorHandler(IntPtr message, IntPtr data);

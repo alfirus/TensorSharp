@@ -347,9 +347,40 @@ raises nor rewrites caller-owned capacities, accounts for existing owners when
 planning optional caches, and returns only its own credits at disposal. Host
 staging hooks are enabled as well as routed device/graph hooks. This does not
 permit a second simultaneous process-global GGML model/scope. Private session
-capacity refresh uses `MemoryBudget.TrySetCapacities` to update pools atomically;
-a failed shrink changes none. No-op refreshes and credit returned to a live request
-envelope do not wake engines waiting for globally available capacity.
+capacity refresh uses `MemoryBudget.RefreshCapacities`: the desired target can
+fall below current owners, while an effective floor preserves their credit.
+That floor decreases on actual release instead of reopening withdrawn capacity.
+`CapacityTargets()` reports the configured ceiling, desired target, effective
+floor and over-target bytes. `TrySetCapacities` remains the explicit, strict
+operator setter. No-op refreshes and credit returned to a live request envelope
+do not wake engines waiting for globally available capacity.
+
+`PhysicalMemoryCapacityPlanner` keeps bounded observation history and plans
+headroom for recent unattributed growth, peak rebound and a future burst. It
+does not add committed bytes back to measured free space unless their inclusion
+in that particular metric is proven; GC, private commit, RSS and mapped pages
+are overlapping observations, not totals to sum. Stale, inconsistent or unknown
+observations refuse a plan. `MemoryHardLimitEvidence` describes an externally
+verified mechanism's actual coverage; the planner does not install or verify
+an OS limit. A Windows private-commit limit cannot satisfy a request for complete
+physical-host or device enforcement.
+
+Adaptive request admission installs `BeforeAdmission` to obtain fresh physical
+constraints at the actual admission boundary, under the model compute lock and
+an open compute gate. The scheduler does not query hardware on submission or
+each admitted token step. A new eligible head receives an initial check; a
+resource-blocked head is checked again when it becomes ready to reserve.
+`MemoryBudget.TryReserve(charges, capacityConstraints)` applies those absolute
+per-pool constraints atomically to current owners plus the request, without
+rewriting a borrowed budget. Failed observations or physically impossible peaks
+fail the affected request explicitly; an external release has no guaranteed
+ledger wakeup. These checks still cannot cap uninstrumented allocations.
+The atomic transaction first checks current owners against configured ceilings:
+if another engine or direct ledger user consumed that credit after sampling,
+it returns null for ordinary release-driven waiting. Only when configured space
+exists does a tighter physical constraint raise terminal pressure; the effective
+refresh target is checked last. Using the lowered effective target for the first
+check would incorrectly wait forever behind permanent owners.
 
 Linux observations include a conservative portion of the current cgroup's clean
 inactive file cache, so an idle container filled by model reads is not mistaken
@@ -455,7 +486,12 @@ Blocked engines now publish pressure to other engines using the same ledger.
 Each peer reclaims its own idle state on its own worker, under its own model lock,
 only when no sequence is running and the compute gate is open. Notifications
 coalesce once per budget generation; cancelled demand cannot cause later eviction.
-This is cooperative reclamation, not global LRU or strict inter-engine fairness.
+Conflicting pool demands have FIFO priority by their first blocked registration;
+independent pools can proceed. Only one cooperative reclaim lease runs at once,
+and a pass releases at most eight prefix victims before yielding. The model's
+opaque idle-trim callback is not a byte/time-bounded victim list. This is not a
+global cost-based LRU, and direct budget users outside the engine registry do not
+participate in its fairness policy.
 It does not permit concurrent AdaptiveModelSessions over process-global GGML caches,
 revoke live owners, or supply missing model-specific peak estimates.
 `MemoryBudget.CanReserve` only observes headroom; atomic reservation still decides

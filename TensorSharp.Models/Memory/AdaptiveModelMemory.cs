@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using TensorSharp.GGML;
 using TensorSharp.Memory;
+using TensorSharp.Memory.Hardware;
 using TensorSharp.Memory.Planning;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Paged;
@@ -21,6 +22,11 @@ public sealed record AdaptiveModelMemoryOptions(int ContextTokens, int PrefillTo
     public long MaximumDeviceBytes { get; init; } = long.MaxValue;
     public long? HostHeadroomBytes { get; init; }
     public long? DeviceHeadroomBytes { get; init; }
+    /// <summary>Forecast for additional uninstrumented host growth at a request
+    /// boundary, beyond observed resident use. This is not GC/tokenizer ownership.</summary>
+    public long HostUninstrumentedBurstBytes { get; init; } = 128L << 20;
+    /// <summary>Additional backend/driver growth beyond currently reported use.</summary>
+    public long DeviceUninstrumentedBurstBytes { get; init; } = 64L << 20;
     public int MaximumPrefillChunkTokens { get; init; } = 2048;
     public bool AllowWeightStreaming { get; init; } = true;
     public int StreamingTileBytes { get; init; } = 16 << 20;
@@ -70,6 +76,7 @@ public sealed class AdaptiveModelSession : IDisposable
     private readonly bool _ownsBudget;
     private readonly long _hostCacheReserveBytes;
     private readonly long _deviceCacheReserveBytes;
+    private readonly PhysicalMemoryCapacityPlanner _physicalPlanner = new();
     private bool _disposed;
 
     private AdaptiveModelSession(ModelBase model, MemoryBudget budget, GgmlCacheBudgetScope nativeBudget,
@@ -82,6 +89,9 @@ public sealed class AdaptiveModelSession : IDisposable
     public ModelBase Model { get; }
     public MemoryBudget Budget { get; }
     public InferenceMemoryPlan Plan { get; }
+    /// <summary>Latest admission-boundary measurements. Unknown physical owners
+    /// remain explicit; neither this plan nor its margins establish an OS hard cap.</summary>
+    public PhysicalMemoryCapacityPlan? LastPhysicalCapacityPlan { get; private set; }
     public Exception? AccountingError => _nativeBudget.CallbackError;
     public (long Bytes, long PeakBytes, int Allocations) HostAllocationUsage => _hostBudget.Usage;
     public IReadOnlyList<GgmlAllocationUsage> NativeAllocationUsage => _nativeBudget.AllocationUsage;
@@ -106,15 +116,16 @@ public sealed class AdaptiveModelSession : IDisposable
         Validate(options);
         if (TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment().Enabled)
             throw new NotSupportedException("AdaptiveModelSession admits trunk-only execution; speculative execution requires a qualified memory adapter.");
-        using var gguf = new GgufFile(path);
-        var profile = DenseMemoryProfile.Read(gguf, options, ModelBase.RetainsAllHostQuantizedWeights, omitEmbeddedDraftWeights: true);
+        DenseMemoryProfile profile;
+        using (var gguf = GgufFile.OpenForMemoryPlanning(path))
+            profile = DenseMemoryProfile.Read(gguf, options, ModelBase.RetainsAllHostQuantizedWeights, omitEmbeddedDraftWeights: true);
         var hardware = InferenceHardwareMemory.CaptureCuda();
-        var budget = sharedBudget ?? new MemoryBudget([new(HostPool, 0), new(DevicePool, 0)]);
+        var budget = sharedBudget ?? new MemoryBudget([new(HostPool, options.MaximumHostBytes), new(DevicePool, options.MaximumDeviceBytes)]);
         var plan = PlanLoad(profile, options, hardware, budget, sharedBudget != null);
         if (!plan.Accepted)
             throw new MemoryPressureException(string.Join(Environment.NewLine, plan.Rejections.Select(r => r.Reason).Distinct()));
-        if (sharedBudget == null && !budget.TrySetCapacities(plan.Capacities.Select(c => new MemoryCharge(c.Pool, c.ProtectedCapacity))))
-            throw new MemoryPressureException("Memory owners changed during load admission.");
+        if (sharedBudget == null)
+            budget.RefreshCapacities(plan.Capacities.Select(c => new MemoryCharge(c.Pool, c.DesiredCapacity)));
 
         // Install before model preload. Callback reservations arbitrate actual
         // buffer sizes/rounding, rather than committing the whole forecast and
@@ -155,7 +166,9 @@ public sealed class AdaptiveModelSession : IDisposable
         }
     }
 
-    /// <summary>Refresh at a quiescent request boundary. Shrinking does not revoke
+    /// <summary>Refresh between forwards while the caller owns the model compute
+    /// lock and the compute gate is open. Other admitted requests may retain live
+    /// state; idle trimming never releases that state. Shrinking does not revoke
     /// live owners or discard KV. False means stop new admission; release work or
     /// reload a smaller supported placement. Do not vary graph shapes per token.</summary>
     public bool RefreshCapacity()
@@ -165,29 +178,55 @@ public sealed class AdaptiveModelSession : IDisposable
         long cachedBytes = Model.StreamingWeightUsage?.HostCacheBytes ?? 0;
         var streaming = Model.StreamingWeightUsage;
         long deviceCachedBytes = checked((streaming?.DeviceCacheBytes ?? 0) + (streaming?.DeviceWorkspaceCacheBytes ?? 0));
-        if (Pools(hw, Budget, _options, !_ownsBudget).Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes,
+        var physical = CapturePhysicalPlan(hw);
+        if (!physical.Accepted) return false;
+        if (physical.Pools.Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes,
                 _deviceCacheReserveBytes, deviceCachedBytes)))
         {
             Model.TrimIdleMemory();
             hw = InferenceHardwareMemory.CaptureCuda();
+            physical = CapturePhysicalPlan(hw);
+            if (!physical.Accepted) return false;
         }
-        bool admitted = true;
-        var updates = new List<MemoryCharge>();
-        foreach (var pool in Pools(hw, Budget, _options, !_ownsBudget))
-        {
-            var owners = checked(pool.Accounting.Reserved + pool.Accounting.Committed);
-            long desired = DesiredCapacity(pool);
-            admitted &= desired >= owners;
-            updates.Add(new(pool.Pool, Math.Max(owners, desired)));
-        }
-        if (_ownsBudget) admitted &= Budget.TrySetCapacities(updates);
+        bool admitted = physical.Pools.All(p => InferenceMemoryPlanner.GetCapacity(p).OverTargetBytes == 0);
+        // Persist the target: after an owner releases, its former protective floor
+        // must not reopen credit while the machine remains under pressure.
+        if (_ownsBudget) admitted &= Budget.RefreshCapacities(physical.DesiredCapacities).All(p => p.OverTarget == 0);
         return admitted && AccountingError == null;
     }
 
     private static long DesiredCapacity(InferenceMemoryPool pool)
+        => InferenceMemoryPlanner.GetCapacity(pool).DesiredCapacity;
+
+    private PhysicalMemoryCapacityPlan CapturePhysicalPlan(InferenceHardwareMemory hw)
     {
-        var physical = Math.Min((decimal)pool.TotalBytes, (decimal)pool.Accounting.Committed + pool.AvailableBytes);
-        return (long)Math.Max(0, Math.Min(pool.MaximumBudgetBytes, physical - pool.HeadroomBytes));
+        var now = DateTimeOffset.UtcNow;
+        var ledger = Budget.Snapshot();
+        var ceilings = Budget.CapacityTargets().ToDictionary(p => p.Pool);
+        long hostCeiling = Math.Min(_options.MaximumHostBytes, ceilings[HostPool].Ceiling);
+        long deviceCeiling = Math.Min(_options.MaximumDeviceBytes, ceilings[DevicePool].Ceiling);
+        // The scope is installed before any cache owner exists. These native
+        // counters report actual cache payload on this CUDA rank, a lower bound
+        // on its allocator occupancy. Callback charges can include reservations
+        // above actual buffer sizes; graph kind alone also does not prove device
+        // residency, so neither is sufficient evidence for adding bytes back.
+        long deviceIncluded = GgmlBasicOps.TryGetCacheMemoryUsage(0, out var cache)
+            ? checked(cache.DeviceCopyCommittedBytes + cache.PreloadCommittedBytes) : 0;
+        return LastPhysicalCapacityPlan = _physicalPlanner.Plan(
+        [
+            new("host-available", HostPool, "host-ram", PhysicalMemoryMetric.HostAvailable,
+                hw.HostTotal, hw.HostAvailable, now)
+            {
+                MaximumBudgetBytes = hostCeiling,
+                Headroom = new() { MinimumBytes = HostHeadroom(hw, _options, hostCeiling), FutureBurstBytes = _options.HostUninstrumentedBurstBytes }
+            },
+            new("cuda-allocator-available", DevicePool, "cuda0", PhysicalMemoryMetric.AllocatorAvailable,
+                hw.DeviceTotal, hw.DeviceAvailable, now)
+            {
+                IncludedCommittedBytes = deviceIncluded, MaximumBudgetBytes = deviceCeiling,
+                Headroom = new() { MinimumBytes = DeviceHeadroom(hw, _options, deviceCeiling), FutureBurstBytes = _options.DeviceUninstrumentedBurstBytes }
+            }
+        ], ledger, now);
     }
 
     internal static bool RequiresIdleTrim(InferenceMemoryPool pool, long hostReserve, long cachedBytes,
@@ -272,15 +311,26 @@ public sealed class AdaptiveModelSession : IDisposable
         }
         var admission = RequestMemoryAdmission.ForKvSnapshots(snapshots, Model.ComputeKVBlockByteSize(blockTokens),
             blockTokens, maximumRunningRequests, additionalPeak: ExecutionPeak, maxQueuedRequests: maximumQueuedRequests);
-        // The bound shape rejects prefix caching and more than one running
-        // request. Queued requests cannot cause a state swap. Engine-owned
-        // capture scratch/staging remain charged, but page/spill reservations
-        // would only strand credit for a path this engine cannot execute.
+        // The bound shape rejects prefix caching. With exactly one running
+        // request, queued requests cannot cause a state swap, so omit snapshot
+        // page/spill reservations in that case. Engine-owned capture scratch
+        // and staging remain charged. Multiple running requests include snapshots.
         Func<SequenceState, IReadOnlyList<MemoryCharge>> estimate = maximumRunningRequests == 1
             ? ExecutionPeak : admission.EstimatePeak;
         return new(Budget, estimate, maximumQueuedRequests)
         {
             ExecutionShape = new(snapshots, blockTokens, maximumRunningRequests, prefillChunkTokens),
+            BeforeAdmission = _ =>
+            {
+                // The engine invokes this at a new-envelope boundary while its
+                // compute gate is open and the model lock is held. Refresh once
+                // here, never during submission or each token. Borrowed budgets
+                // keep their caller's ceilings; the atomic reservation checks
+                // these additional constraints against the latest live ledger.
+                if (!RefreshCapacity())
+                    throw new MemoryPressureException("Fresh physical observations refuse request admission.");
+                return LastPhysicalCapacityPlan!.DesiredCapacities;
+            },
             EnterSerialExecution = seq =>
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
@@ -352,12 +402,17 @@ public sealed class AdaptiveModelSession : IDisposable
         // constrains the plan; explicit operator headroom always takes priority.
         return
         [
-            new(HostPool, hw.HostTotal, hw.HostAvailable, o.HostHeadroomBytes ?? Math.Max(512L << 20, Math.Min(hw.HostTotal, hostCeiling) / 16),
+            new(HostPool, hw.HostTotal, hw.HostAvailable, HostHeadroom(hw, o, hostCeiling),
                 snapshots[HostPool], hostCeiling),
-            new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, o.DeviceHeadroomBytes ?? GpuMemoryBudget.ResolveHeadroomBytes(Math.Min(hw.DeviceTotal, deviceCeiling)),
+            new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, DeviceHeadroom(hw, o, deviceCeiling),
                 snapshots[DevicePool], deviceCeiling)
         ];
     }
+
+    private static long HostHeadroom(InferenceHardwareMemory hw, AdaptiveModelMemoryOptions o, long ceiling)
+        => o.HostHeadroomBytes ?? Math.Max(512L << 20, Math.Min(hw.HostTotal, ceiling) / 16);
+    private static long DeviceHeadroom(InferenceHardwareMemory hw, AdaptiveModelMemoryOptions o, long ceiling)
+        => o.DeviceHeadroomBytes ?? GpuMemoryBudget.ResolveHeadroomBytes(Math.Min(hw.DeviceTotal, ceiling));
 
     private static void Validate(AdaptiveModelMemoryOptions o)
     {
@@ -365,6 +420,7 @@ public sealed class AdaptiveModelSession : IDisposable
             || o.MaximumPrefillChunkTokens <= 0 || o.StreamingTileBytes <= 0
             || o.MaximumHostBytes < 0 || o.MaximumDeviceBytes < 0
             || o.MaximumStreamingHostCacheBytes < 0 || o.MaximumStreamingDeviceCacheBytes < 0 || o.MaximumStreamingWorkspaceCacheBytes < 0
+            || o.HostUninstrumentedBurstBytes < 0 || o.DeviceUninstrumentedBurstBytes < 0
             || o.HostHeadroomBytes < 0 || o.DeviceHeadroomBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(o));
     }

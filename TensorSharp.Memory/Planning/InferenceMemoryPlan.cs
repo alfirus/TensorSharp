@@ -15,12 +15,21 @@ public readonly record struct InferenceWeightBytes(long Host, long Device);
 
 /// <summary>A contemporaneous hardware observation plus accounting snapshot.
 /// AvailableBytes is hardware free/available space, NOT MemoryPoolSnapshot.Available.
-/// It already excludes committed physical allocations, but not unallocated reservations.
+/// Only IncludedCommittedBytes proves which committed bytes it already excludes.
 /// HeadroomBytes is additional space to leave free, supplied by the caller.
 /// MaximumBudgetBytes is an explicit operator limit, independent of the previous capacity.</summary>
 public sealed record InferenceMemoryPool(
     string Pool, long TotalBytes, long AvailableBytes, long HeadroomBytes,
-    MemoryPoolSnapshot Accounting, long MaximumBudgetBytes = long.MaxValue);
+    MemoryPoolSnapshot Accounting, long MaximumBudgetBytes = long.MaxValue)
+{
+    /// <summary>A certified lower bound on this ledger's committed bytes already
+    /// excluded by this particular available-space measurement. Unknown means zero.
+    /// Do not infer this from aggregate RSS, GC bytes, mapped file length, or the
+    /// whole shared ledger. Pageable bytes need not currently consume resident RAM.
+    /// Reservations are never included. The observing allocator must establish the
+    /// overlap; CUDA and host/UMA constraints may have different overlap values.</summary>
+    public long? IncludedCommittedBytes { get; init; }
+}
 
 /// <summary>KV includes both K and V, metadata and dtype-specific storage per token.
 /// WindowTokens=0 means full context. AllocationBlockTokens models page rounding.

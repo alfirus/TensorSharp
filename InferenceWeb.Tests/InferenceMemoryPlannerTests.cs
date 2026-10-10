@@ -163,7 +163,7 @@ public sealed class InferenceMemoryPlannerTests
         Assert.Equal(40, snapshot.Available); // not the 60 bytes physically free
         var input = Input(100, 100) with
         {
-            Pools = [Pool("ram", 100), new("gpu", 100, 60, 10, snapshot)],
+            Pools = [Pool("ram", 100), new("gpu", 100, 60, 10, snapshot) { IncludedCommittedBytes = 40 }],
             Model = new() { DenseWeights = new(30, 30) }
         };
         var plan = InferenceMemoryPlanner.Plan(input);
@@ -186,7 +186,8 @@ public sealed class InferenceMemoryPlannerTests
         using var pending = budget.Reserve([new MemoryCharge("gpu", 30)]);
         var input = Input(1000, 200) with
         {
-            Pools = [Pool("ram", 1000), new("gpu", 200, 10, 20, budget.Snapshot().Single(p => p.Pool == "gpu"))],
+            Pools = [Pool("ram", 1000), new("gpu", 200, 10, 20, budget.Snapshot().Single(p => p.Pool == "gpu"))
+                { IncludedCommittedBytes = 120 }],
             Candidates = [Candidate("reuse") with { ReusableCommittedCharges = [new("gpu", 100)] }]
         };
         var plan = InferenceMemoryPlanner.Plan(input);
@@ -212,7 +213,8 @@ public sealed class InferenceMemoryPlannerTests
     public void ReuseSubtractsOnlyIdentifiedCommittedModelStorage()
     {
         var input = Input(1000, 200) with
-        { Pools = [Pool("ram", 1000), new("gpu", 200, 40, 0, new("gpu", 200, 0, 80))] };
+        { Pools = [Pool("ram", 1000), new("gpu", 200, 40, 0, new("gpu", 200, 0, 80))
+            { IncludedCommittedBytes = 80 }] };
         Assert.False(InferenceMemoryPlanner.Plan(input).Accepted);
         var plan = InferenceMemoryPlanner.Plan(input with
         { Candidates = [Candidate("reuse") with { ReusableCommittedCharges = [new("gpu", 80)] }] });

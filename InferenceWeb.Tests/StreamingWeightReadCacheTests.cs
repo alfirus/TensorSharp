@@ -142,14 +142,15 @@ public sealed class StreamingWeightReadCacheTests
         };
         Assert.Equal(512, AdaptiveModelSession.HostCacheLimit(plan, 2048, 2048));
         var pool = new InferenceMemoryPool(AdaptiveModelSession.HostPool, 2048, 512, 0,
-            new(AdaptiveModelSession.HostPool, 1024, 0, 512), 700);
+            new(AdaptiveModelSession.HostPool, 1024, 0, 512), 700) { IncludedCommittedBytes = 512 };
         // 512 existing bytes fit 700, but another 256 bytes are needed by the request.
         Assert.True(AdaptiveModelSession.RequiresIdleTrim(pool, 256, 128));
         Assert.False(AdaptiveModelSession.RequiresIdleTrim(pool, 256, 0));
         Assert.False(AdaptiveModelSession.RequiresIdleTrim(pool with { MaximumBudgetBytes = 768 }, 256, 128));
         Assert.True(AdaptiveModelSession.RequiresIdleTrim(pool with { MaximumBudgetBytes = 500 }, 0, 0));
-        Assert.False(AdaptiveModelSession.RequiresIdleTrim(pool with { Pool = "gpu" }, 256, 128));
-        var device = pool with { Pool = AdaptiveModelSession.DevicePool };
+        Assert.True(AdaptiveModelSession.RequiresIdleTrim(pool with { IncludedCommittedBytes = null }, 256, 128));
+        Assert.False(AdaptiveModelSession.RequiresIdleTrim(pool with { Pool = "gpu", Accounting = pool.Accounting with { Pool = "gpu" } }, 256, 128));
+        var device = pool with { Pool = AdaptiveModelSession.DevicePool, Accounting = pool.Accounting with { Pool = AdaptiveModelSession.DevicePool } };
         Assert.True(AdaptiveModelSession.RequiresIdleTrim(device, 0, 0, 256, 128));
         Assert.False(AdaptiveModelSession.RequiresIdleTrim(device, 0, 0, 256, 0));
         Assert.False(AdaptiveModelSession.RequiresIdleTrim(device with { MaximumBudgetBytes = 768 }, 0, 0, 256, 128));

@@ -118,11 +118,14 @@ namespace TensorSharp.Runtime.Scheduling
                         cfg));
 
                 if (cfg.MemoryAdmission is { } memoryAdmission)
+                {
                     _sharedReclamation = SharedBudgetReclamation.Register(memoryAdmission.Budget, () =>
                     {
                         if (Interlocked.Exchange(ref _reclamationPending, 1) == 0)
                             _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.Reclaim });
                     });
+                    _scheduler.AttachSharedAdmission(_sharedReclamation);
+                }
                 _worker = new Thread(WorkerLoop)
                 {
                     IsBackground = true,
@@ -177,8 +180,24 @@ namespace TensorSharp.Runtime.Scheduling
         public ComputeGate? ComputeGate
         {
             get => Volatile.Read(ref _computeGate);
-            set => Volatile.Write(ref _computeGate, value);
+            set
+            {
+                lock (_submissionGate)
+                {
+                    var previous = Interlocked.Exchange(ref _computeGate, value);
+                    if (previous != null) previous.Changed -= OnComputeGateChanged;
+                    if (!_stopping && value != null) value.Changed += OnComputeGateChanged;
+                }
+                OnComputeGateChanged(value?.IsOpen ?? true);
+            }
         }
+
+        // Gate changes must also wake a worker waiting on a memory generation:
+        // closed engines relinquish unadmitted FIFO demand, and a replacement gate
+        // must not leave the worker waiting forever on the old gate's open signal.
+        // This callback only enqueues metadata work; it never acquires a model lock.
+        private void OnComputeGateChanged(bool open) =>
+            _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.Reclaim });
 
         private ComputeGate? _computeGate;
         private long _stepsHeldByGate;
@@ -379,7 +398,12 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                 }
             }
-            finally { _sharedReclamation?.Dispose(); }
+            finally
+            {
+                lock (_submissionGate)
+                    if (_computeGate != null) _computeGate.Changed -= OnComputeGateChanged;
+                _sharedReclamation?.Dispose();
+            }
         }
 
         private void RunWorkerLoop()
@@ -421,6 +445,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
 
                 if (_scheduler.WaitingCount == 0) _sharedReclamation?.Clear();
+                if (!(Volatile.Read(ref _computeGate)?.IsOpen ?? true)) _sharedReclamation?.Clear();
                 // Foreign pressure can arrive during a forward. Keep the single
                 // pending bit until every live sequence has finished; never trim
                 // active state or submit GPU work while the host gate is closed.
@@ -428,8 +453,7 @@ namespace TensorSharp.Runtime.Scheduling
                     && (Volatile.Read(ref _computeGate)?.IsOpen ?? true))
                 {
                     Interlocked.Exchange(ref _reclamationPending, 0);
-                    lock (_model.GpuComputeLock)
-                        _executor.ReclaimForAdmission(() => !(_sharedReclamation?.NeedsReclamation() ?? false));
+                    lock (_model.GpuComputeLock) ReclaimSharedDemand();
                 }
 
                 // If there's nothing in flight, block on command channel.
@@ -468,6 +492,9 @@ namespace TensorSharp.Runtime.Scheduling
                 // They share the same compute gate as forwarding and media encoders.
                 lock (_model.GpuComputeLock)
                 {
+                    // The host may have closed the gate while this worker waited
+                    // for a media encoder or another owner of the model lock.
+                    if (!(Volatile.Read(ref _computeGate)?.IsOpen ?? true)) continue;
                     // Run one scheduler step.
                     sw.Restart();
                     SchedulerOutput? output = null;
@@ -506,7 +533,7 @@ namespace TensorSharp.Runtime.Scheduling
                         else if (_scheduler.BlockedMemoryPeak is { } peak
                             && _scheduler.Config.MemoryAdmission is { } admission)
                         {
-                            _executor.ReclaimForAdmission(() => admission.Budget.CanReserve(peak));
+                            ReclaimSharedDemand();
                             // Reclamation itself may pulse the old signal without
                             // freeing enough credit. Capture a fresh signal BEFORE
                             // rechecking, avoiding both missed external releases
@@ -516,14 +543,13 @@ namespace TensorSharp.Runtime.Scheduling
                             // invalidates the queued peak instead of admitting it;
                             // let Schedule reject it rather than waiting for a
                             // second budget change that may never arrive.
-                            if (!admission.Budget.CanEverFit(peak) || admission.Budget.CanReserve(peak))
+                            if (!admission.Budget.CanEverFit(peak) || _scheduler.CanAdmitMemory(peak))
                                 memoryWait = null;
                             else _sharedReclamation?.Publish(peak, memoryWait);
                         }
                         continue;
                     }
                     memoryWait = null;
-                    _sharedReclamation?.Clear();
 
                     try
                     {
@@ -551,6 +577,13 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                 }
             }
+        }
+
+        private void ReclaimSharedDemand()
+        {
+            using var demand = _sharedReclamation?.TryBeginReclamation();
+            if (demand != null)
+                demand.MoreWork = _executor.ReclaimForAdmission(() => !demand.NeedsReclamation(), maximumVictims: 8);
         }
 
         private bool CanApplyWhileGateClosed(EngineCommand command)
