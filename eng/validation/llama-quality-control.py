@@ -62,9 +62,10 @@ def main():
         parser.error('Require positive limits and unique known cases')
     if 'image_ocr' in cases and args.image is None:
         parser.error('Image case needs --image')
-    out = args.output.resolve()
-    if not any(out.is_relative_to(bench.ROOT / base) for base in ('artifacts', 'docs/validation')):
-        parser.error('Evidence must stay in ignored artifact directories')
+    try:
+        out = bench.evidence_directory(args.output)
+    except ValueError as error:
+        parser.error(str(error))
     out.mkdir(parents=True, exist_ok=False)
     report = dict(engine='llama.cpp', started_unix=time.time(), records=[], run_complete=False,
                   image=bench.identity(args.image) if args.image else None,

@@ -12,6 +12,17 @@ spec.loader.exec_module(matrix)
 
 
 class QualityBenchTests(unittest.TestCase):
+    def test_evidence_directory_keeps_volume_backed_workspace_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            path = root / 'artifacts' / 'external-volume' / 'run'
+            # Do not dereference symlinks/junctions: the ignored logical path is
+            # what decides where evidence belongs in the repository.
+            with patch.object(Path, 'resolve', side_effect=AssertionError('dereferenced')):
+                self.assertEqual(matrix.evidence_directory(path, root), path)
+            with self.assertRaises(ValueError):
+                matrix.evidence_directory(root / 'artifacts' / '..' / 'tracked', root)
+
     def test_linux_sampler_observes_server_membership_and_keeps_other_metrics_on_error(self):
         with tempfile.TemporaryDirectory() as directory:
             sampler = matrix.Sampler(Path(directory)/'memory.jsonl')

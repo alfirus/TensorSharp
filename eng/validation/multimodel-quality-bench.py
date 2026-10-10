@@ -67,6 +67,19 @@ def sha(path):
     return digest.hexdigest()
 
 
+def evidence_directory(path, root=ROOT):
+    """Keep the ignored workspace name, including a volume-backed junction.
+
+    Resolving the link first incorrectly rejects artifacts moved to another disk.
+    Normalize parent traversals before checking; this does not authorize deleting
+    either the link or its target. The harness only creates a fresh run directory.
+    """
+    path = Path(os.path.abspath(path))
+    if not any(path.is_relative_to(root / base) for base in ("artifacts", "docs/validation")):
+        raise ValueError("Evidence must be ignored under artifacts/ or docs/validation/")
+    return path
+
+
 def identity(path):
     path = Path(path).resolve()
     stat = path.stat()
@@ -276,7 +289,10 @@ def main():
     parser.add_argument("--expert-cache-mb", type=int, default=0)
     args = parser.parse_args()
     cases = args.cases.split(",")
-    out = args.output.resolve()
+    try:
+        out = evidence_directory(args.output)
+    except ValueError as error:
+        parser.error(str(error))
     if sys.platform not in ("win32", "linux") or not math.isfinite(args.timeout) or args.timeout <= 0 or args.repetitions < 1 or args.max_tokens < 1 or args.context < 1 or args.expert_cache_mb < 0 or args.threads < 1:
         parser.error("Windows/Linux and positive limits required")
     if not re.fullmatch(r"\d+(?:,\d+)*", args.devices) or len(set(args.devices.split(','))) != len(args.devices.split(',')):
@@ -289,8 +305,6 @@ def main():
         parser.error("Require unique known cases")
     if "image_ocr" in cases and not (args.image and args.mmproj):
         parser.error("Image case requires the card and matching projector")
-    if not any(out.is_relative_to(ROOT / base) for base in ("artifacts", "docs/validation")):
-        parser.error("Evidence must be ignored under artifacts/ or docs/validation/")
     out.mkdir(parents=True, exist_ok=False)
     # Keep the executed checker with the evidence even if its source evolves
     # while a later model or independent reference is being investigated.
