@@ -75,8 +75,9 @@ inline bool read_file_range(FILE * file, uint64_t offset, size_t bytes, void * o
 // Gather a TP rank's strip from each checkpoint row. Reading one strip at a
 // time caused millions of small reads on network storage. Bounded source
 // slabs amortize the reads; each worker reuses its scratch allocation.
+template<class Scratch>
 inline bool read_file_strips(FILE * file, uint64_t offset, size_t stride, size_t strip,
-                             size_t bytes, void * output, std::vector<uint8_t> & scratch,
+                             size_t bytes, void * output, Scratch & scratch,
                              size_t slab_bytes = 1024 * 1024)
 {
     if (!file || !output || strip == 0 || stride < strip || bytes == 0 || bytes % strip != 0)

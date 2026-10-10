@@ -32,7 +32,8 @@ public sealed record GgmlAllocationRefusal(int Rank, int Kind, long Bytes,
 /// Cache-only refusal can use unbudgeted per-graph streaming. Dispose only after
 /// model work has stopped and all covered caches/graphs have been released.
 /// Supplying hostPools additionally accounts for the compact expert file-read
-/// arena and DeepSeek demand-read staging against the same budget, independently
+/// arena, DeepSeek demand-read staging and GLM uploader/TP-strip scratch payload
+/// against the same budget, independently
 /// of rank/device pool mappings.
 /// Failed disposal keeps callbacks rooted and accounting active for a retry.</summary>
 public sealed class GgmlCacheBudgetScope : IDisposable
@@ -81,7 +82,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     /// <summary>Also charge explicitly routed native host staging to the supplied
     /// host pools. Null excludes these buffers, preserving the legacy contract.
     /// This mapping is process-wide, independent of device-rank pools. It covers
-    /// the compact expert file arena and DeepSeek demand-read staging,
+    /// the compact expert file arena, DeepSeek demand-read staging and GLM upload scratch,
     /// not mmap residency or all host allocations.</summary>
     public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools,
         bool includeGraphBuffers, IEnumerable<string>? hostPools)

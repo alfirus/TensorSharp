@@ -50,6 +50,7 @@
 #include "glm_file_strip.h"
 #include "glm_joined_workers.h"
 #include "glm_metadata_owner.h"
+#include "glm_upload_buffer.h"
 
 #include "gguf.h"
 #include "ggml-impl.h" // ggml_graph_view for segmented TP execution
@@ -1080,8 +1081,8 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
     auto worker = [&]()
     {
         std::vector<unique_file> files(shards.paths.size());
-        std::vector<uint8_t> staging;
-        std::vector<uint8_t> source_slab;
+        upload_buffer<> staging;
+        upload_buffer<> source_slab;
         while (!failed.load(std::memory_order_relaxed))
         {
             size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
