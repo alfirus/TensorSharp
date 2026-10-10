@@ -20,12 +20,24 @@ import sys
 import time
 
 
-def main():
+def creation_flags(detached=False):
+    """Always create suspended; detached suppresses the console-host Job member."""
+    return 0x4 | (0x8 if detached else 0x08000000)
+
+
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--commit-bytes', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=float, default=1200)
+    parser.add_argument('--detached', action='store_true',
+                        help='Create the owned child without a console (default keeps CREATE_NO_WINDOW).')
     parser.add_argument('command', nargs=argparse.REMAINDER)
+    return parser
+
+
+def main():
+    parser = argument_parser()
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     root = Path(__file__).resolve().parents[2]
@@ -38,6 +50,7 @@ def main():
         parser.error('A command, positive timeout and at least 64 MiB commit are required.')
     output.mkdir(parents=True, exist_ok=False)
     report = dict(command=command, requested_commit_bytes=args.commit_bytes,
+                  creation_flags=creation_flags(args.detached), detached=args.detached,
                   enforcement='unavailable', passed=False, errors=[], samples=[], processes=[],
                   scope='Process-tree private commit only; excludes mapped-file residency, shared file cache and VRAM.')
     job = None
@@ -71,6 +84,9 @@ def main():
 
         class Process(c.Structure):
             _fields_ = [('process', w.HANDLE), ('thread', w.HANDLE), ('pid', w.DWORD), ('tid', w.DWORD)]
+
+        class Members(c.Structure):
+            _fields_ = [('assigned', w.DWORD), ('listed', w.DWORD), ('pids', size * 2)]
 
         def api(name, result_type, *parameters):
             fn = getattr(kernel, name)
@@ -125,13 +141,20 @@ def main():
                     os.set_handle_inheritable(startup.stdout, True)
                     os.set_handle_inheritable(startup.stdin, True)
                     line = c.create_unicode_buffer(subprocess.list2cmdline(argv))
-                    check(create(None, line, None, None, True, 0x4 | 0x08000000, None, None, c.byref(startup), c.byref(proc)))
+                    check(create(None, line, None, None, True, creation_flags(args.detached), None, None, c.byref(startup), c.byref(proc)))
                     check(assign(job, proc.process))
                     belongs = w.BOOL()
                     check(member(proc.process, job, c.byref(belongs)))
                     if not belongs.value:
                         raise RuntimeError('Suspended child is not in the owned job.')
-                    report['processes'].append(dict(name=name, pid=proc.pid, membership_verified=True, assigned_before_resume=True))
+                    members = Members()
+                    queried = bool(query_job(job, 3, c.byref(members), c.sizeof(members), None))
+                    member_error = c.get_last_error() if not queried else None
+                    report['processes'].append(dict(name=name, pid=proc.pid, membership_verified=True,
+                        assigned_before_resume=True, job_members_before_resume=dict(
+                            query_succeeded=queried, win32_error=member_error,
+                            assigned=members.assigned, listed=members.listed,
+                            pids=list(members.pids)[:min(members.listed, len(members.pids))])))
                     if resume(proc.thread) == 0xffffffff:
                         raise c.WinError(c.get_last_error())
                     while True:

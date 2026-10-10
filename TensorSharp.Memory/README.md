@@ -399,6 +399,24 @@ pages already include speculative pages. Inactive/dirty/compressed pages are
 not assumed free, and zero app allowance grants zero new capacity. These are
 conservative observations, not Jetsam protection or a process hard limit.
 
+`HostMemoryInfo.CaptureAllocationConstraints()` additionally reports Windows
+process-available commit from `GlobalMemoryStatusEx`, intersected with observable
+immediate Windows Job limits. The public Job APIs expose per-process limits;
+current private usage also permits attribution in a Job containing only this
+process. A shared Job-wide limit with unknown aggregate usage refuses planning.
+Historical peak usage is not substituted for current usage. Hidden ancestor
+Jobs are unverified, and membership/usage observations are not atomic with
+allocation. Its optional `CommitLimit`/`CommitAvailable` pair is an independent
+allocation constraint, not pagefile disk capacity or extra RAM. Other providers
+currently leave this pair unknown; their cgroup/app physical constraints remain
+in effect. The physical-only `Capture()` contract is unchanged for mapped-file
+prefault. Adaptive host allocation planning intersects known commit and RAM
+allowances, and refresh preserves both observations separately without adding
+them or claiming OS enforcement. CUDA/WDDM driver commitment and allocations
+outside the ledger may still consume that allowance between observations; this
+does not establish complete host/device physical ownership or a hard limit.
+Windows field semantics: [MEMORYSTATUSEX](https://learn.microsoft.com/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex).
+
 The ledger, residency scheduler, host KV paging, request admission and planner
 use byte counts and capability/pool mappings, not a particular OS quota API.
 UMA adapters must charge device allocations to physical RAM and the device

@@ -198,7 +198,8 @@ object MemorySample()
     using var process = Process.GetCurrentProcess();
     bool known = GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total);
     return new { WorkingSet = process.WorkingSet64, PeakWorkingSet = process.PeakWorkingSet64,
-        DeviceKnown = known, DeviceTotal = total, DeviceFree = free, Pools = session?.Budget.Snapshot() };
+        DeviceKnown = known, DeviceTotal = total, DeviceFree = free, Pools = session?.Budget.Snapshot(),
+        PhysicalPlan = session?.LastPhysicalCapacityPlan };
 }
 static string Hash(string file) { using var s = File.OpenRead(file); return Convert.ToHexString(SHA256.HashData(s)); }
 static object NativeIdentity()

@@ -44,6 +44,11 @@ public sealed record AdaptiveModelMemoryOptions(int ContextTokens, int PrefillTo
 public readonly record struct InferenceHardwareMemory(long HostTotal, long HostAvailable,
     long DeviceTotal, long DeviceAvailable)
 {
+    /// <summary>Optional independent allowance for new host commitments. This is
+    /// not extra RAM or proof of a hard cap. CUDA/driver commitment is not owned
+    /// by the host ledger and can consume this allowance between observations.</summary>
+    public long? HostCommitLimit { get; init; }
+    public long? HostCommitAvailable { get; init; }
     /// <summary>Read physical availability, not GC heap usage or an earlier budget.
     /// Unknown measurements fail closed. Initializing the CUDA backend is explicit.</summary>
     public static InferenceHardwareMemory CaptureCuda()
@@ -51,11 +56,31 @@ public readonly record struct InferenceHardwareMemory(long HostTotal, long HostA
         GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
         if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
             throw new NotSupportedException("The backend did not report device memory availability.");
-        var host = CaptureHost();
-        return new(host.Total, host.Available, total, free);
+        var host = HostMemoryInfo.CaptureAllocationConstraints();
+        return new(host.Total, host.Available, total, free)
+        { HostCommitLimit = host.CommitLimit, HostCommitAvailable = host.CommitAvailable };
     }
 
     internal static (long Total, long Available) CaptureHost() => HostMemoryInfo.Capture();
+
+    internal void ValidateCommit()
+    {
+        if (HostCommitLimit.HasValue != HostCommitAvailable.HasValue
+            || HostCommitLimit is <= 0 || HostCommitAvailable is < 0
+            || HostCommitAvailable > HostCommitLimit)
+            throw new ArgumentException("Host commit observation must be a complete, finite limit/available pair.");
+    }
+
+    internal (long Total, long Available) HostAllocationCapacity()
+    {
+        // Validate each observation before intersecting: a tighter commit
+        // ceiling must not conceal an impossible physical sample.
+        if (HostTotal <= 0 || HostAvailable < 0 || HostAvailable > HostTotal)
+            throw new ArgumentException("Invalid physical host capacity observation.");
+        ValidateCommit();
+        return (Math.Min(HostTotal, HostCommitLimit ?? long.MaxValue),
+            Math.Min(HostAvailable, HostCommitAvailable ?? long.MaxValue));
+    }
 }
 
 /// <summary>Hardware/request-aware loading for dense Gemma4/Qwen35 on one CUDA
@@ -212,8 +237,8 @@ public sealed class AdaptiveModelSession : IDisposable
         // residency, so neither is sufficient evidence for adding bytes back.
         long deviceIncluded = GgmlBasicOps.TryGetCacheMemoryUsage(0, out var cache)
             ? checked(cache.DeviceCopyCommittedBytes + cache.PreloadCommittedBytes) : 0;
-        return LastPhysicalCapacityPlan = _physicalPlanner.Plan(
-        [
+        var observations = new List<PhysicalMemoryObservation>
+        {
             new("host-available", HostPool, "host-ram", PhysicalMemoryMetric.HostAvailable,
                 hw.HostTotal, hw.HostAvailable, now)
             {
@@ -226,7 +251,25 @@ public sealed class AdaptiveModelSession : IDisposable
                 IncludedCommittedBytes = deviceIncluded, MaximumBudgetBytes = deviceCeiling,
                 Headroom = new() { MinimumBytes = DeviceHeadroom(hw, _options, deviceCeiling), FutureBurstBytes = _options.DeviceUninstrumentedBurstBytes }
             }
-        ], ledger, now);
+        };
+        AddHostCommitObservation(observations, hw, now, hostCeiling,
+            HostHeadroom(hw, _options, hostCeiling), _options.HostUninstrumentedBurstBytes);
+        return LastPhysicalCapacityPlan = _physicalPlanner.Plan(observations, ledger, now);
+    }
+
+    internal static void AddHostCommitObservation(List<PhysicalMemoryObservation> observations,
+        InferenceHardwareMemory hw, DateTimeOffset now, long ceiling, long headroom, long burst)
+    {
+        hw.ValidateCommit();
+        if (hw.HostCommitLimit is not long total || hw.HostCommitAvailable is not long available) return;
+        observations.Add(new("host-commit-available", HostPool, "host-commit", PhysicalMemoryMetric.PrivateCommitAvailable,
+            total, available, now)
+        {
+            MaximumBudgetBytes = ceiling,
+            Headroom = new() { MinimumBytes = headroom, FutureBurstBytes = burst }
+            // No allocator proves which host-ledger bytes are in process commit;
+            // do not add existing owners back or manufacture enforcement evidence.
+        });
     }
 
     internal static bool RequiresIdleTrim(InferenceMemoryPool pool, long hostReserve, long cachedBytes,
@@ -394,6 +437,7 @@ public sealed class AdaptiveModelSession : IDisposable
 
     private static InferenceMemoryPool[] Pools(InferenceHardwareMemory hw, MemoryBudget budget, AdaptiveModelMemoryOptions o, bool sharedBudget = false)
     {
+        var hostCapacity = hw.HostAllocationCapacity();
         var snapshots = budget.Snapshot().ToDictionary(p => p.Pool);
         long hostCeiling = sharedBudget ? Math.Min(o.MaximumHostBytes, snapshots[HostPool].Capacity) : o.MaximumHostBytes;
         long deviceCeiling = sharedBudget ? Math.Min(o.MaximumDeviceBytes, snapshots[DevicePool].Capacity) : o.MaximumDeviceBytes;
@@ -402,7 +446,7 @@ public sealed class AdaptiveModelSession : IDisposable
         // constrains the plan; explicit operator headroom always takes priority.
         return
         [
-            new(HostPool, hw.HostTotal, hw.HostAvailable, HostHeadroom(hw, o, hostCeiling),
+            new(HostPool, hostCapacity.Total, hostCapacity.Available, HostHeadroom(hw, o, hostCeiling),
                 snapshots[HostPool], hostCeiling),
             new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, DeviceHeadroom(hw, o, deviceCeiling),
                 snapshots[DevicePool], deviceCeiling)
