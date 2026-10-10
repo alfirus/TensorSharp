@@ -305,25 +305,28 @@ static partial class Cases
     {
         await using var f = new Fixture(ram: 4 * Page, disk: 32 * Page, chunk: 512);
         var keys = Enumerable.Range(0, 12).Select(i => f.Add($"state{i}", true)).ToArray();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var completions = new PressureCompletionSignal();
         await Task.WhenAll(Enumerable.Range(0, 8).Select(async worker =>
         {
             var random = new Random(3900 + worker);
             for (int i = 0; i < 40; i++)
             {
                 var key = keys[random.Next(keys.Length)];
-                for (int attempt = 0; ; attempt++)
+                var lease = await PressureRetry.AcquireAsync(f, key, ResourceAccess.Write,
+                    completions, deadline.Token);
+                try
                 {
-                    try
-                    {
-                        using var lease = await f.Scheduler.AcquireAsync(key, f.Host.Location, ResourceAccess.Write);
-                        var bytes = new byte[8];
-                        await lease.ReadAsync(0, bytes);
-                        long value = BitConverter.ToInt64(bytes) + 1;
-                        await lease.WriteAsync(0, BitConverter.GetBytes(value));
-                        Check.True(f.Budget.Snapshot().All(p => p.Available >= 0));
-                        break;
-                    }
-                    catch (MemoryPressureException) when (attempt < 10000) { await Task.Yield(); }
+                    var bytes = new byte[8];
+                    await lease.ReadAsync(0, bytes, deadline.Token);
+                    long value = BitConverter.ToInt64(bytes) + 1;
+                    await lease.WriteAsync(0, BitConverter.GetBytes(value), deadline.Token);
+                    Check.True(f.Budget.Snapshot().All(p => p.Available >= 0));
+                }
+                finally
+                {
+                    lease.Dispose();
+                    completions.Pulse();
                 }
             }
         }));

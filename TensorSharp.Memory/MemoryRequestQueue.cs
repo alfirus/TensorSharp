@@ -15,6 +15,9 @@ public sealed class MemoryRequestQueue
     private readonly Dictionary<string, LinkedListNode<Request>> _index = new(StringComparer.Ordinal);
     private readonly HashSet<string> _active = new(StringComparer.Ordinal);
     private readonly int _maxQueued;
+    internal enum FaultPoint { EnqueueIndex, EnqueueIndexed, AdmissionOwner, AdmissionActive, AdmissionRegistered }
+    // Instance-local deterministic failure injection. No default callback.
+    internal Action<FaultPoint>? FaultInjector { get; set; }
 
     public MemoryRequestQueue(MemoryBudget budget, int maxQueuedRequests = 1024)
     {
@@ -34,7 +37,22 @@ public sealed class MemoryRequestQueue
         {
             if (_index.ContainsKey(requestId) || _active.Contains(requestId)) throw new ArgumentException("Duplicate request id.");
             if (_waiting.Count == _maxQueued) throw new MemoryPressureException("Admission queue is full.");
-            _index.Add(requestId, _waiting.AddLast(new Request(requestId, charges)));
+            // Prepare both objects before publication. An index resize must not
+            // leave an unindexed linked-list entry that cannot be cancelled.
+            var node = new LinkedListNode<Request>(new Request(requestId, charges));
+            try
+            {
+                FaultInjector?.Invoke(FaultPoint.EnqueueIndex);
+                _index.Add(requestId, node);
+                FaultInjector?.Invoke(FaultPoint.EnqueueIndexed);
+            }
+            catch
+            {
+                // Also handles a dictionary failure after it inserted its entry.
+                _index.Remove(requestId);
+                throw;
+            }
+            _waiting.AddLast(node); // Existing node: no allocation after indexing.
         }
     }
 
@@ -63,13 +81,33 @@ public sealed class MemoryRequestQueue
             }
             var reservation = _budget.TryReserve(first.Value.Charges);
             if (reservation == null) return null;
-            _waiting.RemoveFirst();
-            _index.Remove(first.Value.Id);
-            _active.Add(first.Value.Id);
-            return new AdmittedMemoryRequest(first.Value.Id, reservation, () =>
+            try
             {
-                lock (_gate) _active.Remove(first.Value.Id);
-            });
+                string requestId = first.Value.Id;
+                FaultInjector?.Invoke(FaultPoint.AdmissionOwner);
+                var admitted = new AdmittedMemoryRequest(requestId, reservation, () =>
+                {
+                    lock (_gate) _active.Remove(requestId);
+                });
+                FaultInjector?.Invoke(FaultPoint.AdmissionActive);
+                _active.Add(requestId);
+                FaultInjector?.Invoke(FaultPoint.AdmissionRegistered);
+                // Owner and active registration exist. Neither removal allocates.
+                _waiting.RemoveFirst();
+                _index.Remove(requestId);
+                return admitted;
+            }
+            catch (Exception admissionError)
+            {
+                _active.Remove(first.Value.Id);
+                try { reservation.Dispose(); }
+                catch (Exception releaseError)
+                {
+                    throw new AggregateException("Request admission and reservation rollback both failed.",
+                        admissionError, releaseError);
+                }
+                throw;
+            }
         }
     }
 }
@@ -87,8 +125,37 @@ public sealed class AdmittedMemoryRequest : IDisposable
     public BudgetReservation Envelope { get; }
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        Envelope.Dispose();
-        _finish();
+        // 0=retryable, 1=disposing, 2=complete. A notification can fail after the
+        // ledger released its owner: still retire the active ID in that case.
+        // If actual release or the finish callback failed, a later Dispose can
+        // retry without pretending ownership was freed or notifying twice.
+        if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
+        try
+        {
+            Exception? releaseError = null;
+            try { Envelope.Dispose(); }
+            catch (Exception error)
+            {
+                releaseError = error;
+                throw;
+            }
+            finally
+            {
+                if (Volatile.Read(ref Envelope.State) == 2)
+                {
+                    try
+                    {
+                        _finish();
+                        Volatile.Write(ref _disposed, 2);
+                    }
+                    catch (Exception finishError) when (releaseError != null)
+                    {
+                        throw new AggregateException("Request reservation release and completion both failed.",
+                            releaseError, finishError);
+                    }
+                }
+            }
+        }
+        finally { Interlocked.CompareExchange(ref _disposed, 0, 1); }
     }
 }

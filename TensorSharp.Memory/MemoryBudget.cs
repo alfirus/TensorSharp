@@ -38,7 +38,27 @@ public sealed class MemoryBudget
     private readonly object _gate = new();
     private readonly Dictionary<string, Pool> _pools = new(StringComparer.Ordinal);
     private TaskCompletionSource? _changed;
+    // Instance-local fault seam for deterministic allocation-failure tests. The
+    // default path has no factory/delegate allocation and never invokes a hook.
+    internal enum ReservationAllocationPoint { Owner, ChildCharges }
+    internal Action<ReservationAllocationPoint>? BeforeReservationAllocation { get; set; }
+    // Synthetic notification-failure seam, after ownership is already released.
+    // It does not model CLR thread-pool recovery or promise a completed old signal.
+    internal Action? BeforeChangeNotification { get; set; }
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private BudgetReservation NewReservation(MemoryCharge[] charges)
+    {
+        BeforeReservationAllocation?.Invoke(ReservationAllocationPoint.Owner);
+        return new BudgetReservation(this, charges);
+    }
+
+    private static int FindCharge(MemoryCharge[] charges, string pool)
+    {
+        for (int i = 0; i < charges.Length; i++)
+            if (charges[i].Pool == pool) return i;
+        return -1;
+    }
 
     /// <summary>Capture BEFORE trying admission, then wait if it fails. The signal
     /// completes when releases/capacity changes could allow progress; no polling or
@@ -48,7 +68,11 @@ public sealed class MemoryBudget
     {
         var old = _changed;
         _changed = null;
-        old?.TrySetResult();
+        if (old != null)
+        {
+            BeforeChangeNotification?.Invoke();
+            old.TrySetResult();
+        }
     }
 
     public MemoryBudget(IEnumerable<MemoryCharge> capacities)
@@ -179,13 +203,16 @@ public sealed class MemoryBudget
                 }
             if (normalized.Any(c => c.Bytes > _pools[c.Pool].Capacity - _pools[c.Pool].Reserved - _pools[c.Pool].Committed))
                 return null;
+            // Allocate the only object capable of releasing this credit before
+            // changing the ledger. OOM must leave no ownerless reservation.
+            var reservation = NewReservation(normalized);
             foreach (var c in normalized)
             {
                 var pool = _pools[c.Pool];
                 pool.Reserved += c.Bytes;
                 pool.PeakOwned = Math.Max(pool.PeakOwned, pool.Reserved + pool.Committed);
             }
-            return new BudgetReservation(this, normalized);
+            return reservation;
         }
     }
 
@@ -340,7 +367,9 @@ public sealed class MemoryBudget
                 // unused credit; its live children remain physically charged.
                 if (reservation.Parent is { State: 0 } parent)
                 {
-                    int index = Array.FindIndex(parent.Items, x => x.Pool == c.Pool);
+                    // No capturing predicate allocation after changing a pool:
+                    // failure partway through a multi-pool release is not safe.
+                    int index = FindCharge(parent.Items, c.Pool);
                     parent.Items[index] = parent.Items[index] with { Bytes = checked(parent.Items[index].Bytes + c.Bytes) };
                     _pools[c.Pool].Reserved += c.Bytes;
                 }
@@ -364,15 +393,34 @@ public sealed class MemoryBudget
         lock (_gate)
         {
             if (envelope.State != 0) throw new InvalidOperationException("An allocation envelope must remain reserved and open.");
-            if (requested.Any(c => c.Bytes > envelope.Items.FirstOrDefault(x => x.Pool == c.Pool).Bytes)) return null;
+            int childCount = 0;
             foreach (var c in requested)
             {
-                int index = Array.FindIndex(envelope.Items, x => x.Pool == c.Pool);
-                if (index >= 0) envelope.Items[index] = envelope.Items[index] with { Bytes = envelope.Items[index].Bytes - c.Bytes };
+                int index = FindCharge(envelope.Items, c.Pool);
+                if (c.Bytes > (index >= 0 ? envelope.Items[index].Bytes : 0)) return null;
+                if (c.Bytes > 0) childCount++;
+            }
+            MemoryCharge[] childCharges = [];
+            if (childCount > 0)
+            {
+                BeforeReservationAllocation?.Invoke(ReservationAllocationPoint.ChildCharges);
+                childCharges = new MemoryCharge[childCount];
+                int next = 0;
+                foreach (var c in requested)
+                    if (c.Bytes > 0) childCharges[next++] = c;
+            }
+            var child = NewReservation(childCharges);
+            child.Parent = envelope;
+            // The child and its final charge array now exist. The remainder
+            // mutates only value-type array elements and cannot allocate.
+            foreach (var c in childCharges)
+            {
+                int index = FindCharge(envelope.Items, c.Pool);
+                envelope.Items[index] = envelope.Items[index] with { Bytes = envelope.Items[index].Bytes - c.Bytes };
             }
             envelope.HasChildren = true;
             // Accounting is unchanged until the child allocation commits.
-            return new BudgetReservation(this, requested.Where(c => c.Bytes > 0).ToArray()) { Parent = envelope };
+            return child;
         }
     }
 }
