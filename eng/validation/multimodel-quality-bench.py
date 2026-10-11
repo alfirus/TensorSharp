@@ -221,7 +221,20 @@ class Sampler:
         if self.process is not None:
             try:
                 row["memory"] = self.process.memory_info()._asdict()
-                row["io"] = self.process.io_counters()._asdict()
+                # psutil omits this API on Linux kernels without /proc/pid/io.
+                # Optional I/O accounting must not discard observed RSS/VRAM or
+                # silently turn unavailable counters into zero disk traffic.
+                read_io = getattr(self.process, "io_counters", None)
+                row["io"] = None
+                row["io_status"] = "unavailable"
+                if read_io is None:
+                    row["io_unavailable_reason"] = "psutil Process.io_counters is unsupported on this platform/kernel"
+                else:
+                    try:
+                        row["io"] = read_io()._asdict()
+                        row["io_status"] = "observed"
+                    except (psutil.Error, OSError, NotImplementedError) as error:
+                        row["io_unavailable_reason"] = f"{type(error).__name__}: {error}"
                 row["cpu"] = self.process.cpu_times()._asdict()
             except psutil.NoSuchProcess:
                 pass
@@ -246,6 +259,23 @@ class Sampler:
                 self.sample()
             except Exception as error:
                 self.errors.append(str(error))
+
+
+def sampled_memory_summary(rows, errors):
+    peak = lambda key: max((row['memory'][key] for row in rows
+                           if row.get('memory', {}).get(key) is not None), default=None)
+    return dict(samples=len(rows), errors=errors,
+        peak_rss_bytes=peak('rss'), peak_private_bytes=peak('private'),
+        private_bytes_scope='psutil memory_info.private when available; not inferred from VMS/RSS/USS. Null means unavailable.',
+        io_observed_samples=sum(row.get('io_status') == 'observed' for row in rows),
+        io_unavailable_samples=sum(row.get('io_status') == 'unavailable' for row in rows),
+        io_scope='Optional process I/O accounting, not physical SSD traffic; unavailable counters are null and support no I/O-performance conclusion.',
+        peak_board_mib=max((d['used_mib'] for row in rows for d in row.get('gpu', [])), default=None),
+        peak_all_boards_mib=max((sum(d['used_mib'] for d in row['gpu']) for row in rows if row.get('gpu')), default=None),
+        peak_per_board_mib={str(int(i)): max(d['used_mib'] for row in rows for d in row.get('gpu', []) if d['index'] == i)
+                            for i in {d['index'] for row in rows for d in row.get('gpu', [])}},
+        peak_sampled_cgroup_bytes=max((int(row['cgroup']['memory.current']) for row in rows
+            if row.get('cgroup', {}).get('memory.current', '').isdigit()), default=None))
 
 
 def summarize(records):
@@ -453,14 +483,7 @@ def main():
                 server.kill()
                 server.wait(timeout=10)
             report["server_exit"] = server.returncode
-        report["memory"] = dict(samples=len(sampler.rows), errors=sampler.errors,
-            peak_rss_bytes=max((r.get("memory", {}).get("rss", 0) for r in sampler.rows), default=0),
-            peak_private_bytes=max((r.get("memory", {}).get("private", 0) for r in sampler.rows), default=0),
-            peak_board_mib=max((d["used_mib"] for r in sampler.rows for d in r["gpu"]), default=0),
-            peak_all_boards_mib=max((sum(d["used_mib"] for d in r["gpu"]) for r in sampler.rows), default=0),
-            peak_per_board_mib={str(int(i)): max(d['used_mib'] for r in sampler.rows for d in r['gpu'] if d['index'] == i)
-                                for i in {d['index'] for r in sampler.rows for d in r['gpu']}},
-            peak_sampled_cgroup_bytes=max((int(r['cgroup']['memory.current']) for r in sampler.rows if r.get('cgroup', {}).get('memory.current', '').isdigit()), default=None))
+        report["memory"] = sampled_memory_summary(sampler.rows, sampler.errors)
         report["finished_unix"] = time.time()
         save()
     return 0 if report["passed"] else 1

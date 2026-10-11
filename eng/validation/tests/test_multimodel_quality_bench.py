@@ -12,6 +12,51 @@ spec.loader.exec_module(matrix)
 
 
 class QualityBenchTests(unittest.TestCase):
+    def test_missing_optional_io_api_preserves_actual_memory_and_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sampler = matrix.Sampler(Path(directory) / 'memory.jsonl')
+            counters = SimpleNamespace(_asdict=lambda: {'rss': 123})
+            sampler.process = SimpleNamespace(pid=71, memory_info=lambda: counters, cpu_times=lambda: counters)
+            with patch.object(matrix.sys, 'platform', 'linux'), \
+                 patch.object(matrix.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='0,10,100,0\n')), \
+                 patch.object(matrix.CGROUP, 'capture', return_value={}):
+                sampler.sample()
+            row = sampler.rows[0]
+            self.assertEqual(row['memory']['rss'], 123)
+            self.assertEqual(row['gpu'][0]['used_mib'], 10)
+            self.assertIsNone(row['io'])
+            self.assertEqual(row['io_status'], 'unavailable')
+            self.assertIn('unsupported', row['io_unavailable_reason'])
+
+    def test_optional_io_permission_or_kernel_error_is_not_zero(self):
+        for error in (NotImplementedError('kernel'), PermissionError('permission'), matrix.psutil.AccessDenied(pid=71)):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                sampler = matrix.Sampler(Path(directory) / 'memory.jsonl')
+                counters = SimpleNamespace(_asdict=lambda: {'rss': 123})
+                sampler.process = SimpleNamespace(pid=71, memory_info=lambda: counters, cpu_times=lambda: counters,
+                    io_counters=lambda: None)
+                with patch.object(sampler.process, 'io_counters', side_effect=error), \
+                     patch.object(matrix.sys, 'platform', 'linux'), \
+                     patch.object(matrix.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='0,10,100,0\n')), \
+                     patch.object(matrix.CGROUP, 'capture', return_value={}):
+                    sampler.sample()
+                self.assertIsNone(sampler.rows[0]['io'])
+                self.assertEqual(sampler.rows[0]['io_status'], 'unavailable')
+                self.assertEqual(sampler.rows[0]['memory']['rss'], 123)
+
+    def test_memory_summary_distinguishes_unknown_from_observed_zero(self):
+        empty = matrix.sampled_memory_summary([], [])
+        for key in ('peak_rss_bytes', 'peak_private_bytes', 'peak_board_mib', 'peak_all_boards_mib'):
+            self.assertIsNone(empty[key])
+        linux = matrix.sampled_memory_summary([dict(memory={'rss': 123, 'vms': 999}, gpu=[], io_status='unavailable')], [])
+        self.assertEqual(linux['peak_rss_bytes'], 123)
+        self.assertIsNone(linux['peak_private_bytes'])
+        self.assertEqual(linux['io_unavailable_samples'], 1)
+        windows = matrix.sampled_memory_summary([dict(memory={'private': 0}, gpu=[dict(index=0, used_mib=0)], io_status='observed')], [])
+        self.assertEqual(windows['peak_private_bytes'], 0)
+        self.assertEqual(windows['peak_board_mib'], 0)
+        self.assertEqual(windows['io_observed_samples'], 1)
+
     def test_evidence_directory_keeps_volume_backed_workspace_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
