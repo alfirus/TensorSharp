@@ -5,11 +5,13 @@ The input directory must be under ignored artifacts/ or docs/validation/. Model
 quality, geometry parsing, synthetic soak, and physical limits remain separate.
 """
 import argparse
+import hashlib
 import html
 import importlib.util
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 import xml.etree.ElementTree as ET
 
@@ -48,6 +50,89 @@ def recorded_display_rows(data):
         return []
     return [[row.get(field, '未记录') for field in fields] for row in data['display_rows']
             if isinstance(row, dict) and all(isinstance(row.get(field), str) for field in fields)]
+
+
+def collected_audit_summaries(root):
+    """Select only explicitly related audit versions; retain their prior failures.
+
+    An optional schema-1 index records current/history paths and content hashes.
+    Version filenames enable discovery, never imply that a newer passing result
+    supersedes a failed one. Unindexed records remain independent displays.
+    """
+    root = Path(root)
+    paths = {p for p in root.glob('*-summary*.json')
+             if re.fullmatch(r'.+-summary(?:-v[1-9][0-9]*)?\.json', p.name)}
+    paths.update(p for p in root.glob('*/summary*.json')
+                 if re.fullmatch(r'summary(?:-v[1-9][0-9]*)?\.json', p.name))
+    selected, history, sources, indexed = {}, [], [], set()
+    index_path = root / 'readiness-audit-index.json'
+    if index_path.exists():
+        index = read(index_path)
+        if (not isinstance(index, dict) or type(index.get('schema_version')) is not int
+                or index['schema_version'] != 1 or not isinstance(index.get('groups'), list)):
+            raise ValueError('Unsupported readiness audit index schema')
+        sources.append(index_path)
+        groups = set()
+
+        def entry(record, expected_kind=None):
+            if not isinstance(record, dict) or not isinstance(record.get('path'), str):
+                raise ValueError('Audit index entry requires a relative evidence path')
+            relative = Path(record['path'])
+            path = root / relative
+            if (relative.is_absolute() or not path.resolve().is_relative_to(root.resolve())
+                    or not path.is_file() or path == index_path):
+                raise ValueError('Audit index evidence is missing or outside its directory: ' + record['path'])
+            identity = path.resolve()
+            if identity in indexed:
+                raise ValueError('Audit index repeats one evidence file: ' + record['path'])
+            digest = record.get('sha256')
+            if (not isinstance(digest, str) or not re.fullmatch(r'[a-fA-F0-9]{64}', digest)
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != digest.lower()):
+                raise ValueError('Audit index evidence hash differs: ' + record['path'])
+            kind = record.get('kind')
+            if kind not in ('summary', 'terminal') or (expected_kind and kind != expected_kind):
+                raise ValueError('Unsupported audit index evidence kind')
+            data = read(path)
+            rows = recorded_display_rows(data)
+            if (not isinstance(data, dict) or (kind == 'summary'
+                    and (not rows or len(rows) != len(data['display_rows'])))
+                    or (kind == 'terminal' and (type(data.get('exit_code')) is not int
+                        or not isinstance(data.get('stage'), str)))):
+                raise ValueError('Audit index evidence does not match its declared schema: ' + record['path'])
+            indexed.add(identity)
+            sources.append(path)
+            return path, data, rows
+
+        for group in index['groups']:
+            if (not isinstance(group, dict) or not isinstance(group.get('id'), str) or not group['id']
+                    or group['id'] in groups or not isinstance(group.get('history'), list)):
+                raise ValueError('Invalid or duplicate audit index group')
+            groups.add(group['id'])
+            current, _, rows = entry(group.get('current'), 'summary')
+            selected[current] = rows
+            for prior in group['history']:
+                if not isinstance(prior, dict) or not isinstance(prior.get('reason'), str) or not prior['reason']:
+                    raise ValueError('Historical audit evidence requires its explicit relationship')
+                path, data, _ = entry(prior)
+                # Preserve the recorded verdict/error, including an auditor
+                # failure whose underlying model/soak did not run again.
+                status = {k: data[k] for k in ('passed', 'status', 'exit_code') if k in data}
+                detail = {k: data[k] for k in ('errors', 'error', 'stage', 'scope') if k in data}
+                history.append([group['id'], current.relative_to(root).as_posix(),
+                                path.relative_to(root).as_posix(), json.dumps(status, ensure_ascii=False),
+                                prior['reason'], json.dumps(detail, ensure_ascii=False)])
+    for path in sorted(paths):
+        if path.resolve() in indexed:
+            continue
+        rows = recorded_display_rows(read(path))
+        if rows:
+            selected[path] = rows
+            sources.append(path)
+    rows = []
+    for path, recorded in sorted(selected.items()):
+        for row in recorded:
+            rows.append(row[:-1] + [row[-1] + '; 摘要：' + path.relative_to(root).as_posix()])
+    return rows, history, sources
 
 
 def speculative_rows(path):
@@ -172,13 +257,7 @@ def main():
     root = bench.evidence_directory(args.directory)
     quality, reference, image, context, soak, geometry, direct, numerical, tests, limits = [], [], [], [], [], [], [], [], [], []
     speculative, context_comparisons, processes, planned_chats, maya = [], [], [], [], []
-    audited = []
-    sources = []
-    for path in sorted(set(root.glob('*/summary.json')) | set(root.glob('*-summary.json'))):
-        rows = recorded_display_rows(read(path))
-        if rows:
-            audited.extend(rows)
-            sources.append(path)
+    audited, audit_history, sources = collected_audit_summaries(root)
     for path in sorted(root.glob('*/report.json')):
         data = read(path)
         if 'source_revision' in data.get('plan', {}) and 'pack_evidence' in data.get('plan', {}):
@@ -352,8 +431,10 @@ def main():
                              len({r['GeometrySha256'] for r in model['Runs']}) == 1])
         sources.append(path)
     sections = [
-        ('最新专项审计', '展示各摘要明确记录的数值、语义、性能和资源边界；不是重新执行验收。历史失败保留在后续表格和原始证据中。性能观测、性能门槛通过与稳定提速不同；账本归零不等于全物理归属。',
+        ('最新专项审计', '展示各摘要明确记录的数值、语义、性能和资源边界；不是重新执行验收。显式索引按路径和内容身份指定当前审计，不按通过/失败排序；未声明关系的记录不自动合并。摘要与后续原运行记录可能重叠，不能相加为独立测试次数。性能观测、性能门槛通过与稳定提速不同；账本归零不等于全物理归属。',
          ['场景', '状态', '质量/正确性', '性能', '资源', '边界'], audited),
+        ('历史审计与状态快照', '保留索引明确关联的原结论、失败及修订原因；这些是同一底层执行的审计版本或状态快照，不计作新增模型运行。修复时间解析或终端编码不表示重新运行了模型或长期测试。未被索引声明的历史证据仍按原规则展示。',
+         ['审计族', '当前摘要', '历史记录', '原状态', '与当前版本的关系', '原错误/边界'], audit_history),
         ('模型文本质量与速度', '严格任务通过数；没有删改输出。真实工具调用及 JSON Schema 单列。数字不是等工作量的 llama.cpp 性能对照。',
          ['场景', '严格通过', '执行状态', 'prefill tok/s', 'decode tok/s', 'RSS GiB', 'private GiB', '整卡 VRAM GiB', 'Schema', '工具往返'], quality),
         ('图像生成', '完成执行不等于语义质量通过；需检查输出图像。两引擎阶段计时边界不同。',
@@ -398,7 +479,7 @@ def main():
                      f'<img alt="{html.escape(path.parent.name, quote=True)}" src="{relative}" width="512" style="max-width:100%;height:auto">',
                      f'<p>{html.escape(str(review.get("checks", {})))}</p></section>']
         sources.append(path)
-    body.append('<h2>原始证据</h2><ul>' + ''.join(f'<li><a href="{html.escape(p.relative_to(root).as_posix(), quote=True)}">{html.escape(p.relative_to(root).as_posix())}</a></li>' for p in sources) + '</ul>')
+    body.append('<h2>原始证据</h2><ul>' + ''.join(f'<li><a href="{html.escape(p.relative_to(root).as_posix(), quote=True)}">{html.escape(p.relative_to(root).as_posix())}</a></li>' for p in sorted(set(sources))) + '</ul>')
     (root/'report.html').write_text('\n'.join(body), encoding='utf-8')
     print(root/'report.html')
 

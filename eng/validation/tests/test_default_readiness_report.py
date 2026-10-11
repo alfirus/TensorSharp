@@ -4,11 +4,109 @@ from pathlib import Path
 import tempfile
 import unittest
 import copy
+import hashlib
 
 
 SPEC = importlib.util.spec_from_file_location('readiness_report', Path(__file__).parents[1] / 'default-readiness-report.py')
 REPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(REPORT)
+
+
+class AuditSummaryCollectionTests(unittest.TestCase):
+    def summary(self, status='passed'):
+        return dict(passed=status == 'passed', status=status, errors=[] if status == 'passed' else ['audit failure'],
+            display_rows=[dict(scenario='same run', status=status, quality='recorded quality',
+                               performance='no new timing', resources='ledger only', scope='same process')])
+
+    def write(self, root, name, data, kind='summary', **extra):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding='utf-8')
+        return dict(path=name, kind=kind, sha256=hashlib.sha256(path.read_bytes()).hexdigest(), **extra)
+
+    def index(self, root, current, history):
+        (root / 'readiness-audit-index.json').write_text(json.dumps(dict(schema_version=1,
+            groups=[dict(id='one physical run', current=current, history=history)])), encoding='utf-8')
+
+    def test_discovers_versioned_summaries_without_inventing_version_relationships(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write(root, 'case-summary-v2.json', self.summary())
+            self.write(root, 'case-summary-v10.json', self.summary('failed'))
+            self.write(root, 'nested/summary-v2.json', self.summary())
+            self.write(root, 'case-summary-not-a-version.json', self.summary())
+            rows, history, sources = REPORT.collected_audit_summaries(root)
+            self.assertEqual(3, len(rows))
+            self.assertFalse(history)
+            self.assertEqual(3, len(sources))
+            self.assertIn('failed', [row[1] for row in rows])
+
+    def test_explicit_current_is_shown_once_and_old_failure_stays_visible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = self.write(root, 'case-summary-v2.json', self.summary())
+            old = self.write(root, 'case-summary.json', self.summary('failed'), reason='Auditor parsing fixed; no new model run')
+            snapshot = self.write(root, 'case-status-summary.json', self.summary(), reason='Earlier snapshot of the same run')
+            self.index(root, current, [old, snapshot])
+            rows, history, sources = REPORT.collected_audit_summaries(root)
+            self.assertEqual(1, len(rows))
+            self.assertEqual(2, len(history))
+            self.assertIn('failed', history[0][3])
+            self.assertIn('audit failure', history[0][5])
+            self.assertIn('no new model run', history[0][4])
+            self.assertEqual(4, len(sources))
+
+    def test_current_failure_is_never_replaced_by_an_earlier_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = self.write(root, 'case-summary-v2.json', self.summary('failed'))
+            old = self.write(root, 'case-summary.json', self.summary(), reason='Earlier audit')
+            self.index(root, current, [old])
+            rows, history, _ = REPORT.collected_audit_summaries(root)
+            self.assertEqual('failed', rows[0][1])
+            self.assertIn('passed', history[0][3])
+
+    def test_terminal_encoding_failure_is_preserved_separately_from_qualification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = self.write(root, 'case-summary-v2.json', self.summary())
+            old = self.write(root, 'audit-terminal.json', dict(exit_code=1, stage='console rendering', error='UnicodeEncodeError'),
+                             kind='terminal', reason='ASCII stdout repair only; underlying run not repeated')
+            self.index(root, current, [old])
+            rows, history, _ = REPORT.collected_audit_summaries(root)
+            self.assertEqual('passed', rows[0][1])
+            self.assertIn('"exit_code": 1', history[0][3])
+            self.assertIn('UnicodeEncodeError', history[0][5])
+
+    def test_missing_or_changed_selected_evidence_fails_closed(self):
+        for change in ('missing', 'changed'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                current = self.write(root, 'case-summary-v2.json', self.summary())
+                old = self.write(root, 'case-summary.json', self.summary(), reason='Older audit')
+                self.index(root, current, [old])
+                if change == 'missing': (root / current['path']).unlink()
+                else: (root / current['path']).write_text(json.dumps(self.summary('failed')))
+                with self.assertRaises(ValueError): REPORT.collected_audit_summaries(root)
+
+    def test_index_rejects_escape_duplicate_or_malformed_display(self):
+        for change in ('escape', 'duplicate', 'malformed'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'evidence'; root.mkdir()
+                data = self.summary()
+                if change == 'malformed': data['display_rows'][0]['status'] = True
+                name = '../outside.json' if change == 'escape' else 'case-summary-v2.json'
+                current = self.write(root, name, data)
+                history = [{**current, 'reason':'duplicate'}] if change == 'duplicate' else []
+                self.index(root, current, history)
+                with self.assertRaises(ValueError): REPORT.collected_audit_summaries(root)
+
+    def test_unsupported_schema_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for version in (2, True, '1'):
+                (root / 'readiness-audit-index.json').write_text(json.dumps(dict(schema_version=version, groups=[])))
+                with self.assertRaises(ValueError): REPORT.collected_audit_summaries(root)
 
 
 class SpeculativeReadinessTests(unittest.TestCase):
