@@ -24,6 +24,16 @@ int Number(string name, int fallback, int minimum = 1)
     int value = int.Parse(Value(name, fallback.ToString()), System.Globalization.CultureInfo.InvariantCulture);
     return value >= minimum ? value : throw new ArgumentOutOfRangeException(name);
 }
+// Validate the new diagnostic before backend initialization, model load, or KV mutation.
+int prefillChunk = Number("prefill-chunk", 0, 0);
+if (options.Keys.Any(name => name is "image" or "images" or "mmproj" or "mmproj-file"
+    || name.StartsWith("image-", StringComparison.Ordinal) || name.StartsWith("image_", StringComparison.Ordinal)))
+    throw new ArgumentException("This probe accepts text token prompts only; image inputs/projectors are unsupported.");
+if (Number("prefill-plan-self-test", 0, 0) != 0)
+{
+    PrefillChunkPlan.SelfTest();
+    return;
+}
 string output = Path.GetFullPath(Value("output", "artifacts/qwen4exp-expert-cache-probe.json"));
 Directory.CreateDirectory(Path.GetDirectoryName(output)!);
 bool synthetic = !options.ContainsKey("model");
@@ -67,10 +77,12 @@ if (options.TryGetValue("forced-tokens-file", out string? forcedTokenFile))
         throw new ArgumentException("--decode-tokens must equal the number of --forced-tokens-file IDs.");
     decode = explicitForced.Length;
 }
+int maxContext = options.ContainsKey("max-context") ? Number("max-context", 256)
+    : checked((int)Math.Max(256L, (long)prefill + decode + 16));
 foreach (string name in TensorSharp.Runtime.Speculative.SpeculationEnvVars.RemovedNames.Select(pair => pair.Name)
     .Concat(new[] { "TS_SPEC", "TS_SPEC_TYPE", "TS_SPEC_DRAFT", "TS_SPEC_PMIN", "TS_SPEC_DRAFT_MODEL" }))
     Environment.SetEnvironmentVariable(name, null);
-Environment.SetEnvironmentVariable("MAX_CONTEXT", Value("max-context", Math.Max(256, prefill + decode + 16).ToString()));
+Environment.SetEnvironmentVariable("MAX_CONTEXT", maxContext.ToString(System.Globalization.CultureInfo.InvariantCulture));
 KvCacheDtypeConfig.Set(KvCacheDtype.F16);
 string modelPath = synthetic ? Path.Combine(Path.GetDirectoryName(output)!, "fixture.gguf") : Path.GetFullPath(options["model"]);
 long? deviceBudgetBytes = options.TryGetValue("device-budget-bytes", out string? budgetText)
@@ -92,6 +104,7 @@ CudaActivityCapture? activityCapture = null;
 object? completedReport = null;
 object? checkpointIdentity = null;
 object? modelGeometry = null;
+PrefillChunkPlan? prefillPlan = null;
 string? failure = null;
 string? observedNativePath = null;
 string? observedNativeHash = null;
@@ -149,6 +162,9 @@ void WriteEvidence(bool complete)
     node["model_path"] = modelPath;
     node["checkpoint_identity"] = JsonSerializer.SerializeToNode(checkpointIdentity);
     node["model_geometry"] = JsonSerializer.SerializeToNode(modelGeometry);
+    node["prefill_execution"] = JsonSerializer.SerializeToNode(new { requested_chunk_size = prefillChunk,
+        entry = prefillPlan?.Entry, planned_chunk_sizes = prefillPlan?.ChunkSizes,
+        intermediate_logit_rows_captured = false });
     node["model_sha256"] = synthetic && File.Exists(modelPath) ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(modelPath))).ToLowerInvariant() : null;
     node["native_path"] = observedNativePath;
     node["native_sha256"] = observedNativeHash;
@@ -237,8 +253,8 @@ var managedAssemblies = AppDomain.CurrentDomain.GetAssemblies()
 int[] tokenPool = synthetic ? Enumerable.Range(0, 251).ToArray() : model.Tokenizer.Encode(
     "The history of computing spans many centuries, beginning with counting tools and algorithms. ", addSpecial: false).ToArray();
 if (tokenPool.Length == 0) throw new InvalidOperationException("Empty benchmark token pool.");
-int[] prompt = Enumerable.Range(0, prefill).Select(i => tokenPool[(i * 37 + 11) % tokenPool.Length]).ToArray();
-int[] forced = explicitForced ?? Enumerable.Range(0, decode).Select(i => tokenPool[(i * 53 + 17) % tokenPool.Length]).ToArray();
+int[] prompt = Enumerable.Range(0, prefill).Select(i => tokenPool[(int)(((long)i * 37 + 11) % tokenPool.Length)]).ToArray();
+int[] forced = explicitForced ?? Enumerable.Range(0, decode).Select(i => tokenPool[(int)(((long)i * 53 + 17) % tokenPool.Length)]).ToArray();
 string? renderedPrompt = null;
 if (options.TryGetValue("tokens-file", out string? tokenFile))
     prompt = File.ReadAllText(tokenFile).Split(new[] { ',', ' ', '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries)
@@ -262,11 +278,13 @@ if (prompt.Length == 0 || prompt.Any(token => token < 0 || token >= model.Tokeni
     throw new ArgumentException("Prompt must contain valid vocabulary token IDs.");
 if (forced.Any(token => token < 0 || token >= model.Tokenizer.VocabSize))
     throw new ArgumentException("Forced input must contain valid vocabulary token IDs.");
-if (prompt.Length + decode > int.Parse(Environment.GetEnvironmentVariable("MAX_CONTEXT")!))
+if ((long)prompt.Length + decode > maxContext)
     throw new ArgumentException("Prompt plus generation exceeds --max-context.");
+// Allocate and validate the entire plan before any timed request mutates model state.
+prefillPlan = PrefillChunkPlan.Create(prompt, prefillChunk);
 bool requireAllCache = Number("require-all-cache", 0, 0) != 0;
-if (requireAllCache && (!host || backend != BackendType.GgmlCuda || prompt.Length > 8))
-    throw new ArgumentException("--require-all-cache requires all-host experts on CUDA with a 1..8 token prefill.");
+if (requireAllCache && (!host || backend != BackendType.GgmlCuda || prefillPlan.ChunkSizes.Any(size => size > 8)))
+    throw new ArgumentException("--require-all-cache requires all-host experts on CUDA with 1..8 tokens in every prefill call.");
 if (options.TryGetValue("prompt-tokens-output", out string? tokenOutput))
 {
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(tokenOutput))!);
@@ -314,7 +332,7 @@ for (int i = -warmups; i < iterations; i++)
     ObserveProcess($"iteration-{i}-before-prefill");
     activityCapture?.Mark($"prefill/{i}/begin");
     var timer = Stopwatch.StartNew();
-    float[] logits = model.ForwardRefill(prompt);
+    float[] logits = prefillChunk == 0 ? model.ForwardRefill(prompt) : prefillPlan.Execute(model.ForwardRefill);
     timer.Stop();
     activityCapture?.Mark($"prefill/{i}/end");
     ObserveProcess($"iteration-{i}-after-prefill");
@@ -388,6 +406,8 @@ for (int i = -warmups; i < iterations; i++)
     finalLogits = (float[])logits.Clone();
     finalGenerated = generated.ToArray();
     var row = new { warmup = i < 0, iteration = i, prefill_tokens = prompt.Length,
+        prefill_chunk_size = prefillChunk, prefill_entry = prefillPlan.Entry,
+        prefill_chunk_sizes = prefillPlan.ChunkSizes,
         decode_tokens = forwardSteps, generated_tokens = finalGenerated,
         selected_text = generation == "greedy" ? DecodeGeneration(generated) : null,
         finish_reason = generation == "greedy" ? (eos ? "eos" : "length") : "teacher-forced",
@@ -454,7 +474,8 @@ completedReport = new
         "Teacher-forced decode excludes sampling and serves identical token inputs; it is not an HTTP end-to-end throughput result.",
         "Optional CUPTI activity recording instruments execution; its durations are diagnostic, not ordinary throughput.",
         "Working-set and external GPU telemetry are process/driver measurements, not a full allocator peak.",
-        "The cache is opt-in; eligible bias-free SiLU expert paths with one through eight rows engage it."
+        "The cache is opt-in; eligible bias-free SiLU expert paths with one through eight rows engage it.",
+        "Explicit prefill chunking changes model invocation geometry; compare full prediction rows and continuations before interpreting timings. Only the final prefill prediction row enters captures and chain hashes."
     }
 };
 }

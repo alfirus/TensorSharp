@@ -61,9 +61,11 @@ IDs and total context length and writes the exact consumed sequence to
 `forced_tokens`. This is forced computation, not an answer-quality score.
 
 For pressure/reclamation checks, `--require-all-cache 1` requires every expert
-row of a 1..8-token prefill and every subsequent decode call to use the cache.
+row of every prefill call and every subsequent decode call to use the cache.
+Each prefill call must contain 1..8 tokens: either a short whole prompt or an
+explicit `--prefill-chunk 1` through `8` (described below).
 This is stronger than `--require-cache 1`, which only proves that some rows used
-and reused it. Unsupported long-prefill configurations are rejected by this
+and reused it. Unsupported prefill call sizes are rejected by this
 stricter mode. A native allocation/commit failure is never retried as ordinary
 budget pressure; existing rollback tests remain required.
 
@@ -112,6 +114,43 @@ For a controlled prefill comparison, retain the first run's prompt IDs using
 `TS_HOST_MOE_DEVICE_MIN_BATCH=9` and `=0` while keeping model, shared capacity,
 private expert-cache cap, generation inputs and native binary identical. These
 are opt-in diagnostics; the probe does not change the product's default policy.
+
+`--prefill-chunk N` is a text-only invocation-geometry diagnostic. The default
+`0` retains the original single `ForwardRefill(prompt)` call. Positive `N`
+splits the exact prompt IDs into contiguous chunks of at most `N` tokens and
+calls `ForwardRefill(chunk)` in order without resetting KV between chunks. A
+63-token prompt with `N=8` therefore uses `8,8,8,8,8,8,8,7`; `N=1` uses 63
+single-token calls. Negative/out-of-range integers and image/projector options
+are rejected before backend initialization. The complete chunk plan, vocabulary
+IDs and total context length are validated before the first timed forward call;
+chunk arrays are allocated outside the forward stopwatch. This probe does not
+interpret image placeholders embedded in raw text as media.
+
+Reports retain the planned sizes in `prefill_execution` plus each completed run's
+actual `prefill_chunk_size`, `prefill_entry` and `prefill_chunk_sizes`. A failed
+prefill does not turn planned chunks into a completed run. The prefill stopwatch covers the
+ordered model calls and their loop/delegate overhead. Only the final prefill
+prediction row is returned, hashed and captured; intermediate chunk predictions
+do not add rows or change the teacher-forced decode convention. A failed chunk
+propagates its exception and is never retried against partially advanced KV.
+Changing the chunk size can change routing, arithmetic and cache reuse; validate
+the complete final prefill row and every continuation row with the same prompt
+and forced IDs before comparing quiet timings. Chunking is not a product default
+or proof that all model architectures support identical arithmetic across shapes.
+
+For example, add `--prefill-chunk 1` or `--prefill-chunk 8` to a matched
+`--tokens-file prompt.ids --forced-tokens-file continuation.ids` run and use a
+fresh output/capture directory for each configuration. Keep the native, managed
+binaries, cache/budget settings and model identity fixed. The probe's pure CPU
+plan checks need no model or backend initialization:
+
+```powershell
+dotnet eng/validation/Qwen4ExpExpertCacheProbe/bin/Release/net10.0/Qwen4ExpExpertCacheProbe.dll --prefill-plan-self-test 1
+```
+
+These checks cover default array identity, exact token order, final-row return,
+the trailing chunk, `int.MaxValue` chunk arithmetic, invalid/empty plans, and
+stopping at a stateful exception. They do not establish actual model parity.
 
 Add `--logits-dir <fresh-directory>` to retain the full vocabulary prediction
 after the prompt and after each consumed teacher/generated token. `rows.f32`
