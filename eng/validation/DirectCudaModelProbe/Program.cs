@@ -313,12 +313,7 @@ var quality = new List<object>();
 bool qualityPassed = true;
 if (runQuality)
 {
-    foreach ((string name, string text) in new[]
-    {
-        ("math", "Compute 17 + 25. Reply with only the integer."),
-        ("extraction", "Inventory: cedar=3, maple=7, pine=2. Return only the names whose quantity is at least 3, comma-separated in the original order."),
-        ("squares", "Return the squares of the integers 1 through 20, in order, as comma-separated integers. Return only the list."),
-    }.Where(test => qualityCases.Contains(test.Item1, StringComparer.Ordinal)))
+    foreach ((string name, string text) in QualityOutput.Cases.Where(test => qualityCases.Contains(test.Name, StringComparer.Ordinal)))
     {
         QualityPrompt qualityPrompt = QualityPrompt.Create(model.Config.ChatTemplate, model.Config.Architecture, text, qualityReasoningEffort);
         string rendered = qualityPrompt.Text;
@@ -341,13 +336,14 @@ if (runQuality)
         timer.Stop();
         string answer = model.Tokenizer.Decode(generated.TakeWhile(token => !model.Tokenizer.IsEos(token)).ToList());
         QualitySelection selection = QualityOutput.Parse(answer, model.Config.Architecture, rendered, qualityParser);
-        bool passed = QualityOutput.CompletePlainAnswer(selection, eos) && QualityOutput.Semantic(name, selection.Content.Trim());
+        bool passed = QualityOutput.CompleteCaseAnswer(name, selection, eos, rendered) && QualityOutput.Semantic(name, selection.Content.Trim());
         qualityPassed &= passed;
         var row = new { name, prompt = text, prompt_tokens = input, generated_tokens = generated,
             reasoning_effort_requested = qualityReasoningEffort, rendered_prompt = rendered,
             rendered_prompt_utf8_sha256 = qualityPrompt.Utf8Sha256,
             selected_text = answer, raw_text = selection.RawText, parsed_text = selection.Content,
             reasoning_text = selection.Thinking, parsed_tool_calls = selection.ToolCalls,
+            thinking_closed = QualityOutput.ThinkingClosed(rendered, selection.RawText),
             parser = qualityParser, eos, reached_generation_limit = !eos && generated.Count == maxNew,
             passed, first_token_ms = firstMs, total_ms = timer.Elapsed.TotalMilliseconds };
         quality.Add(row);
@@ -430,7 +426,7 @@ var report = new { schema_version = 1, passed = passedAll, synthetic, backend = 
         .OrderBy(e => e.Key.ToString()).ToDictionary(e => e.Key.ToString()!, e => e.Value?.ToString()),
     limitations = new[] { "Teacher-forced timing exercises the full loaded model, excluding HTTP, tokenization, sampling and semantic validation.",
         "Synthetic checkpoints are seeded engine fixtures; their execution does not establish trained-model quality or throughput.",
-        "Semantic checks cover only arithmetic, extraction and square-list generation; they do not establish broad language quality.",
+        "Semantic checks cover only the selected fixed arithmetic, extraction, square-list, pure-function or raw JSON tasks; they do not establish broad language or agent quality.",
         "CUDA memory snapshots are driver-wide used/free dedicated memory and pool-cache bytes, not per-process peak live allocation accounting; WDDM and other processes affect them.",
         "OS working set and private bytes are snapshots plus OS process peak; model weights may be memory mapped.",
         "Binary hashes identify loaded assemblies, available PTX files and loaded native library, but source/build provenance must be supplied by the invoking runner." } };

@@ -71,4 +71,34 @@ string squares = string.Join(", ", Enumerable.Range(1, 20).Select(x => x * x));
 Check(QualityOutput.Semantic("squares", squares) && !QualityOutput.Semantic("squares", "1,4,9"),
     "Existing complete square-list semantics are preserved");
 Check(!QualityOutput.Semantic("unknown", "42"), "Unknown semantic tasks fail closed");
+Check(QualityOutput.SelectCases("code,tool_json").SequenceEqual(new[] { "code", "tool_json" }),
+    "Explicit extended cases must be supported without changing the default three cases");
+foreach (string suffix in new[] { "<think>", "<think>\n", "<think>\r\n", "<think> \t" })
+{
+    Check(!QualityOutput.ThinkingClosed("<|assistant|>" + suffix, "42"), "Whitespace after the GLM prompt opener is still unclosed");
+    Check(QualityOutput.ThinkingClosed("<|assistant|>" + suffix, "reason</think>42"), "A real closing tag closes the prompt opener");
+}
+Check(!QualityOutput.ThinkingClosed("<|assistant|>", "<think>reason"), "Response-emitted opener requires closure");
+Check(!QualityOutput.ThinkingClosed("<think>", "reason</think>42<think>unfinished"), "A response cannot reopen thinking after a valid answer");
+using (var fixture = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(AppContext.BaseDirectory,
+    "fixed-extended-task-answers.json"))))
+{
+    foreach (var prompt in fixture.RootElement.GetProperty("prompts").EnumerateObject())
+        Check(QualityOutput.Cases.Single(test => test.Name == prompt.Name).Prompt == prompt.Value.GetString(),
+            "Extended prompt is exactly the existing Qwen task, without retry-specific rewrites");
+    foreach (var row in fixture.RootElement.GetProperty("rows").EnumerateArray())
+    {
+        string name = row.GetProperty("case").GetString()!, answer = row.GetProperty("answer").GetString()!;
+        bool expected = row.GetProperty("passed").GetBoolean();
+        Check(QualityOutput.Semantic(name, answer) == expected, "Extended static oracle: " + row.GetProperty("id").GetString());
+        var selected = QualityOutput.Parse("Reasoning.</think>" + answer, "glm5-next", "<|assistant|><think>", "production");
+        Check(selected.Content == answer, "Production parser preserves original function/JSON structure");
+        Check(!(QualityOutput.CompleteCaseAnswer(name, selected, false, "<|assistant|><think>") && QualityOutput.Semantic(name, selected.Content)),
+            "No exact-looking answer can pass after generation cap without EOS");
+        Check((QualityOutput.CompleteCaseAnswer(name, selected, true, "<|assistant|><think>") && QualityOutput.Semantic(name, selected.Content)) == expected,
+            "EOS completion and semantic validity are independent requirements");
+        Check(!QualityOutput.CompleteCaseAnswer(name, selected with { RawText = answer }, true, "<|assistant|><think>"),
+            "An extended answer-only case cannot pass via the unclosed-thinking parser fallback");
+    }
+}
 Console.WriteLine($"PASS {checks} probe parser/case-selection/effort/prompt/host-budget-lifetime checks; no model or GPU executed.");

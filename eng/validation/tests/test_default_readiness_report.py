@@ -46,12 +46,13 @@ class MayaReadinessTests(unittest.TestCase):
     def report(self):
         row = dict(tokens=[42, 9], generated=2, prompt_tokens=3, reused=0,
                    drafts_offered=0, drafts_accepted=0, finish='stop', prompt_ms=100, decode_ms=50,
-                   quality=dict(passed=True), semantic=dict(passed=True, thinking_closed=True, tool_calls=[], content='42'))
+                   quality=dict(passed=True), semantic=dict(passed=True, thinking_closed=True, tool_calls=[], content='42', raw_text='reason</think>42'))
         return dict(completed=True, process_success=True, exit_code=0, identities_unchanged=True,
                     errors=[], timed_out=False, prompt_tokenizer_exact=True,
                     performance_observation_complete=True, telemetry_samples=2, sampling_errors=[],
                     quality_passed=True, plan=dict(repetitions=2, eos_ids=[9], case='math'), rows=[row, copy.deepcopy(row)],
                     reference=dict(name='math', prompt=REPORT.fixed_tasks.PROMPTS['math'],
+                        rendered_prompt='<|assistant|><think>',
                         prompt_tokens=[1, 2, 3], generated_tokens=[42, 9], passed=True, eos=True, parsed_text='42'))
 
     def test_semantics_and_exact_tokens_are_independent_and_decode_uses_forward_count(self):
@@ -93,7 +94,7 @@ class MayaReadinessTests(unittest.TestCase):
         report['reference']['parsed_text'] = 'cedar, maple'
         report['quality_passed'] = False
         for row in report['rows']:
-            row['semantic'].update(content='cedar,maple', passed=False)
+            row['semantic'].update(content='cedar,maple', raw_text='reason</think>cedar,maple', passed=False)
             row['quality']['passed'] = False
         result = REPORT.maya_summary(report)
         self.assertTrue(result['independent_quality_passed'])
@@ -125,7 +126,7 @@ class MayaReadinessTests(unittest.TestCase):
             self.assertFalse(REPORT.maya_summary(report)['independent_quality_passed'])
 
     def test_independent_pass_cannot_override_incomplete_parser_or_json_fence(self):
-        for change in [dict(thinking_closed=False), dict(tool_calls=[dict(name='tool')]),
+        for change in [dict(raw_text='reason without closure'), dict(tool_calls=[dict(name='tool')]),
                        dict(content='```\n42\n```'), dict(content='{"answer":42}')]:
             report = self.report(); report['rows'][0]['semantic'].update(change)
             self.assertFalse(REPORT.maya_summary(report)['independent_quality_passed'])
@@ -139,8 +140,41 @@ class MayaReadinessTests(unittest.TestCase):
                 report['reference']['prompt'] = REPORT.fixed_tasks.PROMPTS[case]
                 for row in report['rows']:
                     row['semantic']['content'] = answer
+                    row['semantic']['raw_text'] = 'reason</think>' + answer
                 expected = REPORT.fixed_tasks.evaluate(case, REPORT.fixed_tasks.PROMPTS[case], answer)['passed']
                 self.assertEqual(expected, REPORT.maya_summary(report)['independent_quality_passed'])
+
+    def test_current_closure_rejects_saved_true_reopened_or_missing_close(self):
+        for suffix, raw in [('<think>\n', '42'), ('<think>\r\n', '42'),
+                            ('<think>', 'reason</think>42<think>unfinished')]:
+            report = self.report(); report['reference']['rendered_prompt'] = '<|assistant|>' + suffix
+            report['rows'][0]['semantic']['raw_text'] = raw
+            result = REPORT.maya_summary(report)
+            self.assertFalse(result['independent_quality_passed'])
+            check = result['rows'][0]['thinking_closure_recheck']
+            self.assertTrue(check['saved_thinking_closed'])
+            self.assertFalse(check['current_thinking_closed'])
+            self.assertEqual('rechecked', check['status'])
+
+    def test_raw_closure_recheck_can_correct_saved_false_without_mutation(self):
+        report = self.report(); report['rows'][0]['semantic']['thinking_closed'] = False
+        original = copy.deepcopy(report)
+        result = REPORT.maya_summary(report)
+        self.assertTrue(result['independent_quality_passed'])
+        self.assertFalse(result['rows'][0]['thinking_closure_recheck']['saved_thinking_closed'])
+        self.assertTrue(result['rows'][0]['thinking_closure_recheck']['current_thinking_closed'])
+        self.assertEqual(original, report)
+
+    def test_missing_original_structure_is_explicitly_unavailable_not_pass(self):
+        for field in ('raw_text', 'rendered_prompt'):
+            report = self.report()
+            if field == 'raw_text': report['rows'][0]['semantic'].pop(field)
+            else: report['reference'].pop(field)
+            result = REPORT.maya_summary(report)
+            self.assertFalse(result['independent_quality_passed'])
+            check = result['rows'][0]['thinking_closure_recheck']
+            self.assertEqual('structure_recheck_unavailable', check['status'])
+            self.assertIsNone(check['current_thinking_closed'])
 
     def test_empty_incomplete_run_remains_visible(self):
         report = self.report(); report['rows'] = []; report['completed'] = False

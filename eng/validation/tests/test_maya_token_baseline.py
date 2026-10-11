@@ -102,6 +102,26 @@ class MayaWireTests(unittest.TestCase):
         reference = self.reference(); reference['rendered_prompt'] += '<think>'
         self.assertFalse(mod.semantic_result('42', reference, PlainParser)['passed'])
 
+    def test_extended_fixed_tasks_keep_semantics_eos_and_structure_separate(self):
+        class PlainParser:
+            def __init__(self, **kwargs): pass
+            def feed(self, raw): return [SimpleNamespace(kind='content', text=raw)]
+            def finish(self): return []
+        for name, answer in [('code', 'def square(x):\n    return x*x'),
+                             ('tool_json', '{"name":"get_weather","arguments":{"city":"Hangzhou","unit":"celsius"}}')]:
+            reference = self.reference()
+            reference.update(name=name, prompt=mod.fixed_tasks.PROMPTS[name], parsed_text='wrong reference answer', passed=False)
+            semantic = mod.semantic_result(answer, reference, PlainParser)
+            self.assertTrue(semantic['passed'])
+            self.assertTrue(mod.qualify(self.row(), reference, [9], semantic)['passed'])
+            row = self.row(); row['finish'] = 'length'
+            self.assertFalse(mod.qualify(row, reference, [9], semantic)['passed'])
+            row = self.row(); row['tokens'] = [42, 8]
+            self.assertFalse(mod.qualify(row, reference, [9], semantic)['passed'])
+            wrong = mod.semantic_result('```\n' + answer + '\n```', reference, PlainParser)
+            self.assertFalse(wrong['passed'])
+            self.assertFalse(mod.qualify(self.row(), reference, [9], wrong)['passed'])
+
     def test_nonfinite_negative_unknown_done_rejected(self):
         for line in ['DONE 2 3 nan 20 stop 0 0 0 15 20', 'DONE 2 3 20 inf stop 0 0 0 15 20',
                      'DONE -1 3 20 20 stop 0 0 0 15 20', 'DONE 2 3 20 20 unknown 0 0 0 15 20', 'DONE 2 3 20 20 stop']:

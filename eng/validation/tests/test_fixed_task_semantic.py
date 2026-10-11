@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -44,6 +45,24 @@ class FixedTaskSemanticTests(unittest.TestCase):
         for closed, calls in [(False, []), (None, []), (True, [dict(name='x')]), (True, None)]:
             self.assertFalse(TASKS.parsed_answer('math', TASKS.PROMPTS['math'], '42', closed, calls)['passed'])
         self.assertTrue(TASKS.parsed_answer('math', TASKS.PROMPTS['math'], '42', True, [])['passed'])
+
+    def test_extended_tasks_share_exact_prompts_and_strict_structural_fixtures(self):
+        fixture = json.loads((Path(__file__).parents[1] / 'fixtures/fixed-extended-task-answers.json').read_text(encoding='utf-8'))
+        for name, prompt in fixture['prompts'].items():
+            self.assertEqual(prompt, TASKS.PROMPTS[name])
+        for row in fixture['rows']:
+            with self.subTest(row=row['id']):
+                self.assertEqual(row['passed'], self.check(row['case'], row['answer']))
+                self.assertFalse(TASKS.evaluate(row['case'], TASKS.PROMPTS[row['case']] + ' changed', row['answer'])['passed'])
+                self.assertFalse(TASKS.parsed_answer(row['case'], TASKS.PROMPTS[row['case']], row['answer'], False, [])['passed'])
+                self.assertFalse(TASKS.parsed_answer(row['case'], TASKS.PROMPTS[row['case']], row['answer'], True, [{'name': 'unexpected'}])['passed'])
+
+    def test_thinking_closure_checks_prompt_whitespace_and_response_openers(self):
+        for suffix in ('<think>', '<think>\n', '<think>\r\n', '<think> \t'):
+            self.assertFalse(TASKS.thinking_closed('<|assistant|>' + suffix, '42'))
+            self.assertTrue(TASKS.thinking_closed('<|assistant|>' + suffix, 'reason</think>42'))
+        self.assertFalse(TASKS.thinking_closed('<|assistant|>', '<think>reason'))
+        self.assertFalse(TASKS.thinking_closed('<think>', 'reason</think>42<think>unfinished'))
 
 
 if __name__ == '__main__':

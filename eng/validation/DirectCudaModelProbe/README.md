@@ -201,13 +201,38 @@ reply, parsed user-visible content, reasoning, tool calls and actual EOS status.
 The same independent answer checks run on the selected content; an unfinished
 generation or an unexpected tool call cannot pass. No arbitrary prose is removed.
 
-`--quality-cases math,extraction,squares` is the default complete suite. A
+`--quality-cases math,extraction,squares` remains the historical default suite. A
 nonempty explicit subset, such as `--quality-cases math,extraction`, enables
 staged runs on a slow file-backed checkpoint. The exact selection and
 `--max-new` limit are recorded. A subset does not establish coverage of omitted
 cases, and reaching the generation limit is a failure, including when reasoning
 uses the available token budget. Do not increase that limit retrospectively and
 discard the original result.
+
+Explicit `--quality-cases code,tool_json` adds the same fixed questions used by
+the Qwen comparison, without altering their wording or adding a grammar/schema
+constraint. `code` requires the pure `square(x)` function returning `x*x`;
+generated code is never executed. The managed checker recognizes a single
+return statement, ordinary function headers, comments, redundant expression
+parentheses and implicit continuation inside them. The independent
+`fixed-task-semantic.py` checker
+compares the entire Python AST to the expected function; an otherwise valid
+format outside the managed grammar must be reviewed as a checker disagreement,
+not automatically attributed to model quality. `tool_json` requires exactly
+`{"name":"get_weather","arguments":{"city":"Hangzhou","unit":"celsius"}}`,
+with JSON whitespace/key-order variation allowed. Markdown fences, repeated or
+extra keys, extra text and wrong values fail. This is a raw JSON representation
+task, not a real tool invocation or agent roundtrip.
+
+Both new cases additionally require closed thinking when the rendered prompt
+opens `<think>`, no parsed tool calls and actual checkpoint EOS within the
+unchanged output bound. `thinking_closed`, original text and token IDs remain
+in the report, so truncation, structure and semantic failures stay distinct.
+Use `--quality-parser production --quality-reasoning-effort low --max-new 128`
+for the GLM qualification. The old three case prompts/default selection and
+answer rules are unchanged. Versioned policies identify the expanded tools:
+`direct-answer-only-v3` and `fixed-answer-only-v2`. Historical frozen apps and
+reports retain their original policy; the new tasks need a new app identity.
 
 `--quality-reasoning-effort low|medium|high` explicitly selects the production
 renderer effort. Omission preserves the historical family default; malformed or

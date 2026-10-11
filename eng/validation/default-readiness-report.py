@@ -110,13 +110,21 @@ def maya_summary(data):
         wire = (row.get('generated') == len(tokens) and row.get('prompt_tokens') == len(reference.get('prompt_tokens', []))
                 and row.get('reused') == row.get('drafts_offered') == row.get('drafts_accepted') == 0)
         semantic = row.get('semantic', {})
+        rendered_prompt, raw_text = reference.get('rendered_prompt'), semantic.get('raw_text')
+        closure_available = isinstance(rendered_prompt, str) and isinstance(raw_text, str)
+        current_closed = fixed_tasks.thinking_closed(rendered_prompt, raw_text) if closure_available else None
+        closure = dict(status='rechecked' if closure_available else 'structure_recheck_unavailable',
+            policy=fixed_tasks.THINKING_POLICY, saved_thinking_closed=semantic.get('thinking_closed'),
+            current_thinking_closed=current_closed,
+            scope='Rechecks GLM/Qwen angle-bracket closure from recorded rendered prompt and raw response; content/tool-call fields remain recorded production-parser output, not token re-decoding.')
         independent = fixed_tasks.parsed_answer(case, prompt, semantic.get('content'),
-            semantic.get('thinking_closed'), semantic.get('tool_calls'))
+            current_closed, semantic.get('tool_calls'))
         passed = (complete and reference_structure
                   and wire and eos and row.get('finish') == 'stop' and independent['passed'])
         rate = lambda n, ms: n * 1000 / ms if isinstance(ms, (float, int)) and math.isfinite(ms) and ms > 0 and n > 0 else None
         qualified.append(dict(passed=passed, eos=eos, exact=bool(tokens) and tokens == reference.get('generated_tokens'),
             independent_semantic=independent, recorded_runner_passed=row.get('quality', {}).get('passed'),
+            thinking_closure_recheck=closure,
             recorded_semantic_passed=semantic.get('passed'),
             pp=rate(row.get('prompt_tokens', 0), row.get('prompt_ms')),
             tg=rate(row.get('generated', 0) - 1, row.get('decode_ms'))))
@@ -143,7 +151,10 @@ def maya_rows(path):
         result.append([path.parent.name + f' / {index + 1}', summary['complete'], check['passed'],
             check['exact'], f"{row.get('generated')}; EOS={check['eos']}", row.get('first_token_ms'),
             span([check['pp']]), span([check['tg']]), row.get('wall_ms'), summary['performance_complete'], *memory,
-            'prefill=' + str(data.get('plan', {}).get('prefill', 'auto')) + '; ' + data.get('plan', {}).get('controls_scope', ''),
+            'prefill=' + str(data.get('plan', {}).get('prefill', 'auto')) + '; ' + data.get('plan', {}).get('controls_scope', '')
+                + '; closure=' + check['thinking_closure_recheck']['status']
+                + '; saved/current=' + str(check['thinking_closure_recheck']['saved_thinking_closed'])
+                + '/' + str(check['thinking_closure_recheck']['current_thinking_closed']),
             check['recorded_runner_passed'], summary['recorded_runner_policy'], summary['independent_policy'],
             summary['reference_independent_semantic']['passed']])
     if not result:

@@ -76,13 +76,13 @@ def load_maya_text(source, pack):
 
 
 def semantic_result(raw, reference, parser_class):
-    thinking = reference['rendered_prompt'].endswith('<think>')
+    thinking = reference['rendered_prompt'].rstrip().endswith('<think>')
     parser = parser_class(thinking=thinking, tools=None, stream_tools=False)
     events = parser.feed(raw) + parser.finish()
     content = ''.join(e.text for e in events if e.kind == 'content')
     reasoning = ''.join(e.text for e in events if e.kind == 'reasoning')
     calls = [dict(name=e.call.name, arguments=e.call.arguments) for e in events if e.kind == 'tool_call']
-    closed = not thinking or '</think>' in raw
+    closed = fixed_tasks.thinking_closed(reference['rendered_prompt'], raw)
     independent = fixed_tasks.parsed_answer(reference.get('name'), reference.get('prompt'), content, closed, calls)
     return dict(raw_text=raw, content=content, reasoning=reasoning, tool_calls=calls, thinking_closed=closed,
                 parser='Maya production serve/frontend.py OutputParser',

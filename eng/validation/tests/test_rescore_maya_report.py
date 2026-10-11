@@ -16,10 +16,11 @@ class MayaRescoreTests(unittest.TestCase):
             errors=[], timed_out=False, prompt_tokenizer_exact=True, quality_passed=False,
             plan=dict(repetitions=1, eos_ids=[9], case='extraction'),
             reference=dict(name='extraction', prompt=MOD.reporter.fixed_tasks.PROMPTS['extraction'],
+                rendered_prompt='<|assistant|><think>',
                 prompt_tokens=[1], generated_tokens=[2, 9], passed=True, eos=True, parsed_text='cedar, maple'),
             rows=[dict(tokens=[3, 9], generated=2, prompt_tokens=1, reused=0, drafts_offered=0,
                 drafts_accepted=0, finish='stop', quality=dict(passed=False),
-                semantic=dict(passed=False, content='cedar,maple', thinking_closed=True, tool_calls=[]))])
+                semantic=dict(passed=False, content='cedar,maple', raw_text='reason</think>cedar,maple', thinking_closed=True, tool_calls=[]))])
 
     def test_original_is_unchanged_and_pinned_alongside_new_conclusion(self):
         with tempfile.TemporaryDirectory() as temporary:
