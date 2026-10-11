@@ -2147,11 +2147,13 @@ skipped；MTP 实际执行一项通过。各子集有重叠，不相加成独立
 全局跨引擎回收策略、MoE/多模态/MTP/TP 的完整共享预算适配仍待完成。单卡本机不能把
 Apple 和 TP 场景算作通过；局部 CUDA/受控主机状态机测试也不能替代这些验收。
 
-### 默认就绪续验：2026-10-10（当前工作树）
+### 默认就绪续验：2026-10-10–11 UTC
 
-本轮模型/GPU 验证仍在上述 Windows 单卡笔记本，模型目录来自 `C:\Works\models`。
-另有同机 WSL2 的 Linux CPU/cgroup canary；它不是 Linux CUDA 或完整模型验收。
-新增下载和证据使用 D: USB HDD；不把 HDD 交换数据写成 SSD 性能。
+本轮模型/GPU 验证使用上述 Windows 单卡笔记本及同机 WSL2，模型来自 C:/D:/E:。
+WSL 的 Qwen 0.8B CUDA 数值、性能和 3 GiB cgroup 运行已单独验收，但自然生成三题
+仅通过一题，具体失败与范围见下文；不能写成全模型 Linux 质量通过。
+GLM 当前检查点位于用户指定的 `E:\models\GLM-5.3-Flash-GGUF`，生成证据主要
+位于 D:/E:。D: USB HDD 与 E: USB SSD 的测试分别记录。
 **完整共享预算、AdaptiveModelSession 和请求准入仍须显式启用。** 下表中的
 “已实现”只说明对应代码路径存在；没有列出的真机/模型场景不算验收通过。
 
@@ -2161,11 +2163,12 @@ Apple 和 TP 场景算作通过；局部 CUDA/受控主机状态机测试也不�
 | 动态容量下降 | 保存配置 ceiling、期望 target 和保护存活 owner 的 effective floor；实际释放后 floor 跟随下降，不能重新开放已经撤回的额度 | 已实现并测试 |
 | 请求边界物理准入 | 新请求在计算门开放且持有本模型锁时刷新；共享账本使用每次准入的物理约束原子检查，不修改借用账本的配置 ceiling；提交/已有请求的 token 执行不查询硬件 | CPU 集成通过，含部分回收后物理目标仍不足的拒绝与唤醒回归 |
 | tokenizer/GC 启动开销 | 规划读取跳过 tokenizer 元数据，避免先加载完整词表/merges 再由真实模型重复读取；预读缓冲改为有 owner 的有界原生分配，实际 free 后归还 | 10 个本地模型元数据几何 hash 一致；不等于 tokenizer/GC 全物理纳管 |
-| GLM 主机映射与加载 | 跨平台只读映射、Unicode 路径、边界检查；映射失败拒绝无界私有复制；上传线程异常先 join 再返回，文件 seek/read/size 失败明确拒绝；上传 payload 接入 host budget | Windows/Linux CPU 通过；ASCII/Unicode 单 CUDA 数值回归 2/2；E 盘完整 IQ1_S 模型两题正常 EOS 通过，新上传暂存数值一致/8 MiB 计账归零；广泛质量、缓存性能与完整物理预算仍未验收 |
+| GLM 主机映射与加载 | 跨平台只读映射、Unicode 路径、边界检查；映射失败拒绝无界私有复制；上传线程异常先 join 再返回，文件 seek/read/size 失败明确拒绝；上传 payload 接入 host budget | Windows/Linux CPU 通过；ASCII/Unicode 单 CUDA 数值回归 2/2；E 盘 IQ1_S 的数学、抽取、代码、工具 JSON 四题自然 EOS 严格通过，新上传暂存数值一致/8 MiB 计账归零；自然请求仍仅约 0.19–0.30 tokens/s，广泛质量、缓存性能与完整物理预算未达标 |
+| 可选预热暂存 | 聚合 ticket 同时覆盖 pread payload/mincore scratch，先预留后分配；配额过小明确跳过可选暖页，取消/异常先 join/free 再还账 | Windows 72、Linux 156 项夹具检查；Linux 强制真实 pread 65,534 B，三类生产消费者在两平台对象编译通过。尚未验收新完整 CUDA native、全页缓存归属或高优先级抢占 |
 | MLX | 主机 mirror 先预留再实际分配、实际释放后还账；统计读取失败明确 unknown，不把失败当作零占用，不强制 lazy eval | 主机/模拟 getter 契约通过；用户确认没有可用 Apple 设备，真实 Metal/MLX/iOS GPU 尚未验收 |
 | GPT-OSS 专家副本 | 单 CUDA、非 TP、完整 stacked 权重的自动兼容策略省略持久专家副本；per-expert fallback 用一个临时 gate/up 拼接保留原投影形状，释放前同步并撤销精确 cache key；融合前预检全部专家与偏置 | 23 项 CPU、独立 gated CUDA 1 项通过；1025-token fallback 完整 logits 与 10 种专家行数一致；最终普通 ABBA 在 5% 门槛内，Server 严格任务仍 6/8，保留模型既有 JSON 失败 |
 | 跨引擎回收 | 按首次阻塞需求对冲突 pool 排队；无冲突 pool 可继续；每个存活需求分别记录各 donor 在本次账本 generation 的尝试，避免无法满足的旧 RAM 需求阻塞独立 GPU 回收；单个协同回收租约、每次最多 8 个 prefix victim | CPU 综合 330 项通过，含独立 pool、冲突 FIFO、1000 轮取消与 ID 复用；不是全局成本驱动 LRU |
-| 长期取消/公平性 | 四个真实 CPU worker、128 KiB 共同 RAM、原生内存实际分配/释放、每波 32 请求且半数取消，检查状态输出及额度归零 | 冻结 Runtime 8D2C / Memory A359 的 v5 实际 7200.137 秒通过，119,936 完成及同数取消；基线和两版中间修复也分别完成 2 小时。早期无终态进程保留中断，不拼接时长；不覆盖后续 Memory AD0C，也不是 GPU/真实模型长期验收 |
+| 长期取消/公平性 | 四个真实 CPU worker、128 KiB 共同 RAM、原生内存实际分配/释放、每波 32 请求且半数取消，检查状态输出及额度归零 | 最新冻结 Memory B8E / Runtime 8D2C 独立 7200.429 秒通过，119,776 完成及同数取消、149,720 次实际分配全部释放；历史 A359 v5 7200.137 秒另列。早期中断不拼接时长；不是 GPU/真实模型长期验收，也没有逐请求 FIFO 轨迹 |
 | 全物理硬限 | 硬限证据声明实际覆盖维度；Windows Job private commit、Linux cgroup、Apple available-memory 不能互相冒充 | 全平台等价硬限未完成；无可验证能力时明确拒绝此保证 |
 | 完整模型适配 | dense Gemma/Qwen35 text 单 CUDA 的受限执行 lane；MoE/多模态/MTP/TP 仍有未纳管 owner、执行峰值和回收路径 | 继续显式启用，不以组件测试代替整模型验收 |
 
@@ -2300,14 +2303,94 @@ Windows production native `129E2F8A…` 已使用未修改的上述 ggml 构建�
 **93 项**通过；第二次独立复跑不累计为新的覆盖项。实际 CPU 合成 GLM 在清除
 load-threads/chunk 环境变量后，先拒绝 1-byte 配额，再在同进程将额度提升至
 **32 KiB**：自动选择一个 worker、32 KiB chunk/arena，512 个完整 logits 与无
-预算参考逐位一致，峰值 committed 32768 B，释放后所有 owner 归零。GPU 及完整
-GLM 新规划的资格须另看后续独立报告；上述 C2F/8 MiB 完整模型数据仍属于人工指定
-worker/chunk 的旧版本，不能重新标记为自动规划实测。
+预算参考逐位一致，峰值 committed 32768 B，释放后所有 owner 归零。
+同一 native 随后在真实 CUDA 上完成 **29 项**合成 GLM 检查，512 个完整 logits
+逐位一致，1-byte 拒绝后同进程 32 KiB 重试成功，最终 host/device owner 归零。
+独立 Linux/GCC 编译的同版本 planner **239/239** CPU 检查也通过；该项没有运行
+新 planner 的 Linux CUDA。上述 C2F/8 MiB 完整模型数据属于人工指定 worker/chunk
+的旧版本，不能重新标记为自动规划实测。
+
+完整 E 盘 GLM 另做同额度的旧/新加载验收，**不设置 load-threads/chunk**。
+旧 native `10150D28…` 尝试较大 worker scratch 后抛 `ModelLoadRefusedException`，
+进程退出 **3762504530**，未构造模型。原 sidecar 的 `cleanup_passed=false` 和
+`lifecycle_error` 保留；另外核实 callback 无错误、scope 已卸载、最终 owner 为零，
+不将负例改写为 exit0 或全部清理检查通过。新 native `129E2F8A…` 在
+**7 次预协商拒绝后第 8 次成功**，自动选择 **1 worker × 8 MiB**，加载后数学和
+抽取两题均独立严格评分通过、自然 EOS。两题 prompt/全部输出 token 与旧 C2F
+相同，2×154880=309760 个完整 F32 logits 全有限且逐字节相同，捕获 SHA 为
+`7D5BDF01…`；最终 host/device 账本及活动 owner 归零，cleanup 通过。
+
+该新进程的外层 wall 为 **623.859 秒**，监督器内部为 623.656 秒。数学的
+first-forward/total 为 **118.557/128.565 秒**，抽取为 **286.001/389.206 秒**；
+旧 C2F 对应为 98.642/108.104 和 165.253/222.271 秒。新抽取总耗时增加约
+**75.1%**，不能宣称性能已改善。两题首个预测之后的 decode 分别约
+**0.300/0.194 tokens/s**；重复短 8+1 的热态 3.325 tokens/s 不能替代该结果。
+OS 文件缓存未控制，前半段与低 CPU 的 B8E soak 重叠，尚无同条件 quiet ABBA
+可以把变慢归因于上传 planner；本轮只通过受限加载、数值、语义与所有权资格，
+**不通过性能收益或默认开启资格**。采样峰值 RSS/private/整卡 VRAM 为
+**23,752,839,168 B / 16,041,156,608 B / 12,325 MiB**，不得相加推算总物理占用。
+完整证据为 `glm-upload-autoplan-full-v1/summary.json`，旧失败和全部原始数据保留。
+
+同一 `129E2F8A…` native、Memory `AD0C47B2…`、Models `EE3F66E3…`，配合
+扩展 Direct probe `AE932D7C…`，另完成代码与工具 JSON 两个自然生成请求。
+代码题返回不带 Markdown 的 `def square(x): return x * x`；工具题严格返回
+`get_weather`、`Hangzhou`、`celsius` 对象，无多余键或围栏。两题均闭合 reasoning、
+自然 EOS，生产判定与独立 `fixed-answer-only-v2` 均通过；这使当前原始四类固定
+任务的覆盖达到 **4/4**，不代表实际工具调用往返、多轮智能体或广泛能力验收。
+代码为 **39 prompt / 13 generated tokens**，first-forward/total 为
+**223.014/279.966 秒**；工具 JSON 为 **85/26 tokens**，对应
+**600.409/718.140 秒**。完整 prompt 速率约 **0.1749/0.1416 tokens/s**，首个
+预测之后的生成速率约 **0.2107/0.2123 tokens/s**。重复的固定 8+1 热态结果为
+4.169/4.043 tokens/s，不可替代这些真实自然请求的速度。整个监督进程为
+**1104.282 秒**，退出零，数值重放与共享 host payload 清理资格通过，自动上传
+仍为 1 worker × 8 MiB。报告为 `glm-extended-quality-autoplan-v1.json`，独立审计
+为 `glm-extended-quality-preparation-v1/launch-audit.json`，原始报告 SHA
+`E8B82FE6…`。该进程没有后台 CPU soak 或 WSL，但 OS 页缓存未控制，仍非同条件
+跨引擎 ABBA，也不赋予性能达标或默认开启资格。
+
+新增两题进程的 998 次采样峰值为 RSS **23,402,733,568 B**、private commit
+**17,564,008,448 B**、整卡显存 **12,343 MiB**。这些是同一进程的观测维度，
+并非每题独立峰值；整卡显存含其他进程，不能把它与 RSS/private 相加为物理总额。
+
 映射的虚拟长度不等于 resident RAM，映射和页缓存硬限仍需平台能力或有界执行适配。
-另一个尚未覆盖的 payload 是 Linux `dsv4_file_warm.h` 的每 worker 预读 buffer；
-GLM 在整个映射可装入主机余量时才进入这一路径，但该条件不等于共同账本准入。
-Windows 的映射页触发则直接改变 OS resident/cache，不能按零字节开销处理。
-后续上传规划只管理上传 scratch，不因此获得预热、页缓存或全模型物理归属资格。
+上述实际 GPU 构建 `129E2F8A…` / Linux `A79B5FD3…` 尚未计账 Linux
+`dsv4_file_warm.h` 的每 worker 预读 buffer。GLM 在整个映射可装入主机余量时才
+进入该路径，但该条件不等于共同账本准入。随后 TensorSharp 自有
+`file_warm_budget.h` 已补充聚合 host kind3 ticket，将固定预读 payload 与最坏
+未对齐 `mincore` scratch 一起预留，之后才分配、commit、打开文件和启动线程。
+配额不足按线程数/块大小缩减；最低有效块仍放不下时，明确跳过可选预热，正常
+需求读取继续，不退回未计账 buffer，也不误打印“预热成功”。五处 GLM/DeepSeek/
+Engram/TP 调用同步处理该状态。未配置 scope 的路径保留原 lazy payload 和并行
+几何，但每次完整 warm 新增一次 ticket 生命周期；没有宣称这一开销为零。
+
+例如 8 MiB 配额和 4 KiB 页面下，含 residency scratch 的计划选择一线程、4 MiB
+payload 加 1025 B scratch，不能只按 8 MiB payload 忽略辅助内存。所有线程结束后
+先释放物理 payload，再归还额度。范围端点/总长度溢出提前拒绝；预先取消不会先
+申请大型 payload；分配、commit、读取、回调异常和部分线程启动失败均可清理后重试。
+默认分配器的异常仍由已有 GLM/DeepSeek 加载及后台线程边界捕获，没有穿越 P/Invoke。
+
+新代码实际完成 Windows/MSVC 与 Linux/GCC 的预算夹具、旧 Warm/ExactRead 回归，
+并分别编译 GLM、DeepSeek4、DeepSeek4.1 TP 三个生产消费者的独立对象；Linux
+另通过 host-demand-read 并实际编译旧 warm benchmark。最终增强夹具在 Windows
+执行 **72 项检查**、Linux 执行 **156 项检查**，不相加为互不重复的测试。
+Linux 使用真实只读 mmap/未对齐 mincore，并关闭 resident-skip 强制执行真实
+`pread`，覆盖 **65,534 B**；这是热页缓存正确性测试，不是 SSD 吞吐或冷盘验收。
+v3 的 Windows 10 个、Linux 13 个执行阶段通过；v4 只增强上述夹具，生产源码/头
+与 v3 逐字节一致，引用 v3 的消费者对象与旧回归，未重复计作新的生产编译。
+早期 v2 误在 Windows 编译 Linux-only benchmark 的失败保留；该场景在 Windows
+明确不适用，不计通过，Linux 已实际编译。现有 frozen native 和模型数据未被覆盖。
+
+这次验收是 CPU/POSIX/helper 与生产对象编译，**没有重新构建并验收完整 CUDA
+native，也没有 Apple 真机资格**。ticket 可以占用整个预热过程，目前没有面向
+更高优先级请求的抢占租约；它仍不证明全局公平性。元数据、线程栈、OS resident/
+页缓存及 driver 未因此完整纳管。Windows 映射页触发分支未变，它直接改变 OS
+resident/cache，不能按零字节物理开销处理。源码依赖保持原始 ggml `ffa4e8b…`。
+原始阶段、source/object 身份、失败及清理证据见
+`file-warm-budget-v5/summary.json`。v5 只补充 v4 展示行缺失的 resources 字段，
+底层仍是相同的 v3/v4 执行，原 v4 摘要及 SHA 保留。汇总器现在对格式不完整的
+展示行明确拒绝；原格式错误只能作为索引显式声明的历史记录展示，不能选作当前
+通过记录或静默丢弃。本轮 Windows 自有 Job 进程、Linux 进程组已回收，
+独立检查无本次编译/测试残留，Ubuntu 已停止。
 `glm-staging-budget-audit.json` 记录了具体接线位置、峰值归属和分阶段验收条件，
 因此本项仍不赋予完整共享预算默认开启资格。
 
@@ -2334,8 +2417,11 @@ Maya v2 使用与 TensorSharp 相同的 32 个 prompt IDs，生产 tokenizer 逐
 | Maya v3，batch32 / min1，第一次 | 98.922 | 0.3235 | 0.1415 | 120.125 |
 | Maya v3，batch32 / min1，第二次 | 90.265 | 0.3545 | 0.3003 | 113.578 |
 
-decode 分母是输出数减 1，首个输出来自 prefill logits；TTFT 和请求 wall 包含各工具
-自己的采样/输出开销。该表不是 ABBA，缓存状态与输出工作量也未完全一致，不能据此
+decode 分母是输出数减 1，首个输出来自 prefill logits。TensorSharp 的
+`first_token_ms` 止于首次 `ForwardRefill` 返回、尚未执行 greedy 采样；其后续生成
+区间包括有限值检查与采样。Maya 的 TTFT、prefill 和 decode 使用自己的计时边界，
+请求 wall 还包括采样/输出开销，不能当作完全相同的端到端口径。该表不是 ABBA，
+缓存状态与输出工作量也未完全一致，不能据此
 宣称稳定胜负。Maya 进程采样峰值 RSS/private/整卡显存为 **5.883/17.801/15.442 GiB**；
 TensorSharp 完整两题进程的对应峰值为 **22.078/14.941/12.038 GiB**，不是第一题独立
 峰值。RSS/private/显存存在重叠，不能相加为总物理资源。
@@ -2366,6 +2452,39 @@ TensorSharp 的峰值仍取前述包含两题的整进程观测；不能把不�
 当作同预算吞吐验收。该补测有低负载 CPU 合成 soak 在后台，未清空 OS 页缓存。
 证据为 `maya-e-extraction-batch32-v4/report.json`，原始文本、EOS、指标和身份均保留。
 
+**新增代码与工具 JSON 的 Maya 对照已完成。** 两题分别绑定实际 Direct 报告的
+39/85 个原始 prompt IDs，同一 E 盘 pack、batch32/min1、8 CPU threads、无 MTP/
+prefix reuse；独立新进程运行，两者均自然 EOS、严格答案通过。代码的 13 个 token
+和工具 JSON 的 26 个 token（均包含 EOS）与 TensorSharp **完整逐 ID 相同**。
+
+| 新增自然请求 | TensorSharp first-forward / total s | Maya TTFT / total s | TensorSharp / Maya prompt tokens/s | TensorSharp / Maya 首预测后 tokens/s |
+|---|---:|---:|---:|---:|
+| 代码，39→13 tokens | 223.014 / 279.966 | 176.297 / 247.469 | 0.1749 / 0.2212 | 0.2107 / 0.1686 |
+| 工具 JSON，85→26 tokens | 600.409 / 718.140 | 324.531 / 484.250 | 0.1416 / 0.2619 | 0.2123 / 0.1565 |
+
+Maya 完整 prompt 的 wire 计时分别为 176.3052/324.5369 秒，其内部 batch 计数
+少最后一个 scalar prompt token，不能拿内部 84-token 时间代表完整 85-token
+预填充。TensorSharp 的 first-forward 边界与 Maya TTFT 的差别仍如上文所述。
+首预测后的分子分别是 12/25 次 forward；原生 Maya STAT 计算 ms/token 时用 generated 数作分母，
+表中按 generated−1 修正。TensorSharp 在这两条轨迹中后续生成较快，但请求总耗时
+分别比 Maya **高约 13.1%/48.3%**，因此没有完成“质量与性能全面持平或超越”的目标。
+这些是不同进程/缓存历史和资源布局的观测，不能据此推定稳定比例或优化收益。
+
+Maya 代码/工具 JSON 两个进程的采样峰值 RSS 为 **6,025,957,376 / 6,315,171,840 B**，
+private commit 为 **19,078,066,176 / 19,086,413,824 B**，整卡显存为
+**15,850 / 15,876 MiB**；TensorSharp 新增两题同进程的范围见前文。双方仍未施加
+相等的全物理硬预算，不将 RSS、private 和整卡显存相加。代码/工具 JSON 的进程
+I/O 计数约 65.98/123.14 GB，也不是独占物理 SSD 读取量。两次 Maya 退出零、所有
+自有进程已回收、工具/pack/原生身份前后不变。原 v5 准备脚本的路径检查失败发生在
+启动模型之前，失败记录保留，v6 未借此删改任何模型输出。
+
+当前四任务主汇总中 TensorSharp **4/4**；Maya 四类任务合计五次请求 **5/5**，
+完整 token parity 为 **3/5**，另外两次数学推理/抽取文本不同而最终答案正确。
+该汇总采用新的 `129E2F8A…` TensorSharp 数学/抽取及新增两题，没有用更快的旧 C2F
+替换较慢的新数据。见 `glm-maya-four-task-v6-summary.json`；旧 scalar 数学、不同
+工具评分与历史性能均保留。工具 JSON 只是精确格式输出，尚未执行工具或验收多轮
+智能体；GLM 多模态、MTP/TP 及更长自然生成仍不能计为通过。
+
 验收规则随后进行了独立复核：固定数学/抽取/平方题的答案直接由题目定义，不能拿
 TensorSharp 的输出作为 ground truth。Maya 的旧规则是与参考最终文本相等；现在额外
 按 `fixed-answer-only-v1` 绑定精确题目复核，要求自然 EOS、闭合 reasoning、无 tool call
@@ -2374,6 +2493,14 @@ TensorSharp 的输出作为 ground truth。Maya 的旧规则是与参考最终�
 仅提取英文单词的抽取判定过宽，已改成锚定的 `cedar, maple` 逗号列表，不接受 JSON、
 围栏或额外解释。工具层 37 项 Python、82 项独立 C# CPU 检查通过；旧冻结 GPU app
 仍按原身份记录。证据在 `maya-fixed-task-policy-v1/`。
+
+随后扩展 `fixed-answer-only-v2` 的代码/工具 JSON 规则：代码以独立 Python AST
+与 C# 有限语法检查，避免执行生成代码；JSON 拒绝重复键、额外键、错误参数和围栏。
+同时修复闭合 reasoning 后尾随换行、重新打开 thinking 以及不成对 UTF-16 surrogate
+的判定边界。**345 项 C# 检查与 43 项 Python 测试通过**，详见
+`E:/TensorSharp-validation-cache/glm-quality-extended-v1/summary.json`；这是检查器
+覆盖，不能作为额外模型样本。历史五个 Maya 请求用 v2 离线重评仍为 5/5，保留
+原始评分和报告，详见 `maya-fixed-task-policy-v2/summary.json`。
 
 代码审查确认不能只把 Qwen 路由缓存开关直接用于 GLM：GLM 使用自己的 backend/
 多 backend scheduler，当前缓存依赖全局 backend；GLM 激活还要求 gate 上限 10、
@@ -2384,6 +2511,22 @@ backend/rank、量化精度及激活参数，并在模型解除映射/释放 bac
 全部 miss。需将选中权重分块读取/传输，并用真实 completion fence 保护暂存复用，
 同时规划 dense placement、graph/workspace 与专家保留容量。这些是下界，不含 driver、
 alignment、KV 或未来请求峰值，也不是已经完成的新 GLM 适配。
+
+自然生成瓶颈复核进一步区分了计数含义：Maya 日志的 `disk reads/token` 实际是
+从磁盘层获取的 **expert 数量**，不是 OS read 系统调用次数；默认每个 miss 还拆成
+三组投影 × 8 个 chunk。历史数学运行的 native decode 计数中 disk wait 约占
+94–95%，CPU lane 仅约 0.55–1.52 ms/token；这支持优先研究 I/O 与驻留布局，但
+不是 TensorSharp 的独占时间剖析，不能直接把该比例移植给另一引擎。Maya 的
+代码题加载时还有约 19.3 GiB 可用物理 RAM，却只有约 5.5 GiB commit 余量；
+其 6 GiB headroom 策略使 RAM tier 降至约 0.34 GiB。自动规划必须同时考虑
+private commit、pinned host、VRAM、KV、暂存与请求峰值，不能只看“空闲 RAM”。
+
+下一阶段先用同一组自然 EOS 任务分别比较读取 chunk 数和实际 cache 容量，再做
+TensorSharp 自有的 GLM compact-expert 数值 oracle：验证 clamp/路由顺序、命中/
+未命中/逐出、分块传输、owner 释放与地址复用，之后才接入完整模型。不能借调试
+trace 改变 router materialization/fusion 后将其计时冒充生产基线，也不能用热态
+固定 8+1 重放代替自然路由工作集。具体源码身份与验证顺序在
+`glm-natural-decode-bottleneck-review-v1.json`；这些后续缓存适配尚未实现。
 
 上游 scheduler 的 eval callback 返回 false 只退出当前 split 内循环，不能保证整次
 执行失败，因此不能用它来传播预算拒绝并继续返回 logits。第一阶段应实现 TensorSharp
@@ -2477,6 +2620,49 @@ Strata 历史 PP/decode 中位数 12.983/9.321 仅作参考：没有与此次宽
 `qwen-wide-prefill-local-v1/`，不用于原 context 的数值回归结论。纠正为 context512
 后默认完整链复现，质量组本来就是 512。正式记录为
 `qwen-wide-prefill-local-context512-v2/` 和 `qwen-wide-prefill-local-summary.json`。
+
+随后完成原始 **88-token prefill + 单独 scalar 271** 的完整分布诊断：旧 C2F
+cache0/cache8 两臂的 prefill 逐位相同，第二预测分别仍为围栏 token 71093，
+llama 为 JSON token 4754。每臂两行完整 248320 词表均有限；llama API 返回完整
+logprob，因此先减去共同 token 的偏移再比较，不能冒充原始 logits 逐位相同。
+第二行 cache8 与 llama 的 offset-relative L2 为 **0.101412**，cache0 为
+**0.101162**，证明此失败不是 cache8 独有；尚未定位首个产生偏差的层或算子。
+首轮诊断错误地要求仅一次冷 scalar 就出现缓存命中，失败与原始 F32 保留；工具
+改为验证实际调用、miss、预算和已分配字节，不插入额外 forward 改变历史。
+
+新 native `F70E4BE1…` 将显式行上限扩展至 **128**，保持原外层 batch 及固定
+4096 路由项、16 KiB 路由 scratch 上限。仍限 single CUDA/rank0/TP1/无 bias 的 SiLU，
+形状或资源守卫失败时回到原路径。默认 8、显式 Q8_0、IQ1_M/IQ4_NL、
+IQ2_XXS/IQ4_NL 四个真实 CUDA oracle 进程全部通过，覆盖 9/31/63/64/88/128 行、
+实际 top-10、64×64 边界，以及 65×64/129 行拒绝和缓存释放。
+新默认 8 的两行完整分布与旧 C2F cache8 逐位相同；显式 128 的第二预测变为
+4754，JSON 相对围栏 margin 从 **−2.6688** 变为 **+1.7663**，llama 为
+**+1.8596**；offset-relative L2 降为 **0.02424**。这不是全模型数值一致结论。
+第一行 prefill 对 llama 的同类误差反而由约 **0.0348** 变为 **0.0447**，因此
+不能把第二行更接近或五题语义改善推论为原 CPU 算术错误、所有 logits 精度更高。
+
+相同五个原始提示、context512、max-new256 的独立自然生成 **5/5 通过且全部 EOS**。
+数学、抽取、代码及平方数完整 token 与旧版本相同；工具 JSON 全部 26 tokens 与
+先前 llama 自然输出相同，未剥除围栏、补写内容或加入 schema。五题 prefill 分别
+3.166/3.906/2.989/2.944/7.738 秒，后续 decode 为
+0.349/0.512/1.142/5.834/2.603 秒；JSON 本次 PP/decode 为 **11.372/9.605 tokens/s**。
+采样工作集为 **4.345–4.361 GiB**、整卡显存 **13,444–13,448 MiB**，专家缓存
+额度仍为 8 GiB，不能当作总物理硬限。完整分布诊断单次 PP 为默认/显式
+11.338/20.399 tokens/s，但两臂后续 scalar 分别为冷填/已预填缓存，不能据此推算
+稳态 decode 加速。未重跑同条件 Strata ABBA，历史 Strata 也是五题 5/5，尚不能
+宣布质量或相同资源性能全面超过。**默认仍为 8，此质量修复当前需要显式 128**；
+更长提示、多模态、MTP、TP、其它量化和跨平台尚未由这组检查验收。
+证据在 `qwen-tool-json-prefix-logits-v2/`、`qwen-wide128-model-v1/` 和
+`qwen-wide128-local-summary.json`；upstream ggml 仍为未修改的 `ffa4e8b…`。
+
+默认 8 现在是历史策略，不是 16 KiB 路由缓冲的必要安全上限。这个 CUDA 子功能
+可以先在现有守卫和已分配缓存额度内自动选择宽度，不必等待被守卫排除的 Apple/TP。
+放开前仍须完成：真实 **128 行** quiet ABBA（默认路径从 128 行起会改走原批量
+GPU streaming）、小缓存/共享预算拒绝与缩水、两请求竞争时的取消/trim 尾延迟，
+以及另一量化和 Linux CUDA，或将默认范围明确限制于已验格式。全宽执行持有全局
+cache mutex，不能仅凭五个串行短题推断并发收益。缓存配额环境变量默认仍为零；
+自动选宽度与自动分配缓存容量是两项不同工作。详见
+`qwen-wide128-default-readiness-review.json`。
 
 **物理观测与 owner 的对应关系：** `PhysicalMemoryCapacityPlanner` 接收有时间戳的
 平台样本和账本快照，不自行安装 OS 限制或推断 GC/mmap 的所有权。设观测不可用量为
@@ -2576,6 +2762,13 @@ Runtime `8D2C80A4…`、Memory `A359AA84…`、Models `EE3F66E3…`。v3 的
 缺失、POSIX/bash 与 Windows 路径、CRLF 或过期 exact pins；本轮变更脚本没有失败。
 这些工具测试与上面的 .NET CPU 回归分别记录，不合并计数。
 
+其后修复其中可在本机复现的工具问题：固定比较器恢复到原始 Git blob 的 LF 字节，
+以 `.gitattributes` 保持 exact SHA，不放宽 pin 检查；浏览器配置路径断言改为当前
+平台的 `Path` 表示，继续核对完整 argv/cwd/env。相关 **43 项**定向测试全部通过
+（17 项捕获、7 项基线、19 项浏览器）。历史缺失的 ignored 工件、旧引擎冻结 pin
+与 Windows 上的 bash/WSL 边界并未据此全部解决；没有重写早期 686 项结果，也不
+宣称完整工具套件已全绿。环境和夹具要求补充在 `eng/validation/tests/README.md`。
+
 独立 `eng/tests/unified-memory` harness 另在 Windows 复验 **58 通过、0 失败、1 跳过，
 共 59 项**，见 `standalone-memory-final-windows.json` / `.log`。它覆盖真实文件 I/O、
 RAM/SSD 快照、配额/取消、故障回滚和释放重试；accelerator placement 仍使用主机模拟，
@@ -2659,11 +2852,23 @@ live bytes 为零。随后四轮均实际完成、报告 `passed` 且退出码 0
 准入锁与取消/公平进展；该单 host pool 负载不覆盖独立 pool 和借用 effective target
 交错，后二者由上述 CPU 回归单列。它不是硬件采样、GPU、训练模型、SSD、RSS 硬限
 或推理吞吐验收。
-报告中的 `maximumWaveSeconds=10` 是配置的每波截止时间，不是观测最大延迟；
+报告中的 `maximumWaveSeconds=10` 是各次指定等待的配置超时：逐个取消请求的
+等待与完成集合的等待分别计时，不是整个 wave 的统一截止，也不是观测最大延迟；
 `maximumAdmissionWaitMsPerEngine` 只覆盖成功完成请求的观测等待，不能冒充全部请求的
 p95/p99。原有无 hook 基线与最终 hook 的 CPU 时间也不能代替模型 prefill/decode 性能。
 
-**最终构建的 32K 并发及短请求复验：** `qwen-final-v6-32k-128-comparison.json`
+最新 Memory `B8E77819…` / Runtime `8D2C80A4…` / tool `31F…` 又独立完成
+**7200.429 秒**，不是沿用 A359 的时长：7,486 波、239,552 次提交，119,776 完成及
+同数取消，四引擎各完成 29,944；149,720 次真实原生分配全部释放，最终 payload 和
+账本均为零。235 个进度快照逐一核对计数、身份和排空；12 个文件前后及终态 SHA
+一致。成功请求最大观测准入等待 **1.3984 秒**，总 CPU **73.375 秒**，采样峰值
+private/RSS **28,012,544 / 60,878,848 bytes**。原 soak 测试进程、启动器、观察器均已退出。
+独立审计 v1 因 Python 3.10 对 .NET 时间小数格式解析失败，原失败保留；修正审计并
+覆盖 1–7 位小数后，v2 对原始证据通过，没有改写 soak 输出或重新拼接时长。
+见 `cpu-soak-memory-b8e-final-summary-v2.json`。本次同样不覆盖真实 GPU/训练模型、
+SSD 或 OS 硬限，未记录逐请求 FIFO 顺序；各引擎有进展不等于所有公平性政策已验收。
+
+**前轮冻结构建的 32K 并发及短请求复验：** `qwen-final-v6-32k-128-comparison.json`
 与 `qwen-final-v6-short-comparison.json` 使用 Runtime `8D2C80A4…`、Models `EE3F66E3…`、
 Memory `A359AA84…`、native `4A1E9832…`，probe `615E8B6F…`；上游 ggml 仍为未修改的
 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`。每个形状按 reference/candidate/candidate/reference
@@ -2720,6 +2925,33 @@ forward 计时排除外部 hash、采样和容量刷新；加载加请求计算�
 均为零。该组证明新提交额度观测参与实际规划，不代表完整 GC/driver/mmap 所有权、
 语义/EOS、长上下文或并发资格。证据为 `qwen-host-commit-job-v2/summary.json`。
 
+随后同一 Memory B8E / Models E047 / Runtime 8D2，配合 native `129E2F8A…`、
+probe `1F6CAF5F…` 完成 **12 GiB Job、32K context、两请求各 28,002 prompt +
+128 固定输出**的四进程 reference/candidate/candidate/reference。每个进程前新建
+Job，真实 oversize canary 均被 error 1455 拒绝；实际 effective limit 均为
+12,884,901,888 B，启动前确认单成员及先入 Job 后 resume。使用 detached 创建，
+避免 conhost 成为额外成员后被 fail-closed provider 拒绝。四进程均 exit0、无监督
+错误，全部拥有的子进程退出；29 个冻结文件与加载的程序集/native 身份一致。
+
+两请求确实同时准入并交替执行，四臂完整 prompt hash 与两条 128-token 序列一致。
+两候选 RAM/device/SSD 逻辑额度各 8 GiB；最终 ledger、native、host 与 residency
+owner 均清空。固定长度输出的结束原因仍为 `max_tokens`，不计自然 EOS 或语义通过。
+
+| 12 GiB Job / 32K 双请求 | Reference 两次，秒 | Candidate 两次，秒 | 中位延迟变化 |
+|---|---:|---:|---:|
+| 请求 wall | 69.8655 / 62.1421 | 61.2584 / 61.1126 | −7.300% |
+| 合计 prefill compute | 46.1330 / 42.3431 | 41.7477 / 41.6452 | −5.745% |
+| 合计 decode compute | 3.2907 / 3.4704 | 3.3347 / 3.3608 | −0.972% |
+
+三项均通过既定 5% 门槛，本组没有重现原先 6–10% 的额外开销。首个 reference
+加载 22.928 秒，其余加载 1.082–1.153 秒，文件缓存未控制，因此不能宣布稳定提速
+或受控冷启动通过。Job 提交峰值 reference 为 **8.156/8.077 GiB**，candidate 为
+**7.764/7.760 GiB**；工作集分别 **6.675/6.603 与 6.391/6.388 GiB**，CUDA
+total−free 采样均最高约 **2.708 GiB**，不是进程独占显存。Job 只证明 private
+commit 上限，不证明映射、页缓存或 VRAM 硬限。离线审计 v1 的控制台编码错误保留，
+v2 仅改 ASCII 摘要输出并复核原始证据，未重跑模型；最终资格见
+`qwen-b8e-job12g-32k-summary-v2.json`。
+
 **硬限证据仍按平台和维度分别记录：** planner 只接受执行方提供的 active/verified
 `MemoryHardLimitEvidence`；所要求维度没有覆盖时明确拒绝。该记录不会自行建立 Job、
 cgroup 或 Apple 限制，Adaptive 当前也没有自动安装“全物理硬限”。Windows Job 的 private
@@ -2764,10 +2996,63 @@ WSL 整体工作集每 0.5 秒采样的最高值约 **2.54 GiB**，包含虚拟�
 测试进程 RSS 或硬限结果。运行前没有活动发行版；结束后关闭本轮启动的 Ubuntu 及
 空闲 WSL 虚拟机，确认无活动发行版、无 `vmmemWSL` 残留，过程见 `cleanup.json`。
 
-因此默认开放完整共享预算仍需：未接线 GC/tokenizer/mapping/pagecache/vendor/driver
-owner 或可靠保留余量的完整执行验证、缺失平台的真实执行与强制限制覆盖、最终长期压力
-结果，以及支持模型/模态的数值、语义和性能资格。已有 aggregate gauges、单次 canary、
-CPU fake 和逻辑 ledger 都不能代替这些条件；受配额约束的组件默认优化不等于全局模式默认。
+2026-10-11 UTC 的 `wsl-cuda-current-v4` 补充了实际 Linux CUDA 覆盖。CUDA 12.6.85 /
+GCC 13.3.0 / sm86 构建仍使用未改动 ggml `ffa4e8b…`；原生为
+`A79B5FD3…`，来自 v3 冻结源码。v3 首次资格因 WSL 不提供 `/proc/pid/io`、psutil
+没有 `io_counters` 而采样失败；v4 只修采样工具，保留原失败及相同 native/managed。
+缺失 I/O 和 Linux private 指标现在为 null，不能被解释为零流量/零占用。相同的
+21 项采样/监督测试在 Windows、Linux 各通过一次，另有真实 Linux 采样；不相加为
+42 个独立用例。五组原生 CPU fixture 和合成 GLM CUDA 的 512 个 logits、压力拒绝、
+重试及 owner 清理通过。该 Linux 库没有包含后来的新上传 planner；`b5b76f30` 的
+239 项 Linux planner CPU 检查单独通过，不能借用 A79B 的 GPU 结果。
+
+完整 Qwen3.5-0.8B Q8_0、context 2048、实际 643-token prompt、64 行预测
+（63 次 decode）使用 Memory `B8E77819…` / Models `E04770E7…` / Runtime `8D2C80A4…`。
+resident/adaptive 的 **64×248320 个 logits 逐位一致**，最终 host/device owner 为零。
+独立四进程 ABBA，每进程一次 warmup 和三次测量，关闭外部采样；每臂六次测量的
+prefill 中位数 **2556.52→2558.63 tokens/s**，decode **79.82→78.86 tokens/s**
+（−1.205%），两项通过预先设置的 5% 门槛。Windows 的低 CPU 长测仍在后台，
+模型哈希先于计时且会暖文件缓存；这些结果不是严格冷启动或跨操作系统速度对比。
+
+相同两条路径又在 CLR 启动前加入独立 **3 GiB RAM / swap 0** cgroup。两者正常退出，
+64 行完整词表逐位一致，`max/oom/oom_kill` 均无增长，组在成员退出后删除；kernel
+peak 分别 **1,486,008,320 / 1,260,044,288 B**。Adaptive 实际识别 3 GiB total，
+扣除 512 MiB headroom 等限制后，将配置的 6 GiB host ceiling 收缩到
+**1,803,759,616 B（约 1.680 GiB）**。
+运行顺序与文件缓存归属不同，不能由两次 peak 相减宣称内存节省。DrvFS 外部 Windows
+页缓存、完整 CUDA/driver 与 VRAM 不受这一个 Linux RAM 限额完整约束。
+
+另用冻结普通 Direct `93338809…` / Memory `AD0C47B2…` / Models `EE3F66E3…` 执行
+三道自然生成题，只通过 **1/3**：算术 `42` 正确，抽取错误回答 `pine`，平方列表多出
+方括号且漏掉 400；均自然 EOS，无截断。随后 Windows 未修改 llama.cpp `4ebdf2c…`
+使用同一检查点、38/56/49 个原始 prompt IDs、greedy 和无 grammar，三题完整输出
+（含 EOS）分别 3/2/84 tokens，**逐 ID 全部相同，也是 1/3**。依据用户允许，这两项
+共同失败暂时记录，不修剪输出或当作质量通过。普通 Direct 与 Adaptive 使用不同的
+托管集合，此语义结果不替代 Adaptive 的独立语义验收；同历史数值 parity 与语义
+正确性分开记账。见 `wsl-cuda-current-v4/summary.json` 与
+`qwen08-llama-raw-preparation-v1/summary.json`。本轮所有 WSL 模型/编译进程与测试
+cgroup 已清理，Ubuntu 已停止；Apple 真机仍未验收。
+
+默认开放完整共享预算仍有以下具体门槛；源码位置及摘要见
+`default-readiness-source-audit-v2.json`。
+
+1. **真实多模型、跨引擎后端回收。** Adaptive 仍限定一个 process-global GGML
+   scope/model；四个 CPU 合成引擎与同模型两个请求不证明多真实模型缓存可安全共享。
+   需要 owner/generation/backend/rank 隔离、完整回滚及不同峰值请求下的全局回收。
+2. **物理归属与硬限。** GC/tokenizer/mapping/pagecache/vendor/driver 仍有未纳管
+   owner；动态余量是预测，Windows Job 的 private commit、Linux cgroup 的 RAM/swap
+   与 Apple available-memory 不可冒充等价的 RAM/VRAM 强制上限。
+3. **完整执行适配。** Adaptive 当前只接入 dense Gemma4/Qwen35、单 CUDA、文本
+   trunk；MoE、媒体、推测执行与 TP 仍需逐项峰值、权重/KV/工作区/媒体 buffer
+   准入及运行中压力恢复。普通 GLM、Qwen、图像、Gemma MTP 测试不能替代这些资格。
+4. **长期真实 GPU 请求压力。** CPU soak 能验证其自己的状态输出、取消、进度与
+   释放；尚缺训练模型的 GPU/SSD 长时间取消、恢复、尾延迟和饥饿界限，且当前 soak
+   不保存逐请求 FIFO 顺序轨迹。短冷启动与长上下文也须在对应资源条件下分别验收。
+5. **Apple 执行及真机。** 已有容量观测并不意味着 Metal/MLX/iOS/AOT 的完整执行
+   adapter；用户确认无设备，因此压力、前后台切换、硬限及性能保持未验收。
+
+已有 aggregate gauges、单次 canary、CPU 合成模型和逻辑 ledger 都不能代替上述条件；
+受配额约束的组件默认优化不等于完整共享预算默认开启。
 
 **已默认开启的性能策略与影响：** Q8/F32 prefill 自动 tile、Q8 单 token packed-load、
 Qwen4Exp 的只读视图/broadcast、可用时的 bulk KV restore，以及受配额约束的文件读取/
