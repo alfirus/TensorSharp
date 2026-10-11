@@ -473,3 +473,16 @@ views by default. `TS_Q4E_BROADCAST_VIEWS=0` restores materialized repeats for a
 isolated comparison; it is independent of `TS_Q4E_DECODE_VIEWS`. Batched and
 multi-token graphs keep their existing layouts. Record the switch and native
 binary identity with full-vocabulary logits before comparing throughput.
+
+`TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS` explicitly widens the host expert helper
+to at most 128 rows; unset, invalid and values below 9 preserve the default 8.
+The independent routing limit is 4096 selected-expert entries (16 KiB), so
+`rows * experts_used` must also fit. This leaves the outer batched attention,
+router and dense graph unchanged and reuses scalar CUDA expert arithmetic.
+Single-device rank-0 TP-degree-1 restrictions remain. It is a diagnostic opt-in,
+not a whole-model numerical-equivalence or default-readiness guarantee. Compare
+the original prompt/history, complete logits and natural-EOS semantic outputs
+before interpreting performance. The native wide oracle includes 88/128 rows,
+10-expert routes and the 64-row/64-expert routing boundary; skipped CUDA cases
+are not passing coverage. `host-moe-cache-row-route-policy` is CPU-only and does
+not qualify those GPU or model paths.

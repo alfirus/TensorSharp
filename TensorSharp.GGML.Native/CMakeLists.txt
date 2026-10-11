@@ -672,6 +672,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
     endif()
 
+    add_executable(GgmlOpsHostMoeCachePolicyTest tests/host_moe_cache_policy_test.cpp)
+    add_test(NAME host-moe-cache-row-route-policy COMMAND GgmlOpsHostMoeCachePolicyTest)
+    set_tests_properties(host-moe-cache-row-route-policy PROPERTIES TIMEOUT 30)
+
     add_executable(GgmlOpsHostMoeExpertCacheTest
         tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp)
     target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_TEST_HOOKS)

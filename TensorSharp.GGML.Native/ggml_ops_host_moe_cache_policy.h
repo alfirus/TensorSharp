@@ -5,7 +5,15 @@
 
 namespace tsg
 {
-    constexpr int kHostMoeCacheMaxPrefillRows = 64;
+    constexpr int kHostMoeCacheMaxPrefillRows = 128;
+    // The routing validation scratch stays 16 KiB independently of the
+    // opt-in row ceiling. Larger selected-expert sets permit fewer rows.
+    constexpr int kHostMoeCacheMaxRouteElements = 4096;
+
+    inline bool host_moe_cache_routes_fit(int rows, int selected)
+    {
+        return rows > 0 && selected > 0 && rows <= kHostMoeCacheMaxRouteElements / selected;
+    }
 
     // This opt-in only widens the compact expert helper, never the attention,
     // router, recurrent-state or whole-model precision policy. Invalid values

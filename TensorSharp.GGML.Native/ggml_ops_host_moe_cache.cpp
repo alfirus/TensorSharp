@@ -232,6 +232,7 @@ namespace tsg
             static const int max_rows = host_moe_cache_prefill_rows(
                 std::getenv("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS"));
             if (hm.seq_len <= 0 || hm.seq_len > max_rows
+                || !host_moe_cache_routes_fit(hm.seq_len, hm.n_used)
                 || (hm.seq_len > TSG_PRECISION_DECODE_COLUMNS
                     && (g_device_count.load(std::memory_order_relaxed) != 1 || g_active_rank != 0
                         || tp_global_degree(1) != 1))
@@ -451,7 +452,7 @@ namespace tsg
             // routing block before any slot mutation, while activations and
             // results keep their device-to-device bridge. No retained owner
             // or additional graph/weight allocation is introduced here.
-            std::array<float, kMaxUsed * kHostMoeCacheMaxPrefillRows> values{};
+            std::array<float, kHostMoeCacheMaxRouteElements> values{};
             if (count > values.size()) return false;
             const auto errors_before = g_ggml_error_count.load(std::memory_order_acquire);
             ggml_backend_tensor_get(routes, values.data(), 0, count * sizeof(float));

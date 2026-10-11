@@ -134,12 +134,12 @@ namespace
 
     void prefill_limit_checks()
     {
-        const char* invalid_values[] = {nullptr, "", "0", "1", "8", "65", "+64", " 64", "64 ",
+        const char* invalid_values[] = {nullptr, "", "0", "1", "8", "129", "+64", " 64", "64 ",
                                        "-1", "18446744073709551616", "64x"};
         for (const char* invalid : invalid_values)
             require(tsg::host_moe_cache_prefill_rows(invalid) == TSG_PRECISION_DECODE_COLUMNS,
                 "Invalid/unset wide-prefill limit changed the default decode width");
-        for (const int value : {9, 31, 63, 64})
+        for (const int value : {9, 31, 63, 64, 88, 128})
             require(tsg::host_moe_cache_prefill_rows(std::to_string(value).c_str()) == value,
                 "Bounded opt-in prefill row limit was not parsed exactly");
     }
@@ -249,24 +249,24 @@ namespace
         std::array<std::vector<std::uint8_t>, 3> quantized;
         std::array<ggml_type, 3> types{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0};
 
-        void fill(float seed)
+        void fill(float seed, int expert_count = experts, int selected_count = used)
         {
-            std::vector<float> values(static_cast<std::size_t>(hidden) * ff * experts);
+            std::vector<float> values(static_cast<std::size_t>(hidden) * ff * expert_count);
             std::vector<float> importance(hidden, 1.0f);
             for (int part = 0; part < 3; ++part)
             {
                 for (std::size_t i = 0; i < values.size(); ++i)
                     values[i] = 0.04f * std::sin(seed + float(i % 7919) * 0.013f + part * 0.7f);
-                const auto bytes = ggml_row_size(types[part], hidden) * ff * experts;
+                const auto bytes = ggml_row_size(types[part], hidden) * ff * expert_count;
                 quantized[part].resize(bytes);
                 const auto written = ggml_quantize_chunk(types[part], values.data(),
-                    quantized[part].data(), 0, ff * experts, hidden,
+                    quantized[part].data(), 0, ff * expert_count, hidden,
                     ggml_quantize_requires_imatrix(types[part]) ? importance.data() : nullptr);
                 require(written == bytes, "Synthetic quantized expert layout is incomplete");
             }
             segment.layer = 0;
-            segment.hidden = hidden; segment.n_ff = ff; segment.num_experts = experts;
-            segment.n_used = used; segment.seq_len = 1; segment.activation = 0;
+            segment.hidden = hidden; segment.n_ff = ff; segment.num_experts = expert_count;
+            segment.n_used = selected_count; segment.seq_len = 1; segment.activation = 0;
             segment.gate_data = quantized[0].data(); segment.gate_type = types[0];
             segment.gate_ne0 = hidden; segment.gate_ne1 = ff; segment.gate_bytes = quantized[0].size();
             segment.up_data = quantized[1].data(); segment.up_type = types[1];
@@ -304,12 +304,12 @@ namespace
         ggml_tensor* routes = nullptr;
         ggml_tensor* output = nullptr;
 
-        explicit DeviceInputs(int rows = static_cast<int>(TSG_PRECISION_DECODE_COLUMNS))
+        explicit DeviceInputs(int rows = static_cast<int>(TSG_PRECISION_DECODE_COLUMNS), int selected_count = used)
         {
             context = ggml_init({ggml_tensor_overhead() * 4, nullptr, true});
             require(context != nullptr, "Could not allocate device-bridge input metadata");
             x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, rows);
-            routes = ggml_new_tensor_2d(context, GGML_TYPE_F32, used, rows);
+            routes = ggml_new_tensor_2d(context, GGML_TYPE_F32, selected_count, rows);
             output = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, rows);
             buffer = ggml_backend_alloc_ctx_tensors(context, g_backend);
             require(buffer != nullptr, "Could not allocate device-bridge inputs");
@@ -334,15 +334,15 @@ namespace
 
         explicit FullResidentGraph(const Weights& weights)
         {
-            context = ggml_init({ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false), nullptr, true});
+            context = ggml_init({ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false), nullptr, true});
             require(context != nullptr, "Could not allocate reference tensor metadata");
-            auto* gate = ggml_new_tensor_3d(context, weights.types[0], hidden, ff, experts);
-            auto* up = ggml_new_tensor_3d(context, weights.types[1], hidden, ff, experts);
-            auto* down = ggml_new_tensor_3d(context, weights.types[2], ff, hidden, experts);
+            auto* gate = ggml_new_tensor_3d(context, weights.types[0], hidden, ff, weights.segment.num_experts);
+            auto* up = ggml_new_tensor_3d(context, weights.types[1], hidden, ff, weights.segment.num_experts);
+            auto* down = ggml_new_tensor_3d(context, weights.types[2], ff, hidden, weights.segment.num_experts);
             for (auto* t : {gate, up, down}) { ggml_set_input(t); ggml_set_output(t); }
             x = ggml_new_tensor_3d(context, GGML_TYPE_F32, hidden, 1, 1);
-            ids = ggml_new_tensor_2d(context, GGML_TYPE_I32, used, 1);
-            routes = ggml_new_tensor_3d(context, GGML_TYPE_F32, 1, used, 1);
+            ids = ggml_new_tensor_2d(context, GGML_TYPE_I32, weights.segment.n_used, 1);
+            routes = ggml_new_tensor_3d(context, GGML_TYPE_F32, 1, weights.segment.n_used, 1);
             for (auto* t : {x, ids, routes}) ggml_set_input(t);
             // The outer Qwen host-MoE boundary keeps these source tensors live
             // as graph outputs. Mirror that lifetime when testing D2D reads
@@ -356,12 +356,12 @@ namespace
             ggml_set_output(parts);
             auto* weighted = ggml_mul(context, parts, routes);
             auto* sum = ggml_view_2d(context, weighted, hidden, 1, weighted->nb[2], 0);
-            for (int k = 1; k < used; ++k)
+            for (int k = 1; k < weights.segment.n_used; ++k)
                 sum = ggml_add(context, sum, ggml_view_2d(context, weighted, hidden, 1,
                     weighted->nb[2], static_cast<std::size_t>(k) * weighted->nb[1]));
             output = ggml_cont(context, sum);
             ggml_set_output(output);
-            graph = ggml_new_graph_custom(context, 64, false);
+            graph = ggml_new_graph_custom(context, 256, false);
             ggml_build_forward_expand(graph, output);
             allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
             require(allocator != nullptr && ggml_gallocr_alloc_graph(allocator, graph),
@@ -377,9 +377,11 @@ namespace
             if (context) ggml_free(context);
         }
 
+        template<std::size_t Selected>
         std::array<float, hidden> compute(const std::array<float, hidden>& activation,
-            const std::array<std::int32_t, used>& selected, const std::array<float, used>& probabilities)
+            const std::array<std::int32_t, Selected>& selected, const std::array<float, Selected>& probabilities)
         {
+            require(Selected == static_cast<std::size_t>(ids->ne[0]), "Reference selected-expert geometry differs");
             ggml_backend_tensor_set(x, activation.data(), 0, sizeof(activation));
             ggml_backend_tensor_set(ids, selected.data(), 0, sizeof(selected));
             ggml_backend_tensor_set(routes, probabilities.data(), 0, sizeof(probabilities));
@@ -397,10 +399,10 @@ namespace
         SharedLedger ledger;
         require(ledger.attach(), "Could not attach wide-prefill budget fixture");
         FullResidentGraph reference(weights);
-        DeviceInputs device(64);
+        DeviceInputs device(128);
         std::int64_t retained_bytes = 0;
         std::uint64_t retained_reservations = 0;
-        for (int rows : {9, 31, 63, 64})
+        for (int rows : {9, 31, 63, 64, 88, 128})
         {
             auto hm = weights.segment;
             hm.seq_len = rows;
@@ -492,11 +494,11 @@ namespace
                 require(ledger.pending == 0 && ledger.valid && ledger.committed == retained_bytes,
                     "Wide-prefill graph escaped its shared owner");
             }
-            if (rows == 64)
+            if (rows == 128)
             {
                 // These failures are checked before even reading the caller's
-                // row arrays, so the same 64-row buffers safely test the bound.
-                hm.seq_len = 65; rejected(0); rejected(2); hm.seq_len = 64;
+                // row arrays, so the same 128-row buffers safely test the bound.
+                hm.seq_len = 129; rejected(0); rejected(2); hm.seq_len = 128;
                 tsg::g_device_count.store(2); rejected(0); tsg::g_device_count.store(1);
                 tsg::g_tp_global_degree.store(2); rejected(0); tsg::g_tp_global_degree.store(0);
                 tsg::g_active_rank = 1; rejected(0); tsg::g_active_rank = 0;
@@ -545,7 +547,86 @@ namespace
             }
         }
         require(ledger.detach(), "Wide-prefill owners prevented budget detach after trim");
-        std::puts("PASS: explicit 9/31/63/64-row scalar expert oracle, bridges, invalid routes, admission, interruption and trim");
+        std::puts("PASS: explicit 9/31/63/64/88/128-row scalar expert oracle, bridges, invalid routes, admission, interruption and trim");
+    }
+
+    template<std::size_t Selected>
+    void wide_route_capacity_checks(const std::array<ggml_type, 3>& types)
+    {
+        tsg::host_moe_expert_cache_release();
+        Weights weights;
+        weights.types = types;
+        weights.fill(0.71f, (std::max)(experts, static_cast<int>(Selected)), static_cast<int>(Selected));
+        SharedLedger ledger;
+        ledger.capacity = 32 << 20;
+        require(ledger.attach(), "Could not attach route-capacity fixture");
+        FullResidentGraph reference(weights);
+        // Extra capacity makes every rejected request safe even if its guard
+        // regresses. Rejection must still precede cache/output mutation.
+        DeviceInputs device(129, static_cast<int>(Selected));
+        std::vector<float> inputs(129 * hidden), routes(129 * Selected, 1.0f / Selected);
+        std::vector<std::int32_t> selected(129 * Selected);
+        std::vector<float> expected(129 * hidden), actual(129 * hidden, -999.0f);
+        for (int row = 0; row < 129; ++row)
+        {
+            std::array<float, hidden> x{};
+            std::array<std::int32_t, Selected> ids{};
+            std::array<float, Selected> probabilities{};
+            for (int i = 0; i < hidden; ++i)
+                x[i] = inputs[row * hidden + i] = std::sin(i * .031f + row * .17f);
+            for (std::size_t k = 0; k < Selected; ++k)
+            {
+                ids[k] = selected[row * Selected + k] = (row + static_cast<int>(k)) % weights.segment.num_experts;
+                probabilities[k] = routes[row * Selected + k];
+            }
+            const auto result = reference.compute(x, ids, probabilities);
+            require(std::all_of(result.begin(), result.end(), [](float v) { return std::isfinite(v); }),
+                "Selected-expert capacity reference is nonfinite");
+            std::copy(result.begin(), result.end(), expected.begin() + row * hidden);
+        }
+        ggml_backend_tensor_set(device.x, inputs.data(), 0, inputs.size() * sizeof(float));
+        ggml_backend_tensor_set(device.routes, routes.data(), 0, routes.size() * sizeof(float));
+        auto hm = weights.segment;
+        hm.moe_in = device.x; hm.weights = device.routes; hm.moe_out = device.output;
+        auto call = [&](int bridge) {
+            return tsg::host_moe_cached_experts(hm, bridge ? nullptr : inputs.data(), selected.data(),
+                bridge ? nullptr : routes.data(), bridge == 2 ? nullptr : actual.data(), "qwen4exp fused token span");
+        };
+        const std::vector<int> counts = Selected == 10 ? std::vector<int>{88, 128} : std::vector<int>{64};
+        std::int64_t reserved = 0;
+        for (const int rows : counts) for (const int bridge : {0, 1, 2})
+        {
+            hm.seq_len = rows;
+            const auto before = Stats();
+            require(call(bridge) == 1, "Bounded selected-expert geometry did not engage");
+            if (bridge == 2) ggml_backend_tensor_get(device.output, actual.data(), 0, rows * hidden * sizeof(float));
+            require(std::memcmp(actual.data(), expected.data(), rows * hidden * sizeof(float)) == 0,
+                "Bounded selected-expert geometry differs from scalar resident oracle");
+            require(Stats().calls == before.calls + rows, "Selected-expert boundary skipped/repeated rows");
+            if (!reserved) reserved = Stats().reserved;
+            require(Stats().reserved == reserved && ledger.pending == 0 && ledger.committed == reserved && ledger.valid,
+                "Larger routed block changed retained scalar cache ownership");
+        }
+        // 64*65 exceeds the independent4096 route bound despite an allowed row
+        // count.10*129 instead exceeds the128 row bound with only1290 routes.
+        hm.seq_len = Selected == 64 ? 65 : 129;
+        for (const int bridge : {0, 1, 2})
+        {
+            std::fill(actual.begin(), actual.end(), -999.0f);
+            ggml_backend_tensor_set(device.output, actual.data(), 0, actual.size() * sizeof(float));
+            const auto before = Stats();
+            require(call(bridge) == 0, "Independent row/route bound did not decline");
+            const auto after = Stats();
+            require(before.calls == after.calls && before.hits == after.hits && before.misses == after.misses
+                    && before.reserved == after.reserved, "Overbound routed block mutated the cache");
+            if (bridge == 2) ggml_backend_tensor_get(device.output, actual.data(), 0, actual.size() * sizeof(float));
+            require(std::all_of(actual.begin(), actual.end(), [](float v) { return v == -999.0f; }),
+                "Overbound routed block overwrote output");
+        }
+        require(TSGgml_TrimHostMoeExpertCache(0) == reserved, "Route boundary trim retained cache storage");
+        ledger.check_empty();
+        require(ledger.detach(), "Route boundary left live budget owners");
+        std::printf("PASS: selected=%zu, exact scalar CUDA oracle and independent128-row/4096-route limits\n", Selected);
     }
 
     void shared_budget_checks(Weights& weights)
@@ -1073,7 +1154,8 @@ int main(int argc, char** argv)
         }
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_LFU", lfu ? "1" : "0");
-        set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS", wide_prefill ? "64" : "");
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS", wide_prefill ? "128" : "");
+        if (wide_prefill) set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", "32");
         weights.fill(0.5f);
 #ifdef TSG_GGML_USE_CUDA
         if (!cpu_only)
@@ -1088,6 +1170,8 @@ int main(int argc, char** argv)
             if (wide_prefill)
             {
                 wide_prefill_checks(weights);
+                wide_route_capacity_checks<10>(weights.types);
+                wide_route_capacity_checks<64>(weights.types);
                 ggml_backend_free(g_backend); g_backend = nullptr;
                 return 0;
             }
