@@ -45,6 +45,21 @@ namespace TensorSharp.Runtime.Scheduling
             bool mtpUnprofitable = false;
             string? speculationRefusal = null;
 
+            // An admitted holder is a lifetime contract, not an opportunistic
+            // speed path. Even the first/last solo sequence must bind its own
+            // state so an arriving neighbour never allocates an unbudgeted
+            // replacement primary. Refuse a lost capability rather than falling
+            // through to a shared primary cache at a non-zero history position.
+            if (config.MemoryAdmission?.UsePerSequenceHolders == true)
+            {
+                if (!caps.SupportsPerSequenceFusedForward || !options.PerSeqFusedEnabled
+                    || (options.BatchedFusedDecodeEnabled && config.MemoryAdmission.EnterBatchedExecution == null)
+                    || config.Speculation.Enabled)
+                    throw new System.NotSupportedException("The admitted per-request holder execution contract is unavailable.");
+                candidates.Add(ExecutionPathKind.PerSequenceFused);
+                return Build(candidates, rejections, false, null);
+            }
+
             bool boundedSnapshots = config.KvSnapshots != null;
             bool batchedEnabled = !options.BatchedPathDisabled && !boundedSnapshots;
             bool batchedImpl = caps.SupportsBatchedPagedAttention;
@@ -266,6 +281,8 @@ namespace TensorSharp.Runtime.Scheduling
                 sb.Append("n/a (no batched contract)");
             else if (config.KvSnapshots != null)
                 sb.Append("disabled (bounded host KV snapshots)");
+            else if (config.MemoryAdmission?.UsePerSequenceHolders == true)
+                sb.Append("replaced by admitted per-request holder execution, including solo requests");
             else if (perEnginePolicy && options.BatchedPathDisabled)
                 sb.Append("disabled (per-engine policy selects the serial model route)");
             else if (!caps.SupportsLinearKvMigration)
@@ -329,6 +346,11 @@ namespace TensorSharp.Runtime.Scheduling
                 sb.Append("\nadmitted serial execution: model.Forward runs inside the request allocation envelope; ")
                     .Append("model-owned fused kernels remain available where supported by the model/backend, ")
                     .Append("independently of the scheduler's fused/batched paths");
+            if (config.MemoryAdmission?.UsePerSequenceHolders == true)
+                sb.Append("\nindependent admitted holders: binding, prefix materialization and Forward use the destination request envelope; ")
+                    .Append(config.MemoryAdmission.EnterBatchedExecution != null
+                        ? "eligible decode cohorts execute one fused logical graph inside a separately reserved shared arena"
+                        : "forwards interleave under the compute lock, without a joint multi-request CUDA graph");
 
             return sb.ToString();
         }

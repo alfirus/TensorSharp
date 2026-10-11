@@ -679,8 +679,9 @@ if (!hostingOptions.EmbeddingsEnabled
 // is the trade this feature exists to make: one slow startup instead of one slow first
 // message. Models with persistent checkpoint support can restore the shared prefix on
 // later launches from the store attached above.
-if (!hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
-    && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching
+if (!hostingOptions.EmbeddingsEnabled && PrefixCacheWarmup.ShouldRun(hostingOptions.UnifiedMemoryEnabled,
+        hostingOptions.PrefixCacheEnabled,
+        TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching)
     && !string.IsNullOrWhiteSpace(hostingOptions.StartupModelPath)
     // Image/video diffusion models have no autoregressive chat prefix to prefill.
     // Calling their chat adapter would emit a false startup failure before image serving.
@@ -699,13 +700,16 @@ if (!hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
 {
     var warmupAdapter = app.Services.GetRequiredService<WebUiAdapter>();
     var warmupSessions = app.Services.GetRequiredService<SessionManager>();
+    var warmupModelService = app.Services.GetRequiredService<ModelService>();
+    var warmupModel = warmupModelService.Model;
+    var warmupStages = new List<StartupWarmupStatus.Stage>();
     // A session of its own, never the default one: the default session has no workspace
     // and is therefore offered different tools, which would warm a prompt no real request
     // sends. A dedicated id also keeps the warm-up turn out of any transcript a host keeps.
     ChatSession warmupSession = warmupSessions.CreateSession();
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Preparing the shared prompt before opening the port. The first launch after a prompt, "
-        + "skills or model change pays for it here instead of on the first message.");
+        "Preparing admitted execution and the shared prompt before opening the port. The first launch after a prompt, "
+        + "skills or model change pays for initialization here instead of on the first message.");
 
     // Both thinking modes are reachable and can render different shared prefixes. A
     // client that omits `think` gets false, while the Web UI can send true.
@@ -714,11 +718,14 @@ if (!hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
         PrefixCacheWarmup.Result warmed = PrefixCacheWarmup
             .RunAsync(warmupAdapter.Chat.ChatStreamAsync, warmupSession.Id, think, startupLogger)
             .GetAwaiter().GetResult();
+        warmupStages.Add(new StartupWarmupStatus.Stage(think, warmed.Warmed, warmed.Elapsed.TotalMilliseconds));
         startupLogger.LogInformation(LogEventIds.HostConfiguration,
-            "Prefix cache (thinking {Think}): {Outcome}", think ? "on" : "off", warmed.ToString());
+            "Scheduled startup warmup (thinking {Think}): {Outcome}", think ? "on" : "off", warmed.ToString());
         if (!warmed.Warmed)
             break;
     }
+    warmupModelService.RecordStartupWarmup(warmupModel, new StartupWarmupStatus(warmupStages,
+        hostingOptions.PrefixCacheEnabled && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching));
     // The workspace goes with it. A chat session gets one lazily, and the warm-up IS a
     // chat session, so a launch that only removed the session would leave a directory
     // behind every time the server started.

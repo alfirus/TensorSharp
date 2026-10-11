@@ -22,10 +22,12 @@ struct Ledger {
     std::atomic<int64_t> physical{0};
     uint64_t next = 0;
     bool fail_commit = false;
+    int expected_kind = 2, last_kind = -1;
     static uint64_t reserve(void* context, int rank, int kind, int64_t bytes)
     {
         auto& self = *static_cast<Ledger*>(context);
-        require(kind == 2 && rank >= 0 && rank <= 1, "incorrect graph kind/rank");
+        require(kind == self.expected_kind && rank >= 0 && rank <= 1, "incorrect graph kind/rank");
+        self.last_kind = kind;
         if (bytes > self.capacity - self.reserved - self.committed) return 0;
         auto token = ++self.next;
         self.tickets.emplace(token, Ticket{rank, bytes});
@@ -250,5 +252,28 @@ int main()
         tsg::graph_budget_gallocr_free(allocator); ledger.empty();
         if (mode != 0) require(ledger.detach(), "accounted-only test did not detach");
     }
-    std::puts("PASS graph budget: original buffer ABI, reserve-before-alloc, actual-size rollback, physical-free release, gallocr generations, reuse, concurrent admission and exact accounted-only attachment");
+    // Joint arena owners are independently routable. They retain all ordinary
+    // graph lifecycle guarantees and the legacy graph opt-in behavior.
+    ledger.expected_kind = 5;
+    for (int mode = 0; mode < 4; ++mode) {
+        ledger.capacity = mode == 2 ? 0 : 4096;
+        ledger.fail_commit = mode == 3;
+        require(ledger.attach(mode != 0), "joint graph attach failed");
+        const auto calls = type.calls.load();
+        allocator = tsg::graph_budget_gallocr_new(&type.type, 0, true, 5);
+        require(allocator != nullptr, "joint allocator construction failed");
+        {
+            Graph graph(16);
+            require(tsg::graph_budget_gallocr_alloc_graph(allocator, graph.graph) == (mode == 1),
+                "joint allocator ignored exact attachment/quota/commit failure");
+            if (mode == 0 || mode == 2) require(type.calls == calls, "joint payload allocated before admission");
+            if (mode == 1) require(ledger.last_kind == 5 && ledger.committed > 0 && !ledger.detach(),
+                "joint allocator was not charged to its own live kind");
+        }
+        tsg::graph_budget_gallocr_free(allocator); ledger.empty();
+        require(ledger.detach(), "joint graph owner leaked");
+    }
+    ledger.fail_commit = false;
+    require(!tsg::graph_budget_gallocr_new(&type.type, 0, false, 4), "expert kind accepted by graph allocator");
+    std::puts("PASS graph budget: original buffer ABI, reserve-before-alloc, actual-size rollback, physical-free release, gallocr generations, reuse, concurrent admission, exact attachment and joint arena kind5");
 }

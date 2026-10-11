@@ -2980,6 +2980,9 @@ namespace TensorSharp.GGML
         public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
             => GgmlNative.Qwen4ExpCopyQsaCache(key, destination, bytes, device);
 
+        public static bool Qwen4ExpPrepareQsaCache(IntPtr key, long bytes, int device)
+            => GgmlNative.Qwen4ExpPrepareQsaCache(key, bytes, device);
+
         /// <summary>Drop every cached qwen4exp FFN graph (they pin weight bindings).</summary>
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
 

@@ -183,6 +183,8 @@ namespace TensorSharp.Runtime.Scheduling
         private bool _forwardBatchDeclineWarned;
         private bool _fusedBatchedDeclineWarned;
         private bool _fusedBatchedSuccessReported;
+        private readonly bool _traceFusedBatches = Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_TRACE") == "1";
+        private long _acceptedFusedBatches;
         private bool _specPrefixReuseDeclineWarned;
         private bool _crossSeqSerializationWarned;
         private bool _pastCapSerializationWarned;
@@ -193,6 +195,19 @@ namespace TensorSharp.Runtime.Scheduling
             if (_fusedBatchedSuccessReported) return;
             _fusedBatchedSuccessReported = true;
             _logger.LogInformation("Batched fused decode accepted {Count} sequences in one graph. Reported once.", count);
+        }
+
+        private void ReportPublishedFusedBatch(IBatchedPagedModel model,
+            IReadOnlyList<ScheduledSequenceWork> work, int[] positionsBefore)
+        {
+            long id = ++_acceptedFusedBatches;
+            if (!_traceFusedBatches || model.LastAcceptedFusedBatch is not { } actual) return;
+            _logger.LogInformation("batch.fused.accepted batch={BatchExecutionId} requests={SequenceRequestIdsJson} before={PositionsBeforeJson} after={PositionsAfterJson} count={ActiveSequenceCount} native={NativeAcceptedExecutionId} nodes={NativeNodeCount} graphs={NativeGraphCount} hostSegments={NativeHostSegmentCount} kind={NativeExecutionKind} published={ManagedPublishCompleted}",
+                id, System.Text.Json.JsonSerializer.Serialize(work.Select(w => w.Sequence.RequestId)),
+                System.Text.Json.JsonSerializer.Serialize(positionsBefore),
+                System.Text.Json.JsonSerializer.Serialize(work.Select(w => w.Sequence.NumComputedTokens)),
+                actual.ActiveSequenceCount, actual.NativeAcceptedExecutionId, actual.NativeNodeCount,
+                1, actual.NativeHostSegmentCount, actual.NativeExecutionKind, true);
         }
 
         private sealed class SpecSeqContext
@@ -317,7 +332,8 @@ namespace TensorSharp.Runtime.Scheduling
                 LogPlanTransition(plan);
 
                 if (_scheduler.Config.MemoryAdmission?.EnterSerialExecution != null
-                    && (plan.Candidates[0] != ExecutionPathKind.PerSequence || _scheduler.Config.Speculation.Enabled))
+                    && (plan.Candidates[0] != (_scheduler.Config.MemoryAdmission.UsePerSequenceHolders
+                        ? ExecutionPathKind.PerSequenceFused : ExecutionPathKind.PerSequence) || _scheduler.Config.Speculation.Enabled))
                     throw new NotSupportedException("The request allocation adapter requires non-speculative PerSequence execution. Select that path explicitly before submitting requests.");
 
                 for (int i = 0; i < plan.Candidates.Count; i++)
@@ -1117,6 +1133,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 if (_currentOwner.Status == SequenceStatus.Running)
                 {
+                    using var allocationScope = _scheduler.Config.MemoryAdmission?.EnterSerialExecution?.Invoke(_currentOwner);
                     // N=1 forwards borrow the model-owned logits buffer. The
                     // next request's Forward may overwrite it before this owner
                     // resumes, so detach it once at the ownership transition.
@@ -1172,6 +1189,7 @@ namespace TensorSharp.Runtime.Scheduling
             // vLLM/SGLang schedulers do) - without this, a single admission
             // degraded every in-flight decode to a serial weight sweep.
             HashSet<string>? handledBatched = null;
+            HashSet<string>? rejectedBatchPreparation = null;
             if (options.BatchedFusedDecodeEnabled && n >= 2)
             {
                 var decodeWork = new List<ScheduledSequenceWork>(n);
@@ -1179,6 +1197,26 @@ namespace TensorSharp.Runtime.Scheduling
                     if (!work.IsPrefill &&
                         fused.CanBatchDecode(work.Sequence.RequestId, work.Sequence.NumComputedTokens))
                         decodeWork.Add(work);
+                var batchAdmission = _scheduler.Config.MemoryAdmission;
+                if (batchAdmission?.EnterBatchedExecution != null && decodeWork.Count >= 2)
+                    for (int i = decodeWork.Count - 1; i >= 0; --i)
+                    {
+                        var seq = decodeWork[i].Sequence;
+                        try
+                        {
+                            using var holderScope = batchAdmission.EnterSerialExecution!(seq);
+                            if (!fused.PrepareBatchedFusedDecode(seq.RequestId))
+                                throw new InvalidOperationException("An admitted holder could not prepare for its shared batch.");
+                        }
+                        catch (Exception error)
+                        {
+                            // No joint kernel has run. A refused destination
+                            // cannot invalidate any other holder's history.
+                            (rejectedBatchPreparation ??= new()).Add(seq.RequestId);
+                            results.Add(new SequenceStepResult { Sequence = seq, Error = error });
+                            decodeWork.RemoveAt(i);
+                        }
+                    }
                 int dn = decodeWork.Count;
                 if (dn >= 2)
                 {
@@ -1201,6 +1239,11 @@ namespace TensorSharp.Runtime.Scheduling
                             if (allGreedy && !seq.GetOrCreateSampler().IsPlainGreedyArgmax)
                                 allGreedy = false;
                         }
+                        // Holder metadata/state preparation belongs to each
+                        // request. The subsequent multi-request graph has its
+                        // own independently reserved, session-lived owner.
+                        using var batchAllocationScope = batchAdmission?.EnterBatchedExecution?.Invoke(
+                            decodeWork.Select(work => work.Sequence).ToArray());
                         if (allGreedy)
                         {
                             // Device-sampled fast path: no host logits at all. The
@@ -1233,6 +1276,7 @@ namespace TensorSharp.Runtime.Scheduling
                                         ForwardElapsedTicks = batchTicksPerSequence,
                                     });
                                 }
+                                ReportPublishedFusedBatch(fused, decodeWork, bpositions);
                                 if (dn == n)
                                     return results;
                                 handledBatched = new HashSet<string>(reqIds);
@@ -1266,6 +1310,7 @@ namespace TensorSharp.Runtime.Scheduling
                                         ForwardElapsedTicks = batchTicksPerSequence,
                                     });
                                 }
+                                ReportPublishedFusedBatch(fused, decodeWork, bpositions);
                                 if (dn == n)
                                     return results;
                                 handledBatched = new HashSet<string>(reqIds);
@@ -1326,12 +1371,14 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 // Decode subset already served by the batched fast path
                 // above; only the prefill chunks of a mixed step remain.
-                if (handledBatched != null && handledBatched.Contains(work.Sequence.RequestId))
+                if ((handledBatched != null && handledBatched.Contains(work.Sequence.RequestId))
+                    || (rejectedBatchPreparation != null && rejectedBatchPreparation.Contains(work.Sequence.RequestId)))
                     continue;
                 var seq = work.Sequence;
                 int prevComputed = seq.NumComputedTokens;
                 try
                 {
+                    using var allocationScope = _scheduler.Config.MemoryAdmission?.EnterSerialExecution?.Invoke(seq);
                     bool freshCache = fused.BindSequenceCache(seq.RequestId);
 
                     if (_pendingRetainedFusedTruncations.Remove(
@@ -3534,6 +3581,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// previously that decline degraded every in-flight decode to a serial
         /// weight sweep for the step. Default true.</summary>
         bool CanBatchDecode(string requestId, int position) => true;
+
+        /// <summary>Prepare any holder-owned allocations before entering the
+        /// separate shared allocation scope for a multi-request graph.</summary>
+        bool PrepareBatchedFusedDecode(string requestId) => true;
+
+        FusedBatchExecutionEvidence? LastAcceptedFusedBatch => null;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

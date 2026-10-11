@@ -19,8 +19,10 @@
 #include <fstream>
 #include <stdexcept>
 
+extern "C" int TSGgml_HostMoeExpertCacheBudgetKind();
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
     std::int64_t*, std::int64_t*, std::int64_t*);
+extern "C" int TSGgml_HostMoeExpertCacheExecutionStats(std::uint64_t*, std::uint64_t*, std::uint64_t*);
 extern "C" std::int64_t TSGgml_TrimHostMoeExpertCache(std::int64_t);
 extern "C" int TSGgml_BeginHostMoeExpertCacheScope(std::int64_t, int, int, std::uint64_t*);
 extern "C" int TSGgml_UpdateHostMoeExpertCacheScope(std::uint64_t, std::int64_t, std::int64_t*);
@@ -45,11 +47,50 @@ namespace tsg
     std::uint64_t g_test_file_reads = 0;
     void set_last_error(const std::string& message) { std::fprintf(stderr, "%s\n", message.c_str()); }
     void clear_last_error() { }
-    // Expert tensors in this fixture have no registered dense-Qwen precision
-    // policy. Keep their ordinary unchanged ggml CUDA dispatch.
-    ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph*) { return backend; }
+    struct CacheOperatorShape {
+        int projections = 0, rows = 0, selected = 0, adds = 0, weighted = 0;
+        bool valid = true;
+    } g_test_operator_shape;
+    // Inspect the graph actually submitted by the production cache, not its
+    // supergraph allocation plan. A single submission alone does not prove
+    // that its expert operators batch multiple requests.
+    ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph* graph) {
+        g_test_operator_shape = {};
+        const ggml_tensor* ids = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            const auto* node = ggml_graph_node(graph, i);
+            if (node->op == GGML_OP_MUL_MAT_ID) {
+                auto& shape = g_test_operator_shape;
+                if (shape.projections == 0) {
+                    shape.rows = static_cast<int>(node->src[1]->ne[1]);
+                    shape.selected = static_cast<int>(node->ne[1] / shape.rows);
+                    ids = node->src[2];
+                }
+                const auto expected_inputs = shape.projections < 2 ? shape.rows : shape.rows * shape.selected;
+                shape.valid &= node->ne[1] == shape.rows * shape.selected && node->ne[2] == 1
+                    && node->src[1]->ne[1] == expected_inputs && node->src[1]->ne[2] == 1
+                    && node->src[2] == ids && ids->ne[0] == shape.rows * shape.selected && ids->ne[1] == 1;
+                ++shape.projections;
+            }
+            if (node->op == GGML_OP_MUL && node->src[1]->ne[0] == 1) {
+                auto& shape = g_test_operator_shape;
+                shape.valid &= node->src[0]->ne[1] == shape.selected && node->src[0]->ne[2] == shape.rows
+                    && (node->src[0]->flags & GGML_TENSOR_FLAG_OUTPUT) != 0
+                    && (shape.rows == 1 || node->src[0]->op == GGML_OP_CONT);
+                ++shape.weighted;
+            }
+            if (node->op == GGML_OP_ADD) {
+                g_test_operator_shape.valid &= node->ne[1] == g_test_operator_shape.rows;
+                ++g_test_operator_shape.adds;
+            }
+        }
+        // Expert tensors have no registered dense-Qwen precision policy in
+        // this fixture. Dispatch unchanged upstream ggml CUDA operators.
+        return backend;
+    }
     void host_moe_expert_cache_test_fail_next(int stage);
     std::size_t host_moe_expert_cache_test_physical_bytes();
+    void host_moe_expert_cache_test_file_slice_limit(std::size_t bytes);
     std::size_t host_moe_expert_cache_test_file_workspace_bytes();
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes);
     std::uint64_t host_moe_expert_cache_test_output_drains();
@@ -108,6 +149,14 @@ namespace
         if (!condition) throw std::runtime_error(message);
     }
 
+    void require_operator_batch_shape(int rows, int selected)
+    {
+        const auto& shape = tsg::g_test_operator_shape;
+        require(shape.valid && shape.projections == 3 && shape.rows == rows && shape.selected == selected
+            && shape.weighted == 1 && shape.adds == selected - 1,
+            "Actual cache graph does not contain three exact-width batched expert operators and one batched reduction");
+    }
+
     void set_environment(const char* key, const char* value)
     {
 #if defined(_WIN32)
@@ -160,6 +209,12 @@ namespace
             require(reserved >= 0 && budget >= 0 && reserved <= budget,
                 "Expert-cache allocations exceeded the explicit byte ceiling");
         }
+    };
+
+    struct ExecutionStats {
+        std::uint64_t submissions = 0, joint = 0, rows = 0;
+        ExecutionStats() { require(TSGgml_HostMoeExpertCacheExecutionStats(&submissions, &joint, &rows) == 1,
+            "Missing exact expert graph submission counts"); }
     };
 
     constexpr int hidden = 256, ff = 256, experts = 16, used = 2;
@@ -236,7 +291,7 @@ namespace
         {
             auto& l = *static_cast<SharedLedger*>(context);
             ++l.reserve_calls;
-            if (rank != 0 || (kind != 1 && !(kind == 3 && l.host_enabled)) || bytes <= 0) { l.valid = false; return 0; }
+            if (rank != 0 || (kind != 4 && !(kind == 3 && l.host_enabled)) || bytes <= 0) { l.valid = false; return 0; }
             const bool host = kind == 3;
             if (bytes > (host ? l.host_capacity - l.host_pending - l.host_committed : l.capacity - l.pending - l.committed)) return 0;
             const auto token = ++l.next;
@@ -948,8 +1003,9 @@ namespace
     }
 
 #if defined(_WIN32)
-    void file_read_checks(Weights& weights)
+    void file_read_checks(Weights& weights, bool joint = false)
     {
+        if (joint) tsg::host_moe_expert_cache_test_file_slice_limit(65536);
         const std::string path = "host-moe-source-" + std::to_string(GetCurrentProcessId()) + ".bin";
         std::array<std::int64_t, 3> offsets{};
         {
@@ -989,14 +1045,31 @@ namespace
         auto pair = [&](int first) {
             std::array<std::int32_t, used> ids{first, first+1};
             const auto expected = reference.compute(x, ids, routes);
-            require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
-                actual.data(), "qwen4exp fused token span") == 1, "File-backed cache did not execute");
-            require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0, "File staging changed expert logits");
+            if (joint) {
+                auto hm = weights.segment; hm.seq_len = 2; hm.independent_decode_rows = true;
+                std::array<float, hidden * 2> input{}, result{};
+                std::copy(x.begin(), x.end(), input.begin()); std::copy(x.begin(), x.end(), input.begin() + hidden);
+                std::array<std::int32_t, used * 2> selected{first, first+1, first, first+1};
+                std::array<float, used * 2> probabilities{.65f,.35f,.65f,.35f};
+                const auto before = ExecutionStats();
+                require(tsg::host_moe_cached_experts(hm, input.data(), selected.data(), probabilities.data(),
+                    result.data(), "qwen4exp arena batched decode") == 1, "Joint file cache did not execute");
+                require(ExecutionStats().submissions == before.submissions + 1,
+                    "Joint file rows were computed by separate submissions");
+                require(std::memcmp(result.data(), expected.data(), sizeof(actual)) == 0
+                    && std::memcmp(result.data() + hidden, expected.data(), sizeof(actual)) == 0,
+                    "Joint file chunking changed scalar arithmetic");
+            } else {
+                require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
+                    actual.data(), "qwen4exp fused token span") == 1, "File-backed cache did not execute");
+                require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0, "File staging changed expert logits");
+            }
         };
         SharedLedger ledger;
         require(ledger.attach(true), "Cannot attach shared host/device quota before file staging");
         std::size_t arena_bytes = 0;
         for (const auto& part : weights.quantized) arena_bytes += part.size() / experts * used;
+        if (joint) arena_bytes = std::min<std::size_t>(arena_bytes, 65536);
         ledger.host_capacity = arena_bytes - 1;
         const auto before_denied = tsg::g_test_file_reads;
         rejected = false;
@@ -1049,12 +1122,171 @@ namespace
         require(ledger.detach(), "File teardown did not release shared host/device quota");
         require(std::remove(path.c_str()) == 0, "File handles survived cache teardown");
         require(tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0, "File workspace survived cache teardown");
+        if (joint) tsg::host_moe_expert_cache_test_file_slice_limit(32u << 20);
         std::puts("PASS: exact file extents, cached reuse, out-of-order staging, partial-read recovery and source release");
     }
 #endif
 
-    void cuda_checks(Weights& weights)
+    void joint_budget_checks(Weights& weights)
     {
+        tsg::host_moe_expert_cache_release();
+        std::uint64_t token = 0;
+        require(TSGgml_BeginHostMoeExpertCacheScope(8 << 20, 8, 1, &token) == 1, "Joint budget scope failed");
+        SharedLedger ledger;
+        ledger.capacity = 0;
+        require(ledger.attach(), "Joint budget attach failed");
+        FullResidentGraph reference(weights);
+        auto hm = weights.segment;
+        hm.seq_len = 2; hm.independent_decode_rows = true;
+        std::array<float, hidden * 2> input{}, actual{}, expected{};
+        std::array<std::int32_t, used * 2> ids{0, 1, 2, 3};
+        std::array<float, used * 2> routes{.6f, .4f, .3f, .7f};
+        for (int row = 0; row < 2; ++row) {
+            std::array<float, hidden> x{};
+            for (int h = 0; h < hidden; ++h) input[row * hidden + h] = x[h] = std::sin(h * .03f + row);
+            std::array<std::int32_t, used> ri{ids[row * used], ids[row * used + 1]};
+            std::array<float, used> rr{routes[row * used], routes[row * used + 1]};
+            const auto answer = reference.compute(x, ri, rr);
+            std::copy(answer.begin(), answer.end(), expected.begin() + row * hidden);
+        }
+        auto call = [&] { return tsg::host_moe_cached_experts(hm, input.data(), ids.data(), routes.data(),
+            actual.data(), "qwen4exp arena batched decode"); };
+        auto same = [&] { require(std::memcmp(actual.data(), expected.data(), sizeof(expected)) == 0,
+            "Joint graph changed scalar-row arithmetic"); };
+        actual.fill(-999);
+        const auto before = ExecutionStats();
+        require(call() == 0 && ExecutionStats().submissions == before.submissions, "Refused joint quota submitted work");
+        require(std::all_of(actual.begin(), actual.end(), [](float f) { return f == -999; }), "Refused joint output changed");
+        ledger.check_empty(); ledger.capacity = 8 << 20;
+        for (int stage : {1, 2, 3}) {
+            tsg::host_moe_expert_cache_test_fail_next(stage);
+            require(call() == 0, "Joint allocation failure was not rejected"); ledger.check_empty();
+        }
+        ledger.fail_commit = true;
+        require(call() == 0, "Joint commit refusal published a graph"); ledger.check_empty();
+        ledger.fail_commit = false;
+        // Measure the exact four-expert union floor, including two-row scratch.
+        auto full = hm;
+        hm.num_experts = 4;
+        hm.gate_bytes = hm.gate_bytes / experts * 4;
+        hm.up_bytes = hm.up_bytes / experts * 4;
+        hm.down_bytes = hm.down_bytes / experts * 4;
+        require(call() == 1, "Cannot measure joint union floor"); same();
+        const auto minimum = ledger.committed;
+        TSGgml_TrimHostMoeExpertCache(0); ledger.check_empty(); hm = full;
+        ledger.capacity = minimum - 1;
+        actual.fill(-999); const auto refused = ExecutionStats();
+        require(call() == 0 && ExecutionStats().submissions == refused.submissions,
+            "Joint union exceeded exact minimum quota"); ledger.check_empty();
+        ledger.capacity = minimum;
+        require(call() == 1 && ledger.committed == minimum, "Joint union floor did not retry exactly"); same();
+        const auto reserved = ledger.reserve_calls;
+        const auto warm = ExecutionStats();
+        require(call() == 1 && ledger.reserve_calls == reserved && ExecutionStats().submissions == warm.submissions + 1,
+            "Joint warm replay allocated or submitted more than one graph"); same();
+        // The grown graph's one-row prefix must preserve solo arithmetic and
+        // must not execute dummy lanes or create another retained allocation.
+        hm.seq_len = 1;
+        const auto scalar = ExecutionStats();
+        require(call() == 1 && ledger.reserve_calls == reserved && ExecutionStats().submissions == scalar.submissions + 1,
+            "Solo prefix of joint cache allocated or executed extra submissions");
+        require(std::memcmp(actual.data(), expected.data(), hidden * sizeof(float)) == 0, "Solo prefix arithmetic changed");
+        hm.seq_len = 2;
+        for (int stage : {6, 7}) {
+            actual.fill(-999); tsg::host_moe_expert_cache_test_fail_next(stage);
+            bool failed = false;
+            try { (void)call(); } catch (const std::runtime_error&) { failed = true; }
+            require(failed && std::all_of(actual.begin(), actual.end(), [](float f) { return f == -999; }),
+                "Joint post-upload/compute failure published partial output");
+            require(call() == 1, "Joint execution did not recover after drained failure"); same();
+        }
+        // Invalid later route must reject before updating slots or submitting.
+        ids.back() = experts;
+        const auto invalid = ExecutionStats(); actual.fill(-999);
+        require(call() == 0 && ExecutionStats().submissions == invalid.submissions, "Late invalid route submitted joint work");
+        require(std::all_of(actual.begin(), actual.end(), [](float f) { return f == -999; }), "Invalid route published output");
+        TSGgml_TrimHostMoeExpertCache(0); ledger.check_empty();
+        require(ledger.detach(), "Joint cache leaked a callback owner");
+        std::int64_t released = 0;
+        require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1, "Joint scope release failed");
+        std::printf("PASS: joint union quota floor=%lld, one submission, prefix reuse, allocation/commit and queued/compute failure recovery\n", (long long)minimum);
+    }
+
+    template<int selected_count>
+    void joint_exact_width_checks(const std::array<ggml_type, 3>& types)
+    {
+        constexpr int expert_count = 32;
+        tsg::host_moe_expert_cache_release();
+        std::uint64_t token = 0;
+        require(TSGgml_BeginHostMoeExpertCacheScope(32 << 20, 8, 1, &token) == 1,
+            "Cannot begin exact-width expert graph scope");
+        SharedLedger ledger; ledger.capacity = 32 << 20;
+        require(ledger.attach(), "Cannot attach exact-width expert graph budget");
+        Weights weights; weights.types = types; weights.fill(0.71f, expert_count, selected_count);
+        FullResidentGraph reference(weights);
+        DeviceInputs device(8, selected_count);
+        std::uint64_t first_reserves = 0;
+        std::int64_t first_bytes = 0;
+        for (const int rows : {8, 1, 7, 2, 6, 3, 5, 4, 8}) {
+            auto hm = weights.segment; hm.seq_len = rows; hm.independent_decode_rows = true;
+            std::vector<float> input(rows * hidden), routes(rows * selected_count), expected(rows * hidden);
+            std::vector<std::int32_t> ids(rows * selected_count);
+            std::vector<float> actual(expected.size(), -999.0f);
+            for (int row = 0; row < rows; ++row) {
+                std::array<float, hidden> x{};
+                std::array<float, selected_count> probabilities{};
+                std::array<std::int32_t, selected_count> selected{};
+                for (int h = 0; h < hidden; ++h)
+                    input[row * hidden + h] = x[h] = std::sin(h * .021f + row * .31f + rows * .07f);
+                for (int k = 0; k < selected_count; ++k) {
+                    selected[k] = (row * 7 + k * 3 + rows) % expert_count;
+                    probabilities[k] = (k + 1.0f + row * .125f)
+                        / (selected_count * (selected_count + 1.0f) * .5f + selected_count * .125f * row);
+                }
+                // Duplicate routes must preserve their positions and weights;
+                // unlike the upstream multi-token ID kernel, scalar MMVQ has
+                // no unique-per-token compaction requirement.
+                if constexpr (selected_count > 2)
+                    if (row % 3 == 1) selected[selected_count - 1] = selected[1];
+                std::copy(selected.begin(), selected.end(), ids.begin() + row * selected_count);
+                std::copy(probabilities.begin(), probabilities.end(), routes.begin() + row * selected_count);
+                const auto answer = reference.compute(x, selected, probabilities);
+                std::copy(answer.begin(), answer.end(), expected.begin() + row * hidden);
+            }
+            ggml_backend_tensor_set(device.x, input.data(), 0, input.size() * sizeof(float));
+            ggml_backend_tensor_set(device.routes, routes.data(), 0, routes.size() * sizeof(float));
+            hm.moe_in = device.x; hm.weights = device.routes; hm.moe_out = device.output;
+            for (int bridge = 0; bridge < 3; ++bridge) {
+                const auto before = ExecutionStats();
+                require(tsg::host_moe_cached_experts(hm, bridge ? nullptr : input.data(), ids.data(),
+                    bridge ? nullptr : routes.data(), bridge == 2 ? nullptr : actual.data(),
+                    "qwen4exp arena batched decode") == 1, "Exact-width cache failed to execute");
+                require_operator_batch_shape(rows, selected_count);
+                if (bridge == 2) {
+                    tsg::sync_backend(g_backend);
+                    ggml_backend_tensor_get(device.output, actual.data(), 0, actual.size() * sizeof(float));
+                }
+                require(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0,
+                    "Exact-width route-major expert operators differ from independent scalar CUDA oracle");
+                require(ExecutionStats().submissions == before.submissions + 1,
+                    "Exact-width cache submitted dummy or separate-row graphs");
+                if (first_reserves == 0) { first_reserves = ledger.reserve_calls; first_bytes = ledger.committed; }
+                require(ledger.reserve_calls == first_reserves && ledger.committed == first_bytes,
+                    "Live-width changes duplicated or rebuilt expert owners");
+            }
+        }
+        TSGgml_TrimHostMoeExpertCache(0); ledger.check_empty();
+        require(ledger.detach(), "Exact-width cache retained a shared owner");
+        std::int64_t released = 0;
+        require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1, "Exact-width scope did not release");
+        std::printf("PASS: exact N=8/1/7/2/6/3/5/4/8, K%d, three actual batched projections, scalar CUDA bit-exact, 3 bridges and one owner %lld bytes\n",
+            selected_count, static_cast<long long>(first_bytes));
+    }
+
+    void cuda_checks(Weights& weights, bool arena = false)
+    {
+        const char* kernel = arena ? "qwen4exp arena batched decode" : "qwen4exp fused token span";
+        weights.segment.independent_decode_rows = arena;
         fallback_checks(weights);
         FullResidentGraph reference(weights);
         std::array<float, hidden> x{}, actual{};
@@ -1069,13 +1301,13 @@ namespace
             if (iteration % 5 == 0) ids = {0, 2}; // miss can precede a later protected hit
             const auto expected = reference.compute(x, ids, routes);
             require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
-                actual.data(), "qwen4exp fused token span") == 1,
+                actual.data(), kernel) == 1,
                 "The opt-in CUDA expert cache did not engage");
             require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
                 "Compact/remapped or evicted expert results differ from the full-resident CUDA graph");
             const auto again = reference.compute(x, ids, routes);
             require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
-                actual.data(), "qwen4exp fused token span") == 1,
+                actual.data(), kernel) == 1,
                 "Warm expert slots did not engage");
             require(std::memcmp(actual.data(), again.data(), sizeof(actual)) == 0,
                 "Warm expert slots reused stale activations or different arithmetic");
@@ -1083,13 +1315,13 @@ namespace
             device_hm.moe_in = reference.x;
             device_hm.weights = reference.routes;
             require(tsg::host_moe_cached_experts(device_hm, nullptr, ids.data(), nullptr,
-                actual.data(), "qwen4exp fused token span") == 1,
+                actual.data(), kernel) == 1,
                 "The CUDA device-to-device scalar input bridge did not engage");
             require(std::memcmp(actual.data(), again.data(), sizeof(actual)) == 0,
                 "CUDA device-to-device scalar inputs changed expert arithmetic");
             device_hm.moe_out = reference.output;
             require(tsg::host_moe_cached_experts(device_hm, nullptr, ids.data(), nullptr,
-                nullptr, "qwen4exp fused token span") == 1,
+                nullptr, kernel) == 1,
                 "The CUDA device-to-device scalar output bridge did not engage");
             tsg::sync_backend(g_backend);
             ggml_backend_tensor_get(reference.output, actual.data(), 0, sizeof(actual));
@@ -1101,6 +1333,12 @@ namespace
         const Stats warm;
         require(warm.calls == 320 && warm.hits >= 480 && warm.misses > experts,
             "Test did not exercise warm hits and actual expert eviction");
+        std::uint64_t arena_token = 0;
+        if (arena) {
+            tsg::host_moe_expert_cache_release();
+            require(TSGgml_BeginHostMoeExpertCacheScope(8 << 20, 8, 1, &arena_token) == 1,
+                "Cannot admit a bounded multi-row expert union fixture");
+        }
 
         // Short prefill and speculative target verification must execute the
         // same one-row CUDA FFN arithmetic as successive autoregressive calls.
@@ -1131,13 +1369,19 @@ namespace
                 std::copy(row_result.begin(), row_result.end(), expected.begin() + row * hidden);
             }
             const auto before = Stats();
+            const auto graphs_before = ExecutionStats();
             require(tsg::host_moe_cached_experts(hm, inputs.data(), selected.data(), probabilities.data(),
-                block_result.data(), "qwen4exp fused token span") == 1,
+                block_result.data(), kernel) == 1,
                 "Short-block expert cache did not replay the scalar CUDA graph");
             require(std::memcmp(block_result.data(), expected.data(), expected.size() * sizeof(float)) == 0,
                 "Short-block expert rows differ from full-resident decode rounding");
             require(Stats().calls == before.calls + rows,
                 "Short-block cache did not compute every row through the scalar graph");
+            require(ExecutionStats().submissions == graphs_before.submissions + (arena ? 1 : rows),
+                "Arena expert rows were serialized as separate graph submissions");
+            if (arena) require(ExecutionStats().joint == graphs_before.joint + 1
+                && ExecutionStats().rows == graphs_before.rows + rows, "Joint engagement was not recorded");
+            if (arena) require_operator_batch_shape(rows, used);
 
             ggml_backend_tensor_set(device_inputs.x, inputs.data(), 0, inputs.size() * sizeof(float));
             ggml_backend_tensor_set(device_inputs.routes, probabilities.data(), 0, probabilities.size() * sizeof(float));
@@ -1145,18 +1389,23 @@ namespace
             hm.weights = device_inputs.routes;
             std::fill(block_result.begin(), block_result.end(), -999.0f);
             const auto device_before = Stats();
+            const auto device_graphs_before = ExecutionStats();
             require(tsg::host_moe_cached_experts(hm, nullptr, selected.data(), nullptr,
-                block_result.data(), "qwen4exp fused token span") == 1,
+                block_result.data(), kernel) == 1,
                 "Short-block CUDA device-to-device input bridge did not engage");
             require(std::memcmp(block_result.data(), expected.data(), expected.size() * sizeof(float)) == 0,
                 "Short-block CUDA device-to-device rows changed expert arithmetic");
             require(Stats().calls == device_before.calls + rows,
                 "Short-block device bridge did not compute every row");
+            require(ExecutionStats().submissions == device_graphs_before.submissions + (arena ? 1 : rows),
+                "Device-input joint graph did not execute once");
+            if (arena) require_operator_batch_shape(rows, used);
             hm.moe_out = device_inputs.output;
             std::fill(block_result.begin(), block_result.end(), -999.0f);
             const auto output_before = Stats();
+            const auto output_graphs_before = ExecutionStats();
             require(tsg::host_moe_cached_experts(hm, nullptr, selected.data(), nullptr,
-                nullptr, "qwen4exp fused token span") == 1,
+                nullptr, kernel) == 1,
                 "Short-block CUDA device-to-device output bridge did not engage");
             // Production consumes this queued copy in the next graph on the
             // same backend stream. A standalone host read uses its own CUDA
@@ -1168,6 +1417,9 @@ namespace
                 "Short-block CUDA device-to-device output changed expert arithmetic");
             require(Stats().calls == output_before.calls + rows,
                 "Short-block device output did not compute every row");
+            require(ExecutionStats().submissions == output_graphs_before.submissions + (arena ? 1 : rows),
+                "Device-output joint graph did not execute once");
+            if (arena) require_operator_batch_shape(rows, used);
 
             // A bad later row must reject the complete block before computing
             // the valid early rows or overwriting any caller output.
@@ -1175,7 +1427,7 @@ namespace
             std::fill(block_result.begin(), block_result.end(), -999.0f);
             const auto invalid_before = Stats();
             require(tsg::host_moe_cached_experts(hm, inputs.data(), selected.data(), probabilities.data(),
-                block_result.data(), "qwen4exp fused token span") == 0,
+                block_result.data(), kernel) == 0,
                 "Invalid later-row expert ID did not reject the entire block");
             require(std::all_of(block_result.begin(), block_result.end(), [](float v) { return v == -999.0f; }),
                 "Rejected short block exposed a partially computed CUDA result");
@@ -1184,7 +1436,7 @@ namespace
                 && invalid_after.misses == invalid_before.misses && invalid_after.reserved == invalid_before.reserved,
                 "Rejected short block mutated cache state before validating every row");
             require(tsg::host_moe_cached_experts(hm, nullptr, selected.data(), nullptr,
-                block_result.data(), "qwen4exp fused token span") == 0,
+                block_result.data(), kernel) == 0,
                 "Device bridge did not reject an invalid later-row expert ID");
             require(std::all_of(block_result.begin(), block_result.end(), [](float v) { return v == -999.0f; }),
                 "Rejected device-bridge block exposed a partially computed CUDA result");
@@ -1192,10 +1444,15 @@ namespace
             selected.back() = 0;
             hm.weights = nullptr;
             require(tsg::host_moe_cached_experts(hm, nullptr, selected.data(), nullptr,
-                block_result.data(), "qwen4exp fused token span") == 0,
+                block_result.data(), kernel) == 0,
                 "Missing device routing source did not retain the staged fallback");
         }
 
+        if (arena) {
+            std::int64_t released = 0;
+            require(TSGgml_EndHostMoeExpertCacheScope(arena_token, &released) == 1 && Stats().reserved == 0,
+                "Joint graph scope retained physical payload");
+        }
         tsg::host_moe_expert_cache_on_drop(weights.segment.gate_data);
         require(Stats().reserved == 0, "Invalidated model weights retained compact CUDA slots");
         // Rewrite the same vector allocations, as a reload can recycle an mmap
@@ -1205,7 +1462,7 @@ namespace
         std::array<std::int32_t, used> ids{0, 2};
         const auto expected = reloaded.compute(x, ids, routes);
         require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(), actual.data(),
-            "qwen4exp fused token span") == 1, "Reloaded cache did not engage");
+            kernel) == 1, "Reloaded cache did not engage");
         require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
             "Reloaded expert cache read bytes from the previous model identity");
         auto output_hm = weights.segment;
@@ -1213,7 +1470,7 @@ namespace
         output_hm.weights = reloaded.routes;
         output_hm.moe_out = reloaded.output;
         require(tsg::host_moe_cached_experts(output_hm, nullptr, ids.data(), nullptr,
-            nullptr, "qwen4exp fused token span") == 1, "Reloaded direct output did not engage");
+            nullptr, kernel) == 1, "Reloaded direct output did not engage");
         // No tensor read/synchronize between the final queued row copy and
         // invalidation. Entry retirement must drain that copy before freeing
         // its source graph buffer, leaving the external destination valid.
@@ -1234,7 +1491,7 @@ namespace
             std::array<std::int32_t, used> selected{first, first + 1};
             const auto expected_pair = reloaded.compute(x, selected, routes);
             require(tsg::host_moe_cached_experts(weights.segment, x.data(), selected.data(), routes.data(),
-                actual.data(), "qwen4exp fused token span") == 1, "Failed upload prevented cache recovery");
+                actual.data(), kernel) == 1, "Failed upload prevented cache recovery");
             require(std::memcmp(actual.data(), expected_pair.data(), sizeof(actual)) == 0,
                 "A partially overwritten slot retained a valid old expert ID");
         };
@@ -1253,6 +1510,7 @@ namespace
 
 int main(int argc, char** argv)
 {
+    require(TSGgml_HostMoeExpertCacheBudgetKind() == 4, "Selected-expert charge capability is missing");
     try
     {
         prefetch_policy_checks();
@@ -1271,11 +1529,12 @@ int main(int argc, char** argv)
             return 0;
         }
         Weights weights;
-        bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false, scoped = false;
+        bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false, scoped = false, arena = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
             else if (std::strcmp(argv[arg], "--scope") == 0) scoped = true;
+            else if (std::strcmp(argv[arg], "--arena") == 0) arena = true;
             else if (std::strcmp(argv[arg], "--trim") == 0 && trim_only) { }
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
             else if (std::strcmp(argv[arg], "--file-read") == 0) file_read = true;
@@ -1324,7 +1583,7 @@ int main(int argc, char** argv)
             fallback_checks(weights); // Default 9-row refusal must also hold on CUDA.
 #if defined(_WIN32)
             if (file_read) {
-                file_read_checks(weights);
+                file_read_checks(weights, arena);
                 ggml_backend_free(g_backend); g_backend = nullptr;
                 return 0;
             }
@@ -1337,7 +1596,14 @@ int main(int argc, char** argv)
                 return 0;
             }
             shared_budget_checks(weights);
-            cuda_checks(weights);
+            cuda_checks(weights, arena);
+            if (arena) {
+                joint_budget_checks(weights);
+                joint_exact_width_checks<1>(weights.types);
+                joint_exact_width_checks<3>(weights.types);
+                joint_exact_width_checks<10>(weights.types);
+                joint_exact_width_checks<16>(weights.types);
+            }
             require(prefetch == (tsg::g_test_prefetch_calls > 0),
                 "Opt-in raw expert prefetch did not match its requested mode");
             ggml_backend_free(g_backend);

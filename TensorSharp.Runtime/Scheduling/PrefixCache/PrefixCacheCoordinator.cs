@@ -39,12 +39,13 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         _logger = logger;
         var options = scheduler.Config.ResolveExecutionOptions();
         bool batchedEnabled = !options.BatchedPathDisabled && scheduler.Config.KvSnapshots == null;
+        bool admittedHolders = scheduler.Config.MemoryAdmission?.UsePerSequenceHolders == true;
         // A materialized holder is only readable through the fused per-request route, a paged end state only
         // through the batched route. Without that route (--no-continuous-batching, TS_PER_SEQ_FUSED=0, or a model
         // that lacks it) no placeholder blocks may be adopted for it.
         bool endStateRoute = capabilities.PagedEndStates
             ? batchedEnabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
-            : batchedEnabled && options.PerSeqFusedEnabled
+            : (batchedEnabled || admittedHolders) && options.PerSeqFusedEnabled
               && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true };
         if (!endStateRoute)
             capabilities = capabilities with
@@ -148,7 +149,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private ExpectedRoute PredictRoute()
     {
         var options = _scheduler.Config.ResolveExecutionOptions();
-        if (_scheduler.Config.KvSnapshots == null && !options.BatchedPathDisabled && options.PerSeqFusedEnabled
+        if (_scheduler.Config.KvSnapshots == null
+            && (!options.BatchedPathDisabled || _scheduler.Config.MemoryAdmission?.UsePerSequenceHolders == true) && options.PerSeqFusedEnabled
             && _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true })
             return ExpectedRoute.PerSequenceFused;
         return ExpectedRoute.Primary;

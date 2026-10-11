@@ -14,6 +14,8 @@
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_qwen4exp_fusion_lifetime.h"
+#include "ggml_ops_qwen4exp_attn_diagnostic.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -87,7 +89,9 @@ namespace
     // separate kernels differ in the last bits (FMA), so a one-token and a
     // four-token graph could round the same row differently. Graphs of up to
     // TSG_PRECISION_DECODE_COLUMNS tokens therefore keep those inputs allocated
-    // (graph outputs), which makes both fusions unconditional there.
+    // (graph outputs), removing that aliasing obstacle. Fusion still requires
+    // the backend's topology and shape checks; arena rotary-position views are
+    // visited before the K branch to preserve RMS/MUL/RoPE adjacency.
     // CPU uses the same row construction: ARM F16 reductions also depend on
     // graph width. The QSA fixture's committed-row test differed by up to 0.0032
     // before enabling it on CPU and is bit-exact at widths 1..8 afterwards.
@@ -189,9 +193,7 @@ namespace
     // Keep a fusion input's memory from being reused inside its graph.
     void q4e_keep_fusion_input(ggml_tensor* t)
     {
-        if (!g_q4e_row_kernels.keep_fusion_inputs || t == nullptr) return;
-        while (t->view_src != nullptr) t = t->view_src;
-        if (t->op != GGML_OP_NONE) ggml_set_output(t);
+        tsg::qwen4exp_keep_fusion_input(t, g_q4e_row_kernels.keep_fusion_inputs);
     }
 
     ggml_tensor* q4e_mul_mat(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x)
@@ -352,6 +354,7 @@ namespace
         std::vector<ggml_tensor*> span_pos;
         std::vector<ggml_tensor*> span_kvidx;
         std::vector<ggml_tensor*> gdn_probe;
+        std::vector<Qwen4ExpAttnDiagnostic> attn_diagnostic;
         // Attention only: the mask is an input and the graph shape follows n_kv.
         ggml_tensor* mask = nullptr;
         ggml_tensor* pos = nullptr;
@@ -388,7 +391,7 @@ namespace
             layer_begin = -1; layer_end = -1; kv_capacity = -1;
             use_mrope = 0;
             mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1; row_kv_count = 0; row_scope = false;
-            rebinds.clear(); gdn_probe.clear();
+            rebinds.clear(); gdn_probe.clear(); attn_diagnostic.clear();
             span_masks.clear(); span_pos.clear(); span_kvidx.clear();
             host_moe.clear(); host_moe_seg_end.clear(); host_moe_layers.clear();
         }
@@ -1407,7 +1410,8 @@ ggml_tensor* q4e_nodes_attn(
     std::vector<ggml_tensor*>* kv_out,
     std::vector<ggml_tensor*>* probe,
     const int32_t* mrope_sections,
-    Q4eAttnArenaIO* arena, ggml_tensor* owned_k, ggml_tensor* owned_v, const Q4eQsaGraph* qsa)
+    Q4eAttnArenaIO* arena, ggml_tensor* owned_k, ggml_tensor* owned_v, const Q4eQsaGraph* qsa,
+    Qwen4ExpAttnDiagnostic* diagnostic)
 {
     const int hc_dim = hc * n_embd;
     const int q_dim = head_dim * n_head;
@@ -1452,6 +1456,7 @@ ggml_tensor* q4e_nodes_attn(
     if (qsa != nullptr)
         mask = q4e_nodes_qsa_mask(ctx, graph, bnd, *qsa, mixed, mask, kv_idx,
             n_embd, T, n_kv_pad, n_rot, rope_base, rope_freq_scale, eps);
+    if (diagnostic) diagnostic->add("mixed", mixed, false);
 
     // ---- q | gate, interleaved per head ----
     ggml_tensor* qg = q4e_mul_mat(ctx, wq, mixed);                 // [q_dim*2, T]
@@ -1464,11 +1469,17 @@ ggml_tensor* q4e_nodes_attn(
     // RMS norm * weight -> RoPE fusion inputs: see Q4eRowKernels.
     q = ggml_cont(ctx, q);
     q4e_keep_fusion_input(q);
+    if (diagnostic) diagnostic->add("q_pre_norm", q, g_q4e_row_kernels.keep_fusion_inputs);
     q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), q_norm_w);
     ggml_tensor* k = ggml_reshape_3d(ctx, q4e_mul_mat(ctx, wk, mixed), head_dim, n_head_kv, T);
     q4e_keep_fusion_input(k);
+    if (diagnostic) diagnostic->add("k_pre_norm", k, g_q4e_row_kernels.keep_fusion_inputs);
     k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), k_norm_w);
     ggml_tensor* v = ggml_reshape_3d(ctx, q4e_mul_mat(ctx, wv, mixed), head_dim, n_head_kv, T);
+    if (diagnostic) {
+        diagnostic->add("q_norm", q, false); diagnostic->add("k_norm", k, false);
+        diagnostic->add("v", v, false);
+    }
 
     // Partial rotary over the first n_rot dims. IMRoPE reduces to NEOX when every
     // position component is equal, which it is for text - so text graphs keep the
@@ -1491,6 +1502,9 @@ ggml_tensor* q4e_nodes_attn(
                           0.0f, 1.0f, 0.0f, 0.0f);
     }
 
+    if (diagnostic) {
+        diagnostic->add("q_rope", q, false); diagnostic->add("k_rope", k, false);
+    }
     ggml_tensor* attn = nullptr;
     if (arena != nullptr)
     {
@@ -1532,6 +1546,12 @@ ggml_tensor* q4e_nodes_attn(
             k_cache->nb[1], k_cache->nb[2], 0);
     ggml_tensor* v_full = ggml_view_3d(ctx, v_written, head_dim, n_kv_pad, n_head_kv,
             v_cache->nb[1], v_cache->nb[2], 0);
+    if (diagnostic) {
+        diagnostic->add("k_cache", k_full, true); diagnostic->add("v_cache", v_full, true);
+        // INPUT allocates storage before execution, but does not retain it
+        // after its last consumer. Post-graph mask bytes can already be reused.
+        diagnostic->add("mask", mask, false);
+    }
 
     // The KV write goes into the graph FIRST - see the function comment.
     ggml_build_forward_expand(graph, k_written);
@@ -1596,9 +1616,11 @@ ggml_tensor* q4e_nodes_attn(
     }
     }
 
+    if (diagnostic) diagnostic->add("attention", attn, false);
     // qwen4exp gates the attention output before the output projection.
     attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
     ggml_tensor* proj = q4e_mul_mat(ctx, wo, ggml_reshape_2d(ctx, attn, q_dim, T));
+    if (diagnostic) diagnostic->add("projection", proj, false);
 
     // ---- hyper-connection scatter ----
     ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
@@ -2496,6 +2518,7 @@ static int q4e_token_span_impl(
                 return 0;
             }
             phase_timer.mark("graph_compute");
+            for (const auto& diagnostic : slot->attn_diagnostic) diagnostic.dump("solo", position, 0);
             if (slot->logits != nullptr)
             {
                 ggml_backend_tensor_get(slot->logits, logits_out, 0,
@@ -2713,6 +2736,11 @@ static int q4e_token_span_impl(
                         seeded_states.push_back(state);
                     }
                 }
+                Qwen4ExpAttnDiagnostic* diagnostic = nullptr;
+                if (T == 1 && qwen4exp_attn_diagnostic_config().matches(false, il)) {
+                    slot->attn_diagnostic.emplace_back();
+                    diagnostic = &slot->attn_diagnostic.back(); diagnostic->layer = il;
+                }
                 res = q4e_nodes_attn(ctx, graph, binder, &attn[il], res,
                         mask, pos, kv_idx,
                         n_embd, hc, hc_low_rank, T,
@@ -2721,7 +2749,7 @@ static int q4e_token_span_impl(
                         &kv_tensors,
                         (q4e_span_trace() && attn_seen == 1 && T == 1) ? &probe_nodes : nullptr,
                         use_mrope ? (const int32_t*)mrope_sections : nullptr, nullptr, nullptr, nullptr,
-                        qsa_graph.args ? &qsa_graph : nullptr);
+                        qsa_graph.args ? &qsa_graph : nullptr, diagnostic);
                 ggml_build_forward_expand(graph, res);
             }
             if (q4e_span_trace()) { ggml_set_output(res); trace_res.push_back(res); }
@@ -2870,6 +2898,7 @@ static int q4e_token_span_impl(
         }
 #endif
         q4e_trace_probe(slot, "build", position);
+        for (const auto& diagnostic : slot->attn_diagnostic) diagnostic.dump("solo", position, 0);
 
         if (!probe_nodes.empty())
         {
@@ -3077,6 +3106,29 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpanTp(
 
 // Copy the authoritative indexer cache before managed growth. The source key
 // stays owned until ReleaseSeqState drops every graph which can reference it.
+// Preparation runs inside the individual request's allocation scope. A grown
+// host cache has a new key; create its destination without advancing any token
+// so the joint arena can join it without a serial decode. The arena performs
+// the normal one-time upload while ready is false.
+TSG_EXPORT int TSGgml_Qwen4ExpPrepareQsaCache(const void* key, long long bytes, int device)
+{
+    try
+    {
+        if (!key || bytes <= 0 || static_cast<unsigned long long>(bytes) > SIZE_MAX)
+            throw std::invalid_argument("qwen4exp QSA: invalid preparation size or key");
+        tsg::ScopedRank rank(q4e_resolve_device(device));
+        if (!ensure_backend()) return 0;
+        auto* existing = q4e_seq_state_find(key);
+        if (existing && existing->buf && existing->bytes != static_cast<size_t>(bytes))
+            throw std::invalid_argument("qwen4exp QSA: preparation cannot resize an existing state key");
+        if (!q4e_seq_state(key, static_cast<size_t>(bytes)))
+            throw std::runtime_error("qwen4exp QSA: preparation allocation refused");
+        return 1;
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return 0; }
+    catch (...) { set_last_error("qwen4exp QSA: preparation failed"); return 0; }
+}
+
 TSG_EXPORT int TSGgml_Qwen4ExpCopyQsaCache(const void* key, void* destination, long long bytes, int device)
 {
     try
@@ -3159,6 +3211,25 @@ void q4e_drop_holder_graphs(const void* attn_base, const void* gdn_base, const v
                 sp.reset_graph();
         }
     }
+}
+
+// Quiescent holder-specific phase transition. Keep device-authoritative KV,
+// recurrent state and any live joint arena; only finished solo graphs retire.
+TSG_EXPORT int TSGgml_Qwen4ExpDropHolderGraphs(const void* attn_base, const void* gdn_base, const void* ple_base)
+{
+    try {
+        if (!attn_base && !gdn_base && !ple_base) {
+            set_last_error("qwen4exp: holder descriptors are required to retire graphs"); return 0;
+        }
+        const int ndev = tsg::g_device_count.load(std::memory_order_acquire);
+        for (int d = 0; d < ndev && d < tsg::TSG_MAX_DEVICES; ++d) {
+            tsg::ScopedRank rank(d);
+            if (g_backend) tsg::sync_backend(g_backend);
+        }
+        q4e_drop_holder_graphs(attn_base, gdn_base, ple_base);
+        clear_last_error(); return 1;
+    } catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error retiring qwen4exp holder graphs."); return 0; }
 }
 
 /// Mark one sequence-state entry (keyed by its host seed pointer) as needing a

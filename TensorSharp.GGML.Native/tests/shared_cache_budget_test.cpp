@@ -19,11 +19,13 @@ struct Ledger {
     std::uint64_t next = 0;
     std::map<std::uint64_t, Allocation> allocations;
     bool fail_commit = false;
+    int last_kind = -1;
     static std::vector<int> pools(int rank) { return rank < 0 ? std::vector<int>{0} : std::vector<int>{0, rank + 1}; }
     static std::uint64_t reserve(void* context, int rank, int kind, std::int64_t bytes)
     {
         auto& l = *static_cast<Ledger*>(context);
-        require(kind == 0 || kind == 1 || kind == 3, "unknown cache allocation kind");
+        require(kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5, "unknown cache allocation kind");
+        l.last_kind = kind;
         if (rank < 0 || rank > 1) return 0;
         if (kind == 3) rank = -1; // Host staging consumes shared RAM, no GPU credit.
         for (int pool : pools(rank))
@@ -66,6 +68,10 @@ int main()
     require(bool(unconfigured) && !attach(ledger), "attach adopted unbudgeted in-flight allocation");
     require(unconfigured->commit(64) && !attach(ledger), "attach adopted an unbudgeted resident allocation");
     unconfigured.reset();
+    auto old_expert = SharedCacheCharge::reserve(0, 4, 32);
+    require(old_expert && !attach(ledger), "attach adopted pending unbudgeted selected experts");
+    require(old_expert->commit(32) && !attach(ledger), "attach adopted resident unbudgeted selected experts");
+    old_expert.reset();
     require(attach(ledger), "cannot attach an empty cache budget");
     require(!attach(ledger), "double registration accepted");
     require(!SharedCacheCharge::detach(nullptr), "wrong owner detached callbacks");
@@ -81,11 +87,27 @@ int main()
     require(!SharedCacheCharge::detach(&ledger), "detached resident callbacks");
     first.reset(); second.reset();
 
+    auto preload = SharedCacheCharge::reserve(0, 1, 32);
+    require(preload && ledger.last_kind == 1, "preload kind changed");
+    auto expert = SharedCacheCharge::reserve(0, 4, 32);
+    require(expert && expert->is_accounted() && ledger.last_kind == 4,
+        "selected-expert callback did not receive its dedicated kind");
+    require(!SharedCacheCharge::reserve(0, 4, 1), "selected experts exceeded shared GPU credit");
+    require(!SharedCacheCharge::detach(&ledger), "detached pending selected-expert ownership");
+    require(preload->commit(32) && expert->commit(32) && ledger.committed[1] == 64,
+        "preload/selected-expert shared accounting changed");
+    preload.reset();
+    require(!SharedCacheCharge::detach(&ledger), "detached resident selected-expert ownership");
+    expert.reset();
+    const auto calls_before_invalid = ledger.next;
+    require(!SharedCacheCharge::reserve(0, -1, 1) && !SharedCacheCharge::reserve(0, 6, 1)
+        && ledger.next == calls_before_invalid, "invalid kind reached the callback");
+
     // A native allocation/upload failure unwinds physical storage before its
     // ticket; both pending and committed failures obey the same ownership order.
     for (bool committed : {false, true}) {
         try {
-            auto ticket = SharedCacheCharge::reserve(0, 0, 64);
+            auto ticket = SharedCacheCharge::reserve(0, 4, 64);
             require(bool(ticket), "cannot reserve rollback case");
             auto& allocation = ledger.allocations.at(ledger.next);
             allocation.physical = true;
@@ -109,7 +131,8 @@ int main()
     std::atomic<bool> release{false};
     std::vector<std::thread> workers;
     for (int i = 0; i < 32; ++i) workers.emplace_back([&, i] {
-        auto ticket = SharedCacheCharge::reserve(i % 2, i % 2, 16);
+        const int kinds[] = {0, 1, 4};
+        auto ticket = SharedCacheCharge::reserve(i % 2, kinds[i % 3], 16);
         if (ticket) admitted.fetch_add(1);
         attempted.fetch_add(1);
         while (!release.load()) std::this_thread::yield();
@@ -139,5 +162,18 @@ int main()
     require(!SharedCacheCharge::detach(&ledger), "host arena did not retain callback ownership");
     host.reset();
     require(ledger.allocations.empty() && SharedCacheCharge::detach(&ledger), "host release leaked shared credit");
-    std::puts("PASS shared cache bridge: atomic attach/detach, multi-pool/rank quota, physical-free order, rollback and concurrency");
+    auto graph_attach = [&] { return SharedCacheCharge::attach(&ledger, Ledger::reserve,
+        Ledger::commit, Ledger::release, true); };
+    auto old_joint = SharedCacheCharge::reserve(0, 5, 32);
+    require(old_joint && !graph_attach(), "joint graph scope adopted an uncharged live arena");
+    require(attach(ledger) && SharedCacheCharge::detach(&ledger), "legacy graph exclusion changed for joint arenas");
+    old_joint.reset();
+    require(graph_attach(), "joint graph scope attach failed");
+    auto joint = SharedCacheCharge::reserve(0, 5, 32);
+    require(joint && joint->is_accounted() && ledger.last_kind == 5 && joint->commit(32),
+        "joint graph callback kind/commit missing");
+    require(!SharedCacheCharge::detach(&ledger), "live joint graph did not protect callback lifetime");
+    joint.reset();
+    require(SharedCacheCharge::detach(&ledger) && ledger.allocations.empty(), "joint graph credit leaked");
+    std::puts("PASS shared cache bridge: expert kind4, joint graph kind5, atomic attach/detach, multi-pool/rank quota, physical-free order, rollback and concurrency");
 }

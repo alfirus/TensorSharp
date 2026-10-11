@@ -26,6 +26,31 @@ namespace TensorSharp.Models
         // re-pooled at a different block boundary.
         private Tensor[] _idxKCache;
 
+        // A growth buffer is owned before any fill/copy/native invalidation.
+        // If rollback itself fails, model disposal or the next growth retries
+        // this owner instead of losing it or overwriting it with a new buffer.
+        private Tensor _pendingCacheGrowth;
+        internal Action<string> CacheGrowthFaultInjector { get; set; }
+
+        private void DisposePendingCacheGrowth()
+        {
+            if (_pendingCacheGrowth == null) return;
+            CacheGrowthFaultInjector?.Invoke("release-unpublished");
+            InvalidateTensorDeviceCache(_pendingCacheGrowth);
+            _pendingCacheGrowth.Dispose();
+            _pendingCacheGrowth = null;
+        }
+
+        private void RollbackCacheGrowth(Exception failure)
+        {
+            try { DisposePendingCacheGrowth(); }
+            catch (Exception cleanup)
+            {
+                throw new AggregateException("Qwen4Exp cache growth failed and its unpublished allocation still requires cleanup.",
+                    failure, cleanup);
+            }
+        }
+
         // GDN state, host side. conv is a [convKernel-1, convDim] ring per layer and
         // delta is [numVHeads, headKDim, headVDim].
         private float[][] _gdnConvState;
@@ -147,29 +172,43 @@ namespace TensorSharp.Models
 
         private void GrowCache(ref Tensor cache, int heads, int newLen, int dim, DType dtype)
         {
-            var grown = new Tensor(_allocator, dtype, heads, newLen, dim);
-            // Zero UNCONDITIONALLY. InitializeCacheTensor skips the fill on
-            // GgmlCuda/Mlx, and the native span kernel's own memset is guarded by
-            // `position == 0`, which a mid-sequence grow never satisfies - so the
-            // rows past _cacheSeqLen would keep whatever the memory pool handed
-            // back. The flash window is padded to a 256 stride past n_kv and those
-            // rows ARE read: a masked column contributes nothing only if its K row
-            // is finite, and an Inf there plus the -inf mask is NaN, which takes
-            // the whole softmax row. Fires on any conversation past the initial
-            // 8192-token capacity - e.g. a --max-tokens 20000 answer.
-            Ops.Fill(grown, 0f);
-            if (_cacheSeqLen > 0)
+            DisposePendingCacheGrowth();
+            try
             {
-                using var src = cache.Narrow(1, 0, _cacheSeqLen);
-                using var dst = grown.Narrow(1, 0, _cacheSeqLen);
-                Ops.Copy(dst, src);
+                var grown = _pendingCacheGrowth = new Tensor(_allocator, dtype, heads, newLen, dim);
+                CacheGrowthFaultInjector?.Invoke("allocated");
+                // Zero UNCONDITIONALLY. InitializeCacheTensor skips the fill on
+                // GgmlCuda/Mlx, and the native span kernel's own memset is guarded by
+                // `position == 0`, which a mid-sequence grow never satisfies - so the
+                // rows past _cacheSeqLen would keep whatever the memory pool handed
+                // back. The flash window is padded to a 256 stride past n_kv and those
+                // rows ARE read: a masked column contributes nothing only if its K row
+                // is finite, and an Inf there plus the -inf mask is NaN, which takes
+                // the whole softmax row. Fires on any conversation past the initial
+                // 8192-token capacity - e.g. a --max-tokens 20000 answer.
+                Ops.Fill(grown, 0f);
+                CacheGrowthFaultInjector?.Invoke("initialized");
+                if (_cacheSeqLen > 0)
+                {
+                    using var src = cache.Narrow(1, 0, _cacheSeqLen);
+                    using var dst = grown.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dst, src);
+                }
+                CacheGrowthFaultInjector?.Invoke("copied");
+                // Evict the old tensor's device-resident copy before its host
+                // pointer is freed: a recycled pinned address must never re-find
+                // the smaller stale device slab.
+                InvalidateTensorDeviceCache(cache);
+                CacheGrowthFaultInjector?.Invoke("retire-original");
+                cache.Dispose();
+                cache = grown;
+                _pendingCacheGrowth = null;
             }
-            // Evict the old tensor's device-resident copy before its host
-            // pointer is freed: a recycled pinned address must never re-find
-            // the smaller stale device slab.
-            InvalidateTensorDeviceCache(cache);
-            cache.Dispose();
-            cache = grown;
+            catch (Exception failure)
+            {
+                RollbackCacheGrowth(failure);
+                throw;
+            }
         }
 
         /// <summary>Download the device-resident KV copies back into the host
@@ -1723,6 +1762,7 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            DisposePendingCacheGrowth();
             VisionEncoder?.Dispose();
             VisionEncoder = null;
             DisposeMtpHead();

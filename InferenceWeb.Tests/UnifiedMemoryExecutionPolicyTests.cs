@@ -28,6 +28,291 @@ public sealed class UnifiedMemoryExecutionPolicyTests
     private static SequenceState Request(string id) => new(id, [1, 2, 3, 4], 3, 8, SamplingConfig.Greedy);
     private sealed class NoOpScope : IDisposable { public void Dispose() { } }
 
+    private static SchedulerConfig HolderConfig(RequestMemoryAdmission admission, bool joint = false) => new()
+    {
+        BlockSize = 8, NumBlocks = 64, MaxNumRunningSequences = 2,
+        MaxNumBatchedTokens = 8, MaxPrefillChunkSize = 4, SoloPrefillChunkSize = 8,
+        PrefillChunkTokenLimit = 8, EnablePrefixCaching = false, StopRepetition = false,
+        MemoryAdmission = admission,
+        ExecutionOptionsOverride = new()
+        {
+            BatchedPathDisabled = true, PerSeqFusedEnabled = true,
+            BatchedFusedDecodeEnabled = joint, RetainedFusedCacheBudget = 0,
+            PrefixCheckpointBudget = 0, KvHolderPoolMax = 0
+        }
+    };
+
+    [Fact]
+    public void AdmittedHolderPlannerNeverUsesTheSharedPrimaryEvenWhenSolo()
+    {
+        var budget = new MemoryBudget([new("device", 128)]);
+        var cfg = HolderConfig(new(budget, _ => [new("device", 48)])
+        { UsePerSequenceHolders = true, EnterSerialExecution = _ => new NoOpScope() });
+        var caps = new ExecutionCapabilities { SupportsPerSequenceFusedForward = true };
+        foreach (int count in new[] { 1, 2 })
+            Assert.Equal(ExecutionPathKind.PerSequenceFused, Assert.Single(ExecutionPlanner.PlanStep(caps,
+                cfg.ResolveExecutionOptions(), cfg, new ExecutionStepFeatures { SequenceCount = count }).Candidates));
+        Assert.Throws<NotSupportedException>(() => ExecutionPlanner.PlanStep(new ExecutionCapabilities(),
+            cfg.ResolveExecutionOptions(), cfg, new ExecutionStepFeatures { SequenceCount = 1 }));
+    }
+
+    [Fact]
+    public async Task AdmittedHoldersInterleaveTwoLiveHistoriesAndReleaseTheirOwnCredit()
+    {
+        var budget = new MemoryBudget([new("device", 128)]);
+        using var model = new HolderModel();
+        int samples = 0, maxRunning = 0;
+        InferenceEngine engine = null!;
+        var admission = new RequestMemoryAdmission(budget, _ => [new("device", 48)])
+        {
+            UsePerSequenceHolders = true, ReestimateAfterPhysicalCheck = true,
+            BeforeAdmission = _ => { samples++; return [new("device", 128)]; },
+            EnterSerialExecution = seq =>
+            {
+                Assert.True(Monitor.IsEntered(model.GpuComputeLock));
+                maxRunning = Math.Max(maxRunning, engine.RunningCount);
+                return model.Enter(seq);
+            }
+        };
+        using (engine = new InferenceEngine(model, HolderConfig(admission)))
+        {
+            var first = engine.SubmitRequest(Request("a"));
+            Assert.True(model.FirstForward.Wait(TimeSpan.FromSeconds(3)));
+            var second = engine.SubmitRequest(Request("b"));
+            model.AllowFirstForward.Set();
+            await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { 5, 5, 5 }, first.Sequence.OutputTokens);
+            Assert.Equal(new[] { 6, 6, 6 }, second.Sequence.OutputTokens);
+            Assert.Equal(2, maxRunning); Assert.Equal(2, samples);
+            Assert.Contains("b", model.ForwardOrder.TakeWhile(x => x != "released:a"));
+            Assert.Equal(0, model.UnscopedBinds); Assert.Equal(0, model.JointGraphs);
+        }
+        Assert.Empty(model.Owners);
+        Assert.Equal(128, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task CancellingOneAdmittedHolderDoesNotReleaseItsLiveNeighbour()
+    {
+        var budget = new MemoryBudget([new("device", 128)]);
+        using var model = new HolderModel { PauseOnSecondHolder = true };
+        var admission = new RequestMemoryAdmission(budget, _ => [new("device", 48)])
+        { UsePerSequenceHolders = true, EnterSerialExecution = model.Enter };
+        using var engine = new InferenceEngine(model, HolderConfig(admission));
+        using var cancellation = new CancellationTokenSource();
+        var first = engine.SubmitRequest(new SequenceState("a", [1, 2, 3, 4], 100, 8, SamplingConfig.Greedy), cancellation.Token);
+        Assert.True(model.FirstForward.Wait(TimeSpan.FromSeconds(3)));
+        var second = engine.SubmitRequest(Request("b"));
+        model.AllowFirstForward.Set();
+        Assert.True(model.SecondForward.Wait(TimeSpan.FromSeconds(3)));
+        cancellation.Cancel(); model.AllowSecondForward.Set();
+        await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedAborted, first.Sequence.Status);
+        Assert.Equal(new[] { 6, 6, 6 }, second.Sequence.OutputTokens);
+        Assert.Contains("released:a", model.ForwardOrder);
+        Assert.Contains("released:b", model.ForwardOrder);
+        engine.Dispose(); Assert.Equal(128, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task PhysicalContentionWaitsForLiveHolderReleaseWithoutPerTokenSampling()
+    {
+        var budget = new MemoryBudget([new("device", 128)]);
+        using var model = new HolderModel();
+        int samples = 0;
+        var admission = new RequestMemoryAdmission(budget, _ => [new("device", 48)])
+        {
+            UsePerSequenceHolders = true, ReestimateAfterPhysicalCheck = true,
+            BeforeAdmission = _ => { samples++; return [new("device", 60)]; },
+            EnterSerialExecution = model.Enter
+        };
+        using var engine = new InferenceEngine(model, HolderConfig(admission));
+        var first = engine.SubmitRequest(new SequenceState("a", [1, 2, 3, 4], 12, 8, SamplingConfig.Greedy));
+        Assert.True(model.FirstForward.Wait(TimeSpan.FromSeconds(3)));
+        var second = engine.SubmitRequest(Request("b")); model.AllowFirstForward.Set();
+        await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(12, first.Sequence.OutputTokens.Count);
+        Assert.Equal(new[] { 6, 6, 6 }, second.Sequence.OutputTokens);
+        Assert.Equal(3, samples); // first, one refused neighbour, then release
+        Assert.True(model.ForwardOrder.IndexOf("released:a") < model.ForwardOrder.IndexOf("b"));
+        engine.Dispose(); Assert.Equal(128, budget.Snapshot().Single().Available);
+    }
+
+    private sealed class HolderModel : IModelArchitecture, IBatchedPagedModel
+    {
+        public object GpuComputeLock { get; } = new();
+        public ModelConfig Config { get; } = new() { VocabSize = 8 };
+        public ITokenizer Tokenizer { get; } = new Tokens();
+        public IMultimodalInjector MultimodalInjector => null!;
+        public IBackendExecutionPlan ExecutionPlan => null!;
+        public bool SupportsKVStateSnapshot => false;
+        public bool SupportsKVCacheTruncation => false;
+        public bool SupportsPerSequenceFusedForward => true;
+        public bool BatchedForwardAvailable => false;
+        public Dictionary<string, BudgetReservation> Owners { get; } = new();
+        public List<string> ForwardOrder { get; } = new();
+        public ManualResetEventSlim FirstForward { get; } = new();
+        public ManualResetEventSlim AllowFirstForward { get; } = new();
+        public ManualResetEventSlim SecondForward { get; } = new();
+        public ManualResetEventSlim AllowSecondForward { get; } = new();
+        public bool PauseOnSecondHolder;
+        public int UnscopedBinds, JointGraphs;
+        public bool EnableJoint;
+        public string? RefusePrepare;
+        private BudgetReservation? _jointEnvelope, _jointAllocation;
+        private SequenceState? _scope;
+        private string? _bound;
+        private int _forwards;
+        public IDisposable Enter(SequenceState sequence)
+        {
+            Assert.Null(_scope); Assert.NotNull(sequence.MemoryEnvelope);
+            _scope = sequence; return new Scope(this);
+        }
+        private sealed class Scope(HolderModel model) : IDisposable
+        { public void Dispose() => model._scope = null; }
+        public bool BindSequenceCache(string id)
+        {
+            if (_scope?.RequestId != id) { UnscopedBinds++; throw new InvalidOperationException("Unscoped holder binding"); }
+            _bound = id;
+            if (Owners.ContainsKey(id)) return false;
+            var allocation = _scope.MemoryEnvelope!.TryTake([new("device", 32)])
+                ?? throw new MemoryPressureException("Missing holder allocation credit");
+            allocation.Commit(); Owners.Add(id, allocation); return true;
+        }
+        public bool HasFusedSequenceCache(string id) => Owners.ContainsKey(id);
+        public bool CanBatchDecode(string id, int position) => Owners.ContainsKey(id);
+        public bool PrepareBatchedFusedDecode(string id)
+        {
+            Assert.Equal(id, _scope?.RequestId);
+            if (id == RefusePrepare) throw new MemoryPressureException("Injected holder preparation refusal");
+            return Owners.ContainsKey(id);
+        }
+        public IDisposable EnterJoint(BudgetReservation envelope)
+        {
+            Assert.Null(_scope); Assert.Null(_jointEnvelope); _jointEnvelope = envelope;
+            return new JointScope(this);
+        }
+        private sealed class JointScope(HolderModel model) : IDisposable
+        { public void Dispose() => model._jointEnvelope = null; }
+        public bool TryForwardBatchedFusedDecodeSampled(IReadOnlyList<string> ids, int[] tokens, int[] positions, int[] next)
+        {
+            if (!EnableJoint) return false;
+            Assert.Null(_scope); Assert.NotNull(_jointEnvelope); Assert.Equal(2, ids.Count);
+            _jointAllocation ??= _jointEnvelope!.TryTake([new("device", 48)])
+                ?? throw new MemoryPressureException("Missing shared graph reservation");
+            if (JointGraphs == 0) _jointAllocation.Commit();
+            JointGraphs++;
+            for (int i = 0; i < ids.Count; ++i)
+            { Assert.True(Owners.ContainsKey(ids[i])); next[i] = ids[i] == "a" ? 5 : 6; }
+            return true;
+        }
+        public float[] Forward(int[] tokens)
+        {
+            Assert.Equal(_scope?.RequestId, _bound); Assert.NotNull(_bound);
+            if (_forwards++ == 0)
+            {
+                FirstForward.Set();
+                if (!AllowFirstForward.Wait(TimeSpan.FromSeconds(4))) throw new TimeoutException("First holder barrier");
+            }
+            if (_bound == "b" && !SecondForward.IsSet)
+            {
+                SecondForward.Set();
+                if (PauseOnSecondHolder && !AllowSecondForward.Wait(TimeSpan.FromSeconds(4)))
+                    throw new TimeoutException("Second holder barrier");
+            }
+            ForwardOrder.Add(_bound!);
+            var logits = new float[8]; logits[_bound == "a" ? 5 : 6] = 10; return logits;
+        }
+        public void OnSequenceReleased(string id)
+        {
+            if (Owners.Remove(id, out var owner)) { owner.Dispose(); ForwardOrder.Add("released:" + id); }
+        }
+        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext context)
+        { JointGraphs++; throw new InvalidOperationException("No joint-envelope graph authorized"); }
+        public void ResetKVCache()
+        {
+            // Engine teardown resets the now-idle primary. A reset while any
+            // admitted holder is live would erase another request's state.
+            Assert.Empty(Owners);
+        }
+        public void TruncateKVCache(int tokens) => throw new InvalidOperationException("Cannot rewind hybrid state");
+        public void Dispose()
+        {
+            AllowFirstForward.Set(); AllowSecondForward.Set();
+            foreach (var owner in Owners.Values) owner.Dispose(); Owners.Clear();
+            _jointAllocation?.Dispose(); _jointAllocation = null;
+        }
+        public long ComputeKVBlockByteSize(int count) => 0;
+        public bool TryExtractKVBlock(int start, int count, Span<byte> target) => false;
+        public bool TryInjectKVBlock(int start, int count, ReadOnlySpan<byte> source) => false;
+    }
+
+    [Fact]
+    public async Task PrefillCreditShrinksBeforeSecondAdmissionAndJointGraphUsesSharedOwner()
+    {
+        var budget = new MemoryBudget([new("device", 192)]);
+        using var joint = budget.Reserve([new("device", 0)]);
+        using var model = new HolderModel { EnableJoint = true };
+        int completedPrefills = 0, withNeighbour = 0;
+        var admission = new RequestMemoryAdmission(budget, seq => [new("device", seq.NumComputedTokens >= seq.PromptTokens.Count ? 40 : 96)])
+        {
+            UsePerSequenceHolders = true, ReestimateAfterPhysicalCheck = true,
+            BeforeAdmissionWithRunning = (_, running) =>
+            {
+                if (running.Count > 0)
+                {
+                    Assert.True(completedPrefills > 0); withNeighbour++;
+                    Assert.True(joint.TryResizeTotal([new("device", 48)]));
+                }
+                return [new("device", 192)];
+            },
+            AfterPrefill = seq => { Assert.True(seq.MemoryEnvelope!.TryResizeTotal([new("device", 40)])); completedPrefills++; },
+            EnterSerialExecution = model.Enter,
+            EnterBatchedExecution = _ => model.EnterJoint(joint)
+        };
+        using var engine = new InferenceEngine(model, HolderConfig(admission, joint: true));
+        var first = engine.SubmitRequest(new SequenceState("a", [1, 2, 3, 4], 8, 8, SamplingConfig.Greedy));
+        Assert.True(model.FirstForward.Wait(TimeSpan.FromSeconds(3)));
+        var second = engine.SubmitRequest(new SequenceState("b", [1, 2, 3, 4], 8, 8, SamplingConfig.Greedy));
+        model.AllowFirstForward.Set();
+        await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, completedPrefills); Assert.Equal(1, withNeighbour);
+        Assert.True(model.JointGraphs >= 2);
+        Assert.All(first.Sequence.OutputTokens, token => Assert.Equal(5, token));
+        Assert.All(second.Sequence.OutputTokens, token => Assert.Equal(6, token));
+        Assert.Equal(8, first.Sequence.OutputTokens.Count); Assert.Equal(8, second.Sequence.OutputTokens.Count);
+        Assert.Equal(48, budget.Snapshot().Single().Committed);
+        Assert.Empty(model.Owners);
+        engine.Dispose(); model.Dispose(); joint.Dispose();
+        Assert.Equal(192, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task HolderPreparationFailureDoesNotFailAnUnsubmittedBatchNeighbour()
+    {
+        var budget = new MemoryBudget([new("device", 192)]);
+        using var joint = budget.Reserve([new("device", 48)]);
+        using var model = new HolderModel { EnableJoint = true, RefusePrepare = "b" };
+        var admission = new RequestMemoryAdmission(budget, _ => [new("device", 48)])
+        {
+            UsePerSequenceHolders = true, BeforeAdmission = _ => [new("device", 192)],
+            EnterSerialExecution = model.Enter, EnterBatchedExecution = _ => model.EnterJoint(joint)
+        };
+        using var engine = new InferenceEngine(model, HolderConfig(admission, joint: true));
+        var first = engine.SubmitRequest(new SequenceState("a", [1, 2, 3, 4], 8, 8, SamplingConfig.Greedy));
+        Assert.True(model.FirstForward.Wait(TimeSpan.FromSeconds(3)));
+        var second = engine.SubmitRequest(Request("b")); model.AllowFirstForward.Set();
+        await first.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.ThrowsAsync<MemoryPressureException>(
+            () => second.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, first.Sequence.Status);
+        Assert.Equal(SequenceStatus.FinishedError, second.Sequence.Status);
+        Assert.IsType<MemoryPressureException>(second.Sequence.Error);
+        Assert.Equal(8, first.Sequence.OutputTokens.Count); Assert.Equal(0, model.JointGraphs);
+        engine.Dispose(); model.Dispose(); joint.Dispose();
+        Assert.Equal(192, budget.Snapshot().Single().Available);
+    }
+
     [Fact]
     public void InitiallyOversizedPeakCanShrinkAtPhysicalBoundaryBeforeAdmission()
     {

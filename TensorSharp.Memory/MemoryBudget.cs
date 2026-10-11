@@ -374,6 +374,16 @@ public sealed class MemoryBudget
                     _pools[c.Pool].Reserved += c.Bytes;
                 }
                 else if (c.Bytes > 0) releasedToPool = true;
+                // An immediate live parent receives this credit back, so its
+                // own total and every ancestor's ownership stay unchanged.
+                // With a closed parent the physical credit goes to the pool;
+                // every ancestor must lose this part of its live subtree too.
+                for (var ancestor = reservation.Parent; ancestor != null; ancestor = ancestor.Parent)
+                {
+                    int index = FindCharge(ancestor.Items, c.Pool);
+                    ancestor.DescendantBytes[index] -= c.Bytes;
+                    if (ReferenceEquals(ancestor, reservation.Parent) && ancestor.State == 0) break;
+                }
                 RecomputeCapacity(_pools[c.Pool]);
             }
             reservation.State = 2;
@@ -385,6 +395,86 @@ public sealed class MemoryBudget
 
     internal IReadOnlyList<MemoryCharge> Charges(BudgetReservation reservation)
     { lock (_gate) return Array.AsReadOnly((MemoryCharge[])reservation.Items.Clone()); }
+
+    internal IReadOnlyList<MemoryCharge> OwnedCharges(BudgetReservation reservation, bool descendantsOnly)
+    {
+        lock (_gate)
+        {
+            var result = new MemoryCharge[reservation.Items.Length];
+            for (int i = 0; i < result.Length; i++)
+                result[i] = reservation.Items[i] with { Bytes = checked(reservation.DescendantBytes[i]
+                    + (descendantsOnly || reservation.State == 2 ? 0 : reservation.Items[i].Bytes)) };
+            return Array.AsReadOnly(result);
+        }
+    }
+
+    // Resize only unused credit. Live children keep their physical ownership
+    // and return to this same envelope when they are actually freed. Restrict
+    // this operation to roots and the original pool set so a child's later
+    // refund cannot refer to a missing pool or manufacture parent credit.
+    internal bool TryResizeRemaining(BudgetReservation envelope, IEnumerable<MemoryCharge> charges,
+        IEnumerable<MemoryCharge>? capacityConstraints)
+        => TryResize(envelope, charges, capacityConstraints, totalTarget: false);
+
+    internal bool TryResizeTotal(BudgetReservation envelope, IEnumerable<MemoryCharge> charges,
+        IEnumerable<MemoryCharge>? capacityConstraints)
+        => TryResize(envelope, charges, capacityConstraints, totalTarget: true);
+
+    private bool TryResize(BudgetReservation envelope, IEnumerable<MemoryCharge> charges,
+        IEnumerable<MemoryCharge>? capacityConstraints, bool totalTarget)
+    {
+        if (!ReferenceEquals(envelope.Owner, this)) throw new ArgumentException("Reservation belongs to a different budget.");
+        var requested = Normalize(charges);
+        var limits = capacityConstraints == null ? null : NormalizeCapacityConstraints(capacityConstraints);
+        lock (_gate)
+        {
+            if (envelope.State != 0 || envelope.Parent != null)
+                throw new InvalidOperationException("Only an open root allocation envelope can resize unused credit.");
+            if (requested.Length != envelope.Items.Length)
+                throw new ArgumentException("Resizing must preserve the envelope's pool set.", nameof(charges));
+            // Resolve the target and live descendants in the same accounting
+            // transaction. Children include reserved allocations and retained
+            // allocations below closed intermediate envelopes, not just commits.
+            for (int i = 0; i < requested.Length; i++)
+            {
+                if (requested[i].Pool != envelope.Items[i].Pool)
+                    throw new ArgumentException("Resizing must preserve the envelope's pool set.", nameof(charges));
+                if (totalTarget)
+                    requested[i] = requested[i] with { Bytes = Math.Max(0,
+                        requested[i].Bytes - envelope.DescendantBytes[i]) };
+            }
+            bool grows = false, releases = false;
+            for (int i = 0; i < requested.Length; i++)
+            {
+                long delta = requested[i].Bytes - envelope.Items[i].Bytes;
+                grows |= delta > 0; releases |= delta < 0;
+                var pool = _pools[requested[i].Pool];
+                if (delta > 0 && (delta > pool.Ceiling - pool.Reserved - pool.Committed
+                    || delta > pool.Capacity - pool.Reserved - pool.Committed)) return false;
+            }
+            // Releasing credit must remain possible under pressure. Growth,
+            // including an atomic multi-pool rebalance, respects every supplied
+            // fresh absolute constraint using the post-transaction ledger.
+            if (grows && limits != null)
+                foreach (var (name, capacity) in limits)
+                {
+                    var pool = _pools[name];
+                    int index = FindCharge(requested, name);
+                    long delta = index >= 0 ? requested[index].Bytes - envelope.Items[index].Bytes : 0;
+                    if ((decimal)pool.Reserved + pool.Committed + delta > capacity) return false;
+                }
+            for (int i = 0; i < requested.Length; i++)
+            {
+                var pool = _pools[requested[i].Pool];
+                pool.Reserved += requested[i].Bytes - envelope.Items[i].Bytes;
+                envelope.Items[i] = requested[i];
+                pool.PeakOwned = Math.Max(pool.PeakOwned, pool.Reserved + pool.Committed);
+                RecomputeCapacity(pool);
+            }
+            if (releases) Pulse();
+            return true;
+        }
+    }
 
     internal BudgetReservation? Take(BudgetReservation envelope, IEnumerable<MemoryCharge> charges)
     {
@@ -417,6 +507,7 @@ public sealed class MemoryBudget
             {
                 int index = FindCharge(envelope.Items, c.Pool);
                 envelope.Items[index] = envelope.Items[index] with { Bytes = envelope.Items[index].Bytes - c.Bytes };
+                envelope.DescendantBytes[index] += c.Bytes;
             }
             envelope.HasChildren = true;
             // Accounting is unchanged until the child allocation commits.
@@ -431,6 +522,9 @@ public sealed class BudgetReservation : IDisposable
 {
     internal readonly MemoryBudget Owner;
     internal readonly MemoryCharge[] Items;
+    // Aggregate charges in live descendants, pending or committed. Allocate
+    // before any ledger mutation so child creation remains failure-atomic.
+    internal readonly long[] DescendantBytes;
     internal int State;
     internal BudgetReservation? Parent;
     internal bool HasChildren;
@@ -438,12 +532,35 @@ public sealed class BudgetReservation : IDisposable
     {
         Owner = owner;
         Items = items;
+        DescendantBytes = new long[items.Length];
     }
     public IReadOnlyList<MemoryCharge> Charges => Owner.Charges(this);
+    /// <summary>Current pending and committed descendant ownership. Pools may
+    /// overlap (UMA), so this is not an additive physical byte total.</summary>
+    public IReadOnlyList<MemoryCharge> LiveChildCharges => Owner.OwnedCharges(this, descendantsOnly: true);
+    /// <summary>Current remaining credit plus live descendants; a closed root
+    /// still reports retained children until their physical release.</summary>
+    public IReadOnlyList<MemoryCharge> OwnedCharges => Owner.OwnedCharges(this, descendantsOnly: false);
     public MemoryBudget Budget => Owner;
     /// <summary>Draw allocation credit without double counting a request's reserved
     /// peak. Disposing the child returns credit while this envelope stays open.</summary>
     public BudgetReservation? TryTake(IEnumerable<MemoryCharge> charges) => Owner.Take(this, charges);
+    /// <summary>Atomically replace only this root envelope's unused reservation,
+    /// preserving the pool set and all live child allocations. Bytes are the new
+    /// remaining allowance, not a total including committed children. Shrinks
+    /// always release credit; growth must fit current ledger and optional fresh
+    /// absolute capacity constraints. False leaves the reservation unchanged.</summary>
+    public bool TryResizeRemaining(IEnumerable<MemoryCharge> charges,
+        IEnumerable<MemoryCharge>? capacityConstraints = null)
+        => Owner.TryResizeRemaining(this, charges, capacityConstraints);
+    /// <summary>Atomically target this root's total ownership including every
+    /// live pending/committed descendant. Remaining credit becomes
+    /// max(0, target - live descendants) per pool. A target below live children
+    /// releases only unused credit; it cannot revoke physical owners. The same
+    /// pool-set, growth and absolute constraint rules as TryResizeRemaining apply.</summary>
+    public bool TryResizeTotal(IEnumerable<MemoryCharge> totalTarget,
+        IEnumerable<MemoryCharge>? capacityConstraints = null)
+        => Owner.TryResizeTotal(this, totalTarget, capacityConstraints);
     public void Commit() => Owner.Commit(this);
     public void Dispose() => Owner.Release(this);
 }

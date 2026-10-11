@@ -89,6 +89,41 @@ public sealed class QwenUnifiedMemoryGeometryTests : IDisposable
     }
 
     [Fact]
+    public void CheckpointForecastIncludesBothRetentionCapsAndPublicationTransient()
+    {
+        using var file = GgufFile.OpenForMemoryPlanning(WriteGeometry());
+        var geometry = Qwen4ExpUnifiedGeometry.Read(file);
+        var none = geometry.RequestPeak(512, 8);
+        var one = geometry.RequestPeak(512, 8, checkpointCopies: 1);
+        var bothCapsAndTransient = geometry.RequestPeak(512, 8, checkpointCopies: 5);
+        Assert.True(one.Host > none.Host);
+        Assert.Equal(5 * (one.Host - none.Host), bothCapsAndTransient.Host - none.Host);
+        Assert.Equal(none.Device, bothCapsAndTransient.Device);
+        Assert.Throws<ArgumentOutOfRangeException>(() => geometry.RequestPeak(512, 8, checkpointCopies: -1));
+        Assert.Throws<OverflowException>(() => (geometry with { PleStateBytes = long.MaxValue / 4 }).RequestPeak(512, 8, checkpointCopies: 5));
+    }
+
+    [Fact]
+    public void JointArenaHighWaterRequiresBothContextAndLaneAxes()
+    {
+        using var file = GgufFile.OpenForMemoryPlanning(WriteGeometry());
+        var geometry = Qwen4ExpUnifiedGeometry.Read(file);
+        var twoLong = geometry.JointDecodePeak(4096, 2);
+        var eightShort = geometry.JointDecodePeak(256, 8);
+        var eightAtRetainedCapacity = geometry.JointDecodePeak(4096, 8);
+        // A replacement arena retains the old 4096-row capacity but has nine
+        // state lanes. Taking the maximum of the two old byte totals omits
+        // that combination; it is not a valid reservation for the new shape.
+        Assert.True(eightAtRetainedCapacity.Device > Math.Max(twoLong.Device, eightShort.Device));
+        Assert.True(eightAtRetainedCapacity.Host > Math.Max(twoLong.Host, eightShort.Host));
+        Assert.Equal(geometry.JointDecodePeak(257, 2), geometry.JointDecodePeak(512, 2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => geometry.JointDecodePeak(0, 2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => geometry.JointDecodePeak(256, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => geometry.JointDecodePeak(256, 9));
+        Assert.Throws<OverflowException>(() => (geometry with { PleStateBytes = long.MaxValue }).JointDecodePeak(256, 2));
+    }
+
+    [Fact]
     public void EveryRequestForecastIncludesCpuFallbackWithout128RowDiscontinuity()
     {
         using var file = GgufFile.OpenForMemoryPlanning(WriteGeometry());

@@ -183,9 +183,9 @@ public static class ServerOptionsBuilder
             skillOptions.Selected,
             skillOptions.Sandbox,
             skillOptions.AllowNetwork,
-            // Prefix retention is on unless explicitly disabled, or the selected
-            // unified adapter requires its single primary-cache execution lane.
-            prefixCacheEnabled: !configuredNoPrefixCache && !configuredUnifiedMemory,
+            // The unified session supplies its own budgeted retention policy;
+            // preserve the operator's cache choice instead of disabling it here.
+            prefixCacheEnabled: !configuredNoPrefixCache,
             prefixCacheDirectory: ResolvePrefixCacheDirectory(baseDirectory, startupModelPath),
             embeddingsEnabled: embeddingsEnabled,
             embeddingThreads: embeddingThreads,

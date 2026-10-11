@@ -78,7 +78,8 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.False(ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir).UnifiedMemoryEnabled);
         var enabled = ServerOptionsBuilder.Build(["--backend", "ggml_cuda", "--unified-memory"], _baseDir);
         Assert.True(enabled.UnifiedMemoryEnabled);
-        Assert.False(enabled.PrefixCacheEnabled);
+        Assert.True(enabled.PrefixCacheEnabled);
+        Assert.False(ServerOptionsBuilder.Build(["--backend", "ggml_cuda", "--unified-memory", "--no-prefix-cache"], _baseDir).PrefixCacheEnabled);
         Assert.False(ServerOptionsBuilder.Build(["--stop", "--unified-memory"], _baseDir).UnifiedMemoryEnabled);
     }
 

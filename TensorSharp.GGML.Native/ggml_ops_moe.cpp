@@ -44,6 +44,10 @@
 // already-built whole-model decode graph, pausing at each offloaded layer for
 // the host expert matmul. Same internal API the tensor-parallel executor uses.
 #include "ggml-impl.h"
+#include "ggml_ops_moe_file_pipeline.h"
+#if defined(TSG_GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 
 #include <cstdint>
 #include <cmath>
@@ -154,12 +158,14 @@ namespace
         std::mutex g_moe_cpu_compute_mutex;
         std::mutex g_moe_file_cpu_mutex;
         HostMoeCpuArena g_moe_file_weights, g_moe_file_work;
+        HostMoeFilePipeline g_moe_file_pipeline;
         // Separate from the whole-model and ordinary streaming allocators. A
         // file-backed layer executes inside the outer graph's live allocation.
         // The file mutex serializes use; request-boundary trim frees this slot.
         ggml_gallocr_t g_moe_file_stream_gallocr = nullptr;
         ggml_backend_t g_moe_file_stream_backend = nullptr;
         void clear_file_stream_gallocr() {
+            g_moe_file_pipeline.clear();
             if (g_moe_file_stream_gallocr) graph_budget_gallocr_free(g_moe_file_stream_gallocr);
             g_moe_file_stream_gallocr = nullptr;
             g_moe_file_stream_backend = nullptr;
@@ -1484,6 +1490,7 @@ namespace
 
         if (p.run_on_cpu && !stream_experts)
         {
+            if (p.file_batch) g_moe_file_pipeline.clear();
             MoECpuGraphBinding b;
             b.hidden_t = hidden_t;
             b.hidden_out_t = hidden_out_t;
@@ -1601,7 +1608,26 @@ namespace
         // The only GPU fallback boundary was above, before any transfer or
         // computation. All later errors propagate after draining this backend.
         FileStreamDrain file_drain{file_stream ? g_backend : nullptr};
-        if (file_stream) {
+        bool file_pipeline = false;
+#if defined(TSG_GGML_USE_CUDA)
+        if (file_stream && ggml_backend_is_cuda(g_backend)) {
+            static const bool enabled = [] {
+                const char* option = std::getenv("TS_HOST_MOE_FILE_PIPELINE");
+                if (option && std::strcmp(option, "1") == 0) return true;
+                if (!option || std::strcmp(option, "0") == 0) return false;
+                throw std::runtime_error("TS_HOST_MOE_FILE_PIPELINE must be 0 or 1");
+            }();
+            if (enabled) {
+                // The ring replaces the full layer's CPU arena, never adds a
+                // second retained payload to the host forecast. Trim releases
+                // it with the dedicated file-stream graph at request boundaries.
+                g_moe_file_weights.clear(); g_moe_file_work.clear();
+                file_pipeline = g_moe_file_pipeline.prepare(g_backend, p.file_batch->payload);
+            }
+        }
+#endif
+        if (file_stream && !file_pipeline) {
+            g_moe_file_pipeline.clear();
             p.file_batch->read(g_moe_file_weights);
             // Deferred binding only recorded metadata. Replace every expert
             // upload source with the admitted compact arena, never mmap.
@@ -1633,6 +1659,10 @@ namespace
 
         for (const WeightUploadInfo& u : uploads)
         {
+            if (file_pipeline && (u.tensor == gate_w || u.tensor == up_w || u.tensor == down_w)) {
+                streamed_bytes += u.bytes;
+                continue; // Bounded reads and DMA are issued after small inputs.
+            }
             if (!u.needs_upload || u.tensor == nullptr || u.host_data == nullptr || u.bytes == 0)
                 continue;
             if (file_stream && (u.tensor == gate_w || u.tensor == up_w || u.tensor == down_w)) {
@@ -1716,14 +1746,23 @@ namespace
         if (file_stream && (g_ggml_error_count.load(std::memory_order_acquire) != file_error_epoch
             || g_backend_compute_failed.load(std::memory_order_acquire)))
             throw std::runtime_error("Host MoE compact graph setup or input upload failed");
-        ggml_status status = tsg::compute_graph(g_backend, graph);
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (file_pipeline) {
+            g_moe_file_pipeline.run(mapped_read_pool(), *p.file_batch, {gate_w, up_w, down_w},
+                graph, down_proj, seq_len, s_stream_timing, [] {
+#if defined(TSG_GGML_TEST_HOOKS)
+                    if (g_moe_file_read_failure.exchange(0))
+                        throw std::runtime_error("Injected expert file read failure");
+#endif
+                }, [](int stage) { file_stream_test_failure(stage); });
+        } else status = tsg::compute_graph(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS || (file_stream && g_backend_compute_failed.load(std::memory_order_acquire)))
         {
             set_last_error("MoE prefill: ggml_backend_graph_compute failed.");
             return 0;
         }
-        if (file_stream) file_stream_test_failure(2);
-        if (s_stream_timing && stream_experts)
+        if (file_stream && !file_pipeline) file_stream_test_failure(2);
+        if (s_stream_timing && stream_experts && !file_pipeline)
         {
             const auto t_end = std::chrono::steady_clock::now();
             static thread_local double acc_up = 0.0, acc_gpu = 0.0, acc_mb = 0.0;

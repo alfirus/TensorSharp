@@ -37,6 +37,12 @@ namespace TensorSharp.Server.Hosting
     /// </summary>
     public static class PrefixCacheWarmup
     {
+        /// <summary>Unified execution must initialize its admitted kernels even
+        /// when reusable prompt state is explicitly disabled. Other modes retain
+        /// their existing prefix-warmup opt-out behavior.</summary>
+        public static bool ShouldRun(bool unifiedMemoryEnabled, bool prefixCacheEnabled, bool runtimePrefixEnabled)
+            => unifiedMemoryEnabled || (prefixCacheEnabled && runtimePrefixEnabled);
+
         /// <summary>How the warm-up ended, for a caller that wants to say so.</summary>
         public readonly record struct Result(bool Warmed, string Detail, TimeSpan Elapsed)
         {

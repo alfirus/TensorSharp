@@ -176,9 +176,11 @@ internal sealed record Qwen4ExpUnifiedGeometry
         }
     }
 
-    internal InferenceMemoryBytes RequestPeak(int capacityTokens, int prefillTokens, int elementBytes = 2)
+    internal InferenceMemoryBytes RequestPeak(int capacityTokens, int prefillTokens, int elementBytes = 2,
+        int checkpointCopies = 0)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacityTokens);
+        ArgumentOutOfRangeException.ThrowIfNegative(checkpointCopies);
         if (prefillTokens <= 0 || prefillTokens > capacityTokens) throw new ArgumentOutOfRangeException(nameof(prefillTokens));
         if (elementBytes is not (2 or 4)) throw new NotSupportedException("qwen4exp live caches require F16 or F32.");
         checked
@@ -206,8 +208,43 @@ internal sealed record Qwen4ExpUnifiedGeometry
             long decodeGraph = (64L << 20) + Layers * perRow + state;
             long hostScratch = (16L << 20) + prefillTokens * (4L * (3L * Hidden + HyperHidden) + 12)
                 + 2L * capacityTokens * prefillTokens + 8L * Vocab;
-            return new(2 * hostState + hostScratch + HostPrefillPeak(prefillTokens).TotalBytes,
+            // An exact-state checkpoint is a separate host-authoritative copy.
+            // Reserve it in addition to the old/new holder growth allowance;
+            // its tensor allocations remain charged after the request ends.
+            return new((2L + checkpointCopies) * hostState + hostScratch + HostPrefillPeak(prefillTokens).TotalBytes,
                 2 * deviceState + graph + decodeGraph);
+        }
+    }
+
+    /// <summary>One retained joint-decode entry. Native uses N live lanes and
+    /// one scratch lane for attention/GDN/PLE; QSA uses only the N live lanes.
+    /// This is additional to every request's solo state and selected experts.</summary>
+    internal InferenceMemoryBytes JointDecodePeak(int contextTokens, int sequences)
+    {
+        if (contextTokens <= 0 || sequences is < 2 or > 8) throw new ArgumentOutOfRangeException();
+        checked
+        {
+            long cap = ((long)contextTokens + 255) / 256 * 256;
+            long lanes = sequences + 1L;
+            long conv = (long)RecurrentLayers * (ConvKernel - 1) * ConvDim * 4;
+            long state = (long)RecurrentLayers * ValueHeads * StateDim * StateDim * 4;
+            long attention = 4L * AttentionLayers * KvHeads * HeadDim * cap;
+            long qsa = 2L * QsaLayers * IndexerDim * cap * sequences;
+            // ratio>=1 => block count<=cap and ratio*ceil(cap/ratio)<=cap+63.
+            long selectors = 4L * QsaLayers * sequences * (7 * cap + 67);
+            long replicas = lanes * (attention + conv + state + PleStateBytes) + qsa + selectors;
+            long perRow = 4L * (12L * HyperHidden + 16L * Hidden + 6L * ConvDim
+                + 4L * ExpertFf * UsedExperts + 3L * UsedExperts * Hidden + 4L * SharedFf
+                + (long)(Heads + IndexerHeads) * cap);
+            var seam = DeviceExpertStreamPeak(sequences);
+            long graph = (128L << 20) + (long)Layers * sequences * perRow + 4L * sequences * Vocab;
+            long nodes = (long)Layers * (192 + 160L * sequences) + 32768;
+            // Native graph metadata and managed pinned descriptor arrays are
+            // forecast margins, not claimed as instrumented payload owners.
+            long host = (64L << 20) + (nodes + 8192) * 512 + nodes * 32
+                + 4L * sequences * Vocab + 12L * sequences * cap + HostPrefillPeak(sequences).TotalBytes;
+            return new(host, replicas + graph + 2 * cap * sequences
+                + seam.ExpertWeightBytes + seam.GraphTensorBytes + seam.AllocationSlackBytes);
         }
     }
 
@@ -341,15 +378,16 @@ public partial class Qwen4ExpModel
             throw new NotSupportedException("The qwen4exp memory-policy adapter requires explicit trunk-only execution.");
     }
 
-    internal InferenceMemoryBytes GetUnifiedMemoryRequestPeak(int contextTokens, int prefillTokens)
+    internal InferenceMemoryBytes GetUnifiedMemoryRequestPeak(int contextTokens, int prefillTokens,
+        int checkpointCopies = 0, bool independentHolder = false)
     {
         if (contextTokens <= 0 || contextTokens > _maxContextLength || prefillTokens <= 0
             || prefillTokens > contextTokens || (MemoryPolicy != null && prefillTokens > MemoryPolicy.PrefillChunkTokens))
             throw new ArgumentOutOfRangeException(nameof(contextTokens));
-        long capacity = _kvCacheCapacity;
+        long capacity = independentHolder && _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
         while (capacity < contextTokens) capacity = Math.Min(_maxContextLength, Math.Max(contextTokens, capacity * 2));
         return UnifiedMemoryGeometry.RequestPeak(checked((int)capacity), prefillTokens,
-            _kvCacheDtype == KvCacheDtype.F16 ? 2 : 4);
+            _kvCacheDtype == KvCacheDtype.F16 ? 2 : 4, checkpointCopies);
     }
 
     internal long GetUnifiedMemoryPersistentDeviceBytes() => UnifiedMemoryGeometry.LoadingDeviceBoundBytes;

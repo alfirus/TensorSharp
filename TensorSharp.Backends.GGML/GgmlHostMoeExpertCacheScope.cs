@@ -7,6 +7,8 @@ namespace TensorSharp.GGML;
 
 internal static partial class GgmlNative
 {
+    [LibraryImport(DllName, EntryPoint = "TSGgml_HostMoeExpertCacheBudgetKind")]
+    internal static partial int HostMoeExpertCacheBudgetKind();
     [LibraryImport(DllName, EntryPoint = "TSGgml_BeginHostMoeExpertCacheScope")]
     internal static partial int BeginHostMoeExpertCacheScope(long bytes, int maxRows, int layers, out ulong token);
     [LibraryImport(DllName, EntryPoint = "TSGgml_UpdateHostMoeExpertCacheScope")]
@@ -29,6 +31,18 @@ public readonly record struct GgmlHostMoeExpertCacheUsage(long AccountedBytes, l
 
 public partial class GgmlBasicOps
 {
+    public static void RequireSharedExpertCacheBudgetKind()
+    {
+        try
+        {
+            if (GgmlNative.HostMoeExpertCacheBudgetKind() != 4)
+                throw new NotSupportedException("Unified concurrent execution requires dedicated selected-expert budget ownership (kind 4).");
+        }
+        catch (EntryPointNotFoundException error)
+        {
+            throw new NotSupportedException("Unified concurrent execution requires the matching GgmlOps native library with shared expert-cache ownership.", error);
+        }
+    }
     public static GgmlHostMoeExpertCacheUsage GetHostMoeExpertCacheUsage()
     {
         if (GgmlNative.HostMoeExpertCacheStats(out long accounted, out long budget,

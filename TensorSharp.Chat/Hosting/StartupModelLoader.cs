@@ -105,10 +105,11 @@ namespace TensorSharp.Server.Hosting
             {
                 // The legacy warmup calls Forward/ForwardRefill directly, with
                 // its own prefill geometry and no request allocation envelope.
-                // The first real admitted request must materialize these caches
-                // under the session's capacity checks and bounded chunk size.
+                // The host performs scheduled chat warm-up after the service
+                // container is ready, before opening its listener. That request
+                // materializes caches inside the ordinary admission envelope.
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Kernel warmup deferred (--unified-memory): the first admitted request initializes kernels and caches within its memory envelope.");
+                    "Direct kernel warmup deferred (--unified-memory): scheduled startup warmup initializes kernels and caches within its memory envelope before accepting requests.");
                 return;
             }
             var warmupSw = Stopwatch.StartNew();
@@ -172,8 +173,19 @@ namespace TensorSharp.Server.Hosting
             if (!options.PrefixCacheEnabled)
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Prefix cache disabled ({Reason}): runtime reuse, startup warmup, and disk persistence are off.",
-                    options.UnifiedMemoryEnabled ? "--unified-memory" : "--no-prefix-cache");
+                    "Prefix cache disabled (--no-prefix-cache): runtime reuse and disk persistence are off. {WarmupPolicy}",
+                    options.UnifiedMemoryEnabled
+                        ? "Scheduled unified execution warmup remains enabled."
+                        : "Prefix startup warmup is off.");
+                return;
+            }
+
+            if (options.UnifiedMemoryEnabled)
+            {
+                // FileStore exports a complete managed payload and maintains an
+                // independent disk quota. It is not yet a shared-budget SSD owner.
+                logger.LogInformation(LogEventIds.HostConfiguration,
+                    "Unified prefix cache uses budgeted in-memory checkpoints; disk prefix persistence is disabled until its export buffers and SSD storage share the session budget.");
                 return;
             }
 

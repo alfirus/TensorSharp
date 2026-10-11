@@ -13,6 +13,7 @@ namespace {
         ggml_backend_buffer_type type{};
         ggml_backend_buffer_type_t original;
         int rank;
+        int kind = 2;
         std::mutex operation;
         std::vector<std::shared_ptr<SharedCacheCharge>> charges;
         bool gallocr = false;
@@ -40,7 +41,7 @@ namespace {
                     generation_started = true;
                     charges.clear();
                 }
-                auto charge = requested == 0 ? nullptr : SharedCacheCharge::reserve(rank, 2, requested);
+                auto charge = requested == 0 ? nullptr : SharedCacheCharge::reserve(rank, kind, requested);
                 if (requested != 0 && !charge) return nullptr;
                 // Optional managed attachment may disappear after a caller's
                 // advisory check. This exact live ticket prevents an uncharged
@@ -146,12 +147,13 @@ void graph_budget_free_buffer(ggml_backend_buffer_t buffer)
     // owner destruction refunds only after the original free has returned.
 }
 
-ggml_gallocr_t graph_budget_gallocr_new(ggml_backend_buffer_type_t type, int rank, bool require_accounted)
+ggml_gallocr_t graph_budget_gallocr_new(ggml_backend_buffer_type_t type, int rank, bool require_accounted, int kind)
 {
-    if (!type || rank < 0) return nullptr;
+    if (!type || rank < 0 || (kind != 2 && kind != 5)) return nullptr;
     try {
         auto owner = std::make_shared<Owner>(type, rank);
         owner->gallocr = true;
+        owner->kind = kind;
         owner->require_accounted = require_accounted;
         std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>
             allocator(ggml_gallocr_new(&owner->type), ggml_gallocr_free);

@@ -683,6 +683,13 @@ namespace TensorSharp.Server
             InferenceRequestHandle handle;
             try
             {
+                // Correlate HTTP scope RequestId with the engine's independent
+                // sequence id for opt-in native batch qualification. This is a
+                // mapping only; batch execution is proven by its success event.
+                if (Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_TRACE") == "1")
+                    _logger.LogInformation(
+                        "generation.sequence.bound internal={InternalRequestId} session={SessionId}",
+                        requestId, session?.Id ?? "(none)");
                 handle = engine.SubmitRequest(seq, cancellationToken);
             }
             catch (ObjectDisposedException ex) when (model.IsRetiring || cancellationToken.IsCancellationRequested)
@@ -884,6 +891,11 @@ namespace TensorSharp.Server
 
             string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
             totalSw.Stop();
+            // Log once, before a cancelled stream rethrows. Keep the HTTP
+            // scope and internal engine id together for batch/latency reports.
+            var generationTimings = GenerationTimingTelemetry.Log(_logger, requestId, session?.Id,
+                completion, promptTokenCount, kvCacheReusedTokens, generatedTokens.Count,
+                totalSw.ElapsedTicks, finishReason);
 
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next
@@ -916,8 +928,8 @@ namespace TensorSharp.Server
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopped).Throw();
             }
 
-            long promptNs = InferenceTelemetry.ToNanos(completion?.PrefillElapsedTicks ?? 0);
-            long evalNs = InferenceTelemetry.ToNanos(completion?.DecodeElapsedTicks ?? 0);
+            long promptNs = generationTimings.PromptNs ?? 0;
+            long evalNs = generationTimings.EvalNs ?? 0;
             double evalSeconds = evalNs / 1_000_000_000.0;
             double tokensPerSecond = (evalSeconds > 0 && generatedTokens.Count > 0)
                 ? generatedTokens.Count / evalSeconds
@@ -931,7 +943,7 @@ namespace TensorSharp.Server
                 kvCacheReusePercent, timeToFirstTokenMs, totalSw.Elapsed.TotalMilliseconds,
                 tokensPerSecond, finishReason, assistantText);
 
-            long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
+            long totalNs = generationTimings.TotalNs;
             yield return new ChatStreamUpdate("", true, promptTokenCount, generatedTokens.Count,
                                              kvCacheReusedTokens, totalNs, promptNs, evalNs, finishReason)
             {

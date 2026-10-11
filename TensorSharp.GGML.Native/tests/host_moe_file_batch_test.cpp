@@ -59,7 +59,7 @@ struct Ledger {
     std::uint64_t next=0,calls=0;
     std::uint64_t device_refusals=0,device_calls=0;
     std::uint64_t deny_call=0;
-    bool valid=true,fail_commit=false,graphs=false;
+    bool valid=true,fail_commit=false,fail_host_commit=false,graphs=false;
     static std::uint64_t reserve(void* p,int rank,int kind,std::int64_t bytes) {
         auto& l=*static_cast<Ledger*>(p); ++l.calls;
         if(l.calls==l.deny_call) return 0;
@@ -70,7 +70,10 @@ struct Ledger {
         auto id=++l.next; l.tickets.emplace(id,Ticket{bytes,kind}); live+=bytes; l.live+=bytes;
         l.peak=std::max(l.peak,l.live); l.device_peak=std::max(l.device_peak,l.device_live); l.host_peak=std::max(l.host_peak,l.host_live); return id;
     }
-    static int commit(void* p,std::uint64_t id) { auto& l=*static_cast<Ledger*>(p); return !l.fail_commit && l.tickets.count(id)==1; }
+    static int commit(void* p,std::uint64_t id) {
+        auto& l=*static_cast<Ledger*>(p); const auto found=l.tickets.find(id);
+        return !l.fail_commit && found!=l.tickets.end() && !(l.fail_host_commit && found->second.kind==3);
+    }
     static void release(void* p,std::uint64_t id) {
         auto& l=*static_cast<Ledger*>(p); auto i=l.tickets.find(id);
         if(i==l.tickets.end()) { l.valid=false; return; }
@@ -201,10 +204,15 @@ int main(int argc,char** argv) {
                 trim(); ledger.device_cap=64LL<<20;
                 ledger.cap=1; std::fill(out.begin(),out.end(),-12345.f);
                 require(run(out)==0 && ledger.live==0,"host refusal leaked CUDA arena or bypassed quota"); unchanged(); ledger.cap=64LL<<20;
+                ledger.fail_host_commit=true;
+                require(run(out)==0 && ledger.live==0,"host payload commit failure leaked CUDA or pinned ownership");
+                unchanged(); ledger.fail_host_commit=false;
 #if !defined(TSG_PUBLIC_API_ONLY)
                 TSGgml_TestHostMoeFileReadFailNext();
                 require(run(out)==0 && ledger.live==0,"failed file read leaked stream graph"); unchanged();
-                for(int stage : {1,2}) {
+                const char* pipeline=std::getenv("TS_HOST_MOE_FILE_PIPELINE");
+                const int last_stage=pipeline && std::strcmp(pipeline,"1")==0?3:2;
+                for(int stage=1;stage<=last_stage;++stage) {
                     const auto drains=TSGgml_TestHostMoeFileStreamDrains();
                     TSGgml_TestHostMoeFileStreamFailNext(stage);
                     require(run(out)==0 && ledger.live==0,"partial upload/compute silently retried or leaked");

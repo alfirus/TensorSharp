@@ -4161,6 +4161,11 @@ internal enum GgmlIndexReductionOp
         public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
             => TSGgml_Qwen4ExpCopyQsaCache(key, destination, bytes, device) != 0;
 
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpPrepareQsaCache(IntPtr key, long bytes, int device);
+        public static bool Qwen4ExpPrepareQsaCache(IntPtr key, long bytes, int device)
+            => TSGgml_Qwen4ExpPrepareQsaCache(key, bytes, device) != 0;
+
         public static void Qwen4ExpResetFfnCache() => TSGgml_Qwen4ExpResetFfnCache();
 
         // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte

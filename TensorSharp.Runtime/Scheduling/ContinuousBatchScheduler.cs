@@ -67,12 +67,15 @@ namespace TensorSharp.Runtime.Scheduling
         // target can still refuse an otherwise ready request; schedule that check
         // now rather than waiting for a second owner release that may never occur.
         internal bool CanAdmitMemory(IReadOnlyList<MemoryCharge> peak) =>
-            _cfg.MemoryAdmission!.BeforeAdmission != null
+            _cfg.MemoryAdmission!.HasPhysicalCheck
                 ? _waiting.First is { } head && CanAttemptPhysicalAdmission(head.Value, peak)
             : _sharedAdmission?.CanAdmit(peak) ?? _cfg.MemoryAdmission.Budget.CanReserve(peak);
         private bool CanAttemptPhysicalAdmission(SequenceState request, IReadOnlyList<MemoryCharge> peak)
         {
             var budget = _cfg.MemoryAdmission!.Budget;
+            if (_cfg.MemoryAdmission.UsePerSequenceHolders
+                && _physicalAdmissionWaitSignals.TryGetValue(request, out var holderWait)
+                && ReferenceEquals(holderWait, budget.ChangeSignal)) return false;
             if (!(_sharedAdmission?.CanAttemptPhysicalAdmission(peak) ?? budget.CanReserveConfiguredCeiling(peak)))
                 return false;
             // A caller-owned refreshed ledger target can be stricter than this
@@ -254,7 +257,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // at the physical boundary. Its queued estimate is provisional:
                 // reject only the refreshed peak, before any reservation/forward.
                 if (!admission.ReestimateAfterPhysicalCheck
-                    && !(admission.BeforeAdmission == null ? admission.Budget.CanEverFit(peak)
+                    && !(!admission.HasPhysicalCheck ? admission.Budget.CanEverFit(peak)
                     : admission.Budget.CanEverFitConfiguredCeiling(peak)))
                     throw new MemoryPressureException("Request peak exceeds a configured physical memory pool even in isolation.");
                 _memoryPeaks.Add(seq.RequestId, peak);
@@ -436,7 +439,13 @@ namespace TensorSharp.Runtime.Scheduling
                         IReadOnlyList<MemoryCharge>? constraints = null;
                         IReadOnlyList<MemoryCharge> SamplePhysicalCapacity()
                         {
-                            var sampled = admission.BeforeAdmission!(seq) ?? throw new InvalidOperationException(
+                            // A holder adapter can wait for its live neighbour
+                            // after physical refusal. Observe before any trim or
+                            // sample so a concurrent release cannot be missed.
+                            attemptedSignal = admission.Budget.ChangeSignal;
+                            var sampled = (admission.BeforeAdmissionWithRunning != null
+                                ? admission.BeforeAdmissionWithRunning(seq, _runningOrder)
+                                : admission.BeforeAdmission!(seq)) ?? throw new InvalidOperationException(
                                 "The physical admission check returned no capacity constraints.");
                             if (admission.ReestimateAfterPhysicalCheck)
                             {
@@ -451,7 +460,7 @@ namespace TensorSharp.Runtime.Scheduling
                         // Sample a new eligible head once, even if a private stale
                         // target or owner floor currently makes it wait. Recovery
                         // does not necessarily pulse the ledger's change signal.
-                        if (admission.BeforeAdmission != null
+                        if (admission.HasPhysicalCheck
                             && ((!admission.Budget.CanEverFit(peak)) || (hasTurn
                                 && (!_physicalAdmissionObserved.Contains(seq) || CanAttemptPhysicalAdmission(seq, peak)))))
                         {
@@ -467,8 +476,8 @@ namespace TensorSharp.Runtime.Scheduling
                         // Configured contention has a ledger release signal. A
                         // lowered physical target may never pulse it: attempt the
                         // constrained transaction and explicitly refuse that case.
-                        bool ready = admission.BeforeAdmission == null || CanAttemptPhysicalAdmission(seq, peak);
-                        if (admission.BeforeAdmission != null && ready && constraints == null)
+                        bool ready = !admission.HasPhysicalCheck || CanAttemptPhysicalAdmission(seq, peak);
+                        if (admission.HasPhysicalCheck && ready && constraints == null)
                             constraints = SamplePhysicalCapacity();
                         if (constraints != null && !admission.Budget.CanEverFit(peak, constraints))
                             throw new MemoryPressureException(
@@ -482,6 +491,20 @@ namespace TensorSharp.Runtime.Scheduling
                             envelope = constraints == null ? admission.Budget.TryReserve(peak)
                                 : admission.Budget.TryReserve(peak, constraints);
                         }
+                    }
+                    catch (MemoryPressureException) when (admission.UsePerSequenceHolders && _running.Count > 0
+                        && admission.Budget.CanEverFitConfiguredCeiling(peak))
+                    {
+                        // Another live request owns releasable state/envelope.
+                        // It can finish and wake this head. Do not turn ordinary
+                        // contention into a failed HTTP response, or re-sample
+                        // physical capacity after every decode token.
+                        _physicalAdmissionObserved.Add(seq);
+                        _physicalAdmissionWaitSignals[seq] = attemptedSignal ?? admission.Budget.ChangeSignal;
+                        _sharedAdmission?.TryReserve(seq, peak, waitOnly: true);
+                        MemoryAdmissionBlocked = true;
+                        BlockedMemoryPeak = peak;
+                        break;
                     }
                     catch (Exception error)
                     {
@@ -503,8 +526,15 @@ namespace TensorSharp.Runtime.Scheduling
                     _memoryOwners.Add(seq.RequestId, seq);
                 }
                 bool soleAdmission = false;
-                if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
+                try
                 {
+                  if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
+                  {
+                    // Materializing a retained holder can allocate tensors and
+                    // download native hybrid state before the first Forward.
+                    // Its destination envelope already exists at this point.
+                    using var materializationScope = _cfg.MemoryAdmission?.UsePerSequenceHolders == true
+                        ? _cfg.MemoryAdmission.EnterSerialExecution!(seq) : null;
                     _radixCache!.PrimaryAvailable = _running.Count == 0 && output.ScheduledWork.Count == 0;
                     int length = _prefixCacheLcp?.Invoke(seq) ?? 0;
                     if (WaitForScheduledPublicCheckpoint(seq, output, length))
@@ -529,6 +559,20 @@ namespace TensorSharp.Runtime.Scheduling
                         source == null ? string.Empty : $" from {source}",
                         seq.PromptTokens.Count - seq.PrefixCacheReusedTokens,
                         why == null ? string.Empty : $" ({why})");
+                  }
+                  // Adoption has now published the actual reusable token count
+                  // and its request allocation scope is closed. Return unused
+                  // wide-prefill credit before the remaining prompt executes.
+                  _cfg.MemoryAdmission?.AfterPrefixMaterialization?.Invoke(seq);
+                }
+                catch (Exception error) when (_cfg.MemoryAdmission?.UsePerSequenceHolders == true)
+                {
+                    // Prefix materialization can refuse quota or fail after
+                    // creating a partial holder. Release this request through
+                    // the normal fenced hook; preserve neighbours' scheduled
+                    // work instead of escalating a Schedule exception globally.
+                    NotifyError(seq, error, output);
+                    continue;
                 }
 
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);

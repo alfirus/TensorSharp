@@ -66,6 +66,8 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private bool _disposed;
     private bool _disposing;
     private BudgetReservation? _executionEnvelope;
+    private BudgetReservation? _sharedExpertEnvelope;
+    private BudgetReservation? _sharedJointEnvelope;
     private long _allocationRefusalCount;
     private GgmlAllocationRefusal? _firstAllocationRefusal, _lastAllocationRefusal;
     internal Action? BeforeExecutionOwnerAllocation { get; set; }
@@ -133,7 +135,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     public Exception? CallbackError { get { lock (_gate) return _callbackError; } }
     public int ActiveAllocations { get { lock (_gate) return _allocations.Count; } }
     /// <summary>Kind 0: lazy device copies; 1: preloaded weights; 2: graph/context
-    /// buffers; 3: native host staging. Excludes uninstrumented driver/OS memory.</summary>
+    /// buffers; 3: native host staging; 4: selected-expert cache. Excludes uninstrumented driver/OS memory.</summary>
     public IReadOnlyList<GgmlAllocationUsage> AllocationUsage
     {
         get
@@ -146,6 +148,45 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     }
     public bool IncludesGraphBuffers { get; }
     public bool IncludesHostBuffers => _hostPools.Length != 0;
+
+    /// <summary>Use one session-owned reservation for selected-expert cache
+    /// allocations, independent of the currently executing request. Change only
+    /// while model execution is quiescent. Its live children must be freed before
+    /// removing/replacing this owner; resizing unused credit preserves refunds.</summary>
+    public void SetSharedExpertEnvelope(BudgetReservation? envelope)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_disposing || _executionEnvelope != null)
+                throw new InvalidOperationException("Shared expert ownership changes require quiescent execution.");
+            if (ReferenceEquals(envelope, _sharedExpertEnvelope)) return;
+            if (_allocations.Values.Any(a => a.Kind == 4))
+                throw new InvalidOperationException("Selected-expert allocations still own the previous reservation.");
+            if (envelope != null && !ReferenceEquals(envelope.Budget, _budget))
+                throw new ArgumentException("Expert cache belongs to a different budget.", nameof(envelope));
+            _sharedExpertEnvelope = envelope;
+        }
+    }
+
+    /// <summary>Separate lifetime for a complete multi-request arena. Kind 5
+    /// includes its state replicas as well as graph workspace; no individual
+    /// request receives its refund when a participant finishes.</summary>
+    public void SetSharedJointEnvelope(BudgetReservation? envelope)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_disposing || _executionEnvelope != null)
+                throw new InvalidOperationException("Shared joint ownership changes require quiescent execution.");
+            if (ReferenceEquals(envelope, _sharedJointEnvelope)) return;
+            if (_allocations.Values.Any(a => a.Kind == 5))
+                throw new InvalidOperationException("Joint arena allocations still own their previous reservation.");
+            if (envelope != null && !ReferenceEquals(envelope.Budget, _budget))
+                throw new ArgumentException("Joint arena belongs to a different budget.", nameof(envelope));
+            _sharedJointEnvelope = envelope;
+        }
+    }
 
     /// <summary>Route synchronous model execution allocations through an admitted
     /// request, including callbacks on native worker threads. The caller must
@@ -213,16 +254,19 @@ public sealed class GgmlCacheBudgetScope : IDisposable
                 if (kind == 3 && owner.IncludesHostBuffers)
                     pools = owner._hostPools;
                 else if ((uint)rank < (uint)owner._rankPools.Length
-                    && (kind == 0 || kind == 1 || (kind == 2 && owner.IncludesGraphBuffers)))
+                    && (kind == 0 || kind == 1 || kind == 4 || ((kind == 2 || kind == 5) && owner.IncludesGraphBuffers)))
                     pools = owner._rankPools[rank];
                 else return 0;
                 var charges = pools.Select(pool => new MemoryCharge(pool, bytes));
-                reservation = owner._executionEnvelope == null ? owner._budget.TryReserve(charges)
-                    : owner._executionEnvelope.TryTake(charges);
+                var allocationEnvelope = kind == 4 && owner._sharedExpertEnvelope != null
+                    ? owner._sharedExpertEnvelope : kind == 5 && owner._sharedJointEnvelope != null
+                    ? owner._sharedJointEnvelope : owner._executionEnvelope;
+                reservation = allocationEnvelope == null ? owner._budget.TryReserve(charges)
+                    : allocationEnvelope.TryTake(charges);
                 if (reservation == null)
                 {
                     var refusal = new GgmlAllocationRefusal(rank, kind, bytes,
-                        owner._executionEnvelope?.Charges, owner._budget.Snapshot());
+                        allocationEnvelope?.Charges, owner._budget.Snapshot());
                     owner._allocationRefusalCount++;
                     owner._firstAllocationRefusal ??= refusal;
                     owner._lastAllocationRefusal = refusal;

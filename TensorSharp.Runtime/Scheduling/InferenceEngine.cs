@@ -70,7 +70,9 @@ namespace TensorSharp.Runtime.Scheduling
             ArgumentNullException.ThrowIfNull(cfg);
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
             if (cfg.MemoryAdmission?.EnterSerialExecution != null
-                && (cfg.EnablePrefixCaching || cfg.Speculation.Enabled || !cfg.ResolveExecutionOptions().BatchedPathDisabled))
+                && (cfg.Speculation.Enabled || (cfg.MemoryAdmission.UsePerSequenceHolders
+                    ? model is not IBatchedPagedModel { SupportsPerSequenceFusedForward: true }
+                    : cfg.EnablePrefixCaching || !cfg.ResolveExecutionOptions().BatchedPathDisabled)))
                 throw new NotSupportedException("The serial request allocation adapter requires explicit per-sequence execution with prefix caching and speculation disabled.");
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
             cfg.MemoryAdmission?.ValidateConfiguration(cfg);
@@ -953,6 +955,17 @@ namespace TensorSharp.Runtime.Scheduling
                     LogSpeculationStatsIfAny(seq);
                     _scheduler.NotifyError(seq, r.Error, output);
                     continue;
+                }
+
+                if (r.IsPrefill && seq.NumComputedTokens >= seq.PromptTokens.Count
+                    && _scheduler.Config.MemoryAdmission?.AfterPrefill is { } afterPrefill)
+                {
+                    try { afterPrefill(seq); }
+                    catch (Exception error)
+                    {
+                        _scheduler.NotifyError(seq, error, output);
+                        continue;
+                    }
                 }
 
                 if (r.SampledToken >= 0)

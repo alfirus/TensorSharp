@@ -1886,6 +1886,7 @@ ggml_tensor* q4e_nodes_gdn(
     float eps, Q4eGdnWriteback* wb,
     std::vector<ggml_tensor*>* probe = nullptr);
 
+namespace tsg { struct Qwen4ExpAttnDiagnostic; }
 ggml_tensor* q4e_nodes_attn(
     ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
     const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in,
@@ -1899,7 +1900,8 @@ ggml_tensor* q4e_nodes_attn(
     const std::int32_t* mrope_sections = nullptr,
     Q4eAttnArenaIO* arena = nullptr,
     ggml_tensor* owned_k = nullptr, ggml_tensor* owned_v = nullptr,
-    const Q4eQsaGraph* qsa = nullptr);
+    const Q4eQsaGraph* qsa = nullptr,
+    tsg::Qwen4ExpAttnDiagnostic* diagnostic = nullptr);
 
 // PLE half. `conv_hist` is the persistent history - [hc_dim, hist] for the
 // span (n_streams == 1), a [hc_dim, hist, n_streams] arena view for the arena

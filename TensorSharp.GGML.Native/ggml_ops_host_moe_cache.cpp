@@ -39,11 +39,13 @@ namespace tsg
         std::mutex g_cache_mutex;
         std::size_t g_reserved = 0;
         std::uint64_t g_hits = 0, g_misses = 0, g_calls = 0;
+        std::uint64_t g_graph_submissions = 0, g_joint_submissions = 0, g_joint_rows = 0;
 #if defined(TSG_GGML_TEST_HOOKS)
         std::atomic<int> g_test_failure_stage{0};
         std::atomic<std::size_t> g_test_physical_bytes{0};
         std::atomic<std::uint64_t> g_test_completed_output_drains{0};
         std::atomic<std::size_t> g_test_available_bytes{std::numeric_limits<std::size_t>::max()};
+        std::atomic<std::size_t> g_test_file_slice_bytes{std::size_t(32) << 20};
         bool test_failure(int stage)
         {
             int expected = stage;
@@ -121,7 +123,11 @@ namespace tsg
             int type[3] = {};
             std::size_t stride[3] = {};
             std::size_t bytes = 0;
-            int capacity = 0;
+            int capacity = 0, graph_rows = 1;
+            // One exact-width variant for each live batch width. All variants
+            // share the expert leaves, but never execute padded/dummy lanes.
+            std::vector<ggml_tensor*> width_inputs, width_ids, width_routes, width_outputs;
+            std::vector<ggml_cgraph> width_graphs;
             std::vector<int> expert_for_slot;
             std::vector<std::uint64_t> last_used;
             std::uint64_t clock = 0;
@@ -138,7 +144,7 @@ namespace tsg
             ggml_tensor* routes = nullptr;
             ggml_tensor* output = nullptr;
             // The complete compact graph (weights, routing/activation payload,
-            // padding and the existing workspace allowance) is one kind-1 owner.
+            // padding and the existing workspace allowance) is one kind-4 owner.
             // This allocator deliberately does not use the kind-2 graph wrapper.
             std::shared_ptr<SharedCacheCharge> shared_charge;
 #if defined(TSG_GGML_TEST_HOOKS)
@@ -265,10 +271,11 @@ namespace tsg
             return true;
         }
 
-        bool build_graph(CacheEntry& entry, int capacity, std::size_t quota)
+        bool build_graph(CacheEntry& entry, int capacity, std::size_t quota, int graph_rows)
         {
             ggml_init_params params{};
-            params.mem_size = ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false);
+            const std::size_t graph_size = 256 * static_cast<std::size_t>(graph_rows);
+            params.mem_size = ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false);
             params.no_alloc = true;
             entry.ctx = ggml_init(params);
             if (entry.ctx == nullptr) return false;
@@ -287,37 +294,58 @@ namespace tsg
                 ggml_set_input(w);
                 ggml_set_output(w);
             }
-            entry.input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, entry.hidden, 1, 1);
-            entry.ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, entry.n_used, 1);
-            entry.routes = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, entry.n_used, 1);
-            ggml_set_input(entry.input);
-            ggml_set_input(entry.ids);
-            ggml_set_input(entry.routes);
-
-            auto* gate = ggml_mul_mat_id(ctx, entry.weight[0], entry.input, entry.ids);
-            auto* up = ggml_mul_mat_id(ctx, entry.weight[1], entry.input, entry.ids);
-            auto* activation = ggml_mul(ctx, ggml_silu(ctx, gate), up);
-            auto* down = ggml_mul_mat_id(ctx, entry.weight[2], activation, entry.ids);
-            // Match qwen4exp's decode graph: the down output cannot alias the
-            // weighted-reduction destination, making CUDA's fusion independent
-            // of which freed scratch block the allocator would otherwise reuse.
-            ggml_set_output(down);
-            auto* weighted = ggml_mul(ctx, down, entry.routes);
-            auto* sum = ggml_view_2d(ctx, weighted, entry.hidden, 1, weighted->nb[2], 0);
-            for (int k = 1; k < entry.n_used; ++k)
-                sum = ggml_add(ctx, sum, ggml_view_2d(ctx, weighted, entry.hidden, 1,
-                    weighted->nb[2], static_cast<std::size_t>(k) * weighted->nb[1]));
-            entry.output = ggml_cont(ctx, sum);
-            ggml_set_output(entry.output);
-            entry.graph = ggml_new_graph_custom(ctx, 256, false);
-            // A disjoint UID range prevents a destroyed graph's captured CUDA
-            // executable from being mistaken for a subsequently allocated graph.
+            entry.graph_rows = graph_rows;
+            entry.width_inputs.resize(graph_rows); entry.width_ids.resize(graph_rows);
+            entry.width_routes.resize(graph_rows); entry.width_outputs.resize(graph_rows);
+            entry.width_graphs.reserve(graph_rows);
+            entry.graph = ggml_new_graph_custom(ctx, graph_size, false);
+            // Allocate the supergraph once, including every retained OUTPUT.
+            // Only a disjoint exact-width slice is submitted; shared weight
+            // leaves are already resident and need no graph nodes of their own.
             static std::atomic<std::uint64_t> next_uid{UINT64_C(0x484d4f4500000000)};
             entry.graph->uid = next_uid.fetch_add(1, std::memory_order_relaxed);
-            ggml_build_forward_expand(entry.graph, entry.output);
-            if (!ggml_backend_supports_op(entry.backend, gate)
-                || !ggml_backend_supports_op(entry.backend, up)
-                || !ggml_backend_supports_op(entry.backend, down)) return false;
+            for (int width = 1; width <= graph_rows; ++width) {
+                const int index = width - 1;
+                const int start = ggml_graph_n_nodes(entry.graph);
+                auto* input = entry.width_inputs[index] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, entry.hidden, width, 1);
+                auto* ids = entry.width_ids[index] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, entry.n_used * width, 1);
+                // The caller's row-major [K,N] routes stay a single upload.
+                auto* routes = entry.width_routes[index] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, entry.n_used, width);
+                ggml_set_input(input); ggml_set_input(ids); ggml_set_input(routes);
+                auto* gate = ggml_mul_mat_id(ctx, entry.weight[0], input, ids);
+                auto* up = ggml_mul_mat_id(ctx, entry.weight[1], input, ids);
+                auto* activation = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+                auto* down = ggml_mul_mat_id(ctx, entry.weight[2], activation, ids);
+                // j=k*N+r: ordinary upstream scalar MMVQ sees ncols_dst=1,
+                // expert=ids[j], input channel=j%N. Each projection is one
+                // N-request operator/launch, with the same per-channel scalar
+                // quantization and dot reduction as N independent calls.
+                auto* down_by_route = width == 1 ? down
+                    : ggml_cont(ctx, ggml_permute(ctx,
+                        ggml_reshape_3d(ctx, down, entry.hidden, width, entry.n_used), 0, 2, 1, 3));
+                // Restore [H,K,N] before the weighted reduction. Upstream's
+                // scalar and batched weighted-reduction fusion recognizes this
+                // layout; [H,N,K] would change both fusion and FMA rounding.
+                // Protect its actual CONT producer against in-place MUL reuse.
+                ggml_set_output(down_by_route);
+                auto* weighted = ggml_mul(ctx, down_by_route, routes);
+                auto* sum = ggml_view_2d(ctx, weighted, entry.hidden, width, weighted->nb[2], 0);
+                for (int k = 1; k < entry.n_used; ++k)
+                    sum = ggml_add(ctx, sum, ggml_view_2d(ctx, weighted, entry.hidden, width,
+                        weighted->nb[2], static_cast<std::size_t>(k) * weighted->nb[1]));
+                // Each ADD handles all requests, preserving each row's exact
+                // original k=0..K-1 weighted left-fold order.
+                auto* output = entry.width_outputs[index] = ggml_cont(ctx, sum);
+                ggml_set_output(output);
+                ggml_build_forward_expand(entry.graph, output);
+                entry.width_graphs.push_back(ggml_graph_view(entry.graph, start, ggml_graph_n_nodes(entry.graph)));
+                entry.width_graphs.back().uid = next_uid.fetch_add(1, std::memory_order_relaxed);
+                if (!ggml_backend_supports_op(entry.backend, gate)
+                    || !ggml_backend_supports_op(entry.backend, up)
+                    || !ggml_backend_supports_op(entry.backend, down)) return false;
+            }
+            entry.input = entry.width_inputs[0]; entry.ids = entry.width_ids[0];
+            entry.routes = entry.width_routes[0]; entry.output = entry.width_outputs[0];
 
             entry.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(entry.backend));
             if (entry.allocator == nullptr) return false;
@@ -330,8 +358,9 @@ namespace tsg
 
         std::unique_ptr<CacheEntry> create_entry(const HostMoeSegment& hm,
             const std::size_t (&stride)[3], ggml_backend_t backend, std::size_t quota,
-            std::size_t maximum_capacity)
+            std::size_t maximum_capacity, int graph_rows = 1, int minimum_capacity = 0)
         {
+            minimum_capacity = std::max(minimum_capacity, hm.n_used);
             std::size_t per_expert = 0;
             for (const auto s : stride)
             {
@@ -341,7 +370,7 @@ namespace tsg
             if (quota <= kWorkspaceAllowance || per_expert == 0) return nullptr;
             std::size_t capacity = std::min({static_cast<std::size_t>(hm.num_experts),
                 maximum_capacity, (quota - kWorkspaceAllowance) / per_expert});
-            if (capacity < static_cast<std::size_t>(hm.n_used)) return nullptr;
+            if (capacity < static_cast<std::size_t>(minimum_capacity)) return nullptr;
 
             // Graph scratch and quantized-tensor tail padding must fit too.
             // Shrink a measured graph before allocating any device memory.
@@ -354,9 +383,9 @@ namespace tsg
                 entry->source[0] = hm.gate_data; entry->source[1] = hm.up_data; entry->source[2] = hm.down_data;
                 entry->type[0] = hm.gate_type; entry->type[1] = hm.up_type; entry->type[2] = hm.down_type;
                 for (int i = 0; i < 3; ++i) entry->stride[i] = stride[i];
-                if (build_graph(*entry, static_cast<int>(capacity), quota)) return entry;
-                if (capacity <= static_cast<std::size_t>(hm.n_used)) return nullptr;
-                capacity = std::max<std::size_t>(hm.n_used, capacity * 3 / 4);
+                if (build_graph(*entry, static_cast<int>(capacity), quota, graph_rows)) return entry;
+                if (capacity <= static_cast<std::size_t>(minimum_capacity)) return nullptr;
+                capacity = std::max<std::size_t>(minimum_capacity, capacity * 3 / 4);
             }
         }
 
@@ -375,7 +404,7 @@ namespace tsg
 #endif
             if (total_bytes == 0 || free_bytes <= kDeviceHeadroom
                 || entry.bytes > free_bytes - kDeviceHeadroom) return Admission::refused;
-            entry.shared_charge = SharedCacheCharge::reserve(g_active_rank, 1, entry.bytes);
+            entry.shared_charge = SharedCacheCharge::reserve(g_active_rank, 4, entry.bytes);
             if (!entry.shared_charge) return Admission::refused;
 #if defined(TSG_GGML_TEST_HOOKS)
             if (test_failure(1)) return Admission::failed;
@@ -392,7 +421,9 @@ namespace tsg
             if (!ggml_gallocr_alloc_graph(entry.allocator, entry.graph)) return Admission::failed;
             const std::size_t actual = ggml_gallocr_get_buffer_size(entry.allocator, 0);
             if (actual > entry.bytes - kWorkspaceAllowance) return Admission::failed;
-            entry.bytes = actual + kWorkspaceAllowance;
+            // Keep the exact reserved charge, even if the materialized buffer is
+            // smaller than the size-only plan. The callback ticket cannot shrink;
+            // cache statistics/trim must report the same committed ownership.
             // CUDA initializes each quantized tensor's over-read tail at alloc.
             // Clear its complete payload as well: unused slots must never hold
             // stale NaNs from a prior graph allocation.
@@ -428,6 +459,51 @@ namespace tsg
             std::vector<std::pair<std::size_t, std::size_t>> pieces;
             for (int i = 0; i < 3; ++i)
                 copy_slot_part(entry, slot, expert, i, pieces);
+        }
+
+        void copy_joint_file_misses(CacheEntry& entry,
+            const std::vector<std::pair<int, int>>& misses,
+            const std::array<std::shared_ptr<ExpertFileSource>, 3>& files, std::size_t bytes)
+        {
+            // A joint union can exceed the old one-row transfer ceiling. Read
+            // bounded slices, never fall through to touching mmap weights.
+            std::size_t window = kFileReadWorkspace;
+#if defined(TSG_GGML_TEST_HOOKS)
+            window = std::min(window, g_test_file_slice_bytes.load());
+#endif
+            if (window == 0) throw std::runtime_error("Joint expert file slice limit must be positive");
+            window = std::min(bytes, window);
+            g_file_read_buffer.reserve(window);
+            struct Destination { int slot, part; std::size_t offset; };
+            std::vector<ExpertReadTask> tasks;
+            std::vector<Destination> destinations;
+            std::size_t used = 0;
+            auto flush = [&] {
+                if (tasks.empty()) return;
+                read_expert_files(tasks, [&](std::size_t i) {
+                    const auto& d = destinations[i];
+                    entry.file_read_bytes += tasks[i].bytes;
+                    ggml_backend_tensor_set_async(entry.backend, entry.weight[d.part], tasks[i].destination,
+                        static_cast<std::size_t>(d.slot) * entry.stride[d.part] + d.offset, tasks[i].bytes);
+                });
+                sync_backend(entry.backend); // source ring cannot be reused before H2D drains
+                if (g_backend_compute_failed.load(std::memory_order_acquire))
+                    throw std::runtime_error("Joint expert file upload failed");
+                tasks.clear(); destinations.clear(); used = 0;
+            };
+            for (const auto& miss : misses) for (int part = 0; part < 3; ++part) {
+                std::size_t offset = 0;
+                while (offset < entry.stride[part]) {
+                    if (used == window) flush();
+                    const auto count = std::min(entry.stride[part] - offset, window - used);
+                    tasks.push_back({files[part].get(), static_cast<std::size_t>(miss.second) * entry.stride[part] + offset,
+                        g_file_read_buffer.data() + used, count});
+                    destinations.push_back({miss.first, part, offset});
+                    used += count; offset += count;
+                }
+            }
+            flush();
+            for (const auto& miss : misses) entry.expert_for_slot[miss.first] = miss.second;
         }
 
         ggml_backend_buffer_t tensor_buffer(const ggml_tensor* tensor)
@@ -498,7 +574,8 @@ namespace tsg
         const bool device_inputs = x == nullptr && routes == nullptr;
         const bool device_output = out == nullptr;
         if (kernel_name == nullptr
-            || std::strcmp(kernel_name, "qwen4exp fused token span") != 0
+            || (std::strcmp(kernel_name, "qwen4exp fused token span") != 0
+                && std::strcmp(kernel_name, "qwen4exp arena batched decode") != 0)
             || g_backend == nullptr || !ggml_backend_is_cuda(g_backend)
             || (!device_inputs && (x == nullptr || routes == nullptr))
             || ids == nullptr || (device_output && !device_inputs)) return 0;
@@ -523,15 +600,42 @@ namespace tsg
         const bool wide_prefill = hm.seq_len > TSG_PRECISION_DECODE_COLUMNS;
         if (wide_prefill && device_inputs && !finite_device_routes(hm.weights, route_count)) return 0;
 
+        const bool joint = hm.independent_decode_rows && hm.seq_len > 1
+            && std::strcmp(kernel_name, "qwen4exp arena batched decode") == 0;
+        if (joint && device_inputs && !wide_prefill && !finite_device_routes(hm.weights, route_count)) return 0;
+        int minimum_capacity = hm.n_used;
+        if (joint) {
+            // Protect the complete routed union for the whole submission. This
+            // sorted copy only plans capacity; original route-slot order stays.
+            std::vector<std::int32_t> unique(ids, ids + route_count);
+            std::sort(unique.begin(), unique.end());
+            minimum_capacity = std::max(hm.n_used, static_cast<int>(
+                std::unique(unique.begin(), unique.end()) - unique.begin()));
+        }
+        int graph_rows = joint ? hm.seq_len : 1;
         auto found = g_entries.begin();
         while (found != g_entries.end() && !(*found)->matches(hm, g_backend)) ++found;
+        std::unique_ptr<CacheEntry> planned;
+        if (found != g_entries.end()) {
+            graph_rows = std::max(graph_rows, (*found)->graph_rows);
+            if ((*found)->graph_rows < graph_rows || (*found)->capacity < minimum_capacity) {
+                // Plan without physical allocation first. Retire the old table
+                // before growing so no duplicate weight generation is resident.
+                planned = create_entry(hm, stride, g_backend, budget / layers,
+                    hm.num_experts, graph_rows, minimum_capacity);
+                if (!planned) return 0;
+                const auto retired = (*found)->bytes;
+                g_entries.erase(found); g_reserved -= retired;
+                found = g_entries.end();
+            }
+        }
         if (found == g_entries.end())
         {
             std::unique_ptr<CacheEntry> entry;
             std::size_t maximum_capacity = static_cast<std::size_t>(hm.num_experts);
             for (;;)
             {
-                entry = create_entry(hm, stride, g_backend, budget / layers, maximum_capacity);
+                entry = planned ? std::move(planned) : create_entry(hm, stride, g_backend, budget / layers, maximum_capacity, graph_rows, minimum_capacity);
                 if (!entry) return 0;
                 while (g_reserved > budget - entry->bytes && !g_entries.empty())
                 {
@@ -542,14 +646,14 @@ namespace tsg
                 if (g_reserved > budget - entry->bytes) return 0;
                 const auto admission = allocate_entry(*entry);
                 if (admission == Admission::admitted) break;
-                if (admission == Admission::failed || entry->capacity <= hm.n_used) return 0;
+                if (admission == Admission::failed || entry->capacity <= minimum_capacity) return 0;
                 // Keep the operator's per-layer ceiling, but do not equate that
                 // ceiling with available shared credit or physical free VRAM.
                 // Smaller tables preserve the same scalar expert arithmetic and
                 // retain hot weights across calls. No payload is allocated for
                 // refused candidates, and the final candidate holds every routed
                 // expert even when all IDs are distinct.
-                maximum_capacity = std::max<std::size_t>(hm.n_used,
+                maximum_capacity = std::max<std::size_t>(minimum_capacity,
                     static_cast<std::size_t>(entry->capacity) * 3 / 4);
                 entry.reset();
             }
@@ -575,10 +679,12 @@ namespace tsg
             g_entries.splice(g_entries.begin(), g_entries, found);
         }
         auto& entry = *g_entries.front();
-        std::vector<int> remapped(hm.n_used, -1);
+        const int selected_count = joint ? static_cast<int>(route_count) : hm.n_used;
+        std::vector<int> remapped(selected_count, -1);
+        std::vector<std::int32_t> route_major_ids(selected_count);
         std::vector<std::uint8_t> protected_slots(entry.capacity, 0);
         std::vector<std::pair<int, int>> misses;
-        misses.reserve(hm.n_used);
+        misses.reserve(selected_count);
         static const int prefetch = [] {
             const char* e = std::getenv("TS_HOST_MOE_EXPERT_CACHE_PREFETCH");
             // Unset: follow observed source-read costs for this cache entry.
@@ -588,7 +694,8 @@ namespace tsg
         // Short verify blocks preserve decode rounding. Explicit wide PP also
         // replays these scalar experts, but leaves the outer batched graph
         // unchanged; it needs separate whole-model quality qualification. One
-        // allocation serves every row, with no row-count-dependent cache owner.
+        // allocation serves every row. Arena batches instead reserve a bounded
+        // N-row scratch layout and protect all selected weights until completion.
         struct DrainPendingOutput {
             ggml_backend_t backend;
             bool active = false;
@@ -601,13 +708,15 @@ namespace tsg
 #endif
             }
         } pending_output{entry.backend};
-        for (int row = 0; row < hm.seq_len; ++row)
+        const int execution_rows = joint ? hm.seq_len : 1;
+        for (int row = 0; row < hm.seq_len; row += execution_rows)
         {
             const auto* row_ids = ids + static_cast<std::size_t>(row) * hm.n_used;
-            entry.eviction_policy.observe(row_ids, hm.n_used);
+            for (int lane = 0; lane < execution_rows; ++lane)
+                entry.eviction_policy.observe(row_ids + lane * hm.n_used, hm.n_used);
             if (route_trace()) {
                 std::fprintf(stderr, "[HOSTMOE-ROUTE] layer=%d ids=", hm.layer);
-                for (int k = 0; k < hm.n_used; ++k)
+                for (int k = 0; k < selected_count; ++k)
                     std::fprintf(stderr, "%s%d", k ? "," : "", row_ids[k]);
                 std::fputc('\n', stderr);
             }
@@ -616,7 +725,7 @@ namespace tsg
             misses.clear();
             // Protect ALL hits before filling any miss, including hits later in
             // the router's order. Otherwise an early miss can evict a later hit.
-            for (int k = 0; k < hm.n_used; ++k)
+            for (int k = 0; k < selected_count; ++k)
                 for (int s = 0; s < entry.capacity; ++s)
                     if (entry.expert_for_slot[s] == row_ids[k])
                     {
@@ -625,7 +734,7 @@ namespace tsg
                         ++g_hits;
                         break;
                     }
-            for (int k = 0; k < hm.n_used; ++k)
+            for (int k = 0; k < selected_count; ++k)
             {
                 if (remapped[k] >= 0) continue;
                 // Duplicated selected IDs are legal for the helper, even though
@@ -664,7 +773,7 @@ namespace tsg
             // projection is overwritten, including interrupted uploads.
             for (const auto& miss : misses) entry.expert_for_slot[miss.first] = -1;
             std::array<std::shared_ptr<ExpertFileSource>, 3> files;
-            bool file_read = !misses.empty() && miss_bytes <= kFileReadWorkspace;
+            bool file_read = !misses.empty() && (joint || miss_bytes <= kFileReadWorkspace);
             for (int part = 0; file_read && part < 3; ++part) {
                 const auto source = g_file_sources.find(entry.source[part]);
                 if (source == g_file_sources.end()
@@ -676,11 +785,14 @@ namespace tsg
                 ggml_backend_t backend;
                 bool active;
                 ~DrainFileUploads() { if (active) sync_backend(backend); }
-            } drain{entry.backend, file_read};
+            } drain{entry.backend, true};
             if (file_read)
             {
                 ++entry.file_read_calls;
                 ++entry.prefetch_reads;
+                if (joint) {
+                    copy_joint_file_misses(entry, misses, files, miss_bytes);
+                } else {
                 g_file_read_buffer.reserve(miss_bytes);
                 std::vector<ExpertReadTask> tasks;
                 tasks.reserve(misses.size() * 3);
@@ -699,6 +811,7 @@ namespace tsg
                         static_cast<std::size_t>(misses[i].first) * entry.stride[part], task.bytes);
                     if (++copied_parts[i] == 3) entry.expert_for_slot[misses[i].first] = misses[i].second;
                 });
+                }
             }
             else if (do_prefetch)
             {
@@ -729,47 +842,52 @@ namespace tsg
             if (observe && !do_prefetch && !file_read)
                 entry.prefetch_policy.observe_upload(miss_bytes, ExpertPrefetchPolicy::Clock::now() - upload_started);
             for (const int slot : remapped) entry.last_used[slot] = ++entry.clock;
-            // Copies and compute use the backend's own stream; graph topology and
-            // addresses never change when slots are replaced or IDs are remapped.
-            if (device_inputs)
-            {
-                copy_device_row(entry.backend, hm.moe_in, entry.input,
+            // Exact active width, including when a prior larger batch grew this
+            // cache. Input/routes/output each use one contiguous bridge; only
+            // the small already-host-resident slot IDs need route transposition.
+            const int variant = execution_rows - 1;
+            for (int k = 0; k < entry.n_used; ++k)
+                for (int lane = 0; lane < execution_rows; ++lane)
+                    route_major_ids[k * execution_rows + lane] = remapped[lane * entry.n_used + k];
+            if (device_inputs) {
+                copy_device_row(entry.backend, hm.moe_in, entry.width_inputs[variant],
                     static_cast<std::size_t>(row) * entry.hidden * sizeof(float));
-                copy_device_row(entry.backend, hm.weights, entry.routes,
+                copy_device_row(entry.backend, hm.weights, entry.width_routes[variant],
                     static_cast<std::size_t>(row) * entry.n_used * sizeof(float));
-            }
-            else
-            {
-                ggml_backend_tensor_set_async(entry.backend, entry.input,
+            } else {
+                ggml_backend_tensor_set_async(entry.backend, entry.width_inputs[variant],
                     x + static_cast<std::size_t>(row) * hm.hidden, 0,
-                    static_cast<std::size_t>(entry.hidden) * sizeof(float));
-                ggml_backend_tensor_set_async(entry.backend, entry.routes,
+                    static_cast<std::size_t>(entry.hidden) * execution_rows * sizeof(float));
+                ggml_backend_tensor_set_async(entry.backend, entry.width_routes[variant],
                     routes + static_cast<std::size_t>(row) * hm.n_used, 0,
-                    static_cast<std::size_t>(entry.n_used) * sizeof(float));
+                    static_cast<std::size_t>(entry.n_used) * execution_rows * sizeof(float));
             }
-            ggml_backend_tensor_set_async(entry.backend, entry.ids, remapped.data(), 0,
-                static_cast<std::size_t>(entry.n_used) * sizeof(std::int32_t));
-            if (compute_graph(entry.backend, entry.graph) != GGML_STATUS_SUCCESS
-                || g_backend_compute_failed.load(std::memory_order_acquire))
-            {
+            ggml_backend_tensor_set_async(entry.backend, entry.width_ids[variant],
+                route_major_ids.data(), 0, static_cast<std::size_t>(selected_count) * sizeof(std::int32_t));
+            auto* execute = &entry.width_graphs[variant];
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (joint && test_failure(6)) throw std::runtime_error("Injected joint cache failure after queued inputs");
+#endif
+            ++g_graph_submissions;
+            if (joint) { ++g_joint_submissions; g_joint_rows += execution_rows; }
+            if (compute_graph(entry.backend, execute) != GGML_STATUS_SUCCESS
+                || g_backend_compute_failed.load(std::memory_order_acquire)) {
                 set_last_error("qwen4exp expert cache: CUDA expert graph failed.");
                 return -1;
             }
-            drain.active = false; // compute_graph synchronized the preceding uploads.
-            if (device_output)
-            {
-                copy_device_row(entry.backend, entry.output, hm.moe_out,
+            drain.active = false; // graph_compute drained all preceding uploads.
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (joint && test_failure(7)) throw std::runtime_error("Injected joint cache failure before publishing output");
+#endif
+            if (device_output) {
+                copy_device_row(entry.backend, entry.width_outputs[variant], hm.moe_out,
                     static_cast<std::size_t>(row) * entry.hidden * sizeof(float), true);
-                // A later row may fail before its compute drains this copy.
-                // Error/exception exits must not let the caller free moe_out
-                // while a queued copy still references it. Success retains the
-                // existing same-stream asynchronous handoff to the next graph.
-                pending_output.active = wide_prefill;
-            }
-            else
-                ggml_backend_tensor_get(entry.output, out + static_cast<std::size_t>(row) * hm.hidden,
-                    0, static_cast<std::size_t>(entry.hidden) * sizeof(float));
-            ++g_calls;
+                pending_output.active = wide_prefill || joint;
+            } else
+                ggml_backend_tensor_get(entry.width_outputs[variant], out + static_cast<std::size_t>(row) * hm.hidden,
+                    0, static_cast<std::size_t>(entry.hidden) * execution_rows * sizeof(float));
+            g_calls += execution_rows;
+
 #if defined(TSG_GGML_TEST_HOOKS)
             if (wide_prefill && test_failure(4))
                 throw std::runtime_error("Injected wide expert-cache failure after a completed row");
@@ -817,6 +935,7 @@ namespace tsg
         g_file_read_buffer.clear();
         g_reserved = 0;
         g_hits = g_misses = g_calls = 0;
+        g_graph_submissions = g_joint_submissions = g_joint_rows = 0;
     }
 
     // Caller holds g_cache_mutex. Scope updates also enforce the per-layer
@@ -890,6 +1009,7 @@ namespace tsg
     // Linked only into the standalone cache fixture, never a production export.
     void host_moe_expert_cache_test_fail_next(int stage) { g_test_failure_stage.store(stage); }
     std::size_t host_moe_expert_cache_test_physical_bytes() { return g_test_physical_bytes.load(); }
+    void host_moe_expert_cache_test_file_slice_limit(std::size_t bytes) { g_test_file_slice_bytes.store(bytes); }
     std::size_t host_moe_expert_cache_test_file_workspace_bytes() { return g_file_read_buffer.size(); }
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes) { g_test_available_bytes.store(bytes); }
     std::uint64_t host_moe_expert_cache_test_output_drains() { return g_test_completed_output_drains.load(); }
@@ -948,11 +1068,31 @@ TSG_EXPORT int TSGgml_RegisterHostFileSource(const void* pointer, std::int64_t b
     }
 }
 
+TSG_EXPORT int TSGgml_HostMoeExpertCacheBudgetKind()
+{
+    // Lets managed session envelopes fail closed with an older native library.
+    return 4;
+}
+
 TSG_EXPORT int TSGgml_HostMoeExpertCacheStats(std::int64_t* reserved, std::int64_t* budget,
     std::int64_t* hits, std::int64_t* misses, std::int64_t* calls)
 {
     if (!reserved || !budget || !hits || !misses || !calls) return 0;
     tsg::host_moe_expert_cache_stats(reserved, budget, hits, misses, calls);
+    return 1;
+}
+
+// Counts are submission attempts, not successful publications. A joint graph
+// uses three route-major N-request MUL_MAT_ID operators with scalar dot order;
+// weighted reduction is also N-request. Ordinary PP retains its scalar loop.
+TSG_EXPORT int TSGgml_HostMoeExpertCacheExecutionStats(std::uint64_t* submissions,
+    std::uint64_t* joint_submissions, std::uint64_t* joint_rows)
+{
+    if (!submissions || !joint_submissions || !joint_rows) return 0;
+    std::lock_guard<std::mutex> lock(tsg::g_cache_mutex);
+    *submissions = tsg::g_graph_submissions;
+    *joint_submissions = tsg::g_joint_submissions;
+    *joint_rows = tsg::g_joint_rows;
     return 1;
 }
 

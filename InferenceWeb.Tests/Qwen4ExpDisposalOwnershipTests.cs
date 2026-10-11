@@ -57,6 +57,21 @@ public sealed class Qwen4ExpDisposalOwnershipTests
         f.AssertReleased();
     }
 
+    [Fact]
+    public void ModelDisposalReleasesUnpublishedCopyRetryOwner()
+    {
+        using var f = new Fixture();
+        var holderType = typeof(Qwen4ExpModel).GetNestedType("Qwen4ExpKvCacheHolder", BindingFlags.NonPublic)!;
+        var holder = Activator.CreateInstance(holderType, nonPublic: true)!;
+        holderType.GetField("K")!.SetValue(holder, new[] { f.Tensor() });
+        // Represents a failed copy/publication whose cleanup owner was retained.
+        f.Set("_pendingHolderAllocation", holder);
+        Assert.Same(holder, typeof(Qwen4ExpModel).GetField("_pendingHolderAllocation", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(f.Model));
+        Assert.Equal(1, f.Scope.Usage.Allocations);
+        f.Model.Dispose();
+        f.AssertReleased();
+    }
+
     private sealed class Fixture : IDisposable
     {
         private readonly MemoryBudget _budget = new([new("ram", 8L << 20)]);
