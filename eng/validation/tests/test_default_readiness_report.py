@@ -41,6 +41,39 @@ class AuditSummaryCollectionTests(unittest.TestCase):
             self.assertEqual(3, len(sources))
             self.assertIn('failed', [row[1] for row in rows])
 
+    def test_unindexed_display_rows_must_be_a_list_when_present(self):
+        for value in (None, {}, 'rows', 1, True):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write(root, 'case-summary.json', dict(display_rows=value))
+                with self.assertRaisesRegex(ValueError, 'malformed display_rows: case-summary.json'):
+                    REPORT.collected_audit_summaries(root)
+
+    def test_unindexed_bad_row_cannot_be_silently_dropped_from_valid_rows(self):
+        valid = self.summary()['display_rows'][0]
+        malformed = [None, [], 'row']
+        for field in valid:
+            missing = dict(valid); missing.pop(field)
+            malformed.extend((missing, {**valid, field: None}, {**valid, field: True}))
+        for bad in malformed:
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write(root, 'nested/summary.json', dict(display_rows=[valid, bad]))
+                with self.assertRaisesRegex(ValueError, 'malformed display_rows: nested/summary.json'):
+                    REPORT.collected_audit_summaries(root)
+
+    def test_unindexed_absent_or_empty_display_rows_remain_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write(root, 'absent-summary.json', dict(passed=True))
+            self.write(root, 'empty-summary.json', dict(display_rows=[]))
+            self.write(root, 'valid-summary.json', self.summary('failed'))
+            rows, history, sources = REPORT.collected_audit_summaries(root)
+            self.assertEqual(1, len(rows))
+            self.assertEqual('failed', rows[0][1])
+            self.assertFalse(history)
+            self.assertEqual([root / 'valid-summary.json'], sources)
+
     def test_explicit_current_is_shown_once_and_old_failure_stays_visible(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -77,6 +110,42 @@ class AuditSummaryCollectionTests(unittest.TestCase):
             self.assertEqual('passed', rows[0][1])
             self.assertIn('"exit_code": 1', history[0][3])
             self.assertIn('UnicodeEncodeError', history[0][5])
+
+    def test_malformed_summary_is_explicit_history_without_partial_display(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            current = self.write(root, 'case-summary-v2.json', self.summary())
+            malformed = self.summary()
+            malformed['display_rows'].append(dict(malformed['display_rows'][0]))
+            malformed['display_rows'][1].pop('resources')
+            old = self.write(root, 'case-summary.json', malformed, kind='malformed_summary',
+                             reason='Display metadata repaired; original run unchanged')
+            self.index(root, current, [old])
+            rows, history, sources = REPORT.collected_audit_summaries(root)
+            self.assertEqual(1, len(rows))
+            self.assertEqual(1, len(history))
+            self.assertIn('"passed": true', history[0][3])
+            self.assertIn('原始 display_rows 格式错误', history[0][5])
+            self.assertIn('不计为新增模型执行或模型质量失败', history[0][5])
+            self.assertIn(root / old['path'], sources)
+
+    def test_malformed_summary_cannot_be_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = self.summary(); malformed['display_rows'][0].pop('resources')
+            current = self.write(root, 'case-summary.json', malformed, kind='malformed_summary')
+            self.index(root, current, [])
+            with self.assertRaises(ValueError): REPORT.collected_audit_summaries(root)
+
+    def test_malformed_history_kind_requires_an_actually_invalid_display_field(self):
+        for data in (self.summary(), dict(display_rows=[]), dict(passed=True), []):
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                current = self.write(root, 'case-summary-v2.json', self.summary())
+                old = self.write(root, 'case-summary.json', data, kind='malformed_summary',
+                                 reason='Must not bypass the ordinary summary schema')
+                self.index(root, current, [old])
+                with self.assertRaises(ValueError): REPORT.collected_audit_summaries(root)
 
     def test_missing_or_changed_selected_evidence_fails_closed(self):
         for change in ('missing', 'changed'):

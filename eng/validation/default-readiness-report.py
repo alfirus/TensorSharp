@@ -90,12 +90,16 @@ def collected_audit_summaries(root):
                     or hashlib.sha256(path.read_bytes()).hexdigest() != digest.lower()):
                 raise ValueError('Audit index evidence hash differs: ' + record['path'])
             kind = record.get('kind')
-            if kind not in ('summary', 'terminal') or (expected_kind and kind != expected_kind):
+            if kind not in ('summary', 'terminal', 'malformed_summary') or (expected_kind and kind != expected_kind):
                 raise ValueError('Unsupported audit index evidence kind')
             data = read(path)
             rows = recorded_display_rows(data)
+            malformed_display = (isinstance(data, dict) and 'display_rows' in data
+                and (not isinstance(data['display_rows'], list)
+                     or len(rows) != len(data['display_rows'])))
             if (not isinstance(data, dict) or (kind == 'summary'
                     and (not rows or len(rows) != len(data['display_rows'])))
+                    or (kind == 'malformed_summary' and not malformed_display)
                     or (kind == 'terminal' and (type(data.get('exit_code')) is not int
                         or not isinstance(data.get('stage'), str)))):
                 raise ValueError('Audit index evidence does not match its declared schema: ' + record['path'])
@@ -118,13 +122,22 @@ def collected_audit_summaries(root):
                 # failure whose underlying model/soak did not run again.
                 status = {k: data[k] for k in ('passed', 'status', 'exit_code') if k in data}
                 detail = {k: data[k] for k in ('errors', 'error', 'stage', 'scope') if k in data}
+                if prior['kind'] == 'malformed_summary':
+                    detail['audit_schema_error'] = (
+                        '原始 display_rows 格式错误；此历史项沿用所关联的底层运行证据，'
+                        '不计为新增模型执行或模型质量失败。')
                 history.append([group['id'], current.relative_to(root).as_posix(),
                                 path.relative_to(root).as_posix(), json.dumps(status, ensure_ascii=False),
                                 prior['reason'], json.dumps(detail, ensure_ascii=False)])
     for path in sorted(paths):
         if path.resolve() in indexed:
             continue
-        rows = recorded_display_rows(read(path))
+        data = read(path)
+        rows = recorded_display_rows(data)
+        if (isinstance(data, dict) and 'display_rows' in data
+                and (not isinstance(data['display_rows'], list)
+                     or len(rows) != len(data['display_rows']))):
+            raise ValueError('Audit summary has malformed display_rows: ' + path.relative_to(root).as_posix())
         if rows:
             selected[path] = rows
             sources.append(path)
