@@ -42,6 +42,20 @@ class MemoryCgroupPureTests(unittest.TestCase):
         self.assertEqual(['echo', '42'], args.command)
         self.assertEqual(2, args.timeout)
 
+    def test_first_signal_latches_before_error_reporting_and_repeats_do_not_raise(self):
+        report = {}
+        handler = CGROUP.interrupt_once(report, 'test supervisor')
+        try:
+            handler(signal.SIGTERM, None)
+            self.fail('First cancellation did not interrupt')
+        except InterruptedError as error:
+            # Reproduce the second signal arriving during exception formatting.
+            handler(signal.SIGINT, None)
+            message = str(error)
+        self.assertEqual(signal.SIGTERM, report['interrupted_signal'])
+        self.assertIn('received signal', message)
+        handler(signal.SIGTERM, None)
+
     def test_nonfinite_and_nonpositive_deadlines_rejected(self):
         for value in ('nan', 'inf', '-inf', '0', '-1'):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -174,6 +188,7 @@ raise SystemExit(0 if r['passed'] else 1)
                 code, report = self.run_case('import time;time.sleep(60)', send_signal=number)
                 self.assertEqual(1, code); self.assertFalse(report['passed'])
                 self.assertTrue(any('signal' in error for error in report['errors']))
+                self.assertIn(report['interrupted_signal'], (number, signal.SIGHUP))
 
     def test_sampling_exception_reaps_real_owned_process(self):
         code, report = self.run_case('import time;time.sleep(60)', sample_failure=True)

@@ -127,6 +127,16 @@ def remove_empty_owned_group(group, report, wait_seconds=10):
         report['owned_cgroup_removed'] = False
 
 
+def interrupt_once(report, context):
+    """Publish cancellation before raising; repeated signals cannot break its log."""
+    def interrupted(number, _frame):
+        if 'interrupted_signal' in report:
+            return
+        report['interrupted_signal'] = number
+        raise InterruptedError(f'{context} received signal {number}.')
+    return interrupted
+
+
 def supervise_owned(command, output, timeout, enter_group, sample, group=None):
     """Linux process supervision, invoked only after main has enforced limits.
 
@@ -138,8 +148,7 @@ def supervise_owned(command, output, timeout, enter_group, sample, group=None):
                   live_group_members_after_kill=None)
     child = None
     handled = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-    def interrupted(number, _frame):
-        raise InterruptedError(f'Validation supervisor received signal {number}.')
+    interrupted = interrupt_once(report, 'Validation supervisor')
     previous = {number: signal.signal(number, interrupted) for number in handled}
     started = time.monotonic()
     try:
@@ -191,6 +200,7 @@ def supervise_owned(command, output, timeout, enter_group, sample, group=None):
                 remove_empty_owned_group(group, report)
             report['seconds'] = time.monotonic() - started
             report['passed'] = (report.get('exit_code_before_cleanup') == 0 and not report['timed_out']
+                and 'interrupted_signal' not in report
                 and not report['errors'] and not report['cleanup_errors']
                 and not report.get('stray_live_descendants_before_cleanup')
                 and report['live_group_members_after_kill'] == []
@@ -217,8 +227,7 @@ def main(argv=None):
     try:
         if sys.platform != 'linux' or not hasattr(os, 'WNOWAIT'):
             raise RuntimeError('A delegated Linux memory cgroup and waitid(WNOWAIT) are required.')
-        def interrupted(number, _frame):
-            raise InterruptedError(f'Cgroup setup received signal {number}.')
+        interrupted = interrupt_once(report, 'Cgroup setup')
         previous = {number: signal.signal(number, interrupted)
                     for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
         parent = args.cgroup_parent.resolve(strict=True)
