@@ -4,6 +4,9 @@
 # corrupts every other line, which silently broke the GGML native build and
 # the CUDA arch-detection fallback.
 *.sh text eol=lf
+# The serialized DeepSeek capture verifies this exact audited comparator source
+# byte hash before importing it. Preserve its audited Git-blob bytes on Windows.
+eng/validation/compare-deepseek-teacher-logits.py text eol=lf
 # Localization tables have a canonical LF format verified by the app's tests.
 TensorAgent/src/TensorAgent.Core/Localization/**/*.json text eol=lf
 TensorAgent/src/TensorAgent.Sharing/Localization/**/*.json text eol=lf

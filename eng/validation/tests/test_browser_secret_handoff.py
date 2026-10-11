@@ -111,9 +111,9 @@ class SecretHandoffTests(unittest.TestCase):
         self.assertEqual("submitted", self.server.status)
         self.assertTrue(self.server.done.wait(1))
         argv, options = self.calls[0]
-        self.assertEqual(["/absolute/node", "/absolute/cli.js", "--session", "existing-session", "run-code"], argv[:5])
-        self.assertEqual("/absolute/workspace", options["cwd"])
-        self.assertEqual("/absolute/daemon", options["env"]["PWTEST_DAEMON_SESSION_DIR"])
+        self.assertEqual([str(self.config.node), str(self.config.cli), "--session", "existing-session", "run-code"], argv[:5])
+        self.assertEqual(str(self.config.cwd), options["cwd"])
+        self.assertEqual(str(self.config.daemon_session_dir), options["env"]["PWTEST_DAEMON_SESSION_DIR"])
         self.assertEqual(os.environ.get("HOME"), options["env"].get("HOME"))
         self.assertEqual(subprocess.DEVNULL, options["stdout"])
         self.assertEqual(subprocess.DEVNULL, options["stderr"])
