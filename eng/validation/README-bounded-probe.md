@@ -100,3 +100,19 @@ memory samples and failures are retained separately. It never renders a chat
 template, adds a schema, strips Markdown fences, or retries a failed model run.
 The default five-minute deadline may be too short for some large checkpoints;
 such a run remains a timeout, not a passing model-quality result.
+
+`qwen38-prefix-logits.py --plan <reviewed-plan.json> --output <fresh-evidence-dir>
+--timeout 300` is a separate full-distribution diagnostic. It runs two pinned
+TensorSharp processes (cache 0 and 8192 MiB), each consuming the original prompt
+once and one teacher-forced scalar token, then one owned llama server requesting
+two predictions on that original prompt. The first llama token must equal the
+supplied scalar; an enlarged prompt is never substituted. `--prepare-only` checks
+the plan without starting model processes. Every completed TS capture must prove
+its exact histories, full vocabulary, loaded identities and native cleanup. The
+llama response must contain both complete, unique, finite, unclipped pre-sampling
+distributions and the original CPU sampler. Its normalized log probabilities are
+stored explicitly as F64 values and compared after subtracting a common token's
+value; they are not raw logits. A two-token length stop completes this diagnostic
+only, with no EOS, semantic, arithmetic-equivalence or throughput pass. The raw
+quality runner's strict EOS and JSON gates remain unchanged. Capture HTTP bytes,
+partial failures, pins, deadlines and owned-process cleanup remain in the report.
