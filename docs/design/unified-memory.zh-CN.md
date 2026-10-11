@@ -8,6 +8,8 @@
 
 本次已经构建可运行的调度基础库、RAM/文件搬运与状态回写、请求预算、GGUF 分片目录、CUDA 分配适配器，并将 Qwen4Exp 原有放置算法抽出后接回原路径。文件权重执行现已显式接入 dense Qwen 3.5 的 Q8_0 和 dense Gemma4 的 Q8_0/F16 PLE，两者均限定单 rank GGML CUDA、文本、无 MTP/draft。Qwen 0.8B 的完整 logits 与重复释放验收已通过；Gemma E4B 的短提示诊断、645-token 长提示 Forward/分块 ForwardRefill、后续 decode 和各两次加载均与原常驻路径逐位一致。Gemma 为保持原 CUDA 归约和融合语义，部分投影需要完整逻辑矩阵的临时设备工作区，不能沿用 Qwen 的极小配额结论。具体预算、上下文和硬件范围见第 6、14 节。**尚未完成全部模型的原生执行图、KV 和媒体流水线接入；不能把本次实现描述为“所有模型已自动支持三层调度”。** CLI、Server、TensorAgent 的公共引擎已可通过环境变量启用有预算的主机 KV 快照换页，但没有一个开关可以开启完整的全模型三层调度。
 
+Server 现有一个默认关闭的 `--unified-memory` 专用入口：限定 Qwen3.8 Flash Next / `qwen4exp`、单 GGML CUDA 设备和匹配图像 projector，接入共享分配预算与串行请求准入；它不代表全模型三层调度已完成。可运行命令、开启/关闭项及硬限边界见[第 15 节](#15-后续实际接入与硬件验证入口)。
+
 | 范围 | 本次状态 |
 | --- | --- |
 | 模型无关预算、驻留目录、租约、版本、LRU、固定搬运缓冲 | 已实现并测试 |
@@ -3319,6 +3321,76 @@ text/vision encode 3.353 s、denoise 15.402 s、VAE 2.816 s，峰值 RSS 7.748 G
 
 ## 15. 后续实际接入与硬件验证入口
 
+### 15.1 Server：显式启用 Qwen3.8 Flash Next 统一内存会话
+
+`TensorSharp.Server.Host` 新增 `--unified-memory`，**默认关闭**。当前入口限定 GGUF 架构为 `qwen4exp` 的 Qwen3.8 Flash Next、单个 `ggml_cuda` 设备，以及可选的匹配图像 projector。它接入 `UnifiedMemoryModelSession` 的共享分配预算和请求准入，尚不是所有模型、后端和任务的通用三层调度开关。省略该参数仍走普通模型加载路径；普通路径已有的图优化或独立缓存不等于启用了这个会话。
+
+在仓库根目录的 PowerShell 中运行以下命令；三个 GGUF 分片须保留在同一目录，只将第一片传给 `--model`。统一内存模式在未指定 `--max-tokens` / `MAX_TOKENS`、且请求也未指定输出长度时，默认最多生成 2048 tokens；普通模式的回退仍为 20000。这个 2048 是未锁定的回退，客户端可显式请求更长输出，随后仍须通过上下文和内存准入。显式 `--max-tokens` 或 `MAX_TOKENS` 则沿用原有服务端上限语义，较长请求会被截到该上限，较短请求保持原值；CLI 优先于环境变量。下面的示例使用未锁定的默认值；如需固定服务端输出上限，可额外设置 `--max-tokens 1024`，请求峰值估算也会采用该上限。
+
+```powershell
+dotnet run --project .\TensorSharp.Server.Host\TensorSharp.Server.Host.csproj -c Release -- `
+  --model "C:\Works\models\Qwen3.8-Flash-Next-GGUF\Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf" `
+  --mmproj "C:\Works\models\Qwen3.8-Flash-Next-GGUF\mmproj-BF16.gguf" `
+  --backend ggml_cuda --unified-memory
+```
+
+文本使用可省略 `--mmproj`；图像请求需要匹配的 projector。使用发布目录时，将 `dotnet run ... --` 换成 `dotnet TensorSharp.Server.Host.dll`，后续参数相同，并保证托管程序集和 `GgmlOps` 来自匹配的构建。Linux CUDA 的参数形式相同，但本轮新增的 POSIX 文件读取与 CPU 暂存路径仍须以对应原生构建和实测单独验收，不能只替换路径就视为已经通过；此入口目前不支持 CPU、Metal、MLX 或 Vulkan，也不能将 CUDA 实测推广为 Apple 真机验收。
+
+**不需要额外设置环境变量来打开共享预算或专家缓存。** 会话根据模型元数据、可用 RAM/提交额度、可用 VRAM、保留余量，以及请求的上下文、prefill 和状态峰值规划资源。未设置 `MAX_CONTEXT` 时，上下文上限取模型声明值与 32768 的较小值；请求的展开后提示加最大输出仍须适合该上限。每个请求在实际执行前重新检查容量，必要时缩小或回收可选缓存，预算不能满足时明确拒绝。
+
+| 功能 | 此入口的行为与原因 |
+| --- | --- |
+| 共享分配计账与请求准入 | 开启。已接线的主机 payload、原生权重绑定、图/状态 buffer 和专家读取暂存使用共同的 RAM/设备账本，先预留再分配，物理释放后归还。保留 RAM/提交额度和 VRAM 余量，并在请求边界检查，而不是每 token 采样硬件。 |
+| 专家放置与选中专家 CUDA 缓存 | 统一会话让所有 routed expert 层经过主机入口，按路由和执行形状使用受配额约束的 CUDA 专家缓存、下述逐层 CUDA 文件流或 CPU 执行，不再保留另一个未纳入请求估算的整层 GPU 专家副本。按模型层数、量化和专家几何自动规划可选缓存，不预先分配整个额度；不足全层最低可执行工作集时保持零配额，压力消退后恢复也须满足该下限。无需设置 `TS_HOST_MOE_EXPERT_CACHE_MB` 或 `TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS`。普通加载路径的放置策略和默认值保持不变。 |
+| Prefill 执行形状 | 此显式入口默认按 512 tokens 分块，选中专家 CUDA 缓存的默认行上限调整为 32，避免较长尾块逐行重复执行；实际取值以该构建的启动日志为准。已完成下述实模 A/B 和 EXE HTTP 验收，但性能仍未达到普通路径基线。缓存 helper 的接口最大行上限仍为 128，并保留 `rows × selectedExperts <= 4096` 等布局/算术守卫。默认超过 32 行的 prefill 可走下述独立 CUDA 文件流，这与原缓存 helper 的最大能力是两个边界。 |
+| 宽 prefill CUDA 文件流 | 默认文件流门槛为 32 行；缓存未承接且达到该门槛的批次，在单 CUDA、受支持的无 bias SwiGLU 形状、每行路由专家互不重复且图预算允许时，读取本批实际选中的专家，紧凑排列专家轴并保留 token、路由槽及归并顺序，再沿用宽 batch CUDA 图计算。显式 `TS_HOST_MOE_DEVICE_MIN_BATCH` 仍优先，包含 `0` 关闭设备流、保留有界 CPU 路径的诊断行为，无需设置它才能启用默认策略。独立图 arena 先取得真实设备额度，避免重规划仍在执行的外层图 arena；主机文件暂存与设备图分别归属 RAM/设备账本。图额度拒绝时，仅在尚未上传或计算之前重建有界 CPU 图；重复路由直接走有界 CPU，保留重复槽的原算术。上传、读取或计算失败均报告原错误，等待已提交工作完成后清理，不在部分执行后静默换路径。请求边界回收会释放此独立 arena。 |
+| 有界专家文件读取与暂存 | 统一会话始终注册受支持权重的精确文件范围，包括 CUDA 专家缓存配额为零的情况，不再以正缓存配额或专家总量大于可用 RAM 为条件。CUDA 文件流和 CPU 回退均使用有界文件暂存；单 token CPU decode 保留原专用算术，批量执行只紧凑存放选中专家并重映射对应 ID，不重排路由槽。主机专家暂存、CPU 图张量和计算工作区按实际分配计入 RAM 账本；主机额度拒绝后不得静默改为不受限 mmap 触页。无需额外环境设置，`TS_HOST_MOE_FILE_READ=0` 与此会话冲突并明确拒绝。此机制不等于控制 OS 页缓存或提供异步 CUDA DMA 流水线。 |
+| 模型融合内核 | 保留受支持的模型融合计算；关闭的是尚未纳入此请求峰值契约的多请求 batched/独立 holder 路径，并非关闭全部 GPU 融合。 |
+| 多请求执行 | 可接收并排队多个请求，**同一时刻仅一个生成请求执行**。当前适配器依靠单个主缓存和串行分配 envelope；这不是多请求真正并行执行的验收。 |
+| 前缀缓存与启动预热 | 前缀保留、磁盘 checkpoint 和前缀预热关闭。直接调用 `Forward/ForwardRefill` 的内核预热也跳过，由首个已准入请求初始化内核与缓存，避免启动时绕过请求预算；首请求延迟因此包含这部分初始化。 |
+| 主机 KV 换页 | 关闭。Qwen4Exp 的混合 attention/循环状态尚无完整、可恢复的主机块快照适配；不能只搬运 attention KV 就宣称支持 RAM/SSD 换页。 |
+| MTP、draft、TP/层切分 | 拒绝启用；其额外模型、状态与多设备生命周期尚未通过本入口的请求峰值和共享预算验收。 |
+| 图像、视频、音频 | 匹配 projector 的图像准备进入独立的预算准入；视频/音频准备没有此入口的适配，明确拒绝。图像接线完成不等于所有尺寸、多图和任务均已验收。 |
+
+如果当前终端继承了旧实验的 MTP/draft、TP/层切分、手工 CPU MoE 放置、`TS_HOST_MOE_FILE_READ=0`，或下节的 `TS_SCHED_KV_*` 快照配置，应先清除冲突配置；会话不会静默忽略这些要求或退回普通加载。启动日志的 `[unified-memory]` 段列出实际上下文、prefill、RAM/CUDA 分配上限、专家缓存额度及开启/关闭项；`Kernel warmup deferred (--unified-memory)` 表明首请求负责受预算约束的初始化。`GET /api/models` 返回的 `unifiedMemory` 布尔字段在此开关开启且模型已加载时为 `true`，可用于确认当前加载模式；它不是完整资源归属或物理硬限的验收标记。加载、请求或释放失败应保留原错误；未完成释放的会话仍持有预算作用域，清理成功后才能替换模型。
+
+这里的限额是**已接线分配的配额**。GGUF mmap/OS 页缓存、GC、第三方库与驱动池尚未获得完整物理归属，仍依赖观测与保留余量；它不是进程总 RSS、系统提交量或整张 GPU 的操作系统硬限，也不会自动安装 Windows Job、Linux cgroup 或 Apple 等价硬限。权重按需读取不等于 KV 已换页到 SSD。默认仍关闭；下述有限请求结果不能替代更广的图像、冷启动、压力释放及完整物理归属验收。
+
+本轮 v11 托管代码已完成 41 项 CPU 接线/生命周期检查。最终原生 v9 在 `TESTS=OFF`、无测试 hook 的 DLL 上完成 **6/6 个 public-API 验证进程**；两种量化组合在 32、33、37、77、100、127、128、129、257、512、513 行共 **22 个 CUDA 结果与独立完整专家 CUDA 参考位级一致**，并验证 B31 CPU、显式阈值 0/128、额度拒绝、重复路由、复用和 trim 后账本归零。此前 v7 的 12 个带故障 hook 的进程是单独的历史证据，未将故障注入冒充 v9 新 DLL 的重复实测。实现均位于 TensorSharp 自有代码；ggml 上游 `ffa4e8b80930029a35991f94e7c8a93cd67730ab` 保持干净，未打补丁。
+
+**本机最终 v12 ON/OFF 对照已完成，但不是整体通过。** 两臂均使用同一组托管/原生程序集、同一 Qwen3.8 Flash Next UD-IQ1_M 三分片与 BF16 projector，实际加载 native SHA256 为 `E123DC86F822392B4F6CCB0610E9F4A9F8978C81723DB4F917389D4EC655EFDE`，Models 为 `FB839BF392EEB12FD08C25C6D070DC120671D371C202707D261F310A7AE4319B`。ON 开启统一会话；OFF 使用普通加载，并以 `TS_HOST_MOE_EXPERT_CACHE_MB=0` 固定普通专家缓存为零。共同设置为 `MAX_CONTEXT=2048`、F16 KV、CPU/OMP 各 8 线程、greedy、seed 17、关闭 prefix/spec/multi-agent，且 `TS_HOST_MOE_TIMING=1`。每题独立请求 3 次、输出上限 192；以下热态吞吐是每题后两次的中位数，单位 tokens/s。
+
+| 任务（提示/输出 tokens） | OFF 质量 | ON 质量 | OFF PP | ON PP | OFF TG | ON TG |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Python square（31/11） | 3/3 | 3/3 | 21.58 | 19.73 | 11.66 | 12.10 |
+| 平方数列（37/87） | 3/3 | 3/3 | 21.79 | 17.12 | 13.46 | 16.62 |
+| 较长文本提取（612/4） | 3/3 | 3/3 | 191.85 | 45.94 | 10.58 | 13.28 |
+| 图片 OCR（331/5） | 3/3 | 3/3 | 58.70 | 32.89 | 7.60 | 22.17 |
+| 无 schema 的原始工具 JSON（77/45） | 0/3 | 0/3 | 21.06 | 16.76 | 13.62 | 9.33 |
+
+原始工具 JSON 两臂三次均输出 Markdown 围栏，因此严格 JSON 检查均失败，未剥除围栏或降低门槛；两份报告保留 `run_complete=true, passed=false`。独立的 JSON schema 请求在两臂各 1/1 通过，工具调用与注入回执的 roundtrip 在流式、非流式各 1/1 通过；它们是不同协议场景，不能替代原始 JSON 的失败，也不是多智能体验收。
+
+**预填充差距仍未解决**：612-token 提取的热态 PP 从普通路径 191.85 降至统一路径 45.94 tokens/s，普通路径约快 **4.17 倍**，统一路径吞吐低约 76.1%。TG 随任务变化；平方数列、提取和 OCR 较快，但原始 JSON 从 13.62 降至 9.33 tokens/s。不能以部分 decode 改善宣称与基线达到整体性能一致。尤其 OCR/提取仅生成 5/4 个 token，TG 包含最后 EOS 计算，样本较短，不能外推为长文本解码性能；OFF OCR 的两次热态 PP 为 41.58/75.83，波动也须保留。
+
+| 本轮进程观测 | OFF 普通路径 | ON 统一会话 |
+| --- | ---: | ---: |
+| 启动至就绪（秒） | 30.375 | 8.453 |
+| 采样进程 RSS 峰值（GiB） | 22.612 | 7.293 |
+| 采样进程 private bytes 峰值（GiB） | 18.022 | 15.526 |
+| 采样整卡显存峰值（MiB） | 15722 | 12143 |
+
+ON 跳过启动内核预热并由首个准入请求初始化，OFF 保留启动预热，因此启动数字不能单独代表完整冷启动成本。这里只各运行一个独立进程、按固定题序采样；仅进程的第一题是进程首次请求，各题首次也可能已受前题预热。模型校验会影响 OS 缓存，**不是冷 SSD 基准**。PP 时长仅计模型 forward，不含图像编码、渲染和排队；TG 按 API 的已输出 token 数/包含 EOS 的解码时长计算，不是固定 token 内核基准。RSS/private/整卡显存峰值发生时刻不保证相同，整卡显存包含桌面等其他占用，进程 I/O 也不等于物理 SSD 读取；本轮没有施加相同的物理 RAM/VRAM 硬限，不能把这些峰值当作等预算或完整物理归属证明。两个服务进程由 harness 结束，记录 `server_exit=1`，也不作为正常退出清账的验证。
+
+按原始 `TensorSharp.Server.Host.exe` 命令，仅额外指定回环地址和测试端口的 **v11 HTTP 验收已通过**。保留默认多智能体配置、默认上下文上限 32768 与未锁定的默认输出 2048；七项回答（不指定输出长度、文本、图片 OCR、两个同时提交的客户端、取消后恢复、重载后文本）全部正确，并由同 RequestId 的服务端日志确认自然 EOS。流式请求在第三个非空内容事件后断开，服务端确认取消，队列清空，后续请求成功。同模型 reload 保留 projector、统一会话及默认配置，并将引擎计数重置；这是生命周期功能证据，不是独立测得所有物理账本归零。图片 OCR 在重载前执行，重载后检查 visionReady/projector 配置与文本，不将其写成重载后再次图片验收。默认 32768 上限不代表实际跑过 32K 输入；客户端请求重叠不代表 GPU 并行执行。
+
+v11 使用与 v12 A/B 相同的 14 个程序集及原生 DLL，启动前后校验身份、实际加载路径和空的相关环境覆盖，测试后已结束自己的服务进程。交付目录为 `D:\TensorSharp-validation-cache\unified-server-20261010\server`。HTTP 检查器曾将生产 JSONL 的 `scope` 误读为 `scopes`，导致 v10 错判；原失败记录保留，独立复核与修正后的完整 v11 重跑分开记录，检查器新增回归后 22/22 CPU 检查通过。本轮托管几何/规划检查另有 32/32 通过；这些均为针对性检查，不代表全仓库测试通过。
+
+原始报告位于忽略的 `artifacts/unified-server-20261010/{unified-final-v12,default-control-v12,http-v11}/report.json`，启动及清理核验位于 `http-launch-v11/launch-audit.json`，汇总为同根目录的 `report.html`。原生最新组件摘要为 `artifacts/default-readiness-20261010/host-moe-file-batch-v1/candidate-v9/summary.json`，v7 故障历史仍保留在其原目录。此前冒烟失败、原生负例及后续独立重跑均保留，不提交 Git；运行中记录不算通过。
+
+### 15.2 手工 API、独立 KV 快照配置与硬件探针
+
+以下配置面向已适配相应契约的模型和显式调用方，不应叠加到上面的 `--unified-memory` Qwen4Exp 会话。
+
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。
 
 公共引擎的可用配置：
@@ -3337,11 +3409,11 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 默认 scope 仍为 cache-only；可选 `includeGraphBuffers: true` 增加已接线的 context buffer 和 reuse graph arena，包括 Gemma/Qwen35 主要执行入口、Qwen4Exp 的自有图 arena/循环状态/设备快照、Qwen-Image 2.1 的图/前缀/VAE buffer 及 MiniMax-H3 的已接线执行 buffer。Qwen4Exp batch arena 额度不足时不推进 holder，增加额度后可重试。未接线的 executor、部分 live KV/holder、backend pool、host-pointer wrapper 和 driver overhead 仍不包含，因此不是整个模型的硬 VRAM 上限。Qwen35/Gemma4 的显式文件权重模式通过各自 session 直接预留同一份 `MemoryBudget`；AdaptiveModelSession 同时启用覆盖到的 graph scope，保留实际拒绝而不改用不受限 fallback。接口用法见 [Memory README](../../TensorSharp.Memory/README.md) 和 [adaptive 入口](../../eng/validation/AdaptiveMemoryProbe/README.md)。
 
-四参数 scope 的 `hostPools` 可将紧凑专家文件读取 arena 和 DeepSeek 按路由读取的暂存接入同一账本的 RAM pool，独立于 rank 的 GPU 映射。
+四参数 scope 的 `hostPools` 可将紧凑专家文件读取 arena、已接线的 Qwen4Exp CPU 专家暂存/图张量/计算工作区，以及 DeepSeek 按路由读取的暂存接入同一账本的 RAM pool（原生 host charge kind 3），独立于 rank 的 GPU 映射。
 与其他 RAM owner 原子竞争额度，先准入再分配，物理释放后归还；增长前先释放旧 arena，避免双份暂存。
 配额不足会报告原生原因并终止当前执行，不静默绕到 mmap。已有主机 arena 时拒绝接管，仍存活时拒绝卸载。
-DeepSeek 暂存随模型销毁释放；紧凑 arena 可在空缓存 trim 时释放。
-省略 `hostPools` 保留原契约；OS 页缓存、模型映射、CPU 长 prefill scratch 等仍未覆盖。
+DeepSeek 暂存随模型销毁释放；紧凑 CUDA 读取 arena 可在空缓存 trim 时释放，统一会话在新请求边界另行释放空闲 CPU 专家暂存和计算工作区，保留仍有效的 CUDA 专家条目。
+这只覆盖明确接线的 CPU 路径，不包括所有模型的 CPU scratch、线程栈或库内部堆分配。省略 `hostPools` 保留原契约；OS 页缓存、模型映射、GC 与 vendor/driver 池仍无完整物理归属。新 CPU 暂存及 POSIX 读取的验证范围以本轮独立结果为准，不沿用历史 GPU/CPU 通过记录。
 
 `SchedulerConfig.MemoryAdmission` 已接入实际调度器：执行器提供每请求完整增量峰值，按多 pool 原子预留；准入先于前缀物化，取消/结束/抢占的额度在模型释放完成后才归还。`SequenceState.MemoryEnvelope` 用于实际分配，防止双重计账；缓存存活的子分配继续计费。共享权重、池化 arena 和保留前缀必须采用自己的生命周期额度。预算耗尽且当前引擎无运行请求时，先回收自己的空闲缓存至够用，仍不足则发布共享预算压力，在模型锁外等待预算变化或新命令，不忙轮询。其他空闲引擎在自己的模型锁和计算门约束下协同回收；尚未为所有旧模型自动推导成本。
 

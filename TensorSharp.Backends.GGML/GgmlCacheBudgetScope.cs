@@ -68,6 +68,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private BudgetReservation? _executionEnvelope;
     private long _allocationRefusalCount;
     private GgmlAllocationRefusal? _firstAllocationRefusal, _lastAllocationRefusal;
+    internal Action? BeforeExecutionOwnerAllocation { get; set; }
 
     /// <summary>Bounded failure telemetry: no growing event log or successful-allocation sampling.</summary>
     public (long Count, GgmlAllocationRefusal? First, GgmlAllocationRefusal? Last) AllocationRefusals
@@ -158,8 +159,12 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             if (_disposing) throw new InvalidOperationException("The GGML budget is being detached.");
             if (!ReferenceEquals(envelope.Budget, _budget)) throw new ArgumentException("Request belongs to a different budget.", nameof(envelope));
             if (_executionEnvelope != null) throw new InvalidOperationException("Concurrent or nested GGML execution envelopes are unsupported.");
+            // Do not publish an execution envelope until its final disposable
+            // owner exists. An allocation failure leaves admission retryable.
+            BeforeExecutionOwnerAllocation?.Invoke();
+            var execution = new Execution(this);
             _executionEnvelope = envelope;
-            return new Execution(this);
+            return execution;
         }
     }
 

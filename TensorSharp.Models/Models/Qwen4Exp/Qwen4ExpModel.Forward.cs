@@ -1723,23 +1723,37 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            VisionEncoder?.Dispose();
+            VisionEncoder = null;
             DisposeMtpHead();
             ReleaseSpecSnapshot();
-            // DisposeAllFusedHolders leaves the checked-out holder to the
-            // direct tensor disposal below. Drop its native registration first:
-            // a failed arena fence intentionally survives global state release,
-            // but must never survive this owner's pooled/freed host pointers.
-            if (IsGgmlBackend)
-                GgmlBasicOps.Qwen4ExpReleaseSeqState(HolderStateKeys(SnapshotActiveCache()));
+            // The active holder also owns GDN conv/state seeds, not just K/V.
+            // Retire its native registration before returning any host storage.
+            // DisposeHolder clears each tensor only after successful disposal,
+            // so a failed release keeps the remaining owners reachable for retry.
+            DisposeHolder(SnapshotActiveCache());
             DisposeAllFusedHolders();
             if (IsGgmlBackend)
                 GgmlBasicOps.Qwen4ExpReleaseAllSeqState();
-            if (_kCache != null)
-                foreach (var t in _kCache) t?.Dispose();
-            if (_vCache != null)
-                foreach (var t in _vCache) t?.Dispose();
-            if (_idxKCache != null)
-                foreach (var t in _idxKCache) t?.Dispose();
+            void DisposeScratch(ref Tensor tensor)
+            {
+                if (tensor == null) return;
+                InvalidateTensorDeviceCache(tensor);
+                tensor.Dispose();
+                tensor = null;
+            }
+            DisposeScratch(ref _gdnQBuf); DisposeScratch(ref _gdnKBuf);
+            DisposeScratch(ref _gdnVBuf); DisposeScratch(ref _gdnZBuf);
+            DisposeScratch(ref _gdnAlphaBuf); DisposeScratch(ref _gdnBetaBuf);
+            DisposeScratch(ref _moeScratchGate); DisposeScratch(ref _moeScratchUp);
+            DisposeScratch(ref _moeScratchDown);
+            // A cancelled image request may never consume its queued slice.
+            for (int i = _visionEmbeddingsList.Count - 1; i >= 0; i--)
+            {
+                var embedding = _visionEmbeddingsList[i].Embeddings;
+                DisposeScratch(ref embedding);
+                _visionEmbeddingsList.RemoveAt(i);
+            }
             DisposeQwen4ExpTensorParallel();
             base.Dispose();
         }

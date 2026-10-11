@@ -22,12 +22,17 @@
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
     std::int64_t*, std::int64_t*, std::int64_t*);
 extern "C" std::int64_t TSGgml_TrimHostMoeExpertCache(std::int64_t);
+extern "C" int TSGgml_BeginHostMoeExpertCacheScope(std::int64_t, int, int, std::uint64_t*);
+extern "C" int TSGgml_UpdateHostMoeExpertCacheScope(std::uint64_t, std::int64_t, std::int64_t*);
+extern "C" int TSGgml_TrimHostMoeExpertCacheScope(std::uint64_t, std::int64_t, std::int64_t*);
+extern "C" int TSGgml_EndHostMoeExpertCacheScope(std::uint64_t, std::int64_t*);
 extern "C" int TSGgml_RegisterHostFileSource(const void*, std::int64_t, const char*, std::int64_t);
 
 // This standalone target compiles the production cache implementation with
 // small bridge stubs; it never loads a model or depends on modified ggml code.
 namespace tsg
 {
+    void host_moe_cpu_staging_release() {} // separate CPU staging fixture owns this path
     DeviceState g_device_states[TSG_MAX_DEVICES];
     std::atomic<int> g_device_count{1};
     std::atomic<int> g_tp_global_degree{0};
@@ -39,6 +44,7 @@ namespace tsg
     int g_test_file_failure_countdown = 0;
     std::uint64_t g_test_file_reads = 0;
     void set_last_error(const std::string& message) { std::fprintf(stderr, "%s\n", message.c_str()); }
+    void clear_last_error() { }
     // Expert tensors in this fixture have no registered dense-Qwen precision
     // policy. Keep their ordinary unchanged ggml CUDA dispatch.
     ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph*) { return backend; }
@@ -157,6 +163,55 @@ namespace
     };
 
     constexpr int hidden = 256, ff = 256, experts = 16, used = 2;
+
+    void scope_api_checks()
+    {
+        const auto original = Stats();
+        auto env_value = [](const char* key) {
+            const char* value = std::getenv(key); return std::string(value ? value : "");
+        };
+        const auto env_budget = env_value("TS_HOST_MOE_EXPERT_CACHE_MB");
+        const auto env_layers = env_value("TS_HOST_MOE_EXPERT_CACHE_LAYERS");
+        const auto env_rows = env_value("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS");
+        std::uint64_t token = 99, second = 99;
+        std::int64_t released = 99;
+        require(TSGgml_BeginHostMoeExpertCacheScope(-1, 64, 4, &token) == 0 && token == 0,
+            "Negative scope capacity did not fail before ownership");
+        require(TSGgml_BeginHostMoeExpertCacheScope(1, 129, 4, &token) == 0 && token == 0
+            && TSGgml_BeginHostMoeExpertCacheScope(1, 64, 0, &token) == 0 && token == 0
+            && TSGgml_BeginHostMoeExpertCacheScope(1, 64, 4, nullptr) == 0,
+            "Invalid scope settings or null output acquired ownership");
+        require(TSGgml_BeginHostMoeExpertCacheScope(8 << 20, 64, 4, &token) == 1 && token != 0,
+            "Valid native cache scope did not acquire settings");
+        require(Stats().budget == (8 << 20) && Stats().reserved == 0,
+            "Scoped budget was not visible through existing counters");
+        require(TSGgml_BeginHostMoeExpertCacheScope(1, 1, 1, &second) == 0 && second == 0,
+            "Second native cache scope replaced the live owner");
+        require(TSGgml_UpdateHostMoeExpertCacheScope(token, (8 << 20) + 1, &released) == 0 && released == 0
+            && TSGgml_UpdateHostMoeExpertCacheScope(token + 1, 0, &released) == 0 && released == 0
+            && Stats().budget == (8 << 20), "Invalid update changed the scope ceiling");
+        require(TSGgml_UpdateHostMoeExpertCacheScope(token, 0, &released) == 1 && released == 0
+            && Stats().budget == 0, "Zero update did not disable an empty scope");
+        require(TSGgml_UpdateHostMoeExpertCacheScope(token, 8 << 20, &released) == 1
+            && TSGgml_TrimHostMoeExpertCacheScope(token, 0, &released) == 1 && released == 0
+            && Stats().budget == (8 << 20), "Trim changed capacity or valid regrowth failed");
+        require(TSGgml_EndHostMoeExpertCacheScope(token + 1, &released) == 0 && released == 0
+            && Stats().budget == (8 << 20), "A stale token ended another owner's scope");
+        require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1 && released == 0
+            && Stats().budget == original.budget, "Native scope did not restore its original budget");
+        require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 0 && released == 0,
+            "Ended native token remained reusable");
+        require(TSGgml_BeginHostMoeExpertCacheScope(0, 1, 1, &second) == 1 && second != token,
+            "A clean subsequent scope could not acquire independent ownership");
+        require(TSGgml_TrimHostMoeExpertCacheScope(token, 0, &released) == 0
+            && TSGgml_EndHostMoeExpertCacheScope(second, &released) == 1,
+            "A stale token touched a subsequent scope");
+        require(env_budget == env_value("TS_HOST_MOE_EXPERT_CACHE_MB")
+            && env_layers == env_value("TS_HOST_MOE_EXPERT_CACHE_LAYERS")
+            && env_rows == env_value("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS"),
+            "Native scoped configuration mutated an environment variable");
+        std::puts("PASS: native scope C ABI, validation, exclusive/stale ownership, regrowth and environment restoration");
+    }
 
     struct SharedLedger
     {
@@ -760,6 +815,90 @@ namespace
             static_cast<long long>(minimum_bytes), static_cast<long long>(exact_bytes));
     }
 
+    void scoped_cuda_checks(Weights& weights)
+    {
+        FullResidentGraph reference(weights);
+        std::array<float, hidden> x{}, actual{};
+        for (int i = 0; i < hidden; ++i) x[i] = std::cos(i * 0.019f);
+        std::array<std::int32_t, used> ids{0, 1};
+        std::array<float, used> routes{0.4f, 0.6f};
+        const auto expected = reference.compute(x, ids, routes);
+        auto hm = weights.segment;
+        auto call = [&] { return tsg::host_moe_cached_experts(hm, x.data(), ids.data(), routes.data(),
+            actual.data(), "qwen4exp fused token span"); };
+        auto exact_call = [&] {
+            require(call() == 1, "Configured CUDA cache did not engage");
+            require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+                "Scoped CUDA cache changed full-resident expert results");
+        };
+        exact_call();
+        std::uint64_t token = 99;
+        require(TSGgml_BeginHostMoeExpertCacheScope(8 << 20, 9, 4, &token) == 0 && token == 0,
+            "Scope adopted a live legacy cache instead of refusing it");
+        tsg::host_moe_expert_cache_release();
+        SharedLedger ledger;
+        ledger.capacity = 8 << 20;
+        require(ledger.attach(), "Could not attach scoped CUDA budget fixture");
+        require(TSGgml_BeginHostMoeExpertCacheScope(8 << 20, 9, 4, &token) == 1,
+            "Could not begin scoped CUDA configuration");
+        exact_call();
+        // SharedLedger checks physical-before-credit for one entry at a time.
+        // This entry already fits the new TOTAL limit, but exceeds its new
+        // PER-LAYER share; the update must retire it instead of only doing LRU.
+        const auto live_entry = Stats();
+        require(live_entry.reserved > (1 << 20) && live_entry.reserved < (4 << 20)
+            && ledger.committed == live_entry.reserved,
+            "Scoped entry did not exercise per-layer pressure with shared ownership");
+        std::int64_t released = -1;
+        require(TSGgml_UpdateHostMoeExpertCacheScope(token, 4 << 20, &released) == 1
+            && released == live_entry.reserved && Stats().reserved == 0,
+            "Scope shrink did not enforce the smaller per-layer allowance");
+        ledger.check_empty();
+        require(call() == 0, "Too-small per-layer allowance allocated a cache entry");
+        ledger.check_empty();
+        require(TSGgml_UpdateHostMoeExpertCacheScope(token, 8 << 20, &released) == 1 && released == 0,
+            "Scoped CUDA budget could not regrow to its ceiling");
+        exact_call();
+        // Nine rows use the scoped row limit; ten must fail before reading the
+        // short arrays. The numerical oracle uses the exact same row inputs.
+        std::vector<float> rows(hidden * 9), probabilities(used * 9), output(hidden * 9, -999.0f);
+        std::vector<std::int32_t> selected(used * 9);
+        for (int i = 0; i < 9; ++i) {
+            std::copy(x.begin(), x.end(), rows.begin() + i * hidden);
+            std::copy(routes.begin(), routes.end(), probabilities.begin() + i * used);
+            std::copy(ids.begin(), ids.end(), selected.begin() + i * used);
+        }
+        hm.seq_len = 9;
+        require(tsg::host_moe_cached_experts(hm, rows.data(), selected.data(), probabilities.data(),
+            output.data(), "qwen4exp fused token span") == 1, "Scoped prefill width did not override the default eight");
+        for (int i = 0; i < 9; ++i)
+            require(std::memcmp(output.data() + i * hidden, expected.data(), sizeof(expected)) == 0,
+                "Scoped wide-prefill arithmetic differs from the resident oracle");
+        hm.seq_len = 10;
+        const auto before_reject = Stats();
+        require(call() == 0 && Stats().calls == before_reject.calls && Stats().reserved == before_reject.reserved,
+            "Rows above the scoped limit executed or changed cache state");
+        hm.seq_len = 1;
+        const auto before_trim = Stats();
+        require(TSGgml_TrimHostMoeExpertCacheScope(token, 0, &released) == 1
+            && released == before_trim.reserved && Stats().budget == (8 << 20),
+            "Scoped trim did not release cache storage independently of capacity");
+        ledger.check_empty();
+        exact_call();
+        require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1 && released > 0
+            && Stats().budget == (2 << 20) && Stats().reserved == 0,
+            "Scope disposal did not free before restoring legacy settings");
+        ledger.check_empty();
+        hm.seq_len = 9;
+        require(call() == 0, "Disposal did not restore the legacy default row limit");
+        hm.seq_len = 1;
+        exact_call(); // Original layer quota has also been restored (2 MiB / one layer).
+        tsg::host_moe_expert_cache_release();
+        ledger.check_empty();
+        require(ledger.detach(), "Scoped cache disposal retained shared native ownership");
+        std::puts("PASS: scoped CUDA cache, all-row exact oracle, per-layer shrink, regrowth, trim and restored defaults");
+    }
+
     void trim_lru_checks(Weights& weights)
     {
         // Separate process: 8 MiB global ceiling / four partitions leaves enough
@@ -1132,10 +1271,11 @@ int main(int argc, char** argv)
             return 0;
         }
         Weights weights;
-        bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false;
+        bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false, scoped = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
+            else if (std::strcmp(argv[arg], "--scope") == 0) scoped = true;
             else if (std::strcmp(argv[arg], "--trim") == 0 && trim_only) { }
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
             else if (std::strcmp(argv[arg], "--file-read") == 0) file_read = true;
@@ -1156,6 +1296,7 @@ int main(int argc, char** argv)
         set_environment("TS_HOST_MOE_EXPERT_CACHE_LFU", lfu ? "1" : "0");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS", wide_prefill ? "128" : "");
         if (wide_prefill) set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", "32");
+        if (scoped) scope_api_checks();
         weights.fill(0.5f);
 #ifdef TSG_GGML_USE_CUDA
         if (!cpu_only)
@@ -1167,6 +1308,11 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+            if (scoped) {
+                scoped_cuda_checks(weights);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
             if (wide_prefill)
             {
                 wide_prefill_checks(weights);

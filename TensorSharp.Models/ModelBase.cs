@@ -2945,9 +2945,9 @@ namespace TensorSharp.Models
             if (weightStreaming != null && !architecture.SupportsWeightStreaming)
                 throw new NotSupportedException($"Architecture '{architecture.Id}' has no bounded weight streaming adapter.");
 
-            if (memoryPolicy != null && (architecture.Id is not ("gemma4" or "qwen35")
+            if (memoryPolicy != null && (architecture.Id is not ("gemma4" or "qwen35" or "qwen4exp")
                 || backend != BackendType.GgmlCuda || tpDegree != 1 || tpGroup != null || layerSplitDegree != 1))
-                throw new NotSupportedException("The per-model memory policy currently requires dense Gemma4/Qwen35 on one GGML CUDA device.");
+                throw new NotSupportedException("The per-model memory policy requires Gemma4, Qwen35 or Qwen4Exp on one GGML CUDA device.");
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);

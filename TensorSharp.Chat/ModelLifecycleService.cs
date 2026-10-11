@@ -12,6 +12,8 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Models;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Server
 {
@@ -19,6 +21,11 @@ namespace TensorSharp.Server
     {
         private readonly ILogger _logger;
         private readonly Func<string, BackendType, ITensorParallelGroup, string, ModelBase> _createModel;
+        private readonly Func<string, string, BackendType, UnifiedMemorySessionHandle> _createUnifiedSession;
+        private UnifiedMemorySessionHandle _unifiedSession;
+        private UnifiedMemorySessionHandle _pendingUnifiedSession;
+        private UnifiedMemoryModelSession _pendingFailedUnifiedSession;
+        private bool _unifiedMemoryEnabled;
 
         private ModelBase _model;
         // Retiring models are unpublished immediately, but remain owned here until
@@ -38,13 +45,40 @@ namespace TensorSharp.Server
 
         /// <summary>Test seam: <paramref name="createModel"/> stands in for
         /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string, int)"/>.</summary>
-        internal ModelLifecycleService(ILogger logger, Func<string, BackendType, ITensorParallelGroup, string, ModelBase> createModel)
+        internal ModelLifecycleService(ILogger logger, Func<string, BackendType, ITensorParallelGroup, string, ModelBase> createModel,
+            Func<string, string, BackendType, UnifiedMemorySessionHandle> createUnifiedSession = null)
         {
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
             _createModel = createModel;
+            _createUnifiedSession = createUnifiedSession ?? UnifiedMemorySessionHandle.CreateOwned;
         }
 
         public bool IsLoaded => _model != null;
+
+        public bool UnifiedMemoryEnabled
+        {
+            get => _unifiedMemoryEnabled;
+            set
+            {
+                if (value == _unifiedMemoryEnabled) return;
+                if (_model != null || _pendingDisposal != null || _unifiedSession != null
+                    || _pendingUnifiedSession != null || _pendingFailedUnifiedSession != null)
+                    throw new InvalidOperationException("Unload the current model successfully before changing unified-memory mode.");
+                _unifiedMemoryEnabled = value;
+            }
+        }
+
+        internal SchedulerConfig ConfigureScheduler(ModelBase model, SchedulerConfig config)
+        {
+            if (_unifiedSession == null)
+            {
+                if (UnifiedMemoryEnabled) throw new InvalidOperationException("No active unified-memory session owns this model.");
+                return config;
+            }
+            if (!ReferenceEquals(_model, model) || !ReferenceEquals(_unifiedSession.Model, model) || model.IsRetiring)
+                throw new InvalidOperationException("The unified-memory model is no longer active.");
+            return _unifiedSession.ConfigureScheduler(config);
+        }
 
         /// <summary>
         /// Builds the on-node <see cref="ITensorParallelGroup"/> a load shards across, given
@@ -230,6 +264,8 @@ namespace TensorSharp.Server
             string previousModel = LoadedModelName;
             ModelBase outgoing = _model;
             _pendingDisposal = outgoing;
+            _pendingUnifiedSession = _unifiedSession;
+            _unifiedSession = null;
             _pendingDisposalGroup = failedLoadGroup;
             _pendingDisposalName = previousModel;
             // Unpublished FIRST. While the outgoing model drains below, a request arriving
@@ -249,6 +285,11 @@ namespace TensorSharp.Server
 
         private void RetryPendingDisposal()
         {
+            // A failed constructor never published this model to requests.
+            // Keep its original owner directly; wrapping a recovery exception
+            // must not allocate again before the cleanup owner is retained.
+            _pendingFailedUnifiedSession?.Dispose();
+            _pendingFailedUnifiedSession = null;
             ModelBase outgoing = _pendingDisposal;
             if (outgoing != null)
             {
@@ -268,9 +309,17 @@ namespace TensorSharp.Server
                     throw new TimeoutException("The retiring model still has active uses; retry unloading after they exit.");
                 }
                 lock (outgoing.GpuComputeLock)
-                    outgoing.Dispose();
+                {
+                    if (_pendingUnifiedSession != null) _pendingUnifiedSession.Dispose();
+                    else outgoing.Dispose();
+                }
+                _pendingUnifiedSession = null;
                 _pendingDisposal = null;
             }
+            // A failed constructor can retain a budget/override owner before a
+            // model exists. It must drain before any new factory is invoked.
+            _pendingUnifiedSession?.Dispose();
+            _pendingUnifiedSession = null;
 
             // A failed load may have built a TP group before its model existed.
             // Keep that owner as well; never release it beneath a live model.
@@ -301,17 +350,26 @@ namespace TensorSharp.Server
                 // (an iOS app has no peers and no CUDA). The Server and CLI hand in a
                 // factory that reads TENSORSHARP_TP_* and builds the on-node group to
                 // match the backend; with no factory the load is single-node.
-                if (TensorParallelGroupFactory != null &&
+                if (!UnifiedMemoryEnabled && TensorParallelGroupFactory != null &&
                     !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID")) &&
                     !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
                     ModelBase.ValidateDistributedTensorParallelism(modelPath, _backend);
-                tpGroup = TensorParallelGroupFactory?.Invoke(_backend);
+                if (!UnifiedMemoryEnabled) tpGroup = TensorParallelGroupFactory?.Invoke(_backend);
 
                 // Block drafters go to the factory rather than being attached
                 // afterwards like Gemma 4's draft head: their weights have to be
                 // counted by the layer split and uploaded with the trunk.
-                string blockDraftPath = SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath();
-                _model = _createModel(modelPath, _backend, tpGroup, blockDraftPath);
+                if (UnifiedMemoryEnabled)
+                {
+                    _unifiedSession = _createUnifiedSession(modelPath, mmProjPath, _backend);
+                    _model = _unifiedSession.Model
+                        ?? throw new InvalidOperationException("The unified-memory session did not publish a loaded model.");
+                }
+                else
+                {
+                    string blockDraftPath = SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath();
+                    _model = _createModel(modelPath, _backend, tpGroup, blockDraftPath);
+                }
 
                 // A worker node (--tp-node-id > 0) spends its life blocked in a
                 // mirror loop and cannot also serve HTTP requests, so the server
@@ -330,7 +388,7 @@ namespace TensorSharp.Server
 
                 if (!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath))
                 {
-                    LoadEncoders(mmProjPath);
+                    if (!UnifiedMemoryEnabled) LoadEncoders(mmProjPath);
                     _loadedMmProjPath = mmProjPath;
                 }
 
@@ -338,7 +396,7 @@ namespace TensorSharp.Server
                 // gemma4-assistant draft head) are attached here, by the same
                 // shared loader the CLI uses. DraftHeadActivationError was
                 // cleared when the previous model was unloaded.
-                if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(_model, out string draftError, out bool draftRefusedByModel))
+                if (!UnifiedMemoryEnabled && !SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(_model, out string draftError, out bool draftRefusedByModel))
                 {
                     DraftHeadActivationError = draftError;
                     // The model's own decline (a trunk that refuses speculation, a DFlash
@@ -347,7 +405,7 @@ namespace TensorSharp.Server
                     DraftHeadRefusedByModel = draftRefusedByModel;
                     _logger.LogWarning("{Error}; speculation disabled.", draftError);
                 }
-                else if (SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath() is { } attachedDraft)
+                else if (!UnifiedMemoryEnabled && SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath() is { } attachedDraft)
                 {
                     _logger.LogInformation("Loaded draft head {Draft} (HasDraftHead=True)",
                         Path.GetFileName(attachedDraft));
@@ -376,6 +434,9 @@ namespace TensorSharp.Server
                 }
 
                 loadSw.Stop();
+                if (_unifiedSession != null)
+                    _logger.LogInformation(LogEventIds.ModelLoadCompleted,
+                        "Unified memory enabled: {Features}", _unifiedSession.FeatureReport);
                 long modelBytes = SafeGetFileSize(modelPath);
                 long mmProjBytes = SafeGetFileSize(mmProjPath);
                 _logger.LogInformation(LogEventIds.ModelLoadCompleted,
@@ -385,6 +446,10 @@ namespace TensorSharp.Server
             }
             catch (Exception ex)
             {
+                if (ex is UnifiedMemoryModelLoadException { UnreleasedSession: { } unreleased })
+                {
+                    _pendingFailedUnifiedSession = unreleased;
+                }
                 loadSw.Stop();
                 if (ModelLoadRefusal.TryDescribe(ex, out string reason))
                 {

@@ -50,10 +50,19 @@ public sealed class RequestMemoryAdmission
     /// only supported with the per-sequence, non-speculative execution path.</summary>
     public Func<SequenceState, IDisposable>? EnterSerialExecution { get; init; }
 
+    /// <summary>Re-estimate incremental execution growth after the physical
+    /// boundary callback trims retained caches. Only a single active serial
+    /// request may use this: queued requests must not retain a stale estimate
+    /// from before the previous request materialized reusable allocations.</summary>
+    public bool ReestimateAfterPhysicalCheck { get; init; }
+
     public RequestMemoryExecutionShape? ExecutionShape { get; init; }
 
     internal void ValidateConfiguration(SchedulerConfig config)
     {
+        if (ReestimateAfterPhysicalCheck && (BeforeAdmission == null || EnterSerialExecution == null
+            || config.MaxNumRunningSequences != 1))
+            throw new ArgumentException("Incremental peak refresh requires physical checks and one active serial request.", nameof(config));
         if (ExecutionShape is not { } shape) return;
         if (shape.BlockTokens <= 0 || shape.MaximumRunningRequests <= 0 || shape.MaximumPrefillTokens <= 0
             || shape.Snapshots == null || EnterSerialExecution == null || !ReferenceEquals(shape.Snapshots, config.KvSnapshots)

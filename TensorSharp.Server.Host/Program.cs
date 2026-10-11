@@ -340,6 +340,7 @@ builder.Services.AddSingleton<ICodeRunner>(sp => codeExecOptions.Enabled
 builder.Services.AddSingleton(sp => new ModelService(sp.GetRequiredService<ILogger<ModelService>>())
 {
     TensorParallelGroupFactory = DistributedTensorParallel.CreateGroup,
+    UnifiedMemoryEnabled = hostingOptions.UnifiedMemoryEnabled,
     // Inline Jev image input lands in the same governed upload directory as chat
     // attachments, so --upload-max-mb, --upload-quota-mb and --upload-ttl-hours cover it.
     MediaStorage = uploadPolicy,

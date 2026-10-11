@@ -653,6 +653,29 @@ namespace TensorSharp.Models
         /// </summary>
         internal List<int> ProcessQwenVLHistory(Qwen35VisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
         {
+            if (_model is Qwen4ExpModel { HasUnifiedVisionAdmission: true } unified)
+            {
+                var paths = new List<string>();
+                if (history != null)
+                    foreach (var message in history)
+                    {
+                        if (message?.ImagePaths == null || message.ImagePaths.Count == 0) continue;
+                        foreach (var item in QwenVideoFrames.Layout(message))
+                        {
+                            if (item.IsVideo) throw new NotSupportedException("Unified qwen4exp media admission currently supports still images, not video.");
+                            paths.Add(message.ImagePaths[item.ImageIndex]);
+                        }
+                    }
+                if (paths.Count != 0)
+                    return unified.PrepareUnifiedVision(encoder, paths, inputTokens,
+                        _model.Tokenizer.LookupToken(QwenVideoFrames.ImagePad),
+                        () => ProcessQwenVLHistoryCore(encoder, history, inputTokens));
+            }
+            return ProcessQwenVLHistoryCore(encoder, history, inputTokens);
+        }
+
+        private List<int> ProcessQwenVLHistoryCore(Qwen35VisionEncoder encoder, List<ChatMessage> history, List<int> inputTokens)
+        {
             var layouts = new List<(ChatMessage Message, List<QwenVideoFrames.Item> Items)>();
             bool anyVideo = false;
             if (history != null)

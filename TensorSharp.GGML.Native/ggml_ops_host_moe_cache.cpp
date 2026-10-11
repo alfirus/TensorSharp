@@ -7,10 +7,12 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_moe_prefetch.h"
 #include "ggml_ops_file_source.h"
+#include "ggml_ops_host_moe_file_batch.h"
 #include "ggml_ops_moe_prefetch_policy.h"
 #include "ggml_ops_expert_eviction.h"
 #include "ggml_ops_precision_policy.h"
 #include "ggml_ops_host_moe_cache_policy.h"
+#include "ggml_ops_host_moe_cache_config.h"
 #include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
 #ifdef TSG_GGML_USE_CUDA
@@ -67,22 +69,21 @@ namespace tsg
             return static_cast<std::size_t>(n);
         }
 
-        std::size_t cache_budget()
+        HostMoeCacheConfiguration& cache_configuration()
         {
-            static const std::size_t bytes = [] {
+            static HostMoeCacheConfiguration configuration([] {
                 const std::size_t mb = read_positive_size("TS_HOST_MOE_EXPERT_CACHE_MB", 0);
                 const auto maximum = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max());
-                return mb <= maximum / kMiB ? mb * kMiB : 0;
-            }();
-            return bytes;
+                return HostMoeCacheSettings{mb <= maximum / kMiB ? mb * kMiB : 0,
+                    read_positive_size("TS_HOST_MOE_EXPERT_CACHE_LAYERS", 48),
+                    host_moe_cache_prefill_rows(std::getenv("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS"))};
+            }());
+            return configuration;
         }
 
-        std::size_t cache_layer_count()
+        std::size_t cache_budget()
         {
-            // The opt-in feature is restricted to Qwen4Exp. Its production
-            // checkpoint has 48 layers; smaller fixtures can set this value.
-            static const std::size_t layers = read_positive_size("TS_HOST_MOE_EXPERT_CACHE_LAYERS", 48);
-            return layers;
+            return cache_configuration().fast_budget();
         }
 
         bool diagnostics()
@@ -227,10 +228,8 @@ namespace tsg
         } g_file_read_buffer;
 
 #ifdef TSG_GGML_USE_CUDA
-        bool valid_layout(const HostMoeSegment& hm, std::size_t (&stride)[3])
+        bool valid_layout(const HostMoeSegment& hm, std::size_t (&stride)[3], int max_rows)
         {
-            static const int max_rows = host_moe_cache_prefill_rows(
-                std::getenv("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS"));
             if (hm.seq_len <= 0 || hm.seq_len > max_rows
                 || !host_moe_cache_routes_fit(hm.seq_len, hm.n_used)
                 || (hm.seq_len > TSG_PRECISION_DECODE_COLUMNS
@@ -492,16 +491,23 @@ namespace tsg
         const std::int32_t* ids, const float* routes, float* out, const char* kernel_name)
     {
 #ifdef TSG_GGML_USE_CUDA
-        const std::size_t budget = cache_budget(), layers = cache_layer_count();
+        // The default disabled path does not acquire the cache mutex. Recheck
+        // under the gate before any allocation so concurrent scope maintenance
+        // cannot publish a smaller ceiling underneath an old snapshot.
+        if (cache_budget() == 0) return 0;
         const bool device_inputs = x == nullptr && routes == nullptr;
         const bool device_output = out == nullptr;
-        if (budget == 0 || layers == 0 || kernel_name == nullptr
+        if (kernel_name == nullptr
             || std::strcmp(kernel_name, "qwen4exp fused token span") != 0
             || g_backend == nullptr || !ggml_backend_is_cuda(g_backend)
             || (!device_inputs && (x == nullptr || routes == nullptr))
             || ids == nullptr || (device_output && !device_inputs)) return 0;
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        const auto settings = cache_configuration().settings();
+        const std::size_t budget = settings.budget, layers = settings.layers;
+        if (budget == 0 || layers == 0) return 0;
         std::size_t stride[3] = {};
-        if (!valid_layout(hm, stride)) return 0;
+        if (!valid_layout(hm, stride, settings.max_rows)) return 0;
         // Validate the complete short block before allocating or computing any
         // row. Unsupported data always falls back as one block; execution
         // failure returns an error and never mixes CPU/GPU expert arithmetic.
@@ -517,7 +523,6 @@ namespace tsg
         const bool wide_prefill = hm.seq_len > TSG_PRECISION_DECODE_COLUMNS;
         if (wide_prefill && device_inputs && !finite_device_routes(hm.weights, route_count)) return 0;
 
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
         auto found = g_entries.begin();
         while (found != g_entries.end() && !(*found)->matches(hm, g_backend)) ++found;
         if (found == g_entries.end())
@@ -799,6 +804,7 @@ namespace tsg
     void host_moe_expert_cache_release()
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+        host_moe_cpu_staging_release();
         if (diagnostics() && (g_calls != 0 || g_reserved != 0)) std::fprintf(stderr,
             "[HOSTMOE-CACHE] calls=%llu hits=%llu misses=%llu reserved=%zu budget=%zu release\n",
             static_cast<unsigned long long>(g_calls), static_cast<unsigned long long>(g_hits),
@@ -813,10 +819,22 @@ namespace tsg
         g_hits = g_misses = g_calls = 0;
     }
 
-    std::size_t host_moe_expert_cache_trim(std::size_t target)
+    // Caller holds g_cache_mutex. Scope updates also enforce the per-layer
+    // share, so a formerly large entry cannot occupy another layer's new quota.
+    std::size_t host_moe_expert_cache_trim_locked(std::size_t target,
+        std::size_t per_layer = (std::numeric_limits<std::size_t>::max)())
     {
-        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        // Request-boundary maintenance also releases the one serial CPU layer's
+        // reusable host arena, without dropping registered file sources.
+        host_moe_cpu_staging_release();
         const auto before = g_reserved;
+        for (auto it = g_entries.begin(); per_layer != (std::numeric_limits<std::size_t>::max)()
+            && it != g_entries.end();) {
+            if ((*it)->bytes <= per_layer) { ++it; continue; }
+            const auto bytes = (*it)->bytes;
+            it = g_entries.erase(it);
+            g_reserved -= bytes;
+        }
         while (g_reserved > target && !g_entries.empty())
         {
             const auto bytes = g_entries.back()->bytes;
@@ -827,6 +845,34 @@ namespace tsg
         }
         if (g_entries.empty()) g_file_read_buffer.clear();
         return before - g_reserved;
+    }
+
+    std::size_t host_moe_expert_cache_trim(std::size_t target)
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        return host_moe_expert_cache_trim_locked(target);
+    }
+
+    std::uint64_t host_moe_expert_cache_scope_begin(HostMoeCacheSettings settings) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        return cache_configuration().begin(settings,
+            g_reserved == 0 && g_entries.empty() && g_file_read_buffer.size() == 0);
+    }
+    bool host_moe_expert_cache_scope_update(std::uint64_t token, std::size_t target, std::size_t& released) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        return cache_configuration().update(token, target, [&](std::size_t budget, std::size_t layers) {
+            released = host_moe_expert_cache_trim_locked(budget, budget / layers);
+        });
+    }
+    bool host_moe_expert_cache_scope_trim(std::uint64_t token, std::size_t target, std::size_t& released) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (!cache_configuration().owns(token)) return false;
+        released = host_moe_expert_cache_trim_locked(target);
+        return true;
+    }
+    bool host_moe_expert_cache_scope_end(std::uint64_t token, std::size_t& released) {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        return cache_configuration().end(token, [&] { released = host_moe_expert_cache_trim_locked(0); });
     }
 
     void host_moe_expert_cache_stats(std::int64_t* reserved, std::int64_t* budget,
@@ -864,6 +910,21 @@ namespace tsg
     }
 #undef TSG_MOE_TEST_EXPORT
 #endif
+
+    int host_moe_file_batch_sources(const void* const* pointers, const std::int64_t* bytes,
+        std::array<std::shared_ptr<ExpertFileSource>, 3>& result)
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (!cache_configuration().active() || !SharedCacheCharge::host_accounting_attached()) return 0;
+        int found = 0;
+        for (int part = 0; part < 3; ++part) {
+            auto item = g_file_sources.find(pointers[part]);
+            if (item == g_file_sources.end()) continue;
+            if (bytes[part] <= 0 || item->second->bytes() != static_cast<std::uint64_t>(bytes[part])) return -1;
+            result[part] = item->second; ++found;
+        }
+        return found == 3 ? 1 : found == 0 ? 0 : -1;
+    }
 
     bool register_host_file_source(const void* pointer, std::int64_t bytes,
         const char* path, std::int64_t offset)
@@ -912,4 +973,87 @@ TSG_EXPORT std::int64_t TSGgml_TrimHostMoeExpertCache(std::int64_t target_bytes)
         tsg::set_last_error(std::string("Expert-cache trim failed: ") + error.what());
         return -1;
     }
+}
+
+namespace {
+int cache_scope_failure(const char* message) noexcept {
+    // Even reporting an allocation failure must not throw across the C ABI.
+    try { tsg::set_last_error(message); } catch (...) {}
+    return 0;
+}
+bool cache_scope_bytes(std::int64_t bytes) noexcept {
+    return bytes >= 0 && static_cast<std::uint64_t>(bytes) <= (std::numeric_limits<std::size_t>::max)();
+}
+}
+
+// Exclusive process-wide settings, independent of environment mutations.
+// Quiesce model work before all maintenance; existing ticket ownership and
+// physical-before-credit release are preserved by the original cache objects.
+TSG_EXPORT int TSGgml_BeginHostMoeExpertCacheScope(std::int64_t bytes, int max_rows, int layers,
+    std::uint64_t* token)
+{
+    if (!token) return cache_scope_failure("Expert-cache scope requires an output token");
+    *token = 0;
+    try {
+        tsg::clear_last_error();
+        if (!cache_scope_bytes(bytes) || layers <= 0 || max_rows <= 0 || max_rows > tsg::kHostMoeCacheMaxPrefillRows)
+            return cache_scope_failure("Invalid expert-cache scope capacity, row limit or layer count");
+        *token = tsg::host_moe_expert_cache_scope_begin({static_cast<std::size_t>(bytes),
+            static_cast<std::size_t>(layers), max_rows});
+        return *token ? 1 : cache_scope_failure("Expert-cache scope requires an empty cache and no active scope");
+    }
+    catch (const std::exception& error) { return cache_scope_failure(error.what()); }
+    catch (...) { return cache_scope_failure("Expert-cache scope creation failed with an unknown exception"); }
+}
+
+TSG_EXPORT int TSGgml_UpdateHostMoeExpertCacheScope(std::uint64_t token, std::int64_t bytes,
+    std::int64_t* released)
+{
+    if (!released) return cache_scope_failure("Expert-cache update requires an output count");
+    *released = 0;
+    try {
+        tsg::clear_last_error();
+        if (!cache_scope_bytes(bytes)) return cache_scope_failure("Invalid expert-cache update capacity");
+        std::size_t retired = 0;
+        if (!tsg::host_moe_expert_cache_scope_update(token, static_cast<std::size_t>(bytes), retired))
+            return cache_scope_failure("Expert-cache update requires its active token and cannot exceed the initial ceiling");
+        *released = static_cast<std::int64_t>(retired);
+        return 1;
+    }
+    catch (const std::exception& error) { return cache_scope_failure(error.what()); }
+    catch (...) { return cache_scope_failure("Expert-cache update failed with an unknown exception"); }
+}
+
+TSG_EXPORT int TSGgml_TrimHostMoeExpertCacheScope(std::uint64_t token, std::int64_t bytes,
+    std::int64_t* released)
+{
+    if (!released) return cache_scope_failure("Expert-cache trim requires an output count");
+    *released = 0;
+    try {
+        tsg::clear_last_error();
+        if (!cache_scope_bytes(bytes)) return cache_scope_failure("Invalid expert-cache trim target");
+        std::size_t retired = 0;
+        if (!tsg::host_moe_expert_cache_scope_trim(token, static_cast<std::size_t>(bytes), retired))
+            return cache_scope_failure("Expert-cache trim requires its active scope token");
+        *released = static_cast<std::int64_t>(retired);
+        return 1;
+    }
+    catch (const std::exception& error) { return cache_scope_failure(error.what()); }
+    catch (...) { return cache_scope_failure("Expert-cache trim failed with an unknown exception"); }
+}
+
+TSG_EXPORT int TSGgml_EndHostMoeExpertCacheScope(std::uint64_t token, std::int64_t* released)
+{
+    if (!released) return cache_scope_failure("Expert-cache disposal requires an output count");
+    *released = 0;
+    try {
+        tsg::clear_last_error();
+        std::size_t retired = 0;
+        if (!tsg::host_moe_expert_cache_scope_end(token, retired))
+            return cache_scope_failure("Expert-cache disposal requires its active scope token");
+        *released = static_cast<std::int64_t>(retired);
+        return 1;
+    }
+    catch (const std::exception& error) { return cache_scope_failure(error.what()); }
+    catch (...) { return cache_scope_failure("Expert-cache disposal failed with an unknown exception"); }
 }

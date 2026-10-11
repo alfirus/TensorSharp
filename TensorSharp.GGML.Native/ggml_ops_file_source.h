@@ -16,6 +16,12 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <limits>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace tsg {
@@ -24,12 +30,16 @@ namespace tsg {
 class ExpertFileSource {
 #if defined(_WIN32)
     HANDLE file_ = INVALID_HANDLE_VALUE;
+#else
+    int file_ = -1;
 #endif
     std::uint64_t offset_ = 0, bytes_ = 0;
 public:
     ExpertFileSource(const char* utf8_path, std::uint64_t offset, std::uint64_t bytes)
         : offset_(offset), bytes_(bytes)
     {
+        if (!utf8_path || !*utf8_path || !bytes || offset > UINT64_MAX - bytes)
+            throw std::runtime_error("Invalid expert file extent");
 #if defined(_WIN32)
         if (!utf8_path || !bytes || offset > UINT64_MAX - bytes) throw std::runtime_error("Invalid expert file extent");
         int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1, nullptr, 0);
@@ -48,13 +58,23 @@ public:
             throw std::runtime_error("Expert file extent exceeds its shard");
         }
 #else
-        (void)utf8_path;
-        throw std::runtime_error("Expert file staging is currently available on Windows only");
+        if (offset + bytes > static_cast<std::uint64_t>((std::numeric_limits<off_t>::max)()))
+            throw std::runtime_error("Expert file extent exceeds platform offsets");
+        file_ = ::open(utf8_path, O_RDONLY | O_CLOEXEC);
+        if (file_ < 0) throw std::runtime_error("Cannot open expert file source: " + std::to_string(errno));
+        struct stat info{};
+        if (::fstat(file_, &info) || info.st_size < 0 || offset > static_cast<std::uint64_t>(info.st_size)
+            || bytes > static_cast<std::uint64_t>(info.st_size) - offset) {
+            ::close(file_); file_ = -1;
+            throw std::runtime_error("Expert file extent exceeds its shard");
+        }
 #endif
     }
     ~ExpertFileSource() {
 #if defined(_WIN32)
         if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+#else
+        if (file_ >= 0) ::close(file_);
 #endif
     }
     ExpertFileSource(const ExpertFileSource&) = delete;
@@ -86,6 +106,15 @@ public:
                 ok = GetOverlappedResult(file_, &operation, &got, TRUE);
             if (!ok || !got) throw std::runtime_error("Expert file read failed or truncated: " + std::to_string(GetLastError()));
             target += got; relative += got; count -= got;
+        }
+#else
+        auto* target = static_cast<std::uint8_t*>(destination);
+        while (count) {
+            const auto chunk = std::min<std::size_t>(count, std::size_t(1) << 30);
+            const auto got = ::pread(file_, target, chunk, static_cast<off_t>(offset_ + relative));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) throw std::runtime_error("Expert file read failed or truncated: " + std::to_string(errno));
+            target += got; relative += static_cast<std::size_t>(got); count -= static_cast<std::size_t>(got);
         }
 #endif
     }

@@ -317,6 +317,7 @@ def main():
     parser.add_argument("--tool-roundtrip", action="store_true")
     parser.add_argument("--json-schema", action="store_true", help="Separate constrained OpenAI JSON request; never waives raw-format failures")
     parser.add_argument("--expert-cache-mb", type=int, default=0)
+    parser.add_argument("--unified-memory", action="store_true", help="Exercise the actual Server shared-budget switch and its automatic expert-cache plan")
     args = parser.parse_args()
     cases = args.cases.split(",")
     try:
@@ -331,6 +332,8 @@ def main():
         parser.error("Parallel size must fit the visible device list")
     if args.n_cpu_moe is not None and (args.n_cpu_moe < 0 or args.cpu_moe):
         parser.error("Use either --cpu-moe or a nonnegative --n-cpu-moe")
+    if args.unified_memory and (args.expert_cache_mb or args.cpu_moe or args.n_cpu_moe is not None or args.tp or args.layer_split):
+        parser.error("Unified memory chooses expert placement and requires one device without explicit cache/CPU/parallel overrides")
     if len(cases) != len(set(cases)) or any(c not in PROMPTS for c in cases):
         parser.error("Require unique known cases")
     if "image_ocr" in cases and not (args.image and args.mmproj):
@@ -348,7 +351,9 @@ def main():
     http = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(http)
     settings = dict(CUDA_VISIBLE_DEVICES=args.devices, MAX_CONTEXT=str(args.context), KV_CACHE_DTYPE="f16",
-                    TS_GGML_CPU_THREADS=str(args.threads), OMP_NUM_THREADS=str(args.threads), TS_HOST_MOE_EXPERT_CACHE_MB=str(args.expert_cache_mb))
+                    TS_GGML_CPU_THREADS=str(args.threads), OMP_NUM_THREADS=str(args.threads))
+    if not args.unified_memory:
+        settings["TS_HOST_MOE_EXPERT_CACHE_MB"] = str(args.expert_cache_mb)
     try:
         env, settings = backend_environment(settings, args.env, os.environ)
     except ValueError as error:
@@ -356,6 +361,8 @@ def main():
     command = ["dotnet", str(args.server.resolve()), "--model", str(args.model.resolve()), "--mmproj", str(args.mmproj.resolve()) if args.mmproj else "none",
                "--backend", "ggml_cuda", "--host", "127.0.0.1", "--port", str(args.port), "--no-spec", "--no-prefix-cache", "--no-multi-agent",
                "--temperature", "0", "--top-k", "0", "--top-p", "1", "--repeat-penalty", "1", "--seed", "17"]
+    if args.unified_memory:
+        command += ["--unified-memory"]
     if args.cpu_moe:
         command += ["--cpu-moe", "--cpu-moe-threads", str(args.threads)]
     if args.n_cpu_moe is not None:

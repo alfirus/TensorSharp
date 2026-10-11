@@ -37,7 +37,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         _scheduler = scheduler;
         _cacheModel = (IPrefixCacheModel)model;
         _logger = logger;
-        var options = ExecutionOptions.FromEnvironment();
+        var options = scheduler.Config.ResolveExecutionOptions();
         bool batchedEnabled = !options.BatchedPathDisabled && scheduler.Config.KvSnapshots == null;
         // A materialized holder is only readable through the fused per-request route, a paged end state only
         // through the batched route. Without that route (--no-continuous-batching, TS_PER_SEQ_FUSED=0, or a model
@@ -75,10 +75,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal int RequestCount => _requests.Count;
     internal bool PrimaryAvailable { get; set; }
     internal bool RequiresSoleAdmission { get; private set; }
-    private static bool RetentionEnabled
-        => ExecutionOptions.FromEnvironment() is { RetainedFusedCacheBudget: null or > 0 };
-    private static bool PublicCheckpointsEnabled
-        => ExecutionOptions.FromEnvironment() is { PrefixCheckpointBudget: > 0 };
+    private bool RetentionEnabled
+        => _scheduler.Config.ResolveExecutionOptions() is { RetainedFusedCacheBudget: null or > 0 };
+    private bool PublicCheckpointsEnabled
+        => _scheduler.Config.ResolveExecutionOptions() is { PrefixCheckpointBudget: > 0 };
     internal bool CheckpointsSupported => _tree.Caps.CanCaptureCopy && (PublicCheckpointsEnabled || RetentionEnabled);
     internal bool PublicCheckpointsSupported => PublicCheckpointsEnabled && CheckpointsSupported;
     internal string? LastSource { get; private set; }
@@ -147,7 +147,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     private ExpectedRoute PredictRoute()
     {
-        var options = ExecutionOptions.FromEnvironment();
+        var options = _scheduler.Config.ResolveExecutionOptions();
         if (_scheduler.Config.KvSnapshots == null && !options.BatchedPathDisabled && options.PerSeqFusedEnabled
             && _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true })
             return ExpectedRoute.PerSequenceFused;
@@ -167,7 +167,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                 or MaterializeMode.ConvertPrimaryThenClone)
             _plan.Reset();
         if (!_plan.HasReuse && PredictRoute() == ExpectedRoute.Primary
-            && !ExecutionOptions.FromEnvironment().BatchedPathDisabled
+            && !_scheduler.Config.ResolveExecutionOptions().BatchedPathDisabled
             && _model is IBatchedPagedModel { BatchedForwardAvailable: true } paged
             && (sequence.MediaSpans.Count == 0 || paged.SupportsBatchedMultimodal))
         {

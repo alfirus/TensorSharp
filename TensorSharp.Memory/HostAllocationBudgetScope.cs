@@ -16,6 +16,9 @@ public sealed class HostAllocationBudgetScope : IDisposable
     private long _bytes, _peak;
     private int _allocations;
     private bool _disposed;
+    // Instance-local fault seams; the normal path invokes no delegate.
+    internal Action? BeforeAllocationOwnerAllocation { get; set; }
+    internal Action? BeforeExecutionOwnerAllocation { get; set; }
 
     public HostAllocationBudgetScope(MemoryBudget budget, IEnumerable<string> pools)
     {
@@ -45,13 +48,21 @@ public sealed class HostAllocationBudgetScope : IDisposable
         lock (Gate)
         {
             if (_active is not { } scope) return null;
+            // Allocate the final owner and validate all bookkeeping before
+            // taking credit. After TryReserve/TryTake succeeds only no-throw
+            // assignments remain, so OOM cannot orphan a reservation.
+            int nextAllocations = checked(scope._allocations + 1);
+            long nextBytes = checked(scope._bytes + bytes);
+            scope.BeforeAllocationOwnerAllocation?.Invoke();
+            var owner = new Allocation(scope, bytes);
             var charges = scope._pools.Select(p => new MemoryCharge(p, bytes));
             var reservation = scope._envelope == null ? scope._budget.TryReserve(charges) : scope._envelope.TryTake(charges);
             if (reservation == null) throw new MemoryPressureException($"Host allocation of {bytes} bytes exceeds its allocation envelope.");
-            scope._allocations++;
-            scope._bytes = checked(scope._bytes + bytes);
-            scope._peak = Math.Max(scope._peak, scope._bytes);
-            return new(scope, reservation, bytes);
+            owner.Bind(reservation);
+            scope._allocations = nextAllocations;
+            scope._bytes = nextBytes;
+            scope._peak = Math.Max(scope._peak, nextBytes);
+            return owner;
         }
     }
 
@@ -65,8 +76,10 @@ public sealed class HostAllocationBudgetScope : IDisposable
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (!ReferenceEquals(envelope.Budget, _budget)) throw new ArgumentException("Request belongs to a different budget.", nameof(envelope));
             if (_envelope != null) throw new InvalidOperationException("Concurrent or nested host execution envelopes are unsupported.");
+            BeforeExecutionOwnerAllocation?.Invoke();
+            var execution = new Execution(this);
             _envelope = envelope;
-            return new Execution(this);
+            return execution;
         }
     }
 
@@ -91,11 +104,13 @@ public sealed class HostAllocationBudgetScope : IDisposable
     public sealed class Allocation : IDisposable
     {
         private readonly HostAllocationBudgetScope _scope;
-        private readonly BudgetReservation _reservation;
+        private BudgetReservation _reservation = null!;
         private readonly long _bytes;
         private bool _disposed;
-        internal Allocation(HostAllocationBudgetScope scope, BudgetReservation reservation, long bytes)
-        { _scope = scope; _reservation = reservation; _bytes = bytes; }
+        internal Allocation(HostAllocationBudgetScope scope, long bytes)
+        { _scope = scope; _bytes = bytes; }
+        // Only called before publication, after atomic reservation succeeds.
+        internal void Bind(BudgetReservation reservation) => _reservation = reservation;
         public void Commit() { lock (Gate) { ObjectDisposedException.ThrowIf(_disposed, this); _reservation.Commit(); } }
         public void Dispose()
         {

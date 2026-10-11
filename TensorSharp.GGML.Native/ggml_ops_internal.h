@@ -1277,6 +1277,8 @@ namespace tsg
     // Bounded independent decode rows (1..8), one team dispatch per layer.
     // Dot products and expert summation order remain identical to solo decode.
     // Unsupported input returns false without writing any output row.
+    bool host_moe_decode_experts_rows_bounded(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+        const float* weights, float* out);
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                      const float* weights, float* out);
     // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,

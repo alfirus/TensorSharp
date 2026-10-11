@@ -230,5 +230,25 @@ int main()
     for (auto& worker : workers) worker.join();
     ledger.empty();
     require(ledger.detach() && ledger.attach() && ledger.detach(), "released graph scope cannot detach/reattach");
-    std::puts("PASS graph budget: original buffer ABI, reserve-before-alloc, actual-size rollback, physical-free release, gallocr generations, reuse and concurrent admission");
+    // Required-accounted streams must inspect their actual ticket, not just an
+    // earlier advisory attachment snapshot. Simulate detach between the two.
+    for (int mode = 0; mode < 3; ++mode) {
+        ledger.capacity = 4096;
+        if (mode == 0) require(ledger.attach() && tsg::SharedCacheCharge::graph_accounting_attached()
+            && ledger.detach(), "cannot simulate attachment snapshot race");
+        else require(ledger.attach(mode == 2), "accounted-only test attach failed");
+        const auto calls = type.calls.load();
+        allocator = tsg::graph_budget_gallocr_new(&type.type, 0, true);
+        require(allocator != nullptr, "accounted-only allocator construction failed");
+        {
+            Graph graph(16);
+            const bool admitted = tsg::graph_budget_gallocr_alloc_graph(allocator, graph.graph);
+            require(admitted == (mode == 2), "accounted-only allocator bypassed current graph attachment");
+            if (mode != 2) require(type.calls == calls && ledger.physical == 0, "unaccounted physical allocation occurred");
+            else require(ledger.committed > 0 && !ledger.detach(), "accounted allocator lost owner lifetime");
+        }
+        tsg::graph_budget_gallocr_free(allocator); ledger.empty();
+        if (mode != 0) require(ledger.detach(), "accounted-only test did not detach");
+    }
+    std::puts("PASS graph budget: original buffer ABI, reserve-before-alloc, actual-size rollback, physical-free release, gallocr generations, reuse, concurrent admission and exact accounted-only attachment");
 }

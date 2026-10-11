@@ -70,7 +70,7 @@ namespace TensorSharp.Runtime.Scheduling
             ArgumentNullException.ThrowIfNull(cfg);
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
             if (cfg.MemoryAdmission?.EnterSerialExecution != null
-                && (cfg.EnablePrefixCaching || cfg.Speculation.Enabled || !ExecutionOptions.FromEnvironment().BatchedPathDisabled))
+                && (cfg.EnablePrefixCaching || cfg.Speculation.Enabled || !cfg.ResolveExecutionOptions().BatchedPathDisabled))
                 throw new NotSupportedException("The serial request allocation adapter requires explicit per-sequence execution with prefix caching and speculation disabled.");
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
             cfg.MemoryAdmission?.ValidateConfiguration(cfg);
@@ -114,7 +114,7 @@ namespace TensorSharp.Runtime.Scheduling
                     model.Config?.Architecture ?? "model",
                     ExecutionPlanner.BuildCapabilityReport(
                         ExecutionCapabilities.FromModel(model),
-                        ExecutionOptions.FromEnvironment(),
+                        cfg.ResolveExecutionOptions(),
                         cfg));
 
                 if (cfg.MemoryAdmission is { } memoryAdmission)
@@ -299,6 +299,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public void UpdateSpeculation(SpeculationOptions options)
         {
+            if (options?.Enabled == true && _scheduler.Config.MemoryAdmission?.EnterSerialExecution != null)
+                throw new NotSupportedException("The admitted serial memory adapter does not support speculative execution.");
             _commands.Writer.TryWrite(new EngineCommand
             {
                 Kind = EngineCommandKind.Speculation,

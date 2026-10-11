@@ -305,7 +305,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // only executes the plan. Options/capabilities are snapshotted
                 // per step because several are env-var backed and tests toggle
                 // them at runtime.
-                var options = ExecutionOptions.FromEnvironment();
+                var options = _scheduler.Config.ResolveExecutionOptions();
                 var caps = ExecutionCapabilities.FromModel(_model);
                 var features = ComputeStepFeatures(output, caps);
                 var plan = ExecutionPlanner.PlanStep(caps, options, PlanConfig, features);
@@ -2335,7 +2335,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// byte snapshots are deliberately not cross-request reusable, but its full
         /// request-owned attention + recurrent-state holder is.</summary>
         private bool ModelUsesRetainableFusedCache()
-            => ExecutionOptions.FromEnvironment().RetainedFusedCacheBudget != 0
+            => _scheduler.Config.ResolveExecutionOptions().RetainedFusedCacheBudget != 0
             && _model is IBatchedPagedModel f
             && f.SupportsPerSequenceFusedForward
             && f.SupportsRetainedFusedCache;
@@ -2626,7 +2626,7 @@ namespace TensorSharp.Runtime.Scheduling
                     seq.PromptTokens.Count,
                     seq.MaxNewTokens,
                     _model.MaxContextLength,
-                    ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
+                    _scheduler.Config.ResolveExecutionOptions().KvGenerationReserveMax));
             }
 
             int want = work.NumScheduledTokens;

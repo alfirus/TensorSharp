@@ -81,6 +81,13 @@ namespace TensorSharp.Server
         public virtual bool IsAudioEncoderLoaded => TensorSharp.Models.Architecture.AudioInputSupport.IsAudioEncoderLoaded(_lifecycle.Model);
         public ModelBase Model => _lifecycle.Model;
 
+        /// <summary>Explicit shared-budget loading mode. Set before loading; unsupported configurations are refused.</summary>
+        public bool UnifiedMemoryEnabled
+        {
+            get => _lifecycle.UnifiedMemoryEnabled;
+            set => _lifecycle.UnifiedMemoryEnabled = value;
+        }
+
         /// <summary>
         /// Non-null when an explicitly requested <c>--draft-model</c> could not
         /// be activated on the loaded target (see

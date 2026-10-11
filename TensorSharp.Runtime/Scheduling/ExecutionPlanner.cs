@@ -224,6 +224,7 @@ namespace TensorSharp.Runtime.Scheduling
             SchedulerConfig config)
         {
             var sb = new StringBuilder();
+            bool perEnginePolicy = config.ExecutionOptionsOverride != null;
 
             if (config.KvSnapshots is { } snapshots)
                 sb.Append("bounded host KV snapshots: enabled; per-sequence snapshot/swap route; RAM=")
@@ -236,7 +237,9 @@ namespace TensorSharp.Runtime.Scheduling
             else if (config.KvSnapshots != null)
                 sb.Append("disabled (bounded host KV snapshots)");
             else if (options.BatchedPathDisabled)
-                sb.Append("disabled (TS_SCHED_DISABLE_BATCHED)");
+                sb.Append(perEnginePolicy
+                    ? "disabled (per-engine policy: BatchedPathDisabled)"
+                    : "disabled (TS_SCHED_DISABLE_BATCHED)");
             else if (!caps.BatchedForwardAvailable)
                 sb.Append("unavailable (model opt-out or unsupported layer/KV format)");
             else
@@ -250,7 +253,9 @@ namespace TensorSharp.Runtime.Scheduling
             else if (config.KvSnapshots != null)
                 sb.Append("disabled (bounded host KV snapshots)");
             else if (!options.PerSeqFusedEnabled)
-                sb.Append("disabled (TS_PER_SEQ_FUSED=0)");
+                sb.Append(perEnginePolicy
+                    ? "disabled (per-engine policy: PerSeqFusedEnabled=false)"
+                    : "disabled (TS_PER_SEQ_FUSED=0)");
             else
                 sb.Append(options.BatchedFusedDecodeEnabled
                     ? "available (+ token-batched fused decode)"
@@ -261,6 +266,8 @@ namespace TensorSharp.Runtime.Scheduling
                 sb.Append("n/a (no batched contract)");
             else if (config.KvSnapshots != null)
                 sb.Append("disabled (bounded host KV snapshots)");
+            else if (perEnginePolicy && options.BatchedPathDisabled)
+                sb.Append("disabled (per-engine policy selects the serial model route)");
             else if (!caps.SupportsLinearKvMigration)
                 sb.Append("unavailable (no linear->paged KV migration)");
             else
@@ -304,13 +311,24 @@ namespace TensorSharp.Runtime.Scheduling
             else if (!caps.SupportsRetainedFusedCache)
                 sb.Append("unavailable (model does not support retained holders)");
             else if (options.RetainedFusedCacheBudget == 0)
-                sb.Append("off (TS_RETAINED_FUSED_CACHE_MAX=0)");
+                sb.Append(perEnginePolicy
+                    ? "off (per-engine policy: RetainedFusedCacheBudget=0)"
+                    : "off (TS_RETAINED_FUSED_CACHE_MAX=0)");
             else
                 sb.Append("on (budget=").Append(options.RetainedFusedCacheBudgetFor(config.MaxNumRunningSequences)).Append(')');
 
             string overrides = options.DescribeOverrides();
-            if (!string.IsNullOrEmpty(overrides))
+            if (perEnginePolicy)
+                sb.Append("\nactive per-engine policy: SchedulerConfig.ExecutionOptionsOverride; ")
+                    .Append(string.IsNullOrEmpty(overrides) ? "default execution settings" : "equivalent option names: " + overrides)
+                    .Append(" (does not set environment variables)");
+            else if (!string.IsNullOrEmpty(overrides))
                 sb.Append("\nactive TS_* overrides: ").Append(overrides);
+
+            if (config.MemoryAdmission?.EnterSerialExecution != null)
+                sb.Append("\nadmitted serial execution: model.Forward runs inside the request allocation envelope; ")
+                    .Append("model-owned fused kernels remain available where supported by the model/backend, ")
+                    .Append("independently of the scheduler's fused/batched paths");
 
             return sb.ToString();
         }

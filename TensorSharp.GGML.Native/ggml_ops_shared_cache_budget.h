@@ -46,6 +46,16 @@ namespace tsg
         // Immutable after reserve(): this exact ticket, not an advisory registry
         // snapshot, tells a caller whether allocation is under shared accounting.
         bool is_accounted() const noexcept { return token_ != 0; }
+        static bool host_accounting_attached() {
+            auto& r = registry();
+            std::lock_guard<std::mutex> lock(r.mutex);
+            return r.reserve != nullptr && r.host_buffers;
+        }
+        static bool graph_accounting_attached() {
+            auto& r = registry();
+            std::lock_guard<std::mutex> lock(r.mutex);
+            return r.reserve != nullptr && r.graph_buffers;
+        }
 
         static bool attach(void* context, Reserve reserve, Commit commit, Release release,
             bool graph_buffers = false, bool host_buffers = false)

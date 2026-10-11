@@ -20,6 +20,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Optional RAM/SSD budgets for model snapshot bytes only.</summary>
         public KvSnapshotOptions? KvSnapshots { get; init; }
         public RequestMemoryAdmission? MemoryAdmission { get; init; }
+        /// <summary>Immutable execution policy supplied by a qualified memory
+        /// adapter. It does not mutate process-wide environment variables.</summary>
+        public ExecutionOptions? ExecutionOptionsOverride { get; init; }
+
+        internal ExecutionOptions ResolveExecutionOptions()
+            => ExecutionOptionsOverride ?? ExecutionOptions.FromEnvironment();
 
         /// <summary>Maximum tokens forwarded across all sequences per step.
         /// Equivalent to vLLM's <c>max_num_batched_tokens</c>. Default 4096.</summary>
@@ -136,6 +142,7 @@ namespace TensorSharp.Runtime.Scheduling
             Speculation = speculation,
             KvSnapshots = KvSnapshots,
             MemoryAdmission = MemoryAdmission,
+            ExecutionOptionsOverride = ExecutionOptionsOverride,
         };
 
         public static SchedulerConfig FromEnvironment()

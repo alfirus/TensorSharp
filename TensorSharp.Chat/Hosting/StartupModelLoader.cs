@@ -88,12 +88,7 @@ namespace TensorSharp.Server.Hosting
 
             if (modelService.Model != null)
             {
-                var warmupSw = Stopwatch.StartNew();
-                modelService.Model.WarmUpKernels();
-                warmupSw.Stop();
-                logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
-                modelService.Model.LogVramSnapshot("after kernel warmup");
+                WarmUpLoadedModel(modelService.Model, modelService.UnifiedMemoryEnabled, logger);
 
                 // Multi-node tensor parallelism: from here on this server is the
                 // driver (node 0) — every forward pass broadcasts to the worker
@@ -102,6 +97,26 @@ namespace TensorSharp.Server.Hosting
                 // node and must not broadcast). No-op on single-node groups.
                 modelService.Model.BeginDistributedDriver();
             }
+        }
+
+        internal static void WarmUpLoadedModel(ModelBase model, bool unifiedMemoryEnabled, ILogger logger)
+        {
+            if (unifiedMemoryEnabled)
+            {
+                // The legacy warmup calls Forward/ForwardRefill directly, with
+                // its own prefill geometry and no request allocation envelope.
+                // The first real admitted request must materialize these caches
+                // under the session's capacity checks and bounded chunk size.
+                logger.LogInformation(LogEventIds.HostConfiguration,
+                    "Kernel warmup deferred (--unified-memory): the first admitted request initializes kernels and caches within its memory envelope.");
+                return;
+            }
+            var warmupSw = Stopwatch.StartNew();
+            model.WarmUpKernels();
+            warmupSw.Stop();
+            logger.LogInformation(LogEventIds.HostConfiguration,
+                "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
+            model.LogVramSnapshot("after kernel warmup");
         }
 
         /// <summary>
@@ -157,8 +172,8 @@ namespace TensorSharp.Server.Hosting
             if (!options.PrefixCacheEnabled)
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Prefix cache disabled (--no-prefix-cache): runtime reuse, startup warmup, "
-                    + "and disk persistence are off.");
+                    "Prefix cache disabled ({Reason}): runtime reuse, startup warmup, and disk persistence are off.",
+                    options.UnifiedMemoryEnabled ? "--unified-memory" : "--no-prefix-cache");
                 return;
             }
 

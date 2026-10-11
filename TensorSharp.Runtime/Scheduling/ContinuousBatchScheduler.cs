@@ -250,7 +250,11 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_waiting.Count >= admission.MaxQueuedRequests)
                     throw new MemoryPressureException("The memory admission queue is full.");
                 var peak = admission.EstimatePeak(seq).ToArray();
-                if (!(admission.BeforeAdmission == null ? admission.Budget.CanEverFit(peak)
+                // A refresh adapter may reduce optional retained-cache allowance
+                // at the physical boundary. Its queued estimate is provisional:
+                // reject only the refreshed peak, before any reservation/forward.
+                if (!admission.ReestimateAfterPhysicalCheck
+                    && !(admission.BeforeAdmission == null ? admission.Budget.CanEverFit(peak)
                     : admission.Budget.CanEverFitConfiguredCeiling(peak)))
                     throw new MemoryPressureException("Request peak exceeds a configured physical memory pool even in isolation.");
                 _memoryPeaks.Add(seq.RequestId, peak);
@@ -430,9 +434,19 @@ namespace TensorSharp.Runtime.Scheduling
                     try
                     {
                         IReadOnlyList<MemoryCharge>? constraints = null;
-                        IReadOnlyList<MemoryCharge> SamplePhysicalCapacity() =>
-                            admission.BeforeAdmission!(seq) ?? throw new InvalidOperationException(
+                        IReadOnlyList<MemoryCharge> SamplePhysicalCapacity()
+                        {
+                            var sampled = admission.BeforeAdmission!(seq) ?? throw new InvalidOperationException(
                                 "The physical admission check returned no capacity constraints.");
+                            if (admission.ReestimateAfterPhysicalCheck)
+                            {
+                                peak = admission.EstimatePeak(seq).ToArray();
+                                if (!admission.Budget.CanEverFitConfiguredCeiling(peak))
+                                    throw new MemoryPressureException("Refreshed request peak exceeds a configured memory pool.");
+                                _memoryPeaks[seq.RequestId] = peak;
+                            }
+                            return sampled;
+                        }
                         bool hasTurn = _sharedAdmission?.HasAdmissionTurn(peak) ?? true;
                         // Sample a new eligible head once, even if a private stale
                         // target or owner floor currently makes it wait. Recovery

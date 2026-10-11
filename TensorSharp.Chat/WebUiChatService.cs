@@ -358,6 +358,7 @@ namespace TensorSharp.Chat
                 mmProjModels = mmProjFiles,
                 loaded = _svc.LoadedModelName,
                 loadedMmProj = _svc.LoadedMmProjName,
+                unifiedMemory = _svc.UnifiedMemoryEnabled && _svc.IsLoaded,
                 // A projector path is only configuration; this is the runtime
                 // capability after the model has actually loaded and accepted it.
                 // Phone clients use it to keep an image in the composer instead of

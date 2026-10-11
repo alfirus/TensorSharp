@@ -386,7 +386,6 @@ namespace TensorSharp.Models
         private void DisposeHolder(Qwen4ExpKvCacheHolder holder)
         {
             if (holder == null || holder.Disposed) return;
-            holder.Disposed = true;
             holder.Retired = true;
             ReleaseMtpState(holder.GdnConvStateT);
             if (ReferenceEquals(_specSnapshotOwner, holder.GdnConvStateT))
@@ -406,11 +405,13 @@ namespace TensorSharp.Models
             void DisposeSet(Tensor[] set)
             {
                 if (set == null) return;
-                foreach (var t in set)
+                for (int i = 0; i < set.Length; i++)
                 {
+                    var t = set[i];
                     if (t == null) continue;
                     InvalidateTensorDeviceCache(t);
                     t.Dispose();
+                    set[i] = null;
                 }
             }
             DisposeSet(holder.K);
@@ -418,6 +419,7 @@ namespace TensorSharp.Models
             DisposeSet(holder.IdxK);
             DisposeSet(holder.GdnConvStateT);
             DisposeSet(holder.GdnStateT);
+            holder.Disposed = true;
         }
 
         private void DisposeAllFusedHolders()

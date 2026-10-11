@@ -24,4 +24,12 @@ public sealed record ModelMemoryPolicy
     /// <summary>The admitted graph contains only the trunk. Resolve before
     /// loading so later environment changes cannot add unaccounted draft weights.</summary>
     public bool OmitEmbeddedDraftWeights { get; init; }
+
+    /// <summary>Optional per-session selected-expert cache ceiling. Null retains
+    /// ordinary environment-controlled placement; zero explicitly disables it.</summary>
+    public long? ExpertCacheBytes { get; init; }
+    public int ExpertCachePrefillRows { get; init; } = 8;
+    /// <summary>Device holdout for this model's admitted execution and vision
+    /// workspace, kept free when selecting whole expert layers.</summary>
+    public long DeviceExecutionReserveBytes { get; init; }
 }

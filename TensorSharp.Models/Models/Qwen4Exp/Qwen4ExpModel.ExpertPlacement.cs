@@ -100,7 +100,11 @@ namespace TensorSharp.Models
             if (_backend == BackendType.GgmlCuda && !IsTensorParallel && LayerSplitDegree <= 1)
             {
                 if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                {
+                    if (MemoryPolicy != null)
+                        throw new InvalidOperationException("Cannot inspect CUDA capacity for unified expert placement.");
                     return;
+                }
                 var layerBytes = new long[n];
                 var cacheMinimum = new long[n];
                 var cacheAllocationFloor = new long[n];
@@ -120,16 +124,24 @@ namespace TensorSharp.Models
                 // again. The optional MTP head is preloaded AFTER this plan.
                 long pending = checked(CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes));
                 foreach (var weight in _weights.Values) pending = checked(pending + weight.Storage.ByteLength);
-                long cacheBudget = ResolveCudaExpertCacheBudget(
+                long cacheBudget = MemoryPolicy?.ExpertCacheBytes ?? ResolveCudaExpertCacheBudget(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_MB"));
-                ulong cacheLayers = ResolveCudaExpertCacheLayers(
+                ulong cacheLayers = MemoryPolicy?.ExpertCacheBytes != null ? (ulong)n : ResolveCudaExpertCacheLayers(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_LAYERS"));
-                int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free,
-                    GpuMemoryBudget.ResolveHeadroomBytes(total), cacheBudget, cacheMinimum, cacheLayers, cacheAllocationFloor);
+                long executionReserve = MemoryPolicy?.DeviceExecutionReserveBytes > 0
+                    ? MemoryPolicy.DeviceExecutionReserveBytes : DeviceScratchBytes;
+                // The session owns selected-expert cache tickets and forecasts
+                // that tier explicitly. Whole-layer bindings are a different
+                // persistent owner: do not create them outside its forecast,
+                // including when pressure or an operator disables the cache.
+                int resident = MemoryPolicy != null ? 0 : PlanCudaDeviceExpertLayers(layerBytes, pending, free,
+                    GpuMemoryBudget.ResolveHeadroomBytes(total), cacheBudget, cacheMinimum, cacheLayers, cacheAllocationFloor,
+                    executionReserve);
                 for (int l = 0; l < n - resident; l++) _expertOnHost[l] = true;
-                ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}" +
+                ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved execution {Gb(executionReserve)}" +
                     (cacheBudget > 0 ? $", expert cache ceiling {Gb(cacheBudget)}" : "") +
-                    "; --n-cpu-moe N overrides");
+                    (MemoryPolicy != null ? $", admitted cache prefill rows {MemoryPolicy.ExpertCachePrefillRows}" : "") +
+                    (MemoryPolicy != null ? "; placement selected by unified-memory budget" : "; --n-cpu-moe N overrides"));
                 return;
             }
 
@@ -228,8 +240,18 @@ namespace TensorSharp.Models
             long[] layerCacheMinimumBytes = null, ulong cacheLayers = 48,
             long[] layerCacheAllocationFloorBytes = null)
         {
+            return PlanCudaDeviceExpertLayers(layerExpertBytes, pendingBytes, freeBytes, headroomBytes,
+                expertCacheBytes, layerCacheMinimumBytes, cacheLayers, layerCacheAllocationFloorBytes, DeviceScratchBytes);
+        }
+
+        internal static int PlanCudaDeviceExpertLayers(long[] layerExpertBytes, long pendingBytes,
+            long freeBytes, long headroomBytes, long expertCacheBytes,
+            long[] layerCacheMinimumBytes, ulong cacheLayers,
+            long[] layerCacheAllocationFloorBytes, long executionReserveBytes)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(executionReserveBytes);
             return TensorSharp.Memory.TieredPlacementPlanner.PlanDiscreteResidency(
-                layerExpertBytes, pendingBytes, freeBytes, headroomBytes, DeviceScratchBytes,
+                layerExpertBytes, pendingBytes, freeBytes, headroomBytes, executionReserveBytes,
                 expertCacheBytes, layerCacheMinimumBytes, cacheLayers, layerCacheAllocationFloorBytes);
         }
 

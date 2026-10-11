@@ -15,7 +15,7 @@ namespace tsg {
     // Single-buffer-type gallocr only. Use the matching allocate/free entry points;
     // calling upstream reserve/reserve_size/free directly bypasses ownership.
     // The owner serializes allocator mutation, not concurrent graph execution.
-    ggml_gallocr_t graph_budget_gallocr_new(ggml_backend_buffer_type_t type, int rank);
+    ggml_gallocr_t graph_budget_gallocr_new(ggml_backend_buffer_type_t type, int rank, bool require_accounted = false);
     bool graph_budget_gallocr_alloc_graph(ggml_gallocr_t allocator, ggml_cgraph* graph);
     void graph_budget_gallocr_free(ggml_gallocr_t allocator);
 }

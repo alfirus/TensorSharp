@@ -8,6 +8,53 @@ namespace InferenceWeb.Tests;
 
 public class HostAllocationBudgetTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AllocationOwnerFailureDoesNotTakeCreditOrMutateUsage(bool withinRequest)
+    {
+        var budget = new MemoryBudget([new("ram", 100)]);
+        using var scope = new HostAllocationBudgetScope(budget, ["ram"]);
+        using var envelope = withinRequest ? budget.Reserve([new("ram", 100)]) : null;
+        using var execution = envelope == null ? null : scope.EnterExecution(envelope);
+        var before = budget.Snapshot().ToArray();
+        var beforeUsage = scope.Usage;
+        scope.BeforeAllocationOwnerAllocation = () => throw new OutOfMemoryException("controlled host owner failure");
+        Assert.Throws<OutOfMemoryException>(() => HostAllocationBudgetScope.Reserve(20));
+        Assert.Equal(before, budget.Snapshot());
+        Assert.Equal(beforeUsage, scope.Usage);
+        if (envelope != null) Assert.False(envelope.HasChildren);
+        scope.BeforeAllocationOwnerAllocation = null;
+        using (var retry = HostAllocationBudgetScope.Reserve(20))
+        {
+            Assert.NotNull(retry);
+            retry.Commit();
+            Assert.Equal(20, scope.Usage.Bytes);
+        }
+        Assert.Equal(before, budget.Snapshot());
+        Assert.Equal(0, scope.Usage.Bytes);
+        Assert.Equal(0, scope.Usage.Allocations);
+    }
+
+    [Fact]
+    public void ExecutionOwnerFailureDoesNotPublishAnUnownedEnvelope()
+    {
+        var budget = new MemoryBudget([new("ram", 100)]);
+        using var scope = new HostAllocationBudgetScope(budget, ["ram"]);
+        using var envelope = budget.Reserve([new("ram", 100)]);
+        scope.BeforeExecutionOwnerAllocation = () => throw new OutOfMemoryException("controlled execution owner failure");
+        Assert.Throws<OutOfMemoryException>(() => scope.EnterExecution(envelope));
+        Assert.Equal(0, scope.Usage.Bytes);
+        Assert.False(envelope.HasChildren);
+        scope.BeforeExecutionOwnerAllocation = null;
+        using (scope.EnterExecution(envelope))
+        using (var allocation = HostAllocationBudgetScope.Reserve(100)) allocation!.Commit();
+        Assert.Equal(new MemoryCharge("ram", 100), Assert.Single(envelope.Charges));
+        Assert.Equal(0, scope.Usage.Allocations);
+        Assert.Equal(100, budget.Snapshot().Single().Reserved);
+        scope.Dispose(); // No hidden execution owner prevented detachment.
+    }
+
     [Fact]
     public void InitialPoolRejectionRollsBackEarlierBlocks()
     {
