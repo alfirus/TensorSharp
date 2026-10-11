@@ -73,10 +73,12 @@ def relative_difference(left, right):
     reference = max(range(len(right)), key=right.__getitem__)
     a = [x - left[reference] for x in left]
     b = [x - right[reference] for x in right]
+    delta = [x-y for x,y in zip(a,b)]
     return dict(reference_token=reference,
-        relative_l2_after_common_token_offset=math.sqrt(math.fsum((x-y)**2 for x,y in zip(a,b))) /
+        relative_l2_after_common_token_offset=math.sqrt(math.fsum(x*x for x in delta)) /
             max(math.sqrt(math.fsum(x*x for x in b)), 1e-150),
-        max_abs_pairwise_logit_error=max(abs(x-y) for x,y in zip(a,b)),
+        max_abs_after_common_token_offset=max(abs(x) for x in delta),
+        max_pairwise_margin_error=max(delta)-min(delta),
         argmax=[max(range(len(left)), key=left.__getitem__), reference])
 
 

@@ -102,11 +102,14 @@ class DistributionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'prediction rows'):tool.full_distributions(r,fixture())
 
     def test_common_offset_removes_normalization_without_hiding_margin_difference(self):
-        self.assertEqual(0,tool.relative_difference([7.,8.,9.],[-3.,-2.,-1.])['max_abs_pairwise_logit_error'])
+        self.assertEqual(0,tool.relative_difference([7.,8.,9.],[-3.,-2.,-1.])['max_abs_after_common_token_offset'])
         changed=tool.relative_difference([7.,9.,9.],[-3.,-2.,-1.])
-        self.assertEqual(1,changed['max_abs_pairwise_logit_error'])
+        self.assertEqual(1,changed['max_abs_after_common_token_offset'])
         self.assertAlmostEqual(1/math.sqrt(5),changed['relative_l2_after_common_token_offset'])
         self.assertEqual(-1,tool.row_summary([-3.,-2.,-1.],[0,1])['candidate_margin'])
+        pairwise=tool.relative_difference([-1.,2.,2.],[0.,1.,2.])
+        self.assertEqual(1,pairwise['max_abs_after_common_token_offset'])
+        self.assertEqual(2,pairwise['max_pairwise_margin_error'])
 
     def test_f64_storage_is_explicitly_normalized_and_preserves_api_values_and_history(self):
         with tempfile.TemporaryDirectory() as tmp:
