@@ -1395,6 +1395,7 @@ static bool dsv4_prefault_host_experts(dsv4_model & loaded, const shard_files & 
                 fprintf(stderr, "[dsv4] prefaulting the mmapped host experts failed: %s\n", r.error.c_str());
                 return false;
             }
+            if (r.budget_skipped) return true; // Demand reads continue; no page-touch fallback.
             fprintf(stderr, "[dsv4] prefaulted %.1f GiB of mmapped host experts in %.1fs "
                             "(pread, %d threads: %.1f GiB read, %.1f GiB already resident)\n",
                     warm_bytes / 1073741824.0,
@@ -1577,7 +1578,8 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
                 fprintf(stderr, "[dsv41] warming the Engram tables failed: %s\n", r.error.c_str());
                 return false;
             }
-            fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (%d pread threads: %.2f GiB read, "
+            if (!r.budget_skipped)
+                fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (%d pread threads: %.2f GiB read, "
                 "%.2f GiB already resident)\n",
                 bytes / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
                 r.threads, r.bytes_read / 1073741824.0, r.bytes_resident / 1073741824.0);
@@ -1631,7 +1633,7 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
                         if (r.stopped) return;
                         if (!r.ok)
                             fprintf(stderr, "[dsv41] background Engram warming stopped: %s\n", r.error.c_str());
-                        else
+                        else if (!r.budget_skipped)
                             fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (background, %d pread threads: "
                                 "%.2f GiB read, %.2f GiB already resident)\n",
                                 bytes / 1073741824.0,

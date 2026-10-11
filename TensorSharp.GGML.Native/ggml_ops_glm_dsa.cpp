@@ -2754,7 +2754,8 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                     fprintf(stderr, "[glm] prefaulting mapped host experts failed: %s\n", result.error.c_str());
                     return nullptr;
                 }
-                fprintf(stderr, "[glm] prefaulted %.1f GiB of mmapped host experts in %.1fs "
+                if (!result.budget_skipped)
+                    fprintf(stderr, "[glm] prefaulted %.1f GiB of mmapped host experts in %.1fs "
                                 "(pread, %d threads: %.1f GiB read, %.1f GiB already resident)\n",
                         m->mmap_weight_bytes / 1073741824.0,
                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
