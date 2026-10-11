@@ -43,6 +43,9 @@ namespace tsg
         SharedCacheCharge() = default;
         SharedCacheCharge(const SharedCacheCharge&) = delete;
         SharedCacheCharge& operator=(const SharedCacheCharge&) = delete;
+        // Immutable after reserve(): this exact ticket, not an advisory registry
+        // snapshot, tells a caller whether allocation is under shared accounting.
+        bool is_accounted() const noexcept { return token_ != 0; }
 
         static bool attach(void* context, Reserve reserve, Commit commit, Release release,
             bool graph_buffers = false, bool host_buffers = false)

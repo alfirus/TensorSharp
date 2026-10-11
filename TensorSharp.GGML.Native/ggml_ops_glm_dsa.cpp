@@ -1064,25 +1064,39 @@ struct load_job
     size_t row_len = 0;  // bytes per row when src_row != 0
 };
 
-static bool upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads)
+static bool upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads, size_t chunk)
 {
+    if (jobs.empty()) return true;
     std::sort(jobs.begin(), jobs.end(), [](const load_job & a, const load_job & b)
     {
         if (a.shard != b.shard) return a.shard < b.shard;
         return a.file_off < b.file_off;
     });
 
-    if (n_threads > (int) jobs.size()) n_threads = (int) jobs.size();
     if (n_threads < 1) n_threads = 1;
 
+    upload_plan plan;
+    try { plan = plan_upload(jobs, (size_t) n_threads, chunk); }
+    catch (const upload_budget_refused & refusal) {
+        fprintf(stderr, "[glm] upload host-budget preflight refused: negotiation_refusals=%zu minimum_payload=%zu; no upload started\n",
+                refusal.refusals, refusal.minimum_payload);
+        return false;
+    }
+    // Allocate/commit the complete payload before starting any worker. No worker
+    // can race another for temporary budget, grow a slice, or retry a half-load.
+    std::unique_ptr<upload_arena<>> arena;
+    if (plan.accounted) arena = std::make_unique<upload_arena<>>(plan);
+    fprintf(stderr, "[glm] upload plan: accounted=%d workers=%zu chunk=%zu staging=%zu slab=%zu aggregate_payload_capacity=%zu negotiation_refusals=%zu lazy=%d\n",
+            plan.accounted ? 1 : 0, plan.workers, plan.chunk, plan.staging, plan.slab,
+            plan.aggregate, plan.refusals, plan.accounted ? 0 : 1);
+
     std::atomic<size_t> cursor(0);
+    std::atomic<size_t> worker_slot(0);
     std::atomic<bool> failed(false);
 
-    auto worker = [&]()
+    auto work = [&](auto & staging, auto & source_slab, size_t segment_chunk, size_t slab_limit)
     {
         std::vector<unique_file> files(shards.paths.size());
-        upload_buffer<> staging;
-        upload_buffer<> source_slab;
         while (!failed.load(std::memory_order_relaxed))
         {
             size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
@@ -1101,30 +1115,41 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
                 }
             }
             FILE * f = file.get();
-            if (staging.size() < j.len) staging.resize(j.len);
-
-            bool ok = true;
-            if (j.src_row == 0)
+            for (size_t done = 0; done < j.len && !failed.load(std::memory_order_relaxed);)
             {
-                ok = read_file_range(f, j.file_off, j.len, staging.data());
+                const size_t bytes = upload_segment_bytes(j.len - done, segment_chunk, j.src_row, j.row_len);
+                if (staging.size() < bytes) staging.resize(bytes);
+                const size_t source_offset = upload_add(j.file_off,
+                    j.src_row ? upload_multiply(done / j.row_len, j.src_row) : done);
+                const bool ok = j.src_row == 0
+                    ? read_file_range(f, source_offset, bytes, staging.data())
+                    : tsg_glm::read_file_strips(f, source_offset, j.src_row, j.row_len,
+                                              bytes, staging.data(), source_slab, slab_limit);
+                if (!ok) {
+                    fprintf(stderr, "[glm] seek/read failed for %s: %zu bytes at offset %zu of %s\n",
+                            j.t->name, bytes, source_offset, shards.paths[j.shard].c_str());
+                    failed.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                ggml_backend_tensor_set(j.t, staging.data(), upload_add(j.tensor_off, done), bytes);
+                done += bytes;
             }
-            else
-            {
-                ok = tsg_glm::read_file_strips(f, j.file_off, j.src_row, j.row_len,
-                                             j.len, staging.data(), source_slab);
-            }
-            if (!ok)
-            {
-                fprintf(stderr, "[glm] seek/read failed for %s: %zu bytes at offset %zu of %s\n",
-                        j.t->name, j.len, j.file_off, shards.paths[j.shard].c_str());
-                failed.store(true, std::memory_order_relaxed);
-                break;
-            }
-            ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
         }
     };
-
-    run_joined_workers((size_t) n_threads, failed, worker);
+    auto worker = [&]() {
+        if (arena) {
+            const size_t slot = worker_slot.fetch_add(1, std::memory_order_relaxed);
+            auto staging = arena->staging(slot);
+            auto source_slab = arena->slab(slot);
+            work(staging, source_slab, plan.chunk, plan.slab_limit);
+        } else {
+            // Preserve the ordinary path's lazy allocation and original job/read
+            // sizes. The unaccounted plan ticket prevents mid-load host attach.
+            upload_buffer<> staging, source_slab;
+            work(staging, source_slab, (std::numeric_limits<size_t>::max)(), 1024 * 1024);
+        }
+    };
+    run_joined_workers(plan.workers, failed, worker);
     return !failed.load();
 }
 
@@ -2622,12 +2647,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // --- upload -----------------------------------------------------------
     size_t uploaded = 0;
     {
-        size_t chunk = (size_t) 64 * 1024 * 1024;
-        if (const char * e = getenv("TS_GLM_LOAD_CHUNK_MB")) { long v = atol(e); if (v > 0) chunk = (size_t) v * 1024 * 1024; }
-        int load_threads = 16;
-        if (const char * e = getenv("TS_GLM_LOAD_THREADS")) { int v = atoi(e); if (v > 0) load_threads = v; }
+        const size_t chunk = upload_option(getenv("TS_GLM_LOAD_CHUNK_MB"), size_t(64) * 1024 * 1024,
+            1024 * 1024, (size_t) (std::numeric_limits<int64_t>::max)());
+        int load_threads = (int) upload_option(getenv("TS_GLM_LOAD_THREADS"), 16, 1,
+            (size_t) (std::numeric_limits<int>::max)());
         unsigned hw = std::thread::hardware_concurrency();
-        if (hw > 0 && load_threads > (int) hw) load_threads = (int) hw;
+        if (hw > 0 && (unsigned) load_threads > hw) load_threads = (int) hw;
 
         std::vector<load_job> jobs;
         bool sizes_ok = true;
@@ -2645,28 +2670,34 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 sizes_ok = false;
                 continue;
             }
+            if (!total) continue;
+            validate_upload_range(pw.file_off, total, pw.src_row, pw.row_len);
 
             if (pw.src_row == 0)
             {
-                for (size_t off = 0; off < total; off += chunk)
-                    jobs.push_back({ t, pw.shard, pw.file_off + off, off, std::min(chunk, total - off), 0, 0 });
+                for (size_t off = 0; off < total;) {
+                    const size_t bytes = std::min(chunk, total - off);
+                    jobs.push_back({ t, pw.shard, upload_add(pw.file_off, off), off, bytes, 0, 0 });
+                    off += bytes;
+                }
             }
             else
             {
                 // Strided (row-parallel) slice: chunk by whole source rows.
                 const size_t rows_total = total / pw.row_len;
                 const size_t rows_per_chunk = std::max<size_t>(1, chunk / pw.row_len);
-                for (size_t r0 = 0; r0 < rows_total; r0 += rows_per_chunk)
+                for (size_t r0 = 0; r0 < rows_total;)
                 {
                     const size_t rows = std::min(rows_per_chunk, rows_total - r0);
-                    jobs.push_back({ t, pw.shard, pw.file_off + r0 * pw.src_row, r0 * pw.row_len,
-                                     rows * pw.row_len, pw.src_row, pw.row_len });
+                    jobs.push_back({ t, pw.shard, upload_add(pw.file_off, upload_multiply(r0, pw.src_row)),
+                                     upload_multiply(r0, pw.row_len), upload_multiply(rows, pw.row_len), pw.src_row, pw.row_len });
+                    r0 += rows;
                 }
             }
-            uploaded += total;
+            uploaded = upload_add(uploaded, total);
         }
         if (!sizes_ok) return nullptr;
-        if (!upload_parallel(shards, jobs, load_threads)) return nullptr;
+        if (!upload_parallel(shards, jobs, load_threads, chunk)) return nullptr;
 
         // Warm the mapped experts with the same parallelism the copy path had —
         // lazy faulting would charge the whole read to the first prompt at
