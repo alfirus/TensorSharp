@@ -6,6 +6,7 @@
 #include "ggml_ops_file_source.h"
 #include "ggml_ops_moe_prefetch_policy.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_host_moe_cache_policy.h"
 #include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
 #ifdef TSG_GGML_USE_CUDA
@@ -28,6 +29,8 @@ extern "C" int TSGgml_RegisterHostFileSource(const void*, std::int64_t, const ch
 namespace tsg
 {
     DeviceState g_device_states[TSG_MAX_DEVICES];
+    std::atomic<int> g_device_count{1};
+    std::atomic<int> g_tp_global_degree{0};
     thread_local int g_active_rank = 0;
     std::atomic<std::uint64_t> g_ggml_error_count{0};
     std::atomic<bool> g_backend_compute_failed{false};
@@ -43,6 +46,7 @@ namespace tsg
     std::size_t host_moe_expert_cache_test_physical_bytes();
     std::size_t host_moe_expert_cache_test_file_workspace_bytes();
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes);
+    std::uint64_t host_moe_expert_cache_test_output_drains();
 #ifdef TSG_GGML_USE_CUDA
     void read_expert_files(std::vector<ExpertReadTask>& tasks,
         const std::function<void(std::size_t)>& consume)
@@ -126,6 +130,18 @@ namespace
         require(!policy.should_prefetch(1, bytes), "Re-armed policy lost its minimum work guard");
         tsg::ExpertPrefetchPolicy reloaded;
         require(reloaded.should_prefetch(8, bytes), "Reload inherited another mapping's hot state");
+    }
+
+    void prefill_limit_checks()
+    {
+        const char* invalid_values[] = {nullptr, "", "0", "1", "8", "65", "+64", " 64", "64 ",
+                                       "-1", "18446744073709551616", "64x"};
+        for (const char* invalid : invalid_values)
+            require(tsg::host_moe_cache_prefill_rows(invalid) == TSG_PRECISION_DECODE_COLUMNS,
+                "Invalid/unset wide-prefill limit changed the default decode width");
+        for (const int value : {9, 31, 63, 64})
+            require(tsg::host_moe_cache_prefill_rows(std::to_string(value).c_str()) == value,
+                "Bounded opt-in prefill row limit was not parsed exactly");
     }
 
     struct Stats
@@ -288,13 +304,13 @@ namespace
         ggml_tensor* routes = nullptr;
         ggml_tensor* output = nullptr;
 
-        DeviceInputs()
+        explicit DeviceInputs(int rows = static_cast<int>(TSG_PRECISION_DECODE_COLUMNS))
         {
             context = ggml_init({ggml_tensor_overhead() * 4, nullptr, true});
             require(context != nullptr, "Could not allocate device-bridge input metadata");
-            x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, TSG_PRECISION_DECODE_COLUMNS);
-            routes = ggml_new_tensor_2d(context, GGML_TYPE_F32, used, TSG_PRECISION_DECODE_COLUMNS);
-            output = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, TSG_PRECISION_DECODE_COLUMNS);
+            x = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, rows);
+            routes = ggml_new_tensor_2d(context, GGML_TYPE_F32, used, rows);
+            output = ggml_new_tensor_2d(context, GGML_TYPE_F32, hidden, rows);
             buffer = ggml_backend_alloc_ctx_tensors(context, g_backend);
             require(buffer != nullptr, "Could not allocate device-bridge inputs");
         }
@@ -374,6 +390,163 @@ namespace
             return result;
         }
     };
+
+    void wide_prefill_checks(Weights& weights)
+    {
+        tsg::host_moe_expert_cache_release();
+        SharedLedger ledger;
+        require(ledger.attach(), "Could not attach wide-prefill budget fixture");
+        FullResidentGraph reference(weights);
+        DeviceInputs device(64);
+        std::int64_t retained_bytes = 0;
+        std::uint64_t retained_reservations = 0;
+        for (int rows : {9, 31, 63, 64})
+        {
+            auto hm = weights.segment;
+            hm.seq_len = rows;
+            hm.moe_in = device.x; hm.weights = device.routes; hm.moe_out = device.output;
+            std::vector<float> inputs(rows * hidden), routes(rows * used), expected(rows * hidden);
+            std::vector<float> actual(rows * hidden, -999.0f);
+            std::vector<std::int32_t> selected(rows * used);
+            for (int row = 0; row < rows; ++row)
+            {
+                std::array<float, hidden> x{};
+                for (int i = 0; i < hidden; ++i)
+                    x[i] = inputs[row * hidden + i] = std::sin(i * .07f + row + rows * .2f);
+                std::array<std::int32_t, used> ids{(row * 5 + rows) % experts, (row * 5 + rows + 1) % experts};
+                if (row % 3 == 0) ids[1] = ids[0];
+                std::array<float, used> probabilities{.25f + .001f * row, .75f - .001f * row};
+                std::copy(ids.begin(), ids.end(), selected.begin() + row * used);
+                std::copy(probabilities.begin(), probabilities.end(), routes.begin() + row * used);
+                const auto result = reference.compute(x, ids, probabilities);
+                require(std::all_of(result.begin(), result.end(), [](float v) { return std::isfinite(v); }),
+                    "Full-resident wide-prefill oracle produced a non-finite row");
+                std::copy(result.begin(), result.end(), expected.begin() + row * hidden);
+            }
+            auto call = [&](int bridge) {
+                return tsg::host_moe_cached_experts(hm, bridge ? nullptr : inputs.data(), selected.data(),
+                    bridge ? nullptr : routes.data(), bridge == 2 ? nullptr : actual.data(),
+                    "qwen4exp fused token span");
+            };
+            ggml_backend_tensor_set(device.x, inputs.data(), 0, inputs.size() * sizeof(float));
+            ggml_backend_tensor_set(device.routes, routes.data(), 0, routes.size() * sizeof(float));
+            auto rejected = [&](int bridge) {
+                std::fill(actual.begin(), actual.end(), -999.0f);
+                ggml_backend_tensor_set(device.output, actual.data(), 0, actual.size() * sizeof(float));
+                const auto before = Stats();
+                require(call(bridge) == 0, "Unsupported wide-prefill input did not decline before execution");
+                const auto after = Stats();
+                require(before.calls == after.calls && before.hits == after.hits && before.misses == after.misses
+                    && before.reserved == after.reserved, "Rejected wide-prefill input changed cache state");
+                if (bridge == 2) ggml_backend_tensor_get(device.output, actual.data(), 0, actual.size() * sizeof(float));
+                require(std::all_of(actual.begin(), actual.end(), [](float v) { return v == -999.0f; }),
+                    "Rejected wide-prefill input overwrote an output row");
+            };
+            // Validate the whole block, including its last row, before budget
+            // admission or mutation. The three bridge modes obey one contract.
+            const auto last_id = selected.back();
+            selected.back() = experts;
+            for (int bridge : {0, 1, 2}) rejected(bridge);
+            selected.back() = last_id;
+            const float last_route = routes.back();
+            for (float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()})
+            {
+                routes.back() = invalid;
+                ggml_backend_tensor_set(device.routes, routes.data(), 0, routes.size() * sizeof(float));
+                for (int bridge : {0, 1, 2}) rejected(bridge);
+            }
+            routes.back() = last_route;
+            ggml_backend_tensor_set(device.routes, routes.data(), 0, routes.size() * sizeof(float));
+            if (rows == 9)
+            {
+                ledger.capacity = 0;
+                rejected(0); ledger.check_empty();
+                ledger.capacity = 2 << 20;
+                ledger.fail_commit = true;
+                rejected(0); ledger.check_empty();
+                ledger.fail_commit = false;
+            }
+            for (int bridge : {0, 1, 2})
+            {
+                const auto before = Stats();
+                const auto drains = tsg::host_moe_expert_cache_test_output_drains();
+                require(call(bridge) == 1, "Explicit wide-prefill cache did not engage");
+                require(tsg::host_moe_expert_cache_test_output_drains() == drains,
+                    "Successful wide-prefill handoff introduced an extra output drain");
+                if (bridge == 2)
+                {
+                    tsg::sync_backend(g_backend);
+                    ggml_backend_tensor_get(device.output, actual.data(), 0, actual.size() * sizeof(float));
+                }
+                require(std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(float)) == 0,
+                    "Wide-prefill rows differ from the independent scalar resident oracle");
+                require(Stats().calls == before.calls + rows, "Wide-prefill cache skipped or repeated a row");
+                if (!retained_bytes)
+                {
+                    retained_bytes = Stats().reserved;
+                    retained_reservations = ledger.reserve_calls;
+                }
+                require(Stats().reserved == retained_bytes && ledger.reserve_calls == retained_reservations,
+                    "Wider prefill acquired another cache allocation or shared reservation");
+                require(ledger.pending == 0 && ledger.valid && ledger.committed == retained_bytes,
+                    "Wide-prefill graph escaped its shared owner");
+            }
+            if (rows == 64)
+            {
+                // These failures are checked before even reading the caller's
+                // row arrays, so the same 64-row buffers safely test the bound.
+                hm.seq_len = 65; rejected(0); rejected(2); hm.seq_len = 64;
+                tsg::g_device_count.store(2); rejected(0); tsg::g_device_count.store(1);
+                tsg::g_tp_global_degree.store(2); rejected(0); tsg::g_tp_global_degree.store(0);
+                tsg::g_active_rank = 1; rejected(0); tsg::g_active_rank = 0;
+                // A backend read callback error is an execution failure, not
+                // an unsupported layout that may fall back to CPU arithmetic.
+                const auto before_read_failure = Stats();
+                tsg::host_moe_expert_cache_test_fail_next(5);
+                bool read_failed = false;
+                try { call(2); }
+                catch (const std::runtime_error& error)
+                {
+                    read_failed = std::string(error.what()).find("routing download failed") != std::string::npos;
+                }
+                const auto after_read_failure = Stats();
+                require(read_failed && before_read_failure.calls == after_read_failure.calls
+                    && before_read_failure.hits == after_read_failure.hits
+                    && before_read_failure.misses == after_read_failure.misses
+                    && before_read_failure.reserved == after_read_failure.reserved,
+                    "Failed device routing read fell back or mutated cache state");
+                tsg::host_moe_expert_cache_test_fail_next(4);
+                const auto before = Stats();
+                const auto drains_before = tsg::host_moe_expert_cache_test_output_drains();
+                bool interrupted = false;
+                try { call(2); }
+                catch (const std::runtime_error& error)
+                {
+                    interrupted = std::string(error.what()).find("after a completed row") != std::string::npos;
+                }
+                require(interrupted && Stats().calls == before.calls + 1,
+                    "Injected wide-prefill failure was hidden, retried, or executed later rows");
+                require(tsg::host_moe_expert_cache_test_output_drains() == drains_before + 1,
+                    "Wide-prefill exception returned before its pending output drain completed");
+                // Error cleanup has already drained the pending output. Read
+                // without an explicit sync, then retry all rows from fresh IDs.
+                ggml_backend_tensor_get(device.output, actual.data(), 0, hidden * sizeof(float));
+                require(std::memcmp(actual.data(), expected.data(), hidden * sizeof(float)) == 0,
+                    "Failure cleanup did not preserve its completed device output row");
+                require(call(2) == 1, "Wide-prefill cache did not recover after an interrupted block");
+                // Success queues the final D2D copy. Immediate trim must drain
+                // it before releasing graph storage and returning shared credit.
+                require(TSGgml_TrimHostMoeExpertCache(0) == retained_bytes, "Wide-prefill trim retained cache storage");
+                ledger.check_empty();
+                ggml_backend_tensor_get(device.output, actual.data(), 0, actual.size() * sizeof(float));
+                require(std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(float)) == 0,
+                    "Queued wide-prefill output changed during physical teardown");
+            }
+        }
+        require(ledger.detach(), "Wide-prefill owners prevented budget detach after trim");
+        std::puts("PASS: explicit 9/31/63/64-row scalar expert oracle, bridges, invalid routes, admission, interruption and trim");
+    }
 
     void shared_budget_checks(Weights& weights)
     {
@@ -863,6 +1036,7 @@ int main(int argc, char** argv)
     try
     {
         prefetch_policy_checks();
+        prefill_limit_checks();
         const bool invalid_budget = argc == 3 && std::strcmp(argv[1], "--invalid-budget") == 0;
         const bool trim_only = argc == 2 && std::strcmp(argv[1], "--trim") == 0;
         set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", invalid_budget ? argv[2] : trim_only ? "8" : "2");
@@ -877,7 +1051,7 @@ int main(int argc, char** argv)
             return 0;
         }
         Weights weights;
-        bool cpu_only = false, prefetch = false, file_read = false, lfu = false;
+        bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
@@ -885,6 +1059,7 @@ int main(int argc, char** argv)
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
             else if (std::strcmp(argv[arg], "--file-read") == 0) file_read = true;
             else if (std::strcmp(argv[arg], "--lfu") == 0) lfu = true;
+            else if (std::strcmp(argv[arg], "--wide-prefill") == 0) wide_prefill = true;
             else if (std::strcmp(argv[arg], "--quantization") == 0 && arg + 1 < argc)
             {
                 ggml_type type = GGML_TYPE_COUNT;
@@ -898,6 +1073,7 @@ int main(int argc, char** argv)
         }
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_LFU", lfu ? "1" : "0");
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS", wide_prefill ? "64" : "");
         weights.fill(0.5f);
 #ifdef TSG_GGML_USE_CUDA
         if (!cpu_only)
@@ -909,6 +1085,13 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+            if (wide_prefill)
+            {
+                wide_prefill_checks(weights);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            fallback_checks(weights); // Default 9-row refusal must also hold on CUDA.
 #if defined(_WIN32)
             if (file_read) {
                 file_read_checks(weights);

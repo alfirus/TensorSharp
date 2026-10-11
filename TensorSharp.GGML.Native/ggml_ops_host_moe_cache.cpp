@@ -10,6 +10,7 @@
 #include "ggml_ops_moe_prefetch_policy.h"
 #include "ggml_ops_expert_eviction.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_host_moe_cache_policy.h"
 #include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
 #ifdef TSG_GGML_USE_CUDA
@@ -39,6 +40,7 @@ namespace tsg
 #if defined(TSG_GGML_TEST_HOOKS)
         std::atomic<int> g_test_failure_stage{0};
         std::atomic<std::size_t> g_test_physical_bytes{0};
+        std::atomic<std::uint64_t> g_test_completed_output_drains{0};
         std::atomic<std::size_t> g_test_available_bytes{std::numeric_limits<std::size_t>::max()};
         bool test_failure(int stage)
         {
@@ -227,7 +229,12 @@ namespace tsg
 #ifdef TSG_GGML_USE_CUDA
         bool valid_layout(const HostMoeSegment& hm, std::size_t (&stride)[3])
         {
-            if (hm.seq_len <= 0 || hm.seq_len > TSG_PRECISION_DECODE_COLUMNS
+            static const int max_rows = host_moe_cache_prefill_rows(
+                std::getenv("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS"));
+            if (hm.seq_len <= 0 || hm.seq_len > max_rows
+                || (hm.seq_len > TSG_PRECISION_DECODE_COLUMNS
+                    && (g_device_count.load(std::memory_order_relaxed) != 1 || g_active_rank != 0
+                        || tp_global_degree(1) != 1))
                 || hm.activation != 0 || hm.tp_reduced != 0
                 || hm.layer < 0 || hm.hidden <= 0 || hm.n_ff <= 0
                 || hm.n_used <= 0 || hm.n_used > kMaxUsed || hm.n_used > hm.num_experts
@@ -438,6 +445,28 @@ namespace tsg
                     == ggml_backend_get_default_buffer_type(backend);
         }
 
+        bool finite_device_routes(const ggml_tensor* routes, std::size_t count)
+        {
+            // Wide PP is an explicit bounded path. Read the complete small
+            // routing block before any slot mutation, while activations and
+            // results keep their device-to-device bridge. No retained owner
+            // or additional graph/weight allocation is introduced here.
+            std::array<float, kMaxUsed * kHostMoeCacheMaxPrefillRows> values{};
+            if (count > values.size()) return false;
+            const auto errors_before = g_ggml_error_count.load(std::memory_order_acquire);
+            ggml_backend_tensor_get(routes, values.data(), 0, count * sizeof(float));
+#if defined(TSG_GGML_TEST_HOOKS)
+            // Model a backend read reporting failure through ggml's callback.
+            // This is not an actual CUDA allocation or driver failure test.
+            if (test_failure(5)) g_ggml_error_count.fetch_add(1, std::memory_order_acq_rel);
+#endif
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before
+                || g_backend_compute_failed.load(std::memory_order_acquire))
+                throw std::runtime_error("qwen4exp expert cache: routing download failed");
+            return std::all_of(values.begin(), values.begin() + count,
+                [](float value) { return std::isfinite(value); });
+        }
+
         void copy_device_row(ggml_backend_t backend, const ggml_tensor* source,
             ggml_tensor* destination, std::size_t offset, bool destination_row = false)
         {
@@ -484,6 +513,8 @@ namespace tsg
         for (std::size_t k = 0; k < route_count; ++k)
             if (ids[k] < 0 || ids[k] >= hm.num_experts
                 || (!device_inputs && !std::isfinite(routes[k]))) return 0;
+        const bool wide_prefill = hm.seq_len > TSG_PRECISION_DECODE_COLUMNS;
+        if (wide_prefill && device_inputs && !finite_device_routes(hm.weights, route_count)) return 0;
 
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         auto found = g_entries.begin();
@@ -548,10 +579,22 @@ namespace tsg
             // Explicit 0/1 retain the diagnostic disable/force contracts.
             return e == nullptr ? -1 : e[0] == '1' ? 1 : 0;
         }();
-        // Qwen4Exp's precision policy uses decode kernels for every row in a
-        // short prefill/speculative target block. Replay this same scalar graph
-        // so compact-cache verification has exactly the decode rounding. The
-        // one allocation above serves every row; eviction only replaces slots.
+        // Short verify blocks preserve decode rounding. Explicit wide PP also
+        // replays these scalar experts, but leaves the outer batched graph
+        // unchanged; it needs separate whole-model quality qualification. One
+        // allocation serves every row, with no row-count-dependent cache owner.
+        struct DrainPendingOutput {
+            ggml_backend_t backend;
+            bool active = false;
+            ~DrainPendingOutput()
+            {
+                if (!active) return;
+                sync_backend(backend);
+#if defined(TSG_GGML_TEST_HOOKS)
+                g_test_completed_output_drains.fetch_add(1, std::memory_order_relaxed);
+#endif
+            }
+        } pending_output{entry.backend};
         for (int row = 0; row < hm.seq_len; ++row)
         {
             const auto* row_ids = ids + static_cast<std::size_t>(row) * hm.n_used;
@@ -708,13 +751,25 @@ namespace tsg
             }
             drain.active = false; // compute_graph synchronized the preceding uploads.
             if (device_output)
+            {
                 copy_device_row(entry.backend, entry.output, hm.moe_out,
                     static_cast<std::size_t>(row) * entry.hidden * sizeof(float), true);
+                // A later row may fail before its compute drains this copy.
+                // Error/exception exits must not let the caller free moe_out
+                // while a queued copy still references it. Success retains the
+                // existing same-stream asynchronous handoff to the next graph.
+                pending_output.active = wide_prefill;
+            }
             else
                 ggml_backend_tensor_get(entry.output, out + static_cast<std::size_t>(row) * hm.hidden,
                     0, static_cast<std::size_t>(entry.hidden) * sizeof(float));
             ++g_calls;
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (wide_prefill && test_failure(4))
+                throw std::runtime_error("Injected wide expert-cache failure after a completed row");
+#endif
         }
+        pending_output.active = false;
         return 1;
 #else
         (void)hm; (void)x; (void)ids; (void)routes; (void)out; (void)kernel_name;
@@ -790,6 +845,7 @@ namespace tsg
     std::size_t host_moe_expert_cache_test_physical_bytes() { return g_test_physical_bytes.load(); }
     std::size_t host_moe_expert_cache_test_file_workspace_bytes() { return g_file_read_buffer.size(); }
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes) { g_test_available_bytes.store(bytes); }
+    std::uint64_t host_moe_expert_cache_test_output_drains() { return g_test_completed_output_drains.load(); }
 #if defined(_WIN32)
 #define TSG_MOE_TEST_EXPORT extern "C" __declspec(dllexport)
 #else
