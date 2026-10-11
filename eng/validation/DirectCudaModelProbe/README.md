@@ -283,6 +283,19 @@ JSON fields for an A/B runner:
 Keep reports, binaries, logs and captured logits in ignored `artifacts/` or
 `docs/validation/`. This probe does not start a server or measure HTTP throughput.
 
+Reports built with `quality_semantic_policy=direct-answer-only-v2` require the
+extraction answer to be exactly the ordered comma-separated `cedar,maple` list
+(spacing and case may vary). JSON arrays, Markdown fences, extra prose and
+alternative separators fail. Older binaries only collected alphabetic words
+and could accept those wrappers; do not silently relabel their saved verdicts.
+Arithmetic and square-list rules remain unchanged. The Python
+`fixed-task-semantic.py` checker independently binds all three known questions
+to fixed expected answers; it never takes another model's answer as ground
+truth. `rescore-maya-report.py --reports <report.json> ... --output
+artifacts/<fresh-directory>` writes separate offline Maya rechecks with full
+original-report and checker hashes. It does not run a model, re-decode tokens,
+or overwrite the original report/runner policy.
+
 Compare equal numbers of fresh reference and candidate processes with the
 same binary and checkpoint. Set `TENSORSHARP_CUDA_MOE_FUSION=0` for the direct
 CUDA reference and `1` for the candidate. For the ggml Qwen4Exp prefill combine,

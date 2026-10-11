@@ -341,7 +341,7 @@ if (runQuality)
         timer.Stop();
         string answer = model.Tokenizer.Decode(generated.TakeWhile(token => !model.Tokenizer.IsEos(token)).ToList());
         QualitySelection selection = QualityOutput.Parse(answer, model.Config.Architecture, rendered, qualityParser);
-        bool passed = QualityOutput.CompletePlainAnswer(selection, eos) && Semantic(name, selection.Content.Trim());
+        bool passed = QualityOutput.CompletePlainAnswer(selection, eos) && QualityOutput.Semantic(name, selection.Content.Trim());
         qualityPassed &= passed;
         var row = new { name, prompt = text, prompt_tokens = input, generated_tokens = generated,
             reasoning_effort_requested = qualityReasoningEffort, rendered_prompt = rendered,
@@ -410,6 +410,7 @@ var report = new { schema_version = 1, passed = passedAll, synthetic, backend = 
     logits = new { path = logitsPath, sha256 = Sha(logitsPath), rows = 1 + forced.Length, columns = vocabulary, format = "little-endian-float32", final_logit_sha256 = captureHash },
     quality_checked = runQuality, quality_passed = runQuality ? (bool?)qualityPassed : null,
     quality_parser = qualityParser, quality_cases_requested = qualityCases, quality_max_new = maxNew,
+    quality_semantic_policy = QualityOutput.SemanticPolicy,
     quality_reasoning_effort_requested = qualityReasoningEffort,
     quality, memory, moe_scratch = scratch, fusion,
     ggml_host_staging_budget = hostStagingReport,
@@ -453,12 +454,5 @@ static string HashLogits(float[] values)
     Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
     return Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 }
-static bool Semantic(string name, string answer) => name switch
-{
-    "math" => Regex.IsMatch(answer, @"^42[.!]?$"),
-    "extraction" => Regex.Matches(answer.ToLowerInvariant(), "[a-z]+").Select(m => m.Value).SequenceEqual(new[] { "cedar", "maple" }),
-    "squares" => Regex.IsMatch(answer, @"^\d+(?:\s*,\s*\d+){19}$") && answer.Split(',').Select(s => int.TryParse(s.Trim(), out int value) ? value : -1).SequenceEqual(Enumerable.Range(1, 20).Select(x => x * x)),
-    _ => false,
-};
 static IEnumerable<string> SpeculativeNames() => TensorSharp.Runtime.Speculative.SpeculationEnvVars.RemovedNames.Select(pair => pair.Name)
     .Concat(new[] { "TS_SPEC", "TS_SPEC_TYPE", "TS_SPEC_DRAFT", "TS_SPEC_PMIN", "TS_SPEC_DRAFT_MODEL" });

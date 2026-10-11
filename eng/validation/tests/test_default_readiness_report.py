@@ -50,8 +50,9 @@ class MayaReadinessTests(unittest.TestCase):
         return dict(completed=True, process_success=True, exit_code=0, identities_unchanged=True,
                     errors=[], timed_out=False, prompt_tokenizer_exact=True,
                     performance_observation_complete=True, telemetry_samples=2, sampling_errors=[],
-                    plan=dict(repetitions=2, eos_ids=[9]), rows=[row, copy.deepcopy(row)],
-                    reference=dict(prompt_tokens=[1, 2, 3], generated_tokens=[42, 9], passed=True, eos=True, parsed_text='42'))
+                    quality_passed=True, plan=dict(repetitions=2, eos_ids=[9], case='math'), rows=[row, copy.deepcopy(row)],
+                    reference=dict(name='math', prompt=REPORT.fixed_tasks.PROMPTS['math'],
+                        prompt_tokens=[1, 2, 3], generated_tokens=[42, 9], passed=True, eos=True, parsed_text='42'))
 
     def test_semantics_and_exact_tokens_are_independent_and_decode_uses_forward_count(self):
         report = self.report()
@@ -84,6 +85,62 @@ class MayaReadinessTests(unittest.TestCase):
         result = REPORT.maya_summary(report)
         self.assertTrue(result['quality_passed'])
         self.assertFalse(result['performance_complete'])
+
+    def test_independent_recheck_preserves_original_false_and_policy(self):
+        report = self.report()
+        report['plan']['case'] = report['reference']['name'] = 'extraction'
+        report['reference']['prompt'] = REPORT.fixed_tasks.PROMPTS['extraction']
+        report['reference']['parsed_text'] = 'cedar, maple'
+        report['quality_passed'] = False
+        for row in report['rows']:
+            row['semantic'].update(content='cedar,maple', passed=False)
+            row['quality']['passed'] = False
+        result = REPORT.maya_summary(report)
+        self.assertTrue(result['independent_quality_passed'])
+        self.assertFalse(result['recorded_runner_quality_passed'])
+        self.assertFalse(result['rows'][0]['recorded_runner_passed'])
+        self.assertEqual(REPORT.fixed_tasks.LEGACY_MAYA_POLICY, result['recorded_runner_policy'])
+
+    def test_model_reference_answer_is_never_ground_truth(self):
+        report = self.report()
+        report['reference']['parsed_text'] = '41'
+        report['reference']['passed'] = False
+        result = REPORT.maya_summary(report)
+        self.assertTrue(result['independent_quality_passed'])
+        self.assertFalse(result['reference_independent_semantic']['passed'])
+        self.assertFalse(result['reference_recorded_passed'])
+        report['rows'][0]['semantic']['content'] = '41'
+        self.assertFalse(REPORT.maya_summary(report)['independent_quality_passed'])
+
+    def test_reference_structure_is_separate_from_its_recorded_semantics(self):
+        for change in [dict(eos=False), dict(prompt_tokens=[]), dict(generated_tokens=[42, 8]),
+                       dict(generated_tokens=[9, 9])]:
+            report = self.report(); report['reference'].update(change)
+            self.assertFalse(REPORT.maya_summary(report)['independent_quality_passed'])
+
+    def test_missing_case_or_wrong_prompt_cannot_use_answer_equality(self):
+        for area, key, value in [('plan', 'case', None), ('reference', 'name', None),
+                                 ('reference', 'prompt', ''), ('plan', 'case', 'unknown')]:
+            report = self.report(); report[area][key] = value
+            self.assertFalse(REPORT.maya_summary(report)['independent_quality_passed'])
+
+    def test_independent_pass_cannot_override_incomplete_parser_or_json_fence(self):
+        for change in [dict(thinking_closed=False), dict(tool_calls=[dict(name='tool')]),
+                       dict(content='```\n42\n```'), dict(content='{"answer":42}')]:
+            report = self.report(); report['rows'][0]['semantic'].update(change)
+            self.assertFalse(REPORT.maya_summary(report)['independent_quality_passed'])
+
+    def test_report_recheck_uses_the_same_fixed_rule_vectors(self):
+        for case, good, bad in [('math', '42', '41'), ('extraction', 'cedar,maple', 'maple,cedar'),
+                                ('squares', ','.join(str(i*i) for i in range(1,21)), '1,4,9')]:
+            for answer in (good, bad):
+                report = self.report()
+                report['plan']['case'] = report['reference']['name'] = case
+                report['reference']['prompt'] = REPORT.fixed_tasks.PROMPTS[case]
+                for row in report['rows']:
+                    row['semantic']['content'] = answer
+                expected = REPORT.fixed_tasks.evaluate(case, REPORT.fixed_tasks.PROMPTS[case], answer)['passed']
+                self.assertEqual(expected, REPORT.maya_summary(report)['independent_quality_passed'])
 
     def test_empty_incomplete_run_remains_visible(self):
         report = self.report(); report['rows'] = []; report['completed'] = False

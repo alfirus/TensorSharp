@@ -60,4 +60,15 @@ foreach ((string effort, string rendered) in new[] { ("low", "Low"), ("medium", 
     Check(QualityOutput.Parse(raw, "glm5-next", prompt.Text, "production").Content == "42", "Actual effort prompt still parses the completed answer");
 }
 HostBudgetLifetimeTests.Run(Check);
+foreach (string answer in new[] { "cedar,maple", "cedar, maple", "CEDAR , MAPLE" })
+    Check(QualityOutput.Semantic("extraction", answer), "Exact ordered comma list permits spacing/case variation");
+foreach (string answer in new[] { "cedar maple", "cedar;maple", "maple,cedar", "cedar,maple,pine",
+    "[\"cedar\",\"maple\"]", "```\ncedar,maple\n```", "Names: cedar,maple", "cedar,maple." })
+    Check(!QualityOutput.Semantic("extraction", answer), "Extraction cannot select words out of wrappers/prose: " + answer);
+Check(QualityOutput.Semantic("math", "42") && QualityOutput.Semantic("math", "42.") &&
+    !QualityOutput.Semantic("math", "41"), "Existing arithmetic semantics are preserved");
+string squares = string.Join(", ", Enumerable.Range(1, 20).Select(x => x * x));
+Check(QualityOutput.Semantic("squares", squares) && !QualityOutput.Semantic("squares", "1,4,9"),
+    "Existing complete square-list semantics are preserved");
+Check(!QualityOutput.Semantic("unknown", "42"), "Unknown semantic tasks fail closed");
 Console.WriteLine($"PASS {checks} probe parser/case-selection/effort/prompt/host-budget-lifetime checks; no model or GPU executed.");

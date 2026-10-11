@@ -22,6 +22,9 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('maya_bench_metrics', HERE / 'multimodel-quality-bench.py')
 bench = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bench)
+spec = importlib.util.spec_from_file_location('maya_fixed_task_semantic', HERE / 'fixed-task-semantic.py')
+fixed_tasks = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixed_tasks)
 
 
 def parse_done(line):
@@ -49,10 +52,14 @@ def qualify(row, reference, eos_ids, semantic=None):
     eos = bool(tokens) and tokens[-1] in eos_ids and all(t not in eos_ids for t in tokens[:-1])
     evidence_ok = (len(tokens) == row['generated'] and row['prompt_tokens'] == len(reference['prompt_tokens'])
                    and row['reused'] == 0 and row['drafts_offered'] == 0 and row['drafts_accepted'] == 0)
-    complete = evidence_ok and eos and row['finish'] == 'stop' and reference.get('passed') is True and reference.get('eos') is True
-    passed = complete and (semantic['passed'] if semantic is not None else exact)
+    reference_tokens = reference.get('generated_tokens', [])
+    reference_structure = (reference.get('eos') is True and bool(reference.get('prompt_tokens'))
+        and bool(reference_tokens) and reference_tokens[-1] in eos_ids
+        and not any(t in eos_ids for t in reference_tokens[:-1]))
+    complete = evidence_ok and eos and row['finish'] == 'stop' and reference_structure
+    passed = complete and semantic is not None and semantic.get('passed') is True
     return dict(passed=passed, exact_reference_tokens=exact, checkpoint_eos_observed=eos,
-                wire_evidence_valid=evidence_ok, semantic_inferred_from_exact_reference=passed and semantic is None,
+                wire_evidence_valid=evidence_ok, semantic_inferred_from_exact_reference=False,
                 scope='Complete answer-only task with checkpoint EOS; production Maya parser result and exact token parity are separate.')
 
 
@@ -76,11 +83,12 @@ def semantic_result(raw, reference, parser_class):
     reasoning = ''.join(e.text for e in events if e.kind == 'reasoning')
     calls = [dict(name=e.call.name, arguments=e.call.arguments) for e in events if e.kind == 'tool_call']
     closed = not thinking or '</think>' in raw
+    independent = fixed_tasks.parsed_answer(reference.get('name'), reference.get('prompt'), content, closed, calls)
     return dict(raw_text=raw, content=content, reasoning=reasoning, tool_calls=calls, thinking_closed=closed,
                 parser='Maya production serve/frontend.py OutputParser',
                 reasoning_exact_reference=reasoning == reference['reasoning_text'],
-                passed=closed and not calls and content.strip() == reference['parsed_text'].strip(),
-                scope='Exact expected final answer for this answer-only task; reasoning is retained and compared separately, not semantically graded.')
+                policy=fixed_tasks.POLICY, independent_task=independent, passed=independent['passed'],
+                scope='Fixed question and independent answer-only oracle; reference text is not ground truth. Reasoning is retained and compared separately, not semantically graded.')
 
 
 def cleaned_environment(overrides):
@@ -147,8 +155,14 @@ def verify_inputs(plan):
         raise ValueError('Direct reference changed')
     report = json.loads(reference_path.read_text(encoding='utf-8'))
     cases = [c for c in report['quality'] if c['name'] == plan['case']]
-    if len(cases) != 1 or cases[0].get('parser') != 'production' or cases[0].get('passed') is not True or cases[0].get('eos') is not True:
+    if len(cases) != 1 or cases[0].get('parser') != 'production' or cases[0].get('eos') is not True:
         raise ValueError('Require exactly one completed production-parsed reference')
+    if not fixed_tasks.evaluate(cases[0].get('name'), cases[0].get('prompt'), None)['prompt_matches']:
+        raise ValueError('Reference does not contain the exact known fixed question')
+    reference_tokens = cases[0].get('generated_tokens', [])
+    if (not reference_tokens or reference_tokens[-1] not in plan['eos_ids']
+            or any(t in plan['eos_ids'] for t in reference_tokens[:-1])):
+        raise ValueError('Reference does not contain one terminal checkpoint EOS')
     return cases[0], files
 
 
@@ -203,6 +217,7 @@ def main():
     out = bench.evidence_directory(args.output)
     out.mkdir(parents=True, exist_ok=False)
     result = dict(completed=False, process_success=False, quality_passed=False, rows=[], plan=plan,
+                  semantic_policy=fixed_tasks.POLICY, semantic_checker_sha256=bench.sha(fixed_tasks.__file__),
                   harness_sha256=bench.sha(__file__), helper_sha256=bench.sha(bench.__file__), errors=[],
                   limitations=['Compatibility pack converts listed small projections to BF16; original expert bytes unchanged.',
                     'Same hardware, not an equal physical hard-budget assertion.',
@@ -225,8 +240,10 @@ def main():
         if tokenizer.encode(reference['rendered_prompt'], parse_special=True) != reference['prompt_tokens']:
             raise ValueError('Maya tokenizer does not reproduce the exact Direct prompt IDs')
         reference_raw = tokenizer.decode(reference['generated_tokens'][:-1])
-        if reference_raw != reference['raw_text'] or not semantic_result(reference_raw, reference, parser_class)['passed']:
+        reference_semantic = semantic_result(reference_raw, reference, parser_class)
+        if reference_raw != reference['raw_text'] or reference_semantic['content'] != reference['parsed_text']:
             raise ValueError('Maya text pipeline disagrees on the qualified reference output')
+        result['reference_independent_semantic'] = reference_semantic
         result['text_pipeline_source'] = {str(p): bench.sha(p) for p in
             (Path(plan['source_path']) / 'tools/strata_tokenizer.py', Path(plan['source_path']) / 'serve/frontend.py')}
         result['prompt_tokenizer_exact'] = True
@@ -323,7 +340,9 @@ def main():
         try:
             _, after = verify_inputs(plan)
             result['derived_files_after'] = after
-            result['identities_unchanged'] = after == result.get('derived_files_before')
+            result['semantic_checker_sha256_after'] = bench.sha(fixed_tasks.__file__)
+            result['identities_unchanged'] = (after == result.get('derived_files_before')
+                and result['semantic_checker_sha256_after'] == result['semantic_checker_sha256'])
         except Exception as error:
             result['identities_unchanged'] = False
             result['errors'].append('identity after: ' + repr(error))

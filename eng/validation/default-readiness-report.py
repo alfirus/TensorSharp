@@ -17,6 +17,9 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('bench', HERE/'multimodel-quality-bench.py')
 bench = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bench)
+spec = importlib.util.spec_from_file_location('fixed_task_semantic', HERE/'fixed-task-semantic.py')
+fixed_tasks = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixed_tasks)
 
 
 def read(path):
@@ -36,6 +39,15 @@ def table(headers, rows):
     esc = lambda v: html.escape(str(v))
     return '<table><thead><tr>' + ''.join(f'<th>{esc(h)}</th>' for h in headers) + '</tr></thead><tbody>' + ''.join(
         '<tr>' + ''.join(f'<td>{esc(c)}</td>' for c in row) + '</tr>' for row in rows) + '</tbody></table>'
+
+
+def recorded_display_rows(data):
+    """Display explicit audit summaries; do not infer qualification from exit codes."""
+    fields = ('scenario', 'status', 'quality', 'performance', 'resources', 'scope')
+    if not isinstance(data, dict) or not isinstance(data.get('display_rows'), list):
+        return []
+    return [[row.get(field, '未记录') for field in fields] for row in data['display_rows']
+            if isinstance(row, dict) and all(isinstance(row.get(field), str) for field in fields)]
 
 
 def speculative_rows(path):
@@ -70,7 +82,7 @@ def speculative_rows(path):
 
 
 def maya_summary(data):
-    """Keep process, complete semantics and exact tokens independent."""
+    """Recheck fixed-task semantics; preserve the original runner's decision."""
     rows = data.get('rows', [])
     expected = data.get('plan', {}).get('repetitions', 0)
     complete = (data.get('completed') is True and data.get('process_success') is True
@@ -78,7 +90,19 @@ def maya_summary(data):
                 and not data.get('errors') and data.get('timed_out') is False
                 and expected > 0 and len(rows) == expected and data.get('prompt_tokenizer_exact') is True)
     reference = data.get('reference', {})
+    case = data.get('plan', {}).get('case')
+    task_bound = isinstance(case, str) and case == reference.get('name') and case in fixed_tasks.PROMPTS
+    prompt = reference.get('prompt') if task_bound else None
+    reference_answer = fixed_tasks.evaluate(case, prompt, reference.get('parsed_text'))
+    original_policy = data.get('semantic_policy', fixed_tasks.LEGACY_MAYA_POLICY)
     eos_ids = data.get('plan', {}).get('eos_ids', [])
+    reference_tokens = reference.get('generated_tokens', [])
+    reference_prompt = reference.get('prompt_tokens', [])
+    reference_structure = (reference.get('eos') is True and isinstance(reference_prompt, list)
+        and bool(reference_prompt) and all(type(t) is int and t >= 0 for t in reference_prompt)
+        and isinstance(reference_tokens, list) and bool(reference_tokens)
+        and all(type(t) is int and t >= 0 for t in reference_tokens)
+        and reference_tokens[-1] in eos_ids and not any(t in eos_ids for t in reference_tokens[:-1]))
     qualified = []
     for row in rows:
         tokens = row.get('tokens', [])
@@ -86,15 +110,21 @@ def maya_summary(data):
         wire = (row.get('generated') == len(tokens) and row.get('prompt_tokens') == len(reference.get('prompt_tokens', []))
                 and row.get('reused') == row.get('drafts_offered') == row.get('drafts_accepted') == 0)
         semantic = row.get('semantic', {})
-        passed = (complete and reference.get('passed') is True and reference.get('eos') is True
-                  and wire and eos and row.get('finish') == 'stop' and row.get('quality', {}).get('passed') is True
-                  and semantic.get('passed') is True and semantic.get('thinking_closed') is True
-                  and not semantic.get('tool_calls') and semantic.get('content', '').strip() == reference.get('parsed_text', '').strip())
+        independent = fixed_tasks.parsed_answer(case, prompt, semantic.get('content'),
+            semantic.get('thinking_closed'), semantic.get('tool_calls'))
+        passed = (complete and reference_structure
+                  and wire and eos and row.get('finish') == 'stop' and independent['passed'])
         rate = lambda n, ms: n * 1000 / ms if isinstance(ms, (float, int)) and math.isfinite(ms) and ms > 0 and n > 0 else None
         qualified.append(dict(passed=passed, eos=eos, exact=bool(tokens) and tokens == reference.get('generated_tokens'),
+            independent_semantic=independent, recorded_runner_passed=row.get('quality', {}).get('passed'),
+            recorded_semantic_passed=semantic.get('passed'),
             pp=rate(row.get('prompt_tokens', 0), row.get('prompt_ms')),
             tg=rate(row.get('generated', 0) - 1, row.get('decode_ms'))))
     return dict(complete=complete, expected=expected, rows=qualified,
+                recorded_runner_quality_passed=data.get('quality_passed'), recorded_runner_policy=original_policy,
+                independent_policy=fixed_tasks.POLICY, reference_independent_semantic=reference_answer,
+                reference_structure_valid=reference_structure, reference_recorded_passed=reference.get('passed'),
+                independent_quality_passed=complete and all(row['passed'] for row in qualified),
                 quality_passed=complete and all(row['passed'] for row in qualified),
                 performance_complete=complete and data.get('performance_observation_complete') is True
                     and data.get('telemetry_samples', 0) > 0 and not data.get('sampling_errors'))
@@ -113,10 +143,14 @@ def maya_rows(path):
         result.append([path.parent.name + f' / {index + 1}', summary['complete'], check['passed'],
             check['exact'], f"{row.get('generated')}; EOS={check['eos']}", row.get('first_token_ms'),
             span([check['pp']]), span([check['tg']]), row.get('wall_ms'), summary['performance_complete'], *memory,
-            'prefill=' + str(data.get('plan', {}).get('prefill', 'auto')) + '; ' + data.get('plan', {}).get('controls_scope', '')])
+            'prefill=' + str(data.get('plan', {}).get('prefill', 'auto')) + '; ' + data.get('plan', {}).get('controls_scope', ''),
+            check['recorded_runner_passed'], summary['recorded_runner_policy'], summary['independent_policy'],
+            summary['reference_independent_semantic']['passed']])
     if not result:
         result.append([path.parent.name, False, False, '未测量', '无完整请求', '未测量', '未测量', '未测量',
-                       '未测量', False, *memory, '; '.join(data.get('errors', []))])
+                       '未测量', False, *memory, '; '.join(data.get('errors', [])),
+                       '无完整请求', summary['recorded_runner_policy'], summary['independent_policy'],
+                       summary['reference_independent_semantic']['passed']])
     return result
 
 
@@ -127,7 +161,13 @@ def main():
     root = bench.evidence_directory(args.directory)
     quality, reference, image, context, soak, geometry, direct, numerical, tests, limits = [], [], [], [], [], [], [], [], [], []
     speculative, context_comparisons, processes, planned_chats, maya = [], [], [], [], []
+    audited = []
     sources = []
+    for path in sorted(set(root.glob('*/summary.json')) | set(root.glob('*-summary.json'))):
+        rows = recorded_display_rows(read(path))
+        if rows:
+            audited.extend(rows)
+            sources.append(path)
     for path in sorted(root.glob('*/report.json')):
         data = read(path)
         if 'source_revision' in data.get('plan', {}) and 'pack_evidence' in data.get('plan', {}):
@@ -301,6 +341,8 @@ def main():
                              len({r['GeometrySha256'] for r in model['Runs']}) == 1])
         sources.append(path)
     sections = [
+        ('最新专项审计', '展示各摘要明确记录的数值、语义、性能和资源边界；不是重新执行验收。历史失败保留在后续表格和原始证据中。性能观测、性能门槛通过与稳定提速不同；账本归零不等于全物理归属。',
+         ['场景', '状态', '质量/正确性', '性能', '资源', '边界'], audited),
         ('模型文本质量与速度', '严格任务通过数；没有删改输出。真实工具调用及 JSON Schema 单列。数字不是等工作量的 llama.cpp 性能对照。',
          ['场景', '严格通过', '执行状态', 'prefill tok/s', 'decode tok/s', 'RSS GiB', 'private GiB', '整卡 VRAM GiB', 'Schema', '工具往返'], quality),
         ('图像生成', '完成执行不等于语义质量通过；需检查输出图像。两引擎阶段计时边界不同。',
@@ -309,8 +351,8 @@ def main():
          ['场景', '完整执行', '严格通过/已记录请求', 'prefill tok/s', 'decode tok/s'], reference),
         ('有截止时间的 llama.cpp 单请求', '模型加载和全部 HTTP 请求共用截止时间。low reasoning effort 与 reasoning_budget_tokens=0 不等价。语义通过、模板/token 完全一致、部署身份和执行完成分别记录；单次 HTTP 速度不能与固定 token 探针的计算吞吐直接相除。stop 不证明具体 EOS ID。',
          ['场景', '完成', '语义通过', '超时', '同输入', '加载就绪 s', '请求 wall s', 'prefill tok/s', 'decode tok/s', '部署不变', '错误'], planned_chats),
-        ('Maya 同输入 GLM 对照', '逐请求保留自然 EOS、最终答案语义和完整 reference token 一致性；推理文本不同不自动等于答案错误。未完成、身份失败或进程失败均不能算通过。decode 分母为 generated−1 次模型 forward，DONE 时间还含采样及输出；不能使用 generated/decode_ms 放大速度。compat-bf16 改变部分权重运算，同硬件/源检查点不等于相同物理硬预算。每个进程的峰值采样在其请求行重复展示，RSS/private/整卡 VRAM 不可相加。采样会漏峰且有未量化开销；前后顺序和缓存未平衡，不证明稳定胜负。',
-         ['场景', '进程完整', '完整语义通过', '完整 token exact', '输出 / EOS', 'TTFT ms', 'prefill tok/s', 'decode forward tok/s', 'wall ms', '观测完整', '采样 RSS GiB', '采样 private GiB', '整卡 VRAM GiB', '配置与预算边界'], maya),
+        ('Maya 同输入 GLM 对照', '独立复核以固定任务及其原始问题为准，使用记录的生产解析器 content；不重新解码 token，也不以 reference 答案为 ground truth。原运行器结论与策略另列，历史结果未覆盖；缺少任务或问题不能通过。自然 EOS、完整执行、部署身份和无工具调用仍须满足。decode 分母为 generated−1 次模型 forward，DONE 时间还含采样及输出。compat-bf16 改变部分权重运算，同硬件/源检查点不等于相同物理硬预算。进程峰值在请求行重复展示，RSS/private/整卡 VRAM 不可相加。采样会漏峰且有未量化开销；顺序和缓存未平衡，不证明稳定胜负。',
+         ['场景', '进程完整', '独立完整语义复核', '完整 token exact', '输出 / EOS', 'TTFT ms', 'prefill tok/s', 'decode forward tok/s', 'wall ms', '观测完整', '采样 RSS GiB', '采样 private GiB', '整卡 VRAM GiB', '配置与预算边界', '原运行器结论', '原评分策略', '独立评分策略', 'reference 独立答案复核'], maya),
         ('长上下文', 'reference 是无共享预算 TensorSharp。running=2 是两请求同时准入、交替执行，不是双序列 CUDA 内核。',
          ['场景', '通过', '容量', '最大 running', 'token 一致', '加载 s', 'wall s', 'prefill tok/s', 'decode tok/s'], context),
         ('长上下文同构建对照', '只接收比较器记录；正数是候选延迟增加，负数是减少。完整 token、真实并发宽度、相同程序集和清理另由比较器验收。有限进程对及后台负载仍不能证明稳态性能。',

@@ -33,6 +33,17 @@ internal sealed record QualityPrompt(string Text, string Utf8Sha256)
 
 internal static class QualityOutput
 {
+    // Extraction previously collected every alphabetic word, accidentally
+    // accepting JSON arrays and Markdown-fenced answers as plain comma lists.
+    public const string SemanticPolicy = "direct-answer-only-v2";
+    public static bool Semantic(string name, string answer) => name switch
+    {
+        "math" => Regex.IsMatch(answer, @"^42[.!]?$"),
+        "extraction" => Regex.IsMatch(answer, @"\Acedar\s*,\s*maple\z", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant),
+        "squares" => Regex.IsMatch(answer, @"^\d+(?:\s*,\s*\d+){19}$") && answer.Split(',').Select(s => int.TryParse(s.Trim(), out int value) ? value : -1).SequenceEqual(Enumerable.Range(1, 20).Select(x => x * x)),
+        _ => false,
+    };
+
     public static string[] SelectCases(string value)
     {
         string[] cases = value.Split(',', StringSplitOptions.TrimEntries);

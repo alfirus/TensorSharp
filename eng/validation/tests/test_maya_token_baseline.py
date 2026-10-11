@@ -23,13 +23,15 @@ class MayaWireTests(unittest.TestCase):
                 mod.prefill_argument({'prefill': value})
 
     def reference(self):
-        return dict(generated_tokens=[42, 9], prompt_tokens=[1, 2, 3], passed=True, eos=True)
+        return dict(name='math', prompt=mod.fixed_tasks.PROMPTS['math'], rendered_prompt='<|assistant|>',
+                    parsed_text='42', reasoning_text='', generated_tokens=[42, 9], prompt_tokens=[1, 2, 3], passed=True, eos=True)
 
     def row(self):
         return dict(mod.parse_done('DONE 2 3 120.0 20.0 stop 0 0 0 15 20'), tokens=[42, 9])
 
-    def test_complete_exact_eos(self):
-        self.assertTrue(mod.qualify(self.row(), self.reference(), [9])['passed'])
+    def test_complete_exact_eos_requires_independent_semantics(self):
+        self.assertFalse(mod.qualify(self.row(), self.reference(), [9])['passed'])
+        self.assertTrue(mod.qualify(self.row(), self.reference(), [9], dict(passed=True))['passed'])
 
     def test_length_never_proves_eos_completion(self):
         row = self.row(); row['finish'] = 'length'
@@ -52,9 +54,12 @@ class MayaWireTests(unittest.TestCase):
         self.assertFalse(result['semantic_inferred_from_exact_reference'])
         self.assertTrue(result['checkpoint_eos_observed'])
 
-    def test_failed_reference_not_transferred(self):
+    def test_reference_semantic_flag_does_not_grade_candidate(self):
         ref = self.reference(); ref['passed'] = False
         self.assertFalse(mod.qualify(self.row(), ref, [9])['passed'])
+        self.assertTrue(mod.qualify(self.row(), ref, [9], dict(passed=True))['passed'])
+        ref['eos'] = False
+        self.assertFalse(mod.qualify(self.row(), ref, [9], dict(passed=True))['passed'])
 
     def test_separate_answer_check_can_pass_different_tokens(self):
         row = self.row(); row['tokens'] = [43, 9]
@@ -70,6 +75,32 @@ class MayaWireTests(unittest.TestCase):
     def test_parser_pass_cannot_override_missing_eos(self):
         row = self.row(); row['tokens'] = [42, 8]
         self.assertFalse(mod.qualify(row, self.reference(), [9], dict(passed=True))['passed'])
+
+    def test_production_parser_result_uses_independent_fixed_task(self):
+        class PlainParser:
+            def __init__(self, **kwargs): pass
+            def feed(self, raw): return [SimpleNamespace(kind='content', text=raw)]
+            def finish(self): return []
+        reference = self.reference()
+        reference['parsed_text'] = '41'
+        self.assertTrue(mod.semantic_result('42', reference, PlainParser)['passed'])
+        self.assertFalse(mod.semantic_result('41', reference, PlainParser)['passed'])
+        reference.update(name='extraction', prompt=mod.fixed_tasks.PROMPTS['extraction'], parsed_text='cedar, maple')
+        for answer, expected in [('cedar,maple', True), ('cedar, maple', True),
+                                 ('["cedar","maple"]', False), ('```\ncedar,maple\n```', False)]:
+            result = mod.semantic_result(answer, reference, PlainParser)
+            self.assertEqual(expected, result['passed'])
+            self.assertEqual(mod.fixed_tasks.POLICY, result['policy'])
+        reference.pop('prompt')
+        self.assertFalse(mod.semantic_result('cedar, maple', reference, PlainParser)['passed'])
+
+    def test_unclosed_thinking_cannot_pass_correct_fixed_answer(self):
+        class PlainParser:
+            def __init__(self, **kwargs): pass
+            def feed(self, raw): return [SimpleNamespace(kind='content', text=raw)]
+            def finish(self): return []
+        reference = self.reference(); reference['rendered_prompt'] += '<think>'
+        self.assertFalse(mod.semantic_result('42', reference, PlainParser)['passed'])
 
     def test_nonfinite_negative_unknown_done_rejected(self):
         for line in ['DONE 2 3 nan 20 stop 0 0 0 15 20', 'DONE 2 3 20 inf stop 0 0 0 15 20',
