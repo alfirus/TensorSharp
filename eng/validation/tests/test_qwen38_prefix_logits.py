@@ -145,7 +145,8 @@ def ts_fixture(directory):
         model_geometry=dict(architecture='qwen4exp',hidden_size=4,layers=2,heads=2,kv_heads=1,vocabulary=3,context_limit=32,kv_dtype='f16'),
         cleanup=dict(model_disposed=True,cache_cleared=True,reuse_released=True,native_shutdown=True,
             retained_model_owner=False,retained_scope_owner=False,errors=[]),
-        requested_options={'warmup':'0','iterations':'1','decode-tokens':'1'},
+        requested_options={'warmup':'0','iterations':'1','decode-tokens':'1','require-cache':'0'},
+        cache_stats=dict(Calls=0,Hits=0,Misses=0,ReservedBytes=0,BudgetBytes=0),
         environment={'TS_HOST_MOE_EXPERT_CACHE_MB':'0'},logit_captures=dict(**index,index_path=str(index_path)),
         prompt_tokens=[0,1],forced_tokens=[2],decode_mode='teacher-forced',
         runs=[dict(iteration=0,warmup=False,prefill_tokens=2,decode_tokens=1,final_logit_sha256=rows[1]['sha256'])])
@@ -154,6 +155,19 @@ def ts_fixture(directory):
 
 
 class TensorCaptureTests(unittest.TestCase):
+    def test_single_cold_decode_proves_activation_without_claiming_warm_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d=Path(tmp);p,_,r=ts_fixture(d)
+            r['environment']['TS_HOST_MOE_EXPERT_CACHE_MB']='8192'
+            r['cache_stats']=dict(Calls=2,Hits=0,Misses=20,ReservedBytes=1024,BudgetBytes=8192<<20)
+            tool.save(d/'probe.json',r)
+            self.assertEqual(2,tool.validate_ts(d,p,8192)[0]['validated_rows'])
+            for key,value in [('Calls',0),('Misses',0),('ReservedBytes',0),('BudgetBytes',0),('Hits',True)]:
+                bad=copy.deepcopy(r);bad['cache_stats'][key]=value;tool.save(d/'probe.json',bad)
+                with self.assertRaises(ValueError):tool.validate_ts(d,p,8192)
+            bad=copy.deepcopy(r);bad['requested_options']['require-cache']='1';tool.save(d/'probe.json',bad)
+            with self.assertRaises(ValueError):tool.validate_ts(d,p,8192)
+
     def test_real_history_identity_and_cleanup_are_required(self):
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);p,_,_=ts_fixture(d)

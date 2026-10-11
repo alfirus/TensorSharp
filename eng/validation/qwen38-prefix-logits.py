@@ -301,6 +301,17 @@ def validate_ts(directory, plan, budget):
     require(opts.get('warmup')=='0' and opts.get('iterations')=='1' and opts.get('decode-tokens')=='1'
             and opts.get('prefill-chunk','0')=='0', 'TS invocation geometry changed')
     require(data['environment'].get('TS_HOST_MOE_EXPERT_CACHE_MB')==str(budget), 'TS cache budget differs')
+    # This two-row diagnostic has one cold scalar decode: reuse is not expected.
+    # Prove activation/ownership independently instead of the probe's warm-hit gate.
+    require(opts.get('require-cache')=='0', 'Diagnostic must not require a warm cache hit')
+    stats=data.get('cache_stats', {})
+    require(all(type(stats.get(key)) is int and stats[key]>=0 for key in
+        ('Calls','Hits','Misses','ReservedBytes','BudgetBytes')), 'Missing or invalid cache counters')
+    require(stats['BudgetBytes']==budget*(1<<20) and stats['ReservedBytes']<=stats['BudgetBytes'],
+            'Cache ownership differs from the diagnostic budget')
+    require((stats['Calls']>=identity['geometry']['layers'] and stats['Misses']>0 and stats['ReservedBytes']>0)
+            if budget else stats['Calls']==stats['Hits']==stats['Misses']==stats['ReservedBytes']==0,
+            'Cold cache activation or disabled-cache isolation is not proven')
     files=config['deployment']['files']
     require(Path(data['native_path']).resolve()==Path(files['GgmlOps.dll']['path']).resolve()
             and identity['native_sha256']==files['GgmlOps.dll']['sha256'], 'Loaded TS native identity differs')
@@ -326,7 +337,7 @@ def run_ts(plan,directory,budget,timeout):
         '--placement','host','--backend','ggml_cuda','--tokens-file',str(prompt),
         '--forced-tokens-file',str(forced),'--generation','teacher-forced','--decode-tokens','1',
         '--max-context',str(spec['context']),'--warmup','0','--iterations','1',
-        '--require-cache','1' if budget else '0','--logits-dir',str(directory/'logits'),
+        '--require-cache','0','--logits-dir',str(directory/'logits'),
         '--model-identity-report',llama['checkpoint']['integrity_manifest']]
     env=environment(config['environment']); env['TS_HOST_MOE_EXPERT_CACHE_MB']=str(budget)
     execution=compare.run_process(command,Path(command[1]).parent,env,directory,timeout)
