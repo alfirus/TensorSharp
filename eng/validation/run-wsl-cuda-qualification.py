@@ -152,6 +152,9 @@ def main(argv=None):
                   scope='Serial Linux/WSL CUDA correctness, sampled diagnostics and separate quiet timings; no full physical cap, TP, Apple, MTP or broad multimodal quality qualification.')
     started = time.monotonic()
     def interrupted(number, _frame):
+        if 'interrupted_signal' in report:
+            return
+        report['interrupted_signal'] = number
         raise InterruptedError('Qualification received signal ' + str(number))
     signals = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
     handlers = {number: signal.signal(number, interrupted) for number in signals}

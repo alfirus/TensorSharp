@@ -97,6 +97,7 @@ class BoundedBuildLinuxTests(unittest.TestCase):
     def test_external_term_still_cleans_and_saves_failure(self):
         code, report = self.run_case('import time; time.sleep(60)', send_term=True)
         self.assertEqual(1, code); self.assertFalse(report['passed'])
+        self.assertIn(report['interrupted_signal'], (signal.SIGTERM, signal.SIGHUP))
         self.assertTrue(any('signal' in error for error in report['errors']))
 
     def test_low_space_never_starts_child_and_saves_execution(self):

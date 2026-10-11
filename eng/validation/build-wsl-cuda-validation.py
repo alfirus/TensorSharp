@@ -60,6 +60,9 @@ def main(argv=None):
         if sys.platform != 'linux' or not is_wsl_output_path(root):
             raise RuntimeError('Use an isolated /mnt/d or /mnt/e directory in Linux/WSL.')
         def interrupted(number, _frame):
+            if 'interrupted_signal' in report:
+                return
+            report['interrupted_signal'] = number
             raise InterruptedError(f'Build driver received signal {number}.')
         previous_handlers = {number: signal.signal(number, interrupted)
                              for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}

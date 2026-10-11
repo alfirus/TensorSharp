@@ -85,6 +85,11 @@ def main(argv=None):
     child = None
     group = None
     def interrupted(number, _frame):
+        # A second signal can run while the first exception is being formatted
+        # in except, before finally masks cancellation. Preserve the first one.
+        if 'interrupted_signal' in report:
+            return
+        report['interrupted_signal'] = number
         raise InterruptedError(f'Build supervisor received signal {number}.')
     handled_signals = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
     previous_handlers = {number: signal.signal(number, interrupted) for number in handled_signals}
