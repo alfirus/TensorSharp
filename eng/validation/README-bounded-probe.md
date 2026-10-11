@@ -89,3 +89,14 @@ server, and the separately owned quality client has the remaining deadline.
 Both are reaped on timeout or interruption. The healthy loopback listener must
 belong to that server PID. Teardown is reported separately and can extend past
 the execution deadline; terminating a process does not validate native cleanup.
+
+`llama-raw-completion.py --plan <plan.json> --request <request.json> --output
+artifacts/<fresh-run> --timeout 300` runs one reviewed `/completion` request with
+the exact supplied integer token IDs. It requires a single owned loopback server,
+deployment pins and live executable/llama/CUDA module identity. The deadline
+includes loading and HTTP; an independent watchdog and bounded cleanup reap the
+server. Original request/response bytes, natural EOS IDs, strict semantic results,
+memory samples and failures are retained separately. It never renders a chat
+template, adds a schema, strips Markdown fences, or retries a failed model run.
+The default five-minute deadline may be too short for some large checkpoints;
+such a run remains a timeout, not a passing model-quality result.
