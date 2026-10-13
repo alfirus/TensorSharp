@@ -75,9 +75,11 @@ def sampled_peak(samples, key):
     return max(measured, default=None), len(measured)
 
 
-def summarize(directory):
+def summarize(directory, case_directory="concurrency"):
     directory = Path(directory)
-    source = directory / "concurrency" / "report.json"
+    if case_directory not in ("concurrency", "three-chat", "serial-three"):
+        raise ValueError("Unknown HTTP evidence case directory")
+    source = directory / case_directory / "report.json"
     data = json.loads(source.read_text(encoding="utf-8-sig"))
     timing = {}
     timing_evidence = data.get("generation_timings", {})
@@ -92,8 +94,8 @@ def summarize(directory):
             wall = phase.get("first_content_to_terminal_seconds")
             rows.append({
                 "mode": mode, "name": request.get("name"),
-                "prompt": request.get("request", {}).get("messages", []),
-                "ttft_seconds": request.get("ttft_seconds"),
+                "prompt": request.get("prompt", request.get("request", {}).get("messages", [])),
+                "ttft_seconds": request.get("ttft_seconds", phase.get("dispatch_to_first_content_seconds")),
                 "elapsed_seconds": request.get("elapsed_seconds"),
                 **t,
                 "terminal_reported_tokens": terminal.get("tokenCount"),
@@ -120,14 +122,22 @@ def summarize(directory):
                     pass
     rss, rss_samples = sampled_peak(samples, "rss")
     private, private_samples = sampled_peak(samples, "private")
+    native = data.get("native") if case_directory == "three-chat" else None
+    three_chat_joint = bool(native and native.get("passed") is True
+                            and native.get("n3_steps", 0) > 0
+                            and native.get("n2_sibling_steps", 0) > 0)
+    joint_steps = data.get("fused_joint_steps")
+    if joint_steps is None and three_chat_joint:
+        joint_steps = native["n3_steps"] + native["n2_sibling_steps"]
     return {
         "schema_version": 2,
         "source": str(source.resolve()),
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "acceptance_passed": data.get("passed"),
-        "actual_joint_engagement_verified": data.get("actual_joint_engagement_verified", False),
+        "actual_joint_engagement_verified": data.get("actual_joint_engagement_verified", three_chat_joint),
         "full_interval_continuity_verified": data.get("full_interval_continuity_verified", False),
-        "joint_steps": data.get("fused_joint_steps"),
+        "joint_steps": joint_steps,
+        "three_chat_native_evidence": native,
         "continuity_gaps": data.get("fused_continuity_gaps"),
         "greedy_text_parity": data.get("greedy_text_parity"),
         "startup_warmup": data.get("model", {}).get("startupWarmup"),
@@ -155,6 +165,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--case-directory", choices=("concurrency", "three-chat", "serial-three"), default="concurrency")
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(summarize(args.directory), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.output.write_text(json.dumps(summarize(args.directory, args.case_directory), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

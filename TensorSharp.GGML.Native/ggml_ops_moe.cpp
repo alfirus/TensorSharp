@@ -57,7 +57,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 #ifdef __linux__
@@ -159,6 +161,8 @@ namespace
         std::mutex g_moe_file_cpu_mutex;
         HostMoeCpuArena g_moe_file_weights, g_moe_file_work;
         HostMoeFilePipeline g_moe_file_pipeline;
+        HostMoeFilePipelineConfiguration g_moe_file_pipeline_config;
+        std::uint64_t g_moe_file_pipeline_calls = 0, g_moe_file_pipeline_source_bytes = 0;
         // Separate from the whole-model and ordinary streaming allocators. A
         // file-backed layer executes inside the outer graph's live allocation.
         // The file mutex serializes use; request-boundary trim frees this slot.
@@ -1611,18 +1615,30 @@ namespace
         bool file_pipeline = false;
 #if defined(TSG_GGML_USE_CUDA)
         if (file_stream && ggml_backend_is_cuda(g_backend)) {
-            static const bool enabled = [] {
-                const char* option = std::getenv("TS_HOST_MOE_FILE_PIPELINE");
-                if (option && std::strcmp(option, "1") == 0) return true;
-                if (!option || std::strcmp(option, "0") == 0) return false;
-                throw std::runtime_error("TS_HOST_MOE_FILE_PIPELINE must be 0 or 1");
-            }();
+            // Explicit scopes isolate a model session from process-static
+            // environment settings. Unscoped callers retain legacy behavior.
+            const auto legacy_enabled = [] {
+                static const bool value = [] {
+                    const char* option = std::getenv("TS_HOST_MOE_FILE_PIPELINE");
+                    if (option && std::strcmp(option, "1") == 0) return true;
+                    if (!option || std::strcmp(option, "0") == 0) return false;
+                    throw std::runtime_error("TS_HOST_MOE_FILE_PIPELINE must be 0 or 1");
+                }();
+                return value;
+            };
+            const bool scoped = g_moe_file_pipeline_config.active();
+            const auto& policy = g_moe_file_pipeline_config.settings();
+            const bool enabled = scoped ? host_moe_file_pipeline_eligible(policy, seq_len,
+                p.file_batch->payload, true, true,
+                g_device_count.load() <= 1 && g_tp_global_degree.load() <= 1, graph_allocated)
+                : legacy_enabled();
             if (enabled) {
                 // The ring replaces the full layer's CPU arena, never adds a
                 // second retained payload to the host forecast. Trim releases
                 // it with the dedicated file-stream graph at request boundaries.
                 g_moe_file_weights.clear(); g_moe_file_work.clear();
-                file_pipeline = g_moe_file_pipeline.prepare(g_backend, p.file_batch->payload);
+                file_pipeline = g_moe_file_pipeline.prepare(g_backend, p.file_batch->payload,
+                    scoped ? policy.maximum_ring_bytes : 16u << 20);
             }
         }
 #endif
@@ -1762,6 +1778,10 @@ namespace
             return 0;
         }
         if (file_stream && !file_pipeline) file_stream_test_failure(2);
+        if (file_pipeline) {
+            ++g_moe_file_pipeline_calls;
+            g_moe_file_pipeline_source_bytes += p.file_batch->payload;
+        }
         if (s_stream_timing && stream_experts && !file_pipeline)
         {
             const auto t_end = std::chrono::steady_clock::now();
@@ -1959,6 +1979,57 @@ namespace
 
 namespace tsg
 {
+    // Called only at a quiescent session boundary while the shared host budget
+    // remains installed. No ring is allocated until an eligible file prefill.
+    // Version 2 qualifies the bounded parallel intra-slot reader. Version 1
+    // sequential readers must not be silently promoted by newer managed code.
+    TSG_EXPORT int TSGgml_HostMoeFilePipelineVersion() { return 2; }
+
+    TSG_EXPORT int TSGgml_BeginHostMoeFilePipelineScope(int enabled, int minimum_rows,
+        std::int64_t minimum_payload_bytes, std::int64_t maximum_ring_bytes, std::uint64_t* token) {
+        if (token) *token = 0;
+        try {
+            clear_last_error();
+            if (!token || (enabled != 0 && enabled != 1) || minimum_payload_bytes <= 0 || maximum_ring_bytes <= 0
+                || static_cast<std::uint64_t>(minimum_payload_bytes) > (std::numeric_limits<std::size_t>::max)()
+                || static_cast<std::uint64_t>(maximum_ring_bytes) > (std::numeric_limits<std::size_t>::max)())
+                throw std::invalid_argument("Invalid host MoE pipeline scope configuration");
+            std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+            *token = g_moe_file_pipeline_config.begin({enabled != 0, minimum_rows,
+                static_cast<std::size_t>(minimum_payload_bytes), static_cast<std::size_t>(maximum_ring_bytes)}, [] {
+                const auto epoch = g_ggml_error_count.load(std::memory_order_acquire);
+                g_moe_file_pipeline.clear();
+                if (g_ggml_error_count.load(std::memory_order_acquire) != epoch)
+                    throw std::runtime_error("Host MoE pipeline scope drain failed");
+            });
+            if (!*token) throw std::invalid_argument("Host MoE pipeline scope requires valid thresholds and no active scope");
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { try { set_last_error("Host MoE pipeline scope creation failed"); } catch (...) {} return 0; }
+    }
+    TSG_EXPORT int TSGgml_EndHostMoeFilePipelineScope(std::uint64_t token) {
+        try {
+            clear_last_error();
+            std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+            if (!g_moe_file_pipeline_config.end(token, [] {
+                const auto epoch = g_ggml_error_count.load(std::memory_order_acquire);
+                g_moe_file_pipeline.clear();
+                if (g_ggml_error_count.load(std::memory_order_acquire) != epoch)
+                    throw std::runtime_error("Host MoE pipeline scope drain failed");
+            })) throw std::invalid_argument("Host MoE pipeline disposal requires its active scope token");
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { try { set_last_error("Host MoE pipeline scope disposal failed"); } catch (...) {} return 0; }
+    }
+    TSG_EXPORT int TSGgml_HostMoeFilePipelineStats(std::int64_t* calls,
+        std::int64_t* source_bytes, std::int64_t* retained_ring_bytes) {
+        if (!calls || !source_bytes || !retained_ring_bytes) return 0;
+        std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+        *calls = static_cast<std::int64_t>(g_moe_file_pipeline_calls);
+        *source_bytes = static_cast<std::int64_t>(g_moe_file_pipeline_source_bytes);
+        *retained_ring_bytes = static_cast<std::int64_t>(g_moe_file_pipeline.retained_bytes());
+        return 1;
+    }
     void host_moe_cpu_staging_release() {
         std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
         clear_file_stream_gallocr();
@@ -2266,7 +2337,8 @@ namespace tsg
     }
 
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged, bool allow_device_stream, bool* output_on_device)
+                                  HostMoeStagedInputs* staged, bool allow_device_stream, bool* output_on_device,
+                                  ggml_backend_t explicit_backend)
     {
         if (output_on_device != nullptr) *output_on_device = false;
         if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
@@ -2309,7 +2381,7 @@ namespace tsg
             if (output_on_device != nullptr && s_cache_device_outputs)
             {
                 const int cached = host_moe_cached_experts(hm, nullptr, s_ids.data(),
-                    nullptr, nullptr, kernel_name);
+                    nullptr, nullptr, kernel_name, explicit_backend);
                 if (cached != 0)
                 {
                     *output_on_device = cached > 0;
@@ -2317,7 +2389,7 @@ namespace tsg
                 }
             }
             const int cached = host_moe_cached_experts(hm, nullptr, s_ids.data(),
-                nullptr, out.data(), kernel_name);
+                nullptr, out.data(), kernel_name, explicit_backend);
             if (cached != 0) return cached > 0;
         }
         ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
@@ -2331,7 +2403,7 @@ namespace tsg
         }
 
         const int cached = allow_device_stream ? host_moe_cached_experts(hm, s_moe_in.data(), s_ids.data(),
-            s_weights.data(), out.data(), kernel_name) : 0;
+            s_weights.data(), out.data(), kernel_name, explicit_backend) : 0;
         if (cached != 0)
             return cached > 0;
         const int file_decode = host_moe_file_decode(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data());
@@ -2365,7 +2437,7 @@ namespace tsg
             hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
             hm.gate_bias, hm.up_bias, hm.down_bias,
             hm.activation, hm.oai_alpha, hm.oai_limit,
-            allow_device_stream);
+            allow_device_stream && explicit_backend == nullptr);
         // A batch that took the device stream publishes its result through
         // finalize_compute_with_download, which on Metal with async compute only
         // QUEUES a blit into `out`. The seam reads `out` as soon as this returns

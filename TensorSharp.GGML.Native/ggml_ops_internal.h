@@ -891,11 +891,18 @@ namespace tsg
         int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
         float oai_alpha = 1.702f;
         float oai_limit = 7.0f;
+        // GLM5Next clamps the up branch symmetrically and the gate only above
+        // this value, before SiLU. Zero preserves ordinary Qwen arithmetic.
+        float swiglu_clamp = 0.0f;
 
         int num_experts = 0;
         int n_used = 0;
         int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
         bool independent_decode_rows = false; // preserve scalar expert arithmetic in a decode batch
+        // Explicit single-model CUDA adapters may share a compact expert table
+        // across layers of identical layout. Slots retain exact source triples;
+        // this upper bound is a model-wide ID extent, not resident allocation.
+        int pooled_model_experts = 0;
         int hidden = 0;
         int n_ff = 0;
 
@@ -1264,7 +1271,8 @@ namespace tsg
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
-                                  bool* output_on_device = nullptr);
+                                  bool* output_on_device = nullptr,
+                                  ggml_backend_t explicit_backend = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
     // CPU dot kernels on a team woken once per layer instead of a ggml graph per
@@ -1287,8 +1295,22 @@ namespace tsg
     // IDs stay on the host. out null writes hm.moe_out directly on CUDA;
     // otherwise the complete result is downloaded into out.
     int host_moe_cached_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                               const float* weights, float* out, const char* kernel_name);
+                               const float* weights, float* out, const char* kernel_name,
+                               ggml_backend_t explicit_backend = nullptr);
     void host_moe_expert_cache_on_drop(const void* ptr);
+    void host_moe_expert_cache_release_backend(ggml_backend_t backend);
+    void host_moe_expert_cache_stats(std::int64_t* reserved, std::int64_t* budget,
+                                   std::int64_t* hits, std::int64_t* misses, std::int64_t* calls);
+    bool host_moe_expert_cache_minimum_plan(const HostMoeSegment& hm, int rows,
+        ggml_backend_t backend, std::size_t& bytes);
+    // GLM wide prefill retains one bulk graph and protects its full routed union;
+    // narrow shapes keep the independent decode variants and weight table.
+    bool host_moe_expert_cache_minimum_prefill_plan(const HostMoeSegment& hm, int rows,
+        int prefill_rows, ggml_backend_t backend, std::size_t& bytes);
+    bool host_moe_expert_cache_scope_matches_plan(std::size_t minimum_bytes,
+        int groups, int prefill_rows, int decode_rows);
+    bool register_host_file_source(const void* pointer, std::int64_t bytes,
+                                   const char* path, std::int64_t offset);
     void host_moe_expert_cache_release();
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);

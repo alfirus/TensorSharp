@@ -2945,9 +2945,9 @@ namespace TensorSharp.Models
             if (weightStreaming != null && !architecture.SupportsWeightStreaming)
                 throw new NotSupportedException($"Architecture '{architecture.Id}' has no bounded weight streaming adapter.");
 
-            if (memoryPolicy != null && (architecture.Id is not ("gemma4" or "qwen35" or "qwen4exp")
-                || backend != BackendType.GgmlCuda || tpDegree != 1 || tpGroup != null || layerSplitDegree != 1))
-                throw new NotSupportedException("The per-model memory policy requires Gemma4, Qwen35 or Qwen4Exp on one GGML CUDA device.");
+            if (memoryPolicy != null)
+                ValidateExplicitModelMemoryPolicy(architecture.Id, probe.GetString("general.architecture"),
+                    backend, tpDegree, tpGroup != null, layerSplitDegree);
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
@@ -2956,6 +2956,15 @@ namespace TensorSharp.Models
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);
             return model;
+        }
+
+        internal static void ValidateExplicitModelMemoryPolicy(string architectureId, string metadataArchitecture,
+            BackendType backend, int tpDegree, bool hasTpGroup, int layerSplitDegree)
+        {
+            bool supported = architectureId is "gemma4" or "qwen35" or "qwen4exp"
+                || (architectureId == "glm-dsa" && GlmDsaArchitecture.IsGlm5Next(metadataArchitecture));
+            if (!supported || backend != BackendType.GgmlCuda || tpDegree != 1 || hasTpGroup || layerSplitDegree != 1)
+                throw new NotSupportedException("The per-model memory policy requires Gemma4, Qwen35, Qwen4Exp or GLM5Next on one GGML CUDA device.");
         }
 
         private static int ReadParallelDegree(string variable, int fallback)

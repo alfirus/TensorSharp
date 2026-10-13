@@ -105,7 +105,7 @@ namespace TensorSharp.Models
         /// requires a fully resident load. Other executors remain opt-in.
         /// </summary>
         private int ResolveCpuMoeLayers(BackendType backend)
-            => MoeCpuOffloadConfig.ResolveNativeLayers(backend == BackendType.GgmlCuda &&
+            => MemoryPolicy?.NativeMoeCpuLayers ?? MoeCpuOffloadConfig.ResolveNativeLayers(backend == BackendType.GgmlCuda &&
                 GlmDsaArchitecture.IsGlm5Next(Config.Architecture));
 
         private static int ParseEnvInt(string name, int fallback)
@@ -134,7 +134,7 @@ namespace TensorSharp.Models
             // tile is padding. Doubling the chunk measured pp2048 at 984 vs 696
             // tok/s on 3x RTX PRO 6000 with no change to decode. Raise it further
             // with TS_GLM_UBATCH when the prompts are long and VRAM allows.
-            int nUbatch = ParseEnvInt("TS_GLM_UBATCH", 1024);
+            int nUbatch = MemoryPolicy?.PrefillChunkTokens ?? ParseEnvInt("TS_GLM_UBATCH", 1024);
             _nativeUbatch = nUbatch;
             int nThreads = ParseEnvInt("TS_GLM_THREADS", Math.Min(Environment.ProcessorCount, 32));
 
@@ -144,12 +144,12 @@ namespace TensorSharp.Models
             // the number, the loader treats it as a ceiling and caps it to what
             // the devices hold, rather than loading 200 GiB and only then failing
             // to allocate the first sequence slot.
-            bool ctxIsHardLimit = !string.IsNullOrWhiteSpace(
+            bool ctxIsHardLimit = MemoryPolicy != null || !string.IsNullOrWhiteSpace(
                 Environment.GetEnvironmentVariable("MAX_CONTEXT"));
 
             IntPtr handle = GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
                 ResolveCpuMoeLayers(backend), BackendRegistryName(backend), tp, ctxIsHardLimit,
-                NativeMtpRequested());
+                MemoryPolicy?.OmitEmbeddedDraftWeights != true && NativeMtpRequested());
             if (handle == IntPtr.Zero)
                 throw NativeLoadRefused("glm", ggufPath,
                     "TS_GLM_NATIVE=0 selects the per-op path instead of the native executor.");
@@ -174,6 +174,7 @@ namespace TensorSharp.Models
             {
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
+                PrepareUnifiedGraph(checked(_exec.NPast + tokens.Length), Math.Min(tokens.Length, _nativeUbatch), false);
                 BeforeGraphCall();
                 bool ok;
                 try { ok = _exec.Forward(tokens, _logitsBuffer); }

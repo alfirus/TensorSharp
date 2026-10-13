@@ -2,14 +2,22 @@ param(
     [Parameter(Mandatory=$true)][string]$ServerDirectory,
     [Parameter(Mandatory=$true)][string]$Output,
     [Parameter(Mandatory=$true)][string]$NativeSha256,
+    [string]$ModelPath='C:/Works/models/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf',
+    [string]$MmprojPath='C:/Works/models/Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf',
+    [ValidateSet('qwen4exp','glm5-next','glm5next')][string]$Architecture='qwen4exp',
+    [string]$SerialThreeChatReport,
+    [ValidateRange(0,32768)][int]$ServerMaxTokens=0,
     [int]$Port=52176,
     [ValidateRange(1,2048)][int]$MaxTokens=160,
     [ValidateRange(0,2048)][int]$ExtendedMaxTokens=0,
     [int]$ReadyTimeoutSeconds=600,
     [switch]$PrefixChecks,
     [switch]$HttpChecks,
+    [switch]$ThreeChatRegression,
     [switch]$FusedTrace,
+    [switch]$RequireJointStartupWarmup,
     [switch]$DiagnosticTiming,
+    [switch]$TokenTrace,
     [switch]$SkipSerialControls,
     [switch]$SerialOnlyAllowed
 )
@@ -27,12 +35,23 @@ $exe=Join-Path $server 'TensorSharp.Server.Host.exe'
 $checker=Join-Path $repo 'eng/validation/unified-qwen-concurrency-bench.py'
 $prefixChecker=Join-Path $repo 'eng/validation/qwen-chat-cache-benchmark.py'
 $httpChecker=Join-Path $repo 'eng/validation/unified-server-http-checks.py'
+$threeChatChecker=Join-Path $repo 'eng/validation/unified-three-chat-regression.py'
+$serialThreeChecker=Join-Path $repo 'eng/validation/unified-three-chat-parity.py'
 $fusedVerifier=Join-Path $repo 'eng/validation/verify-fused-batch-evidence.py'
 $sampler=Join-Path $repo 'eng/validation/sample-server-process.py'
 $image=Join-Path $repo 'artifacts/multimodal-local-preflight/vision-fixtures/card-0.png'
 $python=(Get-Command python -ErrorAction Stop).Source
-$modelRoot='C:/Works/models/Qwen3.8-Flash-Next-GGUF'
-$launchArgs=@('--model', "$modelRoot/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf", '--mmproj', "$modelRoot/mmproj-BF16.gguf", '--backend', 'ggml_cuda', '--unified-memory', '--host', '127.0.0.1', '--port', "$Port")
+$modelRoot=Split-Path -Parent ([IO.Path]::GetFullPath($ModelPath))
+$launchArgs=@('--model', $ModelPath, '--mmproj', $MmprojPath, '--backend', 'ggml_cuda', '--unified-memory', '--host', '127.0.0.1', '--port', "$Port")
+if($ThreeChatRegression -and $SerialThreeChatReport) { throw 'Choose concurrent regression or its serial controls for one launch' }
+if($ThreeChatRegression) {
+    if(!$FusedTrace) { throw 'Three-chat regression requires native fused trace' }
+}
+if($ThreeChatRegression -or $SerialThreeChatReport) {
+    if($ServerMaxTokens -ne 0 -and $ServerMaxTokens -ne 20000) { throw 'Three-chat acceptance requires the reported 20000-token server limit' }
+    $ServerMaxTokens=20000
+}
+if($ServerMaxTokens -gt 0) { $launchArgs+=@('--max-tokens',"$ServerMaxTokens") }
 $audit=[ordered]@{startedUtc=[DateTime]::UtcNow.ToString('o'); command=@($exe)+$launchArgs; passed=$false; errors=@(); cleanupComplete=$false}
 $owned=$null; $ownedStart=$null; $checkerExit=2; $sampling=$null
 function Save($value,$name) { ConvertTo-Json -InputObject $value -Depth 32 | Set-Content -LiteralPath (Join-Path $outputPath $name) -Encoding utf8 }
@@ -54,12 +73,21 @@ function Listener {
     return @($rows | Select-Object LocalAddress,LocalPort,OwningProcess)
 }
 try {
+    if($RequireJointStartupWarmup -and ($Architecture -ne 'qwen4exp' -or !$FusedTrace)) {
+        throw 'Joint startup acceptance requires qualified Qwen and native fused trace'
+    }
+    $audit.requireJointStartupWarmup=[bool]$RequireJointStartupWarmup
     if ((Hash (Join-Path $server 'GgmlOps.dll')) -ne $NativeSha256) { throw 'Native artifact differs from pinned candidate' }
     $audit.binariesBefore=Snapshot
     $audit.checkerSha=Hash $checker; $audit.wrapperSha=Hash $PSCommandPath
     $audit.samplerSha=Hash $sampler
+    if($ThreeChatRegression) { $audit.threeChatCheckerSha=Hash $threeChatChecker }
     if($PrefixChecks) { $audit.prefixCheckerSha=Hash $prefixChecker }
     if($HttpChecks) { $audit.httpCheckerSha=Hash $httpChecker }
+    if($SerialThreeChatReport) {
+        $audit.serialThreeCheckerSha=Hash $serialThreeChecker
+        $audit.concurrentReportSha=Hash $SerialThreeChatReport
+    }
     $audit.fusedVerifierSha=Hash $fusedVerifier
     if($PrefixChecks -or $HttpChecks) { $audit.imageSha=Hash $image }
     $audit.modelFiles=@(Get-ChildItem -LiteralPath $modelRoot -Filter '*.gguf' -File | Select-Object FullName,Length,LastWriteTimeUtc)
@@ -72,11 +100,17 @@ try {
     $processOptions=@{FilePath=$exe;ArgumentList=$launchArgs;WorkingDirectory=$repo;WindowStyle='Hidden';PassThru=$true;RedirectStandardOutput=(Join-Path $outputPath 'stdout.log');RedirectStandardError=(Join-Path $outputPath 'stderr.log')}
     $audit.childEnvironment=@{}
     if($FusedTrace) { $audit.childEnvironment.TS_BATCHED_FUSED_TRACE='1' }
+    if($TokenTrace) { $audit.childEnvironment.TS_VALIDATION_TOKEN_TRACE='1' }
     if($DiagnosticTiming) {
         $audit.childEnvironment.TS_HOST_MOE_TIMING='3'
         $audit.childEnvironment.TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS='1'
     }
-    if($audit.childEnvironment.Count -gt 0) { $processOptions.Environment=$audit.childEnvironment }
+    if($audit.childEnvironment.Count -gt 0) {
+        if(!(Get-Command Start-Process).Parameters.ContainsKey('Environment')) {
+            throw 'Child-only trace capture requires Start-Process -Environment; run this validation script with pwsh (PowerShell 7.4 or newer).'
+        }
+        $processOptions.Environment=$audit.childEnvironment
+    }
     $owned=Start-Process @processOptions
     $ownedStart=$owned.StartTime.ToUniversalTime().Ticks
     $audit.owned=@{pid=$owned.Id;startTicks=$ownedStart;executable=$exe}
@@ -86,7 +120,7 @@ try {
     while($clock.Elapsed.TotalSeconds -lt $ReadyTimeoutSeconds) {
         $owned.Refresh()
         if($owned.HasExited) { throw "Server exited during startup: $($owned.ExitCode)" }
-        try { $state=Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/models" -TimeoutSec 2; if($state.unifiedMemory -eq $true -and $state.visionReady -eq $true) { $ready=$true; break } } catch { }
+        try { $state=Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/models" -TimeoutSec 2; if($state.unifiedMemory -eq $true -and $state.visionReady -eq $true -and $state.architecture -eq $Architecture -and $state.loaded -eq [IO.Path]::GetFileName($ModelPath)) { $ready=$true; break } } catch { }
         Start-Sleep -Milliseconds 500
     }
     if(!$ready) { throw 'Server did not become ready' }
@@ -98,14 +132,35 @@ try {
     if($native.Count -ne 1 -or [IO.Path]::GetFullPath($native[0]) -ne (Join-Path $server 'GgmlOps.dll') -or (Hash $native[0]) -ne $NativeSha256) { throw 'Unexpected loaded native library' }
     $audit.loadedNative=$native[0]
     if(!$SerialOnlyAllowed -and $state.startupWarmup.completed -ne $true) { throw 'Scheduled startup warmup did not complete both thinking modes' }
+    if($RequireJointStartupWarmup) {
+        $joint=@($state.startupWarmup.jointStages)
+        if($state.startupWarmup.jointWarmupRequested -ne $true -or $state.startupWarmup.jointCompleted -ne $true -or
+           $state.startupWarmup.jointCleanupPending -ne $false -or $joint.Count -ne 2) {
+            throw 'Startup did not accept and clean both native N2/N3 cohorts; inspect initial-model.json'
+        }
+        foreach($width in 2,3) {
+            $stage=@($joint | Where-Object width -eq $width)
+            if($stage.Count -ne 1 -or $stage[0].completed -ne $true -or
+               $stage[0].nativeBatchAccepted -ne $true -or $stage[0].nativeAcceptedExecutionId -le 0 -or
+               $stage[0].nativeNodeCount -le 0) { throw "Startup native width $width was not qualified" }
+        }
+    }
     $checkArgs=@('-X','utf8','-B',$checker,'--url',"http://127.0.0.1:$Port",'--output',(Join-Path $outputPath 'concurrency'),'--max-tokens',"$MaxTokens",'--timeout','600')
     if(!$SkipSerialControls) { $checkArgs+='--compare-serial' }
     $audit.serialControlsRequested=!$SkipSerialControls
     $fileLog=Join-Path $server "logs/tensorsharp-server-$([DateTime]::UtcNow.ToString('yyyyMMdd')).jsonl"
+    if($ThreeChatRegression) {
+        & $python -X utf8 -B $threeChatChecker --url "http://127.0.0.1:$Port" --output (Join-Path $outputPath 'three-chat') --server-log $fileLog --max-tokens 20000 --timeout 900 --join-timeout 90
+        $audit.threeChatCheckerExit=$LASTEXITCODE
+        if($LASTEXITCODE -ne 0) { throw "Three-chat 20K admission/cancellation checker failed: $LASTEXITCODE" }
+        $audit.listenerAfterThreeChat=Listener
+    }
     if(!$SerialOnlyAllowed) { $checkArgs+='--expect-interleaved' }
     $checkArgs+=@('--server-log',$fileLog)
     if($FusedTrace) { $checkArgs+='--require-fused-batch' }
-    & $python @checkArgs
+    if($SerialThreeChatReport) {
+        & $python -X utf8 -B $serialThreeChecker --url "http://127.0.0.1:$Port" --concurrent-report $SerialThreeChatReport --output (Join-Path $outputPath 'serial-three') --max-tokens $MaxTokens --server-log $fileLog
+    } else { & $python @checkArgs }
     $checkerExit=$LASTEXITCODE
     $audit.checkerExit=$checkerExit
     $audit.listenerAfter=Listener
@@ -129,7 +184,7 @@ try {
         if($LASTEXITCODE -ne 0) { throw "Prefix checker failed: $LASTEXITCODE" }
     }
     if($HttpChecks) {
-        & $python -X utf8 -B $httpChecker --url "http://127.0.0.1:$Port" --model 'Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf' --image $image --server-log $fileLog --require-unified-status --default-output-limit-check --output (Join-Path $outputPath 'http')
+        & $python -X utf8 -B $httpChecker --url "http://127.0.0.1:$Port" --model ([IO.Path]::GetFileName($ModelPath)) --architecture $Architecture --image $image --server-log $fileLog --require-unified-status --default-output-limit-check --output (Join-Path $outputPath 'http')
         $audit.httpCheckerExit=$LASTEXITCODE
         if($LASTEXITCODE -ne 0) { throw "HTTP quality/cancellation/reload checker failed: $LASTEXITCODE" }
     }
@@ -156,6 +211,8 @@ try {
         if((Hash $sampler) -ne $audit.samplerSha) { throw 'Memory sampler changed' }
         if($PrefixChecks -and (Hash $prefixChecker) -ne $audit.prefixCheckerSha) { throw 'Prefix checker changed' }
         if($HttpChecks -and (Hash $httpChecker) -ne $audit.httpCheckerSha) { throw 'HTTP checker changed' }
+        if($ThreeChatRegression -and (Hash $threeChatChecker) -ne $audit.threeChatCheckerSha) { throw 'Three-chat checker changed' }
+        if($SerialThreeChatReport -and ((Hash $serialThreeChecker) -ne $audit.serialThreeCheckerSha -or (Hash $SerialThreeChatReport) -ne $audit.concurrentReportSha)) { throw 'Serial three-chat checker or concurrent evidence changed' }
         if((Hash $fusedVerifier) -ne $audit.fusedVerifierSha) { throw 'Fused evidence verifier changed' }
         if(($PrefixChecks -or $HttpChecks) -and (Hash $image) -ne $audit.imageSha) { throw 'Input image changed' }
     } catch { $audit.errors+="Identity: $_" }

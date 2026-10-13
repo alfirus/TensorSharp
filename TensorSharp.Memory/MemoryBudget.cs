@@ -420,6 +420,83 @@ public sealed class MemoryBudget
         IEnumerable<MemoryCharge>? capacityConstraints)
         => TryResize(envelope, charges, capacityConstraints, totalTarget: true);
 
+    /// <summary>Atomically target several open root envelopes' total ownership.
+    /// Live descendants remain charged even below a target. Capacity checks use
+    /// the combined post-transaction ledger, so a refusal leaves every envelope
+    /// unchanged and released credit can fund another owner's growth.</summary>
+    public bool TryResizeTotals(IEnumerable<(BudgetReservation Envelope, IReadOnlyList<MemoryCharge> TotalTarget)> targets,
+        IEnumerable<MemoryCharge>? capacityConstraints = null)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        var plans = targets.Select(t => (t.Envelope, Requested: Normalize(t.TotalTarget))).ToArray();
+        var limits = capacityConstraints == null ? null : NormalizeCapacityConstraints(capacityConstraints);
+        var unique = new HashSet<BudgetReservation>(ReferenceEqualityComparer.Instance);
+        var deltas = new Dictionary<string, long>(StringComparer.Ordinal);
+        TaskCompletionSource? releasedSignal = null;
+        lock (_gate)
+        {
+            foreach (var (envelope, requested) in plans)
+            {
+                ArgumentNullException.ThrowIfNull(envelope);
+                if (!ReferenceEquals(envelope.Owner, this))
+                    throw new ArgumentException("Reservation belongs to a different budget.", nameof(targets));
+                if (!unique.Add(envelope))
+                    throw new ArgumentException("Each envelope may have only one target.", nameof(targets));
+                if (envelope.State != 0 || envelope.Parent != null)
+                    throw new InvalidOperationException("Only an open root allocation envelope can resize unused credit.");
+                if (requested.Length != envelope.Items.Length)
+                    throw new ArgumentException("Resizing must preserve each envelope's pool set.", nameof(targets));
+                for (int i = 0; i < requested.Length; i++)
+                {
+                    if (requested[i].Pool != envelope.Items[i].Pool)
+                        throw new ArgumentException("Resizing must preserve each envelope's pool set.", nameof(targets));
+                    requested[i] = requested[i] with { Bytes = Math.Max(0,
+                        requested[i].Bytes - envelope.DescendantBytes[i]) };
+                    long delta = requested[i].Bytes - envelope.Items[i].Bytes;
+                    deltas[requested[i].Pool] = checked(deltas.GetValueOrDefault(requested[i].Pool) + delta);
+                }
+            }
+            bool grows = false, releases = false;
+            foreach (var (name, delta) in deltas)
+            {
+                grows |= delta > 0; releases |= delta < 0;
+                var pool = _pools[name];
+                if (delta > 0 && (delta > pool.Ceiling - pool.Reserved - pool.Committed
+                    || delta > pool.Capacity - pool.Reserved - pool.Committed)) return false;
+            }
+            if (grows && limits != null)
+                foreach (var (name, capacity) in limits)
+                {
+                    var pool = _pools[name];
+                    if ((decimal)pool.Reserved + pool.Committed + deltas.GetValueOrDefault(name) > capacity) return false;
+                }
+            // Every plan, validation and aggregate delta exists before mutation.
+            // The remaining transaction assigns value types and allocates nothing.
+            foreach (var (name, delta) in deltas)
+            {
+                var pool = _pools[name];
+                pool.Reserved += delta;
+                pool.PeakOwned = Math.Max(pool.PeakOwned, pool.Reserved + pool.Committed);
+                RecomputeCapacity(pool);
+            }
+            foreach (var (envelope, requested) in plans)
+                for (int i = 0; i < requested.Length; i++) envelope.Items[i] = requested[i];
+            if (releases)
+            {
+                releasedSignal = _changed;
+                _changed = null;
+            }
+        }
+        // Notification sees the completed owner transaction and cannot execute
+        // client continuations or the diagnostic hook under the ledger lock.
+        if (releasedSignal != null)
+        {
+            BeforeChangeNotification?.Invoke();
+            releasedSignal.TrySetResult();
+        }
+        return true;
+    }
+
     private bool TryResize(BudgetReservation envelope, IEnumerable<MemoryCharge> charges,
         IEnumerable<MemoryCharge>? capacityConstraints, bool totalTarget)
     {

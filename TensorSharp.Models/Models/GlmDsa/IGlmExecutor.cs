@@ -72,6 +72,13 @@ namespace TensorSharp.Models
         public int VocabSize => GgmlGlmNative.VocabSize(_handle);
         public int ContextSize => GgmlGlmNative.CtxSize(_handle);
         public int NPast => GgmlGlmNative.NPast(_handle);
+        internal bool ConfigureGraphCache(int capacity, int trim) => GgmlGlmNative.ConfigureGraphCache(_handle, capacity, trim);
+        internal bool TrimMappedResidency() => GgmlGlmNative.TrimMappedResidency(_handle);
+        internal GgmlGlmBatchExecution LastBatchedExecution => GgmlGlmNative.TryGetLastBatchedExecution(_handle);
+        internal bool ConfigureSharedGraphOwner(bool enabled) => GgmlGlmNative.ConfigureSharedGraphOwner(_handle, enabled);
+        internal int SelectedExpertGroups => GgmlGlmNative.SelectedExpertGroupCount(_handle);
+        internal long PlanSelectedExpertMinimum(int rows) => GgmlGlmNative.SelectedExpertMinimumBudget(_handle, rows);
+        internal bool ConfigureSelectedExperts(bool enabled) => GgmlGlmNative.ConfigureSelectedExpertSeams(_handle, enabled);
         public bool HasDraftHead => GgmlGlmNative.HasDraftHead(_handle);
 
         public bool Forward(int[] tokens, float[] logitsOut) => GgmlGlmNative.Forward(_handle, tokens, logitsOut);

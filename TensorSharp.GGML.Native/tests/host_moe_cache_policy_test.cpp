@@ -33,5 +33,19 @@ int main()
     // Exercise every supported row/selected pair, including the exact boundary.
     for (int rows = 1; rows <= 129; ++rows) for (int selected = 1; selected <= 64; ++selected)
         require(tsg::host_moe_cache_routes_fit(rows, selected) == (rows * selected <= 4096));
+    const std::int32_t disjoint[]{0, 1, 1, 2, 2, 3};
+    const std::int32_t repeated[]{0, 1, 0, 1, 0, 1};
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 3, 3, 4) == 3);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 3, 3, 3) == 2);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 3, 3, 2) == 1);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 1, 3, 4) == 1);
+    require(tsg::host_moe_cache_prefill_group_rows(repeated, 2, 3, 3, 2) == 3);
+    require(tsg::host_moe_cache_prefill_group_rows(repeated, 2, 3, 3, 1) == 0);
+    require(tsg::host_moe_cache_prefill_group_rows(nullptr, 2, 3, 3, 4) == 0);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 0, 3, 3, 4) == 0);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 65, 3, 3, 4) == 0);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 0, 3, 4) == 0);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 3, 0, 4) == 0);
+    require(tsg::host_moe_cache_prefill_group_rows(disjoint, 2, 3, 9, 4) == 0);
     std::printf("PASS %d host MoE row/route policy checks; default8, explicit128, routing scratch16KiB\n", checks);
 }

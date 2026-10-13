@@ -52,7 +52,7 @@ namespace TensorSharp.Models
             }
 
             return new GlmDsaModel(context.GgufPath, context.Backend, context.TpDegree, null,
-                context.LayerSplitDegree, GlmDsaModel.DirectCudaApplies(context.Backend, context.Probe));
+                context.LayerSplitDegree, GlmDsaModel.DirectCudaApplies(context.Backend, context.Probe), context.MemoryPolicy);
         }
     }
 }

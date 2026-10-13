@@ -12,3 +12,6 @@ TensorAgent/src/TensorAgent.Core/Localization/**/*.json text eol=lf
 TensorAgent/src/TensorAgent.Sharing/Localization/**/*.json text eol=lf
 # Docker RUN heredocs are shell scripts too.
 Dockerfile* text eol=lf
+# PDF xref offsets and fixture digests require exact bytes on every platform.
+# ASCII-only PDFs are still binary; CRLF checkout conversion corrupts offsets.
+*.pdf binary

@@ -72,6 +72,39 @@ class RawPlanTests(unittest.TestCase):
 
 
 class RawQualityTests(unittest.TestCase):
+    def test_free_text_natural_eos_is_record_only_not_semantic_pass(self):
+        _, body = fixture(); answer = response(); answer['content'] = 'An unverified factual statement.'
+        result = runner.quality_result(answer, body, [99], 'free_text')
+        self.assertTrue(result['passed']); self.assertTrue(result['record_only'])
+        self.assertIsNone(result['semantic_pass']); self.assertIsNone(result['semantic_check']['passed'])
+        self.assertTrue(result['natural_eos']); self.assertFalse(result['bounded_limit'])
+        self.assertEqual(answer['content'], result['content'])
+
+    def test_free_text_exact_cap_is_valid_record_not_complete_answer(self):
+        _, body = fixture(); answer = response()
+        answer.update(tokens=[71]*8, tokens_predicted=8, stop_type='limit')
+        result = runner.quality_result(answer, body, [99], 'free_text')
+        self.assertTrue(result['passed']); self.assertTrue(result['bounded_limit'])
+        self.assertFalse(result['natural_eos']); self.assertIsNone(result['semantic_pass'])
+        for key, value in [('tokens',[71]*7), ('tokens',[71]*7+[99]), ('truncated',True),
+                           ('stop_type','word'), ('tokens_evaluated',1), ('tokens',[2**31]*8)]:
+            bad=copy.deepcopy(answer); bad[key]=value
+            with self.subTest(key=key,value=value):
+                self.assertFalse(runner.quality_result(bad,body,[99],'free_text')['passed'])
+
+    def test_recorded_trajectory_divergence_is_descriptive(self):
+        row=runner.compare_trajectory([1,2,3], {'tokens':[1,4,99]})
+        self.assertEqual(1,row['first_mismatch_index']); self.assertFalse(row['full_trajectory_exact'])
+        self.assertNotIn('semantic_pass',row)
+        row=runner.compare_trajectory([1,2], {'tokens':[1,2,99]})
+        self.assertTrue(row['compared_prefix_exact']); self.assertFalse(row['full_trajectory_exact'])
+
+    def test_int32_token_hash_is_little_endian_and_rejects_coercion(self):
+        import hashlib,struct
+        self.assertEqual(hashlib.sha256(struct.pack('<ii',1,256)).hexdigest(),runner.token_hash([1,256]))
+        for values in ([],[True],[-1],[2**31],[float('nan')]):
+            with self.subTest(values=values),self.assertRaises(ValueError): runner.token_hash(values)
+
     def test_raw_json_with_whitespace_and_real_eos_passes(self):
         _, body = fixture()
         result = runner.quality_result(response(), body, [99], 'tool_json')
@@ -140,6 +173,24 @@ class RawLifetimeTests(unittest.TestCase):
 
 
 class LoadedIdentityTests(unittest.TestCase):
+    def test_free_text_conditioning_is_bound_to_actual_export(self):
+        import json
+        plan,_=fixture(); plan.update(case='free_text',record_only=True,semantic_pass=None)
+        plan['prompt']['i32le_sha256']=runner.token_hash(plan['prompt']['tokens'])
+        plan['checkpoint']={'shards':[{'path':'checkpoint','sha256':'a'*64}]}
+        plan['reference_output']={'tokens':[71,99], 'i32le_sha256':runner.token_hash([71,99])}
+        export={'status':'extracted-not-baseline-executed','requests':[{'http_request_id':'http-1',
+            'prompt':plan['prompt'],'output':plan['reference_output']}], 'identity':{'checkpoint':plan['checkpoint']}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'tokens.json'; path.write_text(json.dumps(export),encoding='utf-8')
+            plan['conditioning_evidence']={'path':str(path),'sha256':runner.bench.sha(path),'request_index':0,'http_request_id':'http-1'}
+            self.assertEqual('http-1',runner.conditioning_evidence(plan)['http_request_id'])
+            for key,value in [('request_index',True),('http_request_id','other'),('sha256','0'*64)]:
+                bad=copy.deepcopy(plan); bad['conditioning_evidence'][key]=value
+                with self.subTest(key=key),self.assertRaises(ValueError): runner.conditioning_evidence(bad)
+            plan['reference_output']['tokens'][0]=72
+            with self.assertRaises(ValueError): runner.conditioning_evidence(plan)
+
     def test_required_live_modules_must_match_pinned_paths_and_hashes(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths=[Path(tmp)/name for name in ('llama-server.exe','llama.dll','ggml-cuda.dll')]

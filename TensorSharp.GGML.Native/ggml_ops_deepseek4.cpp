@@ -2158,7 +2158,9 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
 
     m->n_gpu = n_gpu;
-    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    // Avoid global device enumeration for this auxiliary CPU backend: a host
+    // run must not initialize linked accelerator drivers merely to create it.
+    ggml_backend_t cpu = ggml_backend_cpu_init();
     {
         // The CPU backend normally only builds rope tables at load time, so the
         // caller's modest thread count is right. With --n-cpu-moe it also runs

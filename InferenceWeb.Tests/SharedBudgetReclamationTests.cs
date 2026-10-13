@@ -9,6 +9,210 @@ public sealed class SharedBudgetReclamationTests
     static SequenceState Request(string id) => new(id, [1, 2], 2, 8, SamplingConfig.Greedy);
 
     [Fact]
+    public void AReestimatedLargerPeakCanReclaimWithoutLosingItsFifoPlace()
+    {
+        var budget = new MemoryBudget([new("ram", 128)]);
+        using var retained = budget.Reserve([new("ram", 64)]);
+        using var temporary = budget.Reserve([new("ram", 64)]);
+        using var head = SharedBudgetReclamation.Register(budget, () => { });
+        using var follower = SharedBudgetReclamation.Register(budget, () => { });
+        using var donor = SharedBudgetReclamation.Register(budget, () => { });
+        var first = Request("growing"); var next = Request("younger-small");
+        Assert.Null(head.TryReserve(first, [new("ram", 64)]));
+        Assert.Null(follower.TryReserve(next, [new("ram", 32)]));
+        temporary.Dispose();
+        Assert.Null(head.TryReserve(first, [new("ram", 128)]));
+        Assert.False(follower.CanAdmit([new("ram", 32)]));
+        using var reclaim = donor.TryBeginReclamation();
+        Assert.NotNull(reclaim); Assert.True(reclaim.NeedsReclamation());
+        retained.Dispose();
+        Assert.False(reclaim.NeedsReclamation());
+        Assert.Null(follower.TryReserve(next, [new("ram", 32)]));
+        using var admitted = head.TryReserve(first, [new("ram", 128)]);
+        Assert.NotNull(admitted);
+        admitted.Dispose();
+        using var second = follower.TryReserve(next, [new("ram", 32)]);
+        Assert.NotNull(second);
+    }
+
+    [Fact]
+    public void AReestimatedSmallerPeakInvalidatesItsOldLeaseAndStopsAfterEnoughRelease()
+    {
+        var budget = new MemoryBudget([new("ram", 128)]);
+        using var firstCache = budget.Reserve([new("ram", 64)]);
+        using var secondCache = budget.Reserve([new("ram", 64)]);
+        using var head = SharedBudgetReclamation.Register(budget, () => { });
+        using var donor = SharedBudgetReclamation.Register(budget, () => { });
+        var request = Request("shrinking");
+        Assert.Null(head.TryReserve(request, [new("ram", 128)]));
+        using var oldLease = donor.TryBeginReclamation();
+        Assert.NotNull(oldLease); Assert.True(oldLease.NeedsReclamation());
+        var signal = budget.ChangeSignal;
+        Assert.Null(head.TryReserve(request, [new("ram", 64)]));
+        Assert.Same(signal, budget.ChangeSignal);
+        Assert.False(oldLease.NeedsReclamation());
+        oldLease.Dispose();
+        using var newLease = donor.TryBeginReclamation();
+        Assert.NotNull(newLease); Assert.True(newLease.NeedsReclamation());
+        firstCache.Dispose();
+        Assert.False(newLease.NeedsReclamation());
+        Assert.Equal(64, budget.Snapshot().Single().Reserved); // Second cache was not evicted.
+        using var admitted = head.TryReserve(request, [new("ram", 64)]);
+        Assert.NotNull(admitted);
+    }
+
+    [Fact]
+    public void AChangedPoolSetKeepsQueuePriorityAndUsesTheCurrentPoolForReclamation()
+    {
+        var budget = new MemoryBudget([new("ram", 100), new("gpu", 100)]);
+        using var hostCache = budget.Reserve([new("ram", 100)]);
+        using var deviceCache = budget.Reserve([new("gpu", 100)]);
+        using var head = SharedBudgetReclamation.Register(budget, () => { });
+        using var follower = SharedBudgetReclamation.Register(budget, () => { });
+        using var donor = SharedBudgetReclamation.Register(budget, () => { });
+        var first = Request("changed-pool"); var next = Request("younger-device");
+        Assert.Null(head.TryReserve(first, [new("ram", 50)]));
+        Assert.Null(follower.TryReserve(next, [new("gpu", 50)]));
+        Assert.Null(head.TryReserve(first, [new("ram", 0), new("gpu", 50)]));
+        using var lease = donor.TryBeginReclamation();
+        Assert.NotNull(lease);
+        hostCache.Dispose();
+        Assert.True(lease.NeedsReclamation()); // Unrelated RAM release cannot satisfy GPU demand.
+        deviceCache.Dispose();
+        Assert.False(lease.NeedsReclamation());
+        Assert.Null(follower.TryReserve(next, [new("gpu", 50)]));
+        using var admitted = head.TryReserve(first, [new("gpu", 50)]);
+        Assert.NotNull(admitted);
+        using var second = follower.TryReserve(next, [new("gpu", 50)]);
+        Assert.NotNull(second);
+    }
+
+    [Fact]
+    public void EquivalentNormalizedPeaksDoNotWakePeersInvalidateLeasesOrResetAttempts()
+    {
+        var budget = new MemoryBudget([new("ram", 100), new("gpu", 100), new("unused", 1)]);
+        using var permanent = budget.Reserve([new("ram", 100), new("gpu", 100)]);
+        using var head = SharedBudgetReclamation.Register(budget, () => { });
+        int wakes = 0;
+        using var donor = SharedBudgetReclamation.Register(budget, () => wakes++);
+        var request = Request("same-total");
+        Assert.Null(head.TryReserve(request, [new("ram", 40), new("gpu", 100), new("ram", 60)]));
+        using var lease = donor.TryBeginReclamation();
+        Assert.NotNull(lease);
+        int before = wakes;
+        Assert.Null(head.TryReserve(request, [new("gpu", 50), new("ram", 100), new("gpu", 50), new("unused", 0)]));
+        Assert.Equal(before, wakes);
+        Assert.True(lease.NeedsReclamation());
+        lease.Dispose();
+        var signal = budget.ChangeSignal;
+        before = wakes;
+        for (int attempt = 0; attempt < 100; attempt++)
+        {
+            Assert.Null(head.TryReserve(request, [new("gpu", 100), new("ram", 50), new("ram", 50)]));
+            Assert.Null(donor.TryBeginReclamation());
+        }
+        Assert.Equal(before, wakes);
+        Assert.Same(signal, budget.ChangeSignal);
+    }
+
+    [Fact]
+    public void AChangedPeakAllowsOneNewDonorAttemptWithoutABudgetPulse()
+    {
+        var budget = new MemoryBudget([new("ram", 200)]);
+        using var permanent = budget.Reserve([new("ram", 200)]);
+        using var head = SharedBudgetReclamation.Register(budget, () => { });
+        int wakes = 0;
+        using var donor = SharedBudgetReclamation.Register(budget, () => wakes++);
+        var request = Request("fresh-forecast");
+        Assert.Null(head.TryReserve(request, [new("ram", 100)]));
+        using (var exhausted = donor.TryBeginReclamation()) Assert.NotNull(exhausted);
+        Assert.Null(donor.TryBeginReclamation());
+        var signal = budget.ChangeSignal;
+        int before = wakes;
+        Assert.Null(head.TryReserve(request, [new("ram", 150)]));
+        Assert.Equal(before + 1, wakes);
+        Assert.Same(signal, budget.ChangeSignal);
+        using (var retry = donor.TryBeginReclamation())
+        {
+            Assert.NotNull(retry); Assert.True(retry.NeedsReclamation());
+        }
+        Assert.Null(donor.TryBeginReclamation());
+    }
+
+    [Fact]
+    public void InvalidReestimatedPeaksCannotReplaceTheLiveDemand()
+    {
+        var budget = new MemoryBudget([new("ram", 100)]);
+        using var permanent = budget.Reserve([new("ram", 100)]);
+        using var head = SharedBudgetReclamation.Register(budget, () => { });
+        int wakes = 0;
+        using var donor = SharedBudgetReclamation.Register(budget, () => wakes++);
+        var request = Request("invalid-forecast");
+        Assert.Null(head.TryReserve(request, [new("ram", 100)]));
+        using var lease = donor.TryBeginReclamation();
+        Assert.NotNull(lease);
+        int before = wakes;
+        Assert.Throws<OverflowException>(() => head.TryReserve(request, [new("ram", long.MaxValue), new("ram", 1)]));
+        Assert.Throws<ArgumentOutOfRangeException>(() => head.TryReserve(request, [new("ram", -1)]));
+        Assert.Throws<ArgumentException>(() => head.TryReserve(request, [new("missing", 1)]));
+        Assert.Equal(before, wakes);
+        Assert.True(lease.NeedsReclamation());
+        head.Cancel(request);
+        Assert.False(lease.NeedsReclamation());
+    }
+
+    [Theory]
+    [InlineData(true, "unknown-positive")]
+    [InlineData(true, "unknown-zero")]
+    [InlineData(true, "negative")]
+    [InlineData(true, "overflow")]
+    [InlineData(false, "unknown-positive")]
+    [InlineData(false, "unknown-zero")]
+    [InlineData(false, "negative")]
+    [InlineData(false, "overflow")]
+    public void InvalidFifoOrWaitOnlyPeaksLeaveTheOriginalDemandLeaseAndWakeStateUnchanged(
+        bool waitOnly, string invalidKind)
+    {
+        var budget = new MemoryBudget([new("ram", 100), new("gpu", 100)]);
+        using var permanent = budget.Reserve([new("ram", 100), new("gpu", 100)]);
+        using var oldest = SharedBudgetReclamation.Register(budget, () => { });
+        using var subject = SharedBudgetReclamation.Register(budget, () => { });
+        int wakes = 0;
+        using var donor = SharedBudgetReclamation.Register(budget, () => wakes++);
+        Assert.Null(oldest.TryReserve(Request("older-host"), [new("ram", 100)]));
+        var request = Request("original-device");
+        Assert.Null(subject.TryReserve(request, [new("gpu", 100)]));
+        using (var hostAttempt = donor.TryBeginReclamation()) Assert.NotNull(hostAttempt);
+        using var originalLease = donor.TryBeginReclamation();
+        Assert.NotNull(originalLease); Assert.True(originalLease.NeedsReclamation());
+        MemoryCharge[] invalid = invalidKind switch
+        {
+            "unknown-positive" => [new("ram", 1), new("missing", 1)],
+            "unknown-zero" => [new("ram", 1), new("missing", 0)],
+            "negative" => [new("ram", 1), new("gpu", -1)],
+            _ => [new("ram", long.MaxValue), new("ram", 1)]
+        };
+        // A wait-only replacement must not erase the old request before its
+        // input is validated. The other path keeps the request but conflicts
+        // with older RAM demand, so neither path reaches budget.TryReserve.
+        var attemptedRequest = waitOnly ? Request("invalid-replacement") : request;
+        var signal = budget.ChangeSignal;
+        int before = wakes;
+        if (invalidKind == "overflow")
+            Assert.Throws<OverflowException>(() => subject.TryReserve(attemptedRequest, invalid, waitOnly: waitOnly));
+        else if (invalidKind == "negative")
+            Assert.Throws<ArgumentOutOfRangeException>(() => subject.TryReserve(attemptedRequest, invalid, waitOnly: waitOnly));
+        else
+            Assert.Throws<ArgumentException>(() => subject.TryReserve(attemptedRequest, invalid, waitOnly: waitOnly));
+        Assert.Equal(before, wakes);
+        Assert.Same(signal, budget.ChangeSignal);
+        Assert.True(originalLease.NeedsReclamation());
+        Assert.All(budget.Snapshot(), pool => Assert.Equal(100, pool.Reserved));
+        subject.Cancel(request);
+        Assert.False(originalLease.NeedsReclamation());
+    }
+
+    [Fact]
     public void EqualPhysicalAndConfiguredCapacityRaceQueuesTheLoserWithoutLosingFifoPriority()
     {
         var budget = new MemoryBudget([new("ram", 128)]);

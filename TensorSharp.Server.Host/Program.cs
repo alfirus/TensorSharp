@@ -713,6 +713,9 @@ if (!hostingOptions.EmbeddingsEnabled && PrefixCacheWarmup.ShouldRun(hostingOpti
     var warmupModelService = app.Services.GetRequiredService<ModelService>();
     var warmupModel = warmupModelService.Model;
     var warmupStages = new List<StartupWarmupStatus.Stage>();
+    var jointWarmupStages = new List<StartupWarmupStatus.JointStage>();
+    bool jointWarmupRequested = false;
+    string? jointWarmupSkipReason = null;
     // A session of its own, never the default one: the default session has no workspace
     // and is therefore offered different tools, which would warm a prompt no real request
     // sends. A dedicated id also keeps the warm-up turn out of any transcript a host keeps.
@@ -721,26 +724,69 @@ if (!hostingOptions.EmbeddingsEnabled && PrefixCacheWarmup.ShouldRun(hostingOpti
         "Preparing admitted execution and the shared prompt before opening the port. The first launch after a prompt, "
         + "skills or model change pays for initialization here instead of on the first message.");
 
-    // Both thinking modes are reachable and can render different shared prefixes. A
-    // client that omits `think` gets false, while the Web UI can send true.
-    foreach (bool think in new[] { false, true })
+    // Initialize the thinking-on prefix for the joint cohorts first. The ordinary
+    // thinking-off stage runs last, after their pressure/reclamation, so a client
+    // that omits `think` still starts from the default shared prompt. Both serial
+    // stages run once; optional joint initialization adds no repeated cold request.
+    try
     {
-        PrefixCacheWarmup.Result warmed = PrefixCacheWarmup
-            .RunAsync(warmupAdapter.Chat.ChatStreamAsync, warmupSession.Id, think, startupLogger)
-            .GetAwaiter().GetResult();
+        bool thinkingWarmed = RunSerialWarmup(think: true);
+        var warmupEngine = warmupModelService.EngineHost.TryGetEngine();
+        if (thinkingWarmed
+            && hostingOptions.UnifiedMemoryEnabled && warmupModel is Qwen4ExpModel)
+        {
+            jointWarmupSkipReason = JointDecodeStartupWarmup.QualificationDeclineReason(warmupModel,
+                hostingOptions.UnifiedMemoryEnabled, warmupModelService.LoadedBackend, warmupEngine);
+            if (jointWarmupSkipReason != null)
+            {
+                startupLogger.LogInformation(LogEventIds.HostConfiguration,
+                    "Scheduled startup joint warmup skipped: {Reason}", jointWarmupSkipReason);
+            }
+            else
+            {
+                jointWarmupRequested = true;
+                foreach (int width in new[] { 2, 3 })
+                {
+                    var result = JointDecodeStartupWarmup.RunAsync(warmupEngine, warmupAdapter.Chat.ChatStreamAsync,
+                        () => warmupSessions.CreateSession().Id, ReleaseWarmupSession, width, think: true, startupLogger,
+                        app.Lifetime.ApplicationStopping).GetAwaiter().GetResult();
+                    jointWarmupStages.Add(new(width, result.RequestsCompleted, result.NativeBatchAccepted, result.CleanupCompleted,
+                        result.Evidence?.NativeAcceptedExecutionId ?? 0, result.Evidence?.NativeNodeCount ?? 0,
+                        result.Elapsed.TotalMilliseconds, result.Detail, result.CleanupPending));
+                    if (!result.Warmed) break;
+                }
+            }
+        }
+        if (thinkingWarmed && !jointWarmupStages.Any(s => s.CleanupPending))
+            RunSerialWarmup(think: false);
+        else if (jointWarmupStages.Any(s => s.CleanupPending))
+            startupLogger.LogWarning(LogEventIds.HostConfiguration,
+                "Scheduled startup default-prefix warmup skipped while joint physical cleanup remains pending.");
+    }
+    finally
+    {
+        warmupModelService.RecordStartupWarmup(warmupModel, new StartupWarmupStatus(warmupStages,
+            hostingOptions.PrefixCacheEnabled && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching,
+            jointWarmupStages, jointWarmupRequested, jointWarmupSkipReason));
+        ReleaseWarmupSession(warmupSession.Id);
+    }
+    bool RunSerialWarmup(bool think)
+    {
+        var warmed = PrefixCacheWarmup.RunAsync(warmupAdapter.Chat.ChatStreamAsync, warmupSession.Id,
+            think, startupLogger, app.Lifetime.ApplicationStopping).GetAwaiter().GetResult();
         warmupStages.Add(new StartupWarmupStatus.Stage(think, warmed.Warmed, warmed.Elapsed.TotalMilliseconds));
         startupLogger.LogInformation(LogEventIds.HostConfiguration,
             "Scheduled startup warmup (thinking {Think}): {Outcome}", think ? "on" : "off", warmed.ToString());
-        if (!warmed.Warmed)
-            break;
+        return warmed.Warmed;
     }
-    warmupModelService.RecordStartupWarmup(warmupModel, new StartupWarmupStatus(warmupStages,
-        hostingOptions.PrefixCacheEnabled && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching));
-    // The workspace goes with it. A chat session gets one lazily, and the warm-up IS a
-    // chat session, so a launch that only removed the session would leave a directory
-    // behind every time the server started.
-    warmupSessions.TryRemove(warmupSession.Id);
-    workspaceManager?.Release(warmupSession.Id);
+    void ReleaseWarmupSession(string id)
+    {
+        // The workspace and tracked transcript belong to this startup lease.
+        // The joint helper never invokes this while its stream is in flight.
+        var removed = warmupSessions.TryRemove(id);
+        try { workspaceManager?.Release(id); }
+        finally { warmupModelService.DisposeSession(removed); }
+    }
 }
 
 StartupBanner.Emit(startupLogger, hostingOptions, hostingOptions.ListenUrls);

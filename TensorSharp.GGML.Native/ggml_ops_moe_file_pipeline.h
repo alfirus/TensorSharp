@@ -1,8 +1,11 @@
 // Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
 #pragma once
 #include "ggml_ops_bounded_read_pipeline.h"
+#include "ggml_ops_parallel_read_pipeline.h"
 #include "ggml_ops_host_moe_file_batch.h"
 #include "ggml_ops_moe_pipeline_timeline.h"
+#include "ggml_ops_moe_file_pipeline_config.h"
+#include "ggml_ops_moe_file_pipeline_plan.h"
 
 namespace tsg {
 // Used only under the existing serial file-MoE gate. It owns its copy backend,
@@ -16,7 +19,6 @@ class HostMoeFilePipeline {
     std::array<bool, 2> submitted_{};
     ggml_backend_event_t gate_ready_ = nullptr, down_ready_ = nullptr;
     std::size_t slot_bytes_ = 0;
-    struct Chunk { int part; std::size_t source, destination, bytes; };
     struct Span {
         std::int64_t read_start = 0, read_end = 0;
         std::atomic<std::int64_t> copy_start{0}, copy_end{0};
@@ -37,6 +39,7 @@ class HostMoeFilePipeline {
     }
 public:
     ~HostMoeFilePipeline() { clear(); }
+    std::size_t retained_bytes() const noexcept { return ring_ ? ggml_backend_buffer_get_size(ring_) : 0; }
     void drain() {
         // Either stream can be awaiting the other only through a successfully
         // recorded event. Copy never waits compute, so this order cannot cycle.
@@ -57,10 +60,12 @@ public:
     }
     // Unsupported pageable fallback is explicit: free it and use the existing
     // fully budgeted serial path before any file read or graph submission.
-    bool prepare(ggml_backend_t compute, std::size_t full_host_payload) {
-        const auto requested = std::min<std::size_t>(8u << 20, full_host_payload / 2) & ~std::size_t(63);
+    bool prepare(ggml_backend_t compute, std::size_t full_host_payload,
+        std::size_t maximum_ring_bytes = 16u << 20) {
+        const auto requested = host_moe_file_pipeline_slot_bytes(full_host_payload, maximum_ring_bytes);
         if (!requested) return false;
-        if (ring_ && compute_ == compute && slot_bytes_ == requested) return true;
+        if (ring_ && compute_ == compute && slot_bytes_ == requested
+            && ggml_backend_buffer_get_size(ring_) <= maximum_ring_bytes) return true;
         clear();
         const auto bytes = host_moe_checked_mul(requested, 2);
         auto charge = SharedCacheCharge::reserve(0, 3, bytes);
@@ -73,6 +78,9 @@ public:
         // CUDA's host allocator can return a pageable CPU buffer on pin failure.
         // Never claim asynchronous/pinned qualification for that fallback.
         if (ggml_backend_buffer_get_type(buffer) != host_type) {
+            ggml_backend_buffer_free(buffer); return false;
+        }
+        if (ggml_backend_buffer_get_size(buffer) > maximum_ring_bytes) {
             ggml_backend_buffer_free(buffer); return false;
         }
         ring_ = buffer; charge_ = std::move(charge); compute_ = compute;
@@ -94,19 +102,29 @@ public:
         ggml_cgraph* graph, ggml_tensor* down, int rows, bool diagnostic,
         BeforeRead before_read, Failure failure) {
         if (!ring_ || !copy_ || !compute_) throw std::runtime_error("Unprepared host MoE pipeline");
-        std::vector<Chunk> chunks;
-        std::size_t gate_chunks = 0;
+        HostMoeFilePipelinePlan plan(slot_bytes_);
         for (int part = 0; part < 3; ++part)
             if (!batch.sources[part] || batch.sources[part]->bytes() != batch.extent[part])
                 throw std::runtime_error("Host MoE pipeline expert extent changed");
         batch.for_each_read_range([&](int part, auto source, auto destination, auto bytes) {
-            while (bytes) {
-                const auto length = std::min(bytes, slot_bytes_);
-                chunks.push_back({part, source, destination - batch.offset[part], length});
-                if (part != 2) ++gate_chunks;
-                source += length; destination += length; bytes -= length;
-            }
+            plan.append(part, source, destination - batch.offset[part], bytes);
         });
+        plan.validate(batch.bytes);
+        const auto& chunks = plan.transfers();
+        const auto gate_chunks = plan.gate_transfers();
+        // Full-layer serial reads already use the joined pool across source
+        // ranges. Let it fill each bounded slot in parallel too, instead of
+        // leaving its workers blocked behind two single-reader slots.
+        constexpr std::size_t maximum_read_bytes = 1u << 20;
+        std::vector<std::size_t> read_counts;
+        read_counts.reserve(chunks.size());
+        std::size_t read_jobs = 0;
+        for (std::size_t i = 0; i < chunks.size(); ++i)
+        {
+            const auto count = plan.read_job_count(i, maximum_read_bytes);
+            read_jobs = host_moe_checked_add(read_jobs, count);
+            read_counts.push_back(count);
+        }
         int split = 0;
         while (split < graph->n_nodes && graph->nodes[split] != down) ++split;
         if (split == 0 || split == graph->n_nodes || !gate_chunks)
@@ -128,16 +146,17 @@ public:
         // Even the first read/transfer/compute error drains before their lifetime
         // ends. The I/O pool separately joins all producers before propagating.
         struct Drain { HostMoeFilePipeline& owner; ~Drain() { owner.drain(); } } drain{*this};
-        run_bounded_read_pipeline(pool, chunks.size(), 2, [&](std::size_t slot) {
+        run_bounded_parallel_read_pipeline(pool, read_counts, 2, [&](std::size_t index, std::size_t slot) {
             if (submitted_[slot]) ggml_backend_event_synchronize(fences_[slot]);
             check(epoch);
-        }, [&](std::size_t index, std::size_t slot) {
-            before_read();
-            const auto& chunk = chunks[index];
             if (spans) spans[index].read_start = moe_pipeline_clock_ns();
-            batch.sources[chunk.part]->read(chunk.source, base + slot * slot_bytes_, chunk.bytes);
-            if (spans) spans[index].read_end = moe_pipeline_clock_ns();
+        }, [&](std::size_t index, std::size_t job, std::size_t slot) {
+            plan.read_job(index, job, maximum_read_bytes, base + slot * slot_bytes_, before_read,
+                [&](int part, auto source, auto* destination, auto bytes) {
+                    batch.sources[part]->read(source, destination, bytes);
+                });
         }, [&](std::size_t index, std::size_t slot) {
+            if (spans) spans[index].read_end = moe_pipeline_clock_ns();
             const auto& chunk = chunks[index];
             if (spans) mark(copy_, spans[index].copy_start);
             ggml_backend_tensor_set_async(copy_, weights[chunk.part], base + slot * slot_bytes_,
@@ -172,8 +191,8 @@ public:
                 read_overlap += overlap(spans[i].read_start, spans[i].read_end);
                 copy_overlap += overlap(spans[i].copy_start.load(), spans[i].copy_end.load());
             }
-            std::fprintf(stderr, "[HOSTMOE-FILE-PIPELINE] seq=%d chunks=%zu pinned=%zu total_ms=%.3f gate_stream_start_ns=%lld gate_stream_end_ns=%lld down_read_overlap_sum_ms=%.3f down_copy_overlap_sum_ms=%.3f\n",
-                rows, chunks.size(), slot_bytes_ * 2, (moe_pipeline_clock_ns()-start)/1e6,
+            std::fprintf(stderr, "[HOSTMOE-FILE-PIPELINE] seq=%d chunks=%zu read_jobs=%zu max_read_bytes=%zu pinned=%zu total_ms=%.3f gate_stream_start_ns=%lld gate_stream_end_ns=%lld down_read_overlap_sum_ms=%.3f down_copy_overlap_sum_ms=%.3f\n",
+                rows, chunks.size(), read_jobs, maximum_read_bytes, slot_bytes_ * 2, (moe_pipeline_clock_ns()-start)/1e6,
                 static_cast<long long>(a), static_cast<long long>(b), read_overlap/1e6, copy_overlap/1e6);
             for (std::size_t i = 0; i < chunks.size(); ++i)
                 std::fprintf(stderr, "[HOSTMOE-FILE-PIPELINE-SPAN] seq=%d chunk=%zu part=%d bytes=%zu read_start_ns=%lld read_end_ns=%lld copy_start_ns=%lld copy_end_ns=%lld\n",

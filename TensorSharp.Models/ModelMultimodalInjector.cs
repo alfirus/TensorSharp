@@ -1188,6 +1188,15 @@ namespace TensorSharp.Models
             if (imageId < 0)
                 return inputTokens;
 
+            if (model.HasUnifiedVisionAdmission)
+                return model.PrepareUnifiedVision(imagePaths, inputTokens, imageId,
+                    () => ProcessGlmNextHistoryCore(model, imagePaths, inputTokens, imageId));
+            return ProcessGlmNextHistoryCore(model, imagePaths, inputTokens, imageId);
+        }
+
+        private List<int> ProcessGlmNextHistoryCore(GlmDsaModel model, List<string> imagePaths, List<int> inputTokens, int imageId)
+        {
+            var encoder = model.VisionEncoder;
             var processor = new GlmNextImageProcessor(encoder.PatchSize, encoder.SpatialMergeSize);
             var cachedEmbeddings = new CachedEmbedding[imagePaths.Count];
             var tokenCounts = new int[imagePaths.Count];

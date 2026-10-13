@@ -81,7 +81,7 @@ namespace TensorSharp.Models
                 // No count of its own: each running request retains its slot for its conversation's next turn,
                 // and memory takes them back oldest first when a new slot or a graph needs it (AllocReclaiming,
                 // glm_reclaim_for_graph). A cap of 1 left all but one of N parallel conversations re-prefilling.
-                MaxRetainedNativeSlots = 0,
+                MaxRetainedNativeSlots = _unifiedRetainedSlotLimit ?? 0,
             };
         }
 

@@ -32,4 +32,8 @@ public sealed record ModelMemoryPolicy
     /// <summary>Device holdout for this model's admitted execution and vision
     /// workspace, kept free when selecting whole expert layers.</summary>
     public long DeviceExecutionReserveBytes { get; init; }
+    /// <summary>Per-model native GLM leading routed-expert CPU placement; null
+    /// retains the ordinary capacity/environment policy.</summary>
+    public int? NativeMoeCpuLayers { get; init; }
+
 }

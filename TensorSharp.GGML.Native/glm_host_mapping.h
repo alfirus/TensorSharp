@@ -54,6 +54,24 @@ public:
     void * data() const { return data_; }
     size_t size() const { return size_; }
 
+    // A quiescent owner may request release of this read-only view's resident
+    // pages while keeping its address, file lifetime and contents unchanged.
+    // This is an OS hint, not a released-byte measurement or allocation credit.
+    bool trim_residency() noexcept {
+        if (!data_ || size_ == 0) return true;
+#if defined(_WIN32)
+        // No mapping owned here is VirtualLock'ed. The documented unlocked-page
+        // path removes these exact pages from the process working set and
+        // returns ERROR_NOT_LOCKED. It does not unlock unrelated allocations.
+        SetLastError(ERROR_SUCCESS);
+        return VirtualUnlock(data_, size_) != 0 || GetLastError() == ERROR_NOT_LOCKED;
+#elif defined(MADV_DONTNEED)
+        return madvise(data_, size_, MADV_DONTNEED) == 0;
+#else
+        return false;
+#endif
+    }
+
     bool close() noexcept {
         if (!data_) return true;
 #if defined(_WIN32)

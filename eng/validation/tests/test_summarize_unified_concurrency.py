@@ -10,17 +10,33 @@ spec.loader.exec_module(summary)
 
 
 class SummaryTests(unittest.TestCase):
-    def run_summary(self, report, samples=None):
+    def run_summary(self, report, samples=None, case_directory="concurrency"):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            (root / "concurrency").mkdir()
-            (root / "concurrency" / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            (root / case_directory).mkdir()
+            (root / case_directory / "report.json").write_text(json.dumps(report), encoding="utf-8")
             if samples is None:
                 samples = [{"rss": 10, "private": 20, "board_gpu": "GPU-a, 100, 200, 30"},
                            {"rss": 12, "private": 18, "board_gpu": "N/A"}]
             (root / "memory-samples.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in samples), encoding="utf-8")
-            return summary.summarize(root)
+            return summary.summarize(root, case_directory)
+
+    def test_three_chat_verified_graphs_are_reported_without_claiming_full_continuity(self):
+        result = self.run_summary({"passed": True, "native": {
+            "passed": True, "n3_steps": 17, "n2_sibling_steps": 260}}, case_directory="three-chat")
+        self.assertTrue(result["actual_joint_engagement_verified"])
+        self.assertEqual(277, result["joint_steps"])
+        self.assertFalse(result["full_interval_continuity_verified"])
+
+    def test_three_chat_requires_both_live_cohorts_and_verified_native_proof(self):
+        for native in ({"passed": False, "n3_steps": 17, "n2_sibling_steps": 260},
+                       {"passed": True, "n3_steps": 0, "n2_sibling_steps": 260},
+                       {"passed": True, "n3_steps": 17, "n2_sibling_steps": 0}, None):
+            with self.subTest(native=native):
+                result = self.run_summary({"passed": True, "native": native}, case_directory="three-chat")
+                self.assertFalse(result["actual_joint_engagement_verified"])
+                self.assertIsNone(result["joint_steps"])
 
     def generation(self, **changes):
         row = {"http_request_id": "r", "internal_request_id": "g1", "prompt_tokens": 1000,

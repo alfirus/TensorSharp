@@ -1286,6 +1286,37 @@ internal sealed class PrefixTree
         return revived ? AttachResult.Revived : AttachResult.Attached;
     }
 
+    /// <summary>Refresh a physically demoted holder's device residency without
+    /// dropping its exact host state. The unique key plus previous footprint
+    /// reject a delayed notification for a detached or replaced payload. Only
+    /// device reductions are allowed; every other resource and state identity
+    /// must stay identical, so this path cannot manufacture capacity.</summary>
+    internal bool TryApplyDeviceDemotion(string key, PayloadFootprint previous, PayloadFootprint current)
+    {
+        if (key == null || !_keyIndex.TryGetValue(key, out var node)
+            || node.EndState is not { Kind: EndStateKind.Holder } payload
+            || payload.Key != key || payload.Footprint != previous
+            || previous.Tokens != node.Depth || current.Tokens != previous.Tokens
+            || current.CapacityTokens != previous.CapacityTokens || current.PositionDelta != previous.PositionDelta
+            || previous.Bytes.AnyNegative || current.Bytes.AnyNegative
+            || current.Bytes.DeviceKv > previous.Bytes.DeviceKv)
+            return false;
+        var expected = previous.Bytes; expected.DeviceKv = current.Bytes.DeviceKv;
+        if (current.Bytes != expected) return false;
+        ResourceVector delta = current.Bytes - previous.Bytes;
+        if (delta.IsZero && !payload.DeviceDirty) return true;
+        ResourceVector before = ProtectedOf(node);
+        payload.Footprint = current;
+        payload.DeviceDirty = false; // The complete host state is authoritative.
+        node.Bytes += delta;
+        _cached += delta;
+        ScopeBytesAdjust(node.ScopeIx, delta);
+        _protected += ProtectedOf(node) - before;
+        Relink(node);
+        Version++; // A match planned against the old resource shape is stale.
+        return true;
+    }
+
     /// <summary>
     /// Attaches pages (§4.4 owner rule, §5.10): each page goes to the node on <paramref name="node"/>'s
     /// root path whose edge contains its last token. Pages already owned there are skipped, and a page

@@ -379,15 +379,27 @@ public partial class Qwen4ExpModel
     }
 
     internal InferenceMemoryBytes GetUnifiedMemoryRequestPeak(int contextTokens, int prefillTokens,
-        int checkpointCopies = 0, bool independentHolder = false)
+        int checkpointCopies = 0, bool independentHolder = false, string? requestId = null)
     {
         if (contextTokens <= 0 || contextTokens > _maxContextLength || prefillTokens <= 0
             || prefillTokens > contextTokens || (MemoryPolicy != null && prefillTokens > MemoryPolicy.PrefillChunkTokens))
             throw new ArgumentOutOfRangeException(nameof(contextTokens));
-        long capacity = independentHolder && _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
-        while (capacity < contextTokens) capacity = Math.Min(_maxContextLength, Math.Max(contextTokens, capacity * 2));
+        long capacity = GetUnifiedMemoryCapacity(contextTokens, independentHolder, requestId);
         return UnifiedMemoryGeometry.RequestPeak(checked((int)capacity), prefillTokens,
             _kvCacheDtype == KvCacheDtype.F16 ? 2 : 4, checkpointCopies);
+    }
+
+    internal int GetUnifiedMemoryCapacity(int requiredTokens, bool independentHolder = true, string? requestId = null)
+    {
+        if (requiredTokens <= 0 || requiredTokens > _maxContextLength)
+            throw new ArgumentOutOfRangeException(nameof(requiredTokens));
+        long capacity = independentHolder && _initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity;
+        if (requestId != null && _fusedHolders != null && _fusedHolders.TryGetValue(requestId, out var holder))
+            capacity = string.Equals(requestId, _activeFusedKey, StringComparison.Ordinal)
+                ? _kvCacheCapacity : holder.KvCapacity;
+        capacity = Math.Max(1, capacity);
+        while (capacity < requiredTokens) capacity = Math.Min(_maxContextLength, Math.Max(requiredTokens, capacity * 2));
+        return checked((int)capacity);
     }
 
     internal long GetUnifiedMemoryPersistentDeviceBytes() => UnifiedMemoryGeometry.LoadingDeviceBoundBytes;

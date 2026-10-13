@@ -30,7 +30,7 @@ public class ServerUsageAccuracyTests
         string usage = Usage();
         Assert.Contains("--unified-memory", usage);
         Assert.Contains("Default: off. Unsupported models", usage);
-        Assert.Contains("One active request", usage);
+        Assert.Contains("Up to three requests can join native decode batches", usage);
         Assert.Contains("not an OS-enforced whole-process RAM/VRAM hard limit", usage);
         Assert.Contains("unpinned fallback is 2048 with --unified-memory, otherwise 20000", usage);
         Assert.Contains("an explicit request limit may exceed that fallback", usage);

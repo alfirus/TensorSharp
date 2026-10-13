@@ -123,11 +123,11 @@ public sealed class HostCommitPlanningTests
     }
 
     [Theory]
-    [InlineData(null, 1)]
-    [InlineData(1, null)]
-    [InlineData(0, 0)]
-    [InlineData(8, -1)]
-    [InlineData(8, 9)]
+    [InlineData(null, 1L)]
+    [InlineData(1L, null)]
+    [InlineData(0L, 0L)]
+    [InlineData(8L, -1L)]
+    [InlineData(8L, 9L)]
     public void MalformedInjectedPairCannotGrantAllowance(long? total, long? available)
     {
         var hw = new InferenceHardwareMemory(32, 17, 16, 12)

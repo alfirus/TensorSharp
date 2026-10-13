@@ -8,6 +8,7 @@ are separate evidence. Source and checkpoint files are never modified.
 """
 from __future__ import annotations
 import argparse
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import struct
 import sys
 import threading
 import time
@@ -36,6 +38,13 @@ bench = owned.bench
 semantic = load_module('raw_semantic_check', 'qwen38-strata-compare.py')
 
 
+def token_hash(tokens):
+    """Canonical checkpoint IDs, never a hash of retokenized response text."""
+    if not isinstance(tokens, list) or not tokens or any(type(x) is not int or not 0 <= x <= 2147483647 for x in tokens):
+        raise ValueError('Require nonempty signed-int32 nonnegative token IDs')
+    return hashlib.sha256(struct.pack('<' + 'i' * len(tokens), *tokens)).hexdigest()
+
+
 def validate_plan(plan, body):
     endpoint = urlsplit(plan['futureRequest']['endpoint'])
     if (endpoint.scheme != 'http' or endpoint.hostname != '127.0.0.1' or not endpoint.port
@@ -50,10 +59,12 @@ def validate_plan(plan, body):
         if command.count(option) != 1 or command.index(option) + 1 >= len(command) or command[command.index(option) + 1] != value:
             raise ValueError('Server arguments differ from the owned scalar endpoint')
     prompt = body.get('prompt')
-    if (not isinstance(prompt, list) or not prompt or any(type(x) is not int or x < 0 for x in prompt)
+    if (not isinstance(prompt, list) or not prompt or any(type(x) is not int or not 0 <= x <= 2147483647 for x in prompt)
             or prompt != plan['prompt']['tokens'] or len(prompt) != plan['prompt']['count']
             or body != plan['futureRequest']['body']):
         raise ValueError('Raw integer prompt/request differs from the reviewed plan')
+    if 'i32le_sha256' in plan['prompt'] and token_hash(prompt) != plan['prompt']['i32le_sha256']:
+        raise ValueError('Raw prompt int32LE digest differs')
     expected = dict(temperature=0.0, samplers=['temperature'], top_k=0, top_p=1.0, min_p=0.0,
         repeat_penalty=1.0, repeat_last_n=0, presence_penalty=0.0, frequency_penalty=0.0,
         dry_multiplier=0.0, cache_prompt=False, return_tokens=True, n_probs=0, stream=False,
@@ -71,7 +82,7 @@ def validate_plan(plan, body):
     if int(command[command.index('--ctx-size') + 1]) < len(prompt) + body['n_predict']:
         raise ValueError('Context must contain the complete requested trajectory')
     eos = plan['expected_checkpoint_eos_ids']
-    if not isinstance(eos, list) or not eos or any(type(x) is not int or x < 0 for x in eos):
+    if not isinstance(eos, list) or not eos or any(type(x) is not int or not 0 <= x <= 2147483647 for x in eos):
         raise ValueError('Require actual checkpoint EOS IDs')
     return endpoint
 
@@ -79,7 +90,7 @@ def validate_plan(plan, body):
 def quality_result(response, body, eos, case):
     tokens = response.get('tokens')
     valid_tokens = (isinstance(tokens, list) and 0 < len(tokens) <= body['n_predict']
-        and all(type(x) is int and x >= 0 for x in tokens))
+        and all(type(x) is int and 0 <= x <= 2147483647 for x in tokens))
     prompt_matches = (type(response.get('tokens_evaluated')) is int
         and response['tokens_evaluated'] == len(body['prompt']))
     output_count_matches = (valid_tokens and type(response.get('tokens_predicted')) is int
@@ -87,6 +98,21 @@ def quality_result(response, body, eos, case):
     natural_eos = (valid_tokens and tokens[-1] in eos and not any(t in eos for t in tokens[:-1])
         and response.get('stop_type') == 'eos' and response.get('truncated') is False)
     content = response.get('content')
+    if case == 'free_text':
+        # A bounded prefix is legitimate observation, not semantic completion.
+        # llama's `truncated` denotes context truncation, not n_predict exhaustion.
+        bounded_limit = (valid_tokens and len(tokens) == body['n_predict']
+            and not any(t in eos for t in tokens) and response.get('stop_type') == 'limit'
+            and response.get('truncated') is False)
+        trajectory = bool(prompt_matches and output_count_matches and isinstance(content, str)
+                          and (natural_eos or bounded_limit))
+        return dict(passed=trajectory, trajectory_passed=trajectory, record_only=True,
+            semantic_pass=None, semantic_check=dict(passed=None, reason='Free text is unassessed; no factual oracle applied'),
+            natural_eos=bool(natural_eos), bounded_limit=bool(bounded_limit),
+            prompt_token_count_matches=prompt_matches, returned_token_count_matches=bool(output_count_matches),
+            returned_tokens_valid=valid_tokens, generated_tokens_i32le_sha256=token_hash(tokens) if valid_tokens else None,
+            content=content, generated_tokens=tokens, stop_type=response.get('stop_type'), truncated=response.get('truncated'),
+            scope='Record-only exact raw-ID conditioning/count/stop validation. PASS is not semantic or factual acceptance; capped output is not a completed answer.')
     check = semantic.semantic_check(case, content, natural_eos and prompt_matches) if isinstance(content, str) else {
         'passed': False, 'reason': 'Missing original string content'}
     return dict(passed=bool(check['passed'] and natural_eos and prompt_matches and output_count_matches),
@@ -95,6 +121,45 @@ def quality_result(response, body, eos, case):
         returned_tokens_valid=valid_tokens, semantic_check=check, content=content,
         generated_tokens=tokens, stop_type=response.get('stop_type'), truncated=response.get('truncated'),
         scope='Exact submitted raw IDs and returned count; original response text is not repaired.')
+
+
+def conditioning_evidence(plan):
+    """Bind record-only plans to the separately validated actual Server IDs."""
+    if plan.get('case') != 'free_text':
+        return None
+    if plan.get('record_only') is not True or plan.get('semantic_pass') is not None:
+        raise ValueError('Free text must be explicit record-only, semantically unassessed')
+    pin = plan['conditioning_evidence']
+    raw = Path(pin['path']).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != pin['sha256']:
+        raise ValueError('Server token export changed')
+    export = json.loads(raw)
+    index = pin['request_index']
+    if type(index) is not int or index < 0 or index >= len(export['requests']):
+        raise ValueError('Invalid conditioning request index')
+    row = export['requests'][index]
+    if (export.get('status') != 'extracted-not-baseline-executed'
+            or row['http_request_id'] != pin['http_request_id']
+            or row['prompt'] != plan['prompt'] or row['output'] != plan['reference_output']
+            or export['identity']['checkpoint']['shards'] != plan['checkpoint']['shards']
+            or token_hash(row['prompt']['tokens']) != row['prompt']['i32le_sha256']
+            or token_hash(row['output']['tokens']) != row['output']['i32le_sha256']):
+        raise ValueError('Server conditioning/reference identity differs from plan')
+    return dict(path=pin['path'], sha256=pin['sha256'], http_request_id=row['http_request_id'],
+                prompt_i32le_sha256=row['prompt']['i32le_sha256'])
+
+
+def compare_trajectory(tokens, reference):
+    """Descriptive only: a divergence is not an execution/semantic verdict."""
+    expected = reference['tokens']
+    common = min(len(tokens), len(expected))
+    mismatch = next((i for i in range(common) if tokens[i] != expected[i]), None)
+    return dict(compared_token_count=common, compared_prefix_exact=mismatch is None,
+        full_trajectory_exact=tokens == expected, first_mismatch_index=mismatch,
+        reference_token=expected[mismatch] if mismatch is not None else None,
+        observed_token=tokens[mismatch] if mismatch is not None else None,
+        reference_count=len(expected), observed_count=len(tokens),
+        scope='Recorded raw-ID agreement only, including any EOS. Matching capped prefixes do not establish complete-answer or factual correctness.')
 
 
 def start_watchdog(server, timeout, timed_out, errors):
@@ -157,7 +222,11 @@ def run(plan, body, request_bytes, output, timeout, case):
     if case != plan.get('case', 'tool_json'):
         raise ValueError('Semantic case differs from the reviewed plan')
     output.mkdir(parents=True, exist_ok=False)
-    report = dict(complete=False, passed=False, quality_passed=False, timed_out=False,
+    report = dict(complete=False, passed=False, quality_passed=None if case == 'free_text' else False,
+        semantic_pass=None if case == 'free_text' else False, trajectory_passed=False,
+        record_only=case == 'free_text',
+        passed_scope='Owned execution and valid raw-token trajectory only; semantics unassessed' if case == 'free_text' else 'Owned execution and fixed-task semantic check',
+        timed_out=False,
         timeout_seconds=timeout, timeout_scope='One server lifetime including load and HTTP; preflight hashes excluded',
         command=plan['futureCommand'], plan=plan, case=case, started_unix=time.time(),
         harness_sha256=bench.sha(__file__), semantic_checker_sha256=bench.sha(semantic.__file__),
@@ -178,6 +247,7 @@ def run(plan, body, request_bytes, output, timeout, case):
     timed_out = threading.Event()
     watchdog_errors = []
     try:
+        report['conditioning_evidence'] = conditioning_evidence(plan)
         with socket.socket() as check:
             check.bind(('127.0.0.1', endpoint.port))
         source = plan['source']
@@ -258,7 +328,11 @@ def run(plan, body, request_bytes, output, timeout, case):
                 response_data = json.loads(raw)
                 save('response.json', response_data)
                 report['quality'] = quality_result(response_data, body, plan['expected_checkpoint_eos_ids'], case)
-                report['quality_passed'] = report['quality']['passed']
+                report['trajectory_passed'] = report['quality']['passed']
+                report['quality_passed'] = None if case == 'free_text' else report['quality']['passed']
+                report['semantic_pass'] = None if case == 'free_text' else report['quality']['passed']
+                if case == 'free_text' and report['quality']['returned_tokens_valid']:
+                    report['reference_comparison'] = compare_trajectory(response_data['tokens'], plan['reference_output'])
                 report['timings'] = response_data.get('timings')
                 report['complete'] = True
             finally:
@@ -275,12 +349,14 @@ def run(plan, body, request_bytes, output, timeout, case):
         report['resource_observation_valid'] = bool(sampler is not None and sampler.rows and not sampler.errors)
         try:
             report['deployment_after'] = deployment_hashes(plan)
+            if case == 'free_text' and 'conditioning_evidence' in report:
+                report['conditioning_evidence_after'] = conditioning_evidence(plan)
             if 'checkpoint_before' in report:
                 report['checkpoint_after'] = checkpoint_state()
         except Exception as error:
             report['identity_after_error'] = repr(error)
         report['finished_unix'] = time.time()
-        report['passed'] = (report['complete'] and report['quality_passed'] and report['owned_server_exited']
+        report['passed'] = (report['complete'] and report['trajectory_passed'] and report['owned_server_exited']
             and not report['timed_out'] and not report.get('error') and not report['cleanup_errors']
             and not watchdog_errors and not report.get('identity_after_error'))
         save('execution.json', report)
@@ -292,7 +368,7 @@ def main():
     parser.add_argument('--plan', type=Path, required=True)
     parser.add_argument('--request', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--case', choices=tuple(semantic.CASES), default='tool_json')
+    parser.add_argument('--case', choices=tuple(semantic.CASES) + ('free_text',), default='tool_json')
     parser.add_argument('--timeout', type=float, default=300)
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:

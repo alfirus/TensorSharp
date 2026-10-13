@@ -20,16 +20,21 @@ public sealed record UnifiedMemoryModelOptions
 {
     public int ContextTokens { get; init; }
     public int PrefillChunkTokens { get; init; } = 512;
-    // The expert cache executes rows separately. Keep small requests on that
-    // reuse path, but let longer prefill tails use a compact CUDA batch.
+    // Small prefill uses selected-expert reuse with admitted microgroups;
+    // longer tails use compact CUDA batches. Joint decode fuses all live lanes.
     public int ExpertCachePrefillRows { get; init; } = 32;
-    public int MaximumRunningRequests { get; init; } = 2;
+    public int MaximumRunningRequests { get; init; } = 3;
     // Each startup thinking mode has two distinct reusable boundaries.
     public int PrefixCheckpointCount { get; init; } = 4;
     public int RetainedConversationCount { get; init; } = 2;
     public long MaximumHostBytes { get; init; } = long.MaxValue;
     public long MaximumDeviceBytes { get; init; } = long.MaxValue;
     public long MaximumExpertCacheBytes { get; init; } = long.MaxValue;
+    public bool EnableAsyncExpertPrefill { get; init; } = false;
+    public bool EnableExpertCacheCapacityGrowth { get; init; } = false;
+    /// <summary>Experimental GLM5Next selected-expert CUDA tier. Requires its
+    /// matching native planner and remains off until real-model qualification.</summary>
+    public bool EnableGlmSelectedExperts { get; init; } = false;
 }
 
 /// <summary>One Qwen4Exp GGML CUDA model, including its optional image tower.
@@ -38,7 +43,7 @@ public sealed record UnifiedMemoryModelOptions
 /// mapped pages, GC and vendor/driver memory remain observed with headroom.
 /// Admitted requests retain independent complete hybrid holders. Eligible
 /// decode cohorts share one separately owned fused graph; excess callers queue.</summary>
-public sealed partial class UnifiedMemoryModelSession : IDisposable
+public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSession
 {
     public const string HostPool = "unified/ram";
     public const string DevicePool = "unified/cuda0";
@@ -56,8 +61,11 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
     private GgmlCacheBudgetScope? _native;
     private HostAllocationBudgetScope? _host;
     private GgmlHostMoeExpertCacheScope? _experts;
+    private GgmlHostMoeFilePipelineScope? _filePipeline;
     private BudgetReservation? _expertEnvelope;
     private Qwen4ExpModel? _model;
+    private readonly Dictionary<string, SequenceState> _requestOwners = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (int Capacity, int Prefill)> _requestShapes = new(StringComparer.Ordinal);
     private bool _disposed;
 
     private UnifiedMemoryModelSession(UnifiedMemoryModelOptions options, Qwen4ExpUnifiedGeometry geometry,
@@ -87,21 +95,25 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
         $"[unified-memory] on: shared native/host payload accounting, hardware/commit headroom, request admission, " +
         $"bounded expert reuse and pressure trimming, file staging for CUDA/CPU expert execution, fused model kernels{(_vision != null ? ", image preparation admission" : "")}\n" +
         "[unified-memory] concurrency: continuous batching with admitted hybrid holders and a separately charged joint fused-decode arena; bounded in-memory exact-state prefix checkpoints when enabled\n" +
-        "[unified-memory] off: host KV paging (hybrid state has no complete block snapshot adapter); " +
+        "[unified-memory] pressure: inactive retained complete-holder GPU state can demote to its charged host mirrors; wide prefill is admitted after actual prefix materialization\n" +
+        (_filePipeline?.Enabled == true
+            ? "[unified-memory] async expert file prefill: eligible one-device CUDA graphs, at least 64 rows and 32 MiB payload; two charged pinned slots bounded to 16 MiB\n"
+            : "[unified-memory] async expert file prefill: off (parallel reads passed model correctness and improved isolated prefill; server/shared-budget and cross-platform qualification are pending)\n") +
+        "[unified-memory] off: live block-KV/SSD paging (no admitted whole-state preemption/recovery adapter); " +
         "MTP/TP (not qualified with this request envelope); video/audio (no admitted preparation adapter)\n" +
         "[unified-memory] limits: mapped/page-cache residency, GC, vendor/driver pools are observed with margins, " +
         "not fully attributed or OS-enforced RAM/VRAM hard caps.";
 
-    public static UnifiedMemoryModelSession Create(string path, string? mmprojPath, BackendType backend)
+    public static IUnifiedMemoryModelSession Create(string path, string? mmprojPath, BackendType backend)
         => Create(path, mmprojPath, backend, new UnifiedMemoryModelOptions());
 
-    public static UnifiedMemoryModelSession Create(string path, string? mmprojPath, BackendType backend,
+    public static IUnifiedMemoryModelSession Create(string path, string? mmprojPath, BackendType backend,
         UnifiedMemoryModelOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
         ValidateOptions(options);
         if (backend != BackendType.GgmlCuda)
-            throw new NotSupportedException("--unified-memory currently requires qwen4exp on ggml_cuda.");
+            throw new NotSupportedException("--unified-memory requires a qualified architecture on ggml_cuda.");
         if (ParallelDegree("TENSORSHARP_TP_DEGREE") != 1 || ParallelDegree("TENSORSHARP_LAYER_SPLIT_DEGREE") != 1
             || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID"))
             || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
@@ -116,7 +128,15 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
             throw new NotSupportedException("--unified-memory requires bounded expert file staging, including its CPU fallback; remove TS_HOST_MOE_FILE_READ or set it to 1.");
         GgmlBasicOps.RequireSharedExpertCacheBudgetKind();
         Qwen4ExpUnifiedGeometry geometry;
-        using (var file = GgufFile.OpenForMemoryPlanning(path)) geometry = Qwen4ExpUnifiedGeometry.Read(file);
+        using (var file = GgufFile.OpenForMemoryPlanning(path))
+        {
+            string? architecture = file.GetString("general.architecture");
+            if (architecture is "glm5next" or "glm5-next")
+                return GlmUnifiedMemoryModelSession.Create(path, mmprojPath, backend, options);
+            if (architecture != "qwen4exp")
+                throw new NotSupportedException($"--unified-memory has no execution adapter for architecture '{architecture}'.");
+            geometry = Qwen4ExpUnifiedGeometry.Read(file);
+        }
         Qwen35VisionMemoryGeometry? vision = string.IsNullOrWhiteSpace(mmprojPath) || mmprojPath == "none"
             ? null : Qwen35VisionMemoryGeometry.Read(mmprojPath);
         int context = options.ContextTokens;
@@ -154,7 +174,9 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
                 $"automatic expert-cache ceiling={cache / 1048576.0:F0} MiB");
             session._native = new(session.Budget, [[DevicePool]], includeGraphBuffers: true, hostPools: [HostPool]);
             session._host = new(session.Budget, [HostPool]);
-            session._experts = new(cache, Math.Min(options.ExpertCachePrefillRows, session._prefillTokens), geometry.Layers);
+            session._filePipeline = new(options.EnableAsyncExpertPrefill);
+            session._experts = new(cache, Math.Min(options.ExpertCachePrefillRows, session._prefillTokens), geometry.Layers,
+                options.MaximumRunningRequests, options.EnableExpertCacheCapacityGrowth);
             session._expertEnvelope = session.Budget.Reserve([new(DevicePool, cache)]);
             session._native.SetSharedExpertEnvelope(session._expertEnvelope);
             session._jointArena = new(1);
@@ -218,13 +240,14 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
             },
             MemoryAdmission = new RequestMemoryAdmission(Budget, EstimateRequest)
             {
+                EstimateMaterializationPeak = EstimateMaterialization,
                 ReestimateAfterPhysicalCheck = true,
                 UsePerSequenceHolders = true,
                 BeforeAdmissionWithRunning = PrepareRequestCapacity,
                 AfterPrefixMaterialization = CompletePrefixMaterialization,
                 AfterPrefill = CompletePrefill,
-                EnterSerialExecution = seq => EnterAllocations(seq.MemoryEnvelope
-                    ?? throw new InvalidOperationException("Unified execution requires an admitted envelope.")),
+                AfterSequenceMemoryRelease = RecoverReleasedSequenceCapacity,
+                EnterSerialExecution = EnterSequenceAllocations,
                 EnterBatchedExecution = sequences => EnterAllocations(_jointEnvelope
                     ?? throw new InvalidOperationException("Unified batch execution requires its shared arena envelope."))
             }
@@ -234,28 +257,64 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
     private InferenceMemoryBytes RequestPeak(SequenceState seq)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return _model!.GetUnifiedMemoryRequestPeak(checked(seq.PromptTokens.Count + seq.MaxNewTokens),
-            Math.Min(_prefillTokens, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens)),
-            // Public and private scoped payload caps are separate. A new copy
-            // is allocated before the tree trims its old payload, so include
-            // one publication transient as well as both bounded retained sets.
-            checkpointCopies: _checkpointCopies,
-            independentHolder: true);
+        int rows = Math.Min(_prefillTokens, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens));
+        var peak = _model!.GetUnifiedMemoryRequestPeak(RequiredContext(seq), rows,
+            // Copies can be published at exact prefill boundaries, including
+            // the prompt end. After that publication completed, their fixed
+            // tensors remain charged children; decode growth must not pretend
+            // every immutable checkpoint grows with the active KV holder.
+            checkpointCopies: seq.NumComputedTokens < seq.PromptTokens.Count ? _checkpointCopies : 0,
+            independentHolder: true, requestId: seq.RequestId);
+        if (seq.NumComputedTokens >= seq.PromptTokens.Count && seq.MemoryEnvelope != null)
+        {
+            // The root can own previously published copies, pooled blocks or
+            // host graph payloads in addition to this holder. A child floor
+            // alone protects those bytes but leaves no credit for new KV or
+            // scratch when it exceeds the live execution peak. Preserve every
+            // actual host child, then reserve the complete live growth peak.
+            // This conservatively counts an existing live seed twice until
+            // exact per-payload attribution is available; it never projects
+            // immutable checkpoints at the new decode capacity.
+            long children = seq.MemoryEnvelope.LiveChildCharges.Single(c => c.Pool == HostPool).Bytes;
+            peak = new(checked(peak.Host + children), peak.Device);
+        }
+        // Ring slots are physical pinned host payload, independent of the CUDA
+        // graph and CPU wide-prefill arenas. Forecast the complete admitted
+        // ring even when source/threshold checks later decline the async path.
+        return _filePipeline?.Enabled == true && rows >= _filePipeline.MinimumRows
+            ? new(checked(peak.Host + _filePipeline.MaximumRingBytes), peak.Device) : peak;
     }
+
+    // Output allowance is a termination limit, not the current physical shape.
+    // Reserve each real holder capacity and grow its quota before allocating.
+    private static int RequiredContext(SequenceState sequence)
+        => Math.Max(sequence.PromptTokens.Count, checked(sequence.NumComputedTokens + 1));
+
+    private (int Capacity, int Prefill) RequestShape(SequenceState sequence)
+        => (_model!.GetUnifiedMemoryCapacity(RequiredContext(sequence), requestId: sequence.RequestId),
+            Math.Min(_prefillTokens, Math.Max(1, sequence.PromptTokens.Count - sequence.NumComputedTokens)));
 
     private IReadOnlyList<MemoryCharge> EstimateRequest(SequenceState seq) => IncrementalPeak(RequestPeak(seq));
 
+    private InferenceMemoryBytes MaterializationPeak(SequenceState sequence)
+        => _model!.GetUnifiedMemoryRequestPeak(RequiredContext(sequence), 1,
+            checkpointCopies: _checkpointCopies, independentHolder: true, requestId: sequence.RequestId);
+
+    private IReadOnlyList<MemoryCharge> EstimateMaterialization(SequenceState sequence)
+        => IncrementalPeak(MaterializationPeak(sequence));
+
     private IReadOnlyList<MemoryCharge> PrepareRequestCapacity(SequenceState sequence, IReadOnlyList<SequenceState> running)
     {
-        var request = RequestPeak(sequence);
+        PruneFinishedRequestOwners();
+        var request = MaterializationPeak(sequence);
         if (running.Count == 0)
         {
             ReleaseIdleJointCredit();
             return PrepareCapacity(request);
         }
-        int tokens = checked(sequence.PromptTokens.Count + sequence.MaxNewTokens);
+        int tokens = _model!.GetUnifiedMemoryCapacity(RequiredContext(sequence), requestId: sequence.RequestId);
         foreach (var live in running)
-            tokens = Math.Max(tokens, checked(live.PromptTokens.Count + live.MaxNewTokens));
+            tokens = Math.Max(tokens, _model.GetUnifiedMemoryCapacity(RequiredContext(live), requestId: live.RequestId));
         // Native keeps its context high water mark even when a replacement
         // entry has more lanes. Maxing byte totals alone loses this shape axis.
         tokens = Math.Max(tokens, _jointContextHighWater);
@@ -295,11 +354,24 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
     {
         var envelope = sequence.MemoryEnvelope
             ?? throw new InvalidOperationException("Prefix materialization ended without its admitted owner.");
-        // Retained hybrid state has already been cloned into this envelope.
-        // Resize only unused credit; the adopted state and other requests'
-        // state/arena owners remain charged even when they exceed the target.
-        if (!envelope.TryResizeTotal(IncrementalPeak(RequestPeak(sequence))))
-            throw new MemoryPressureException("The adopted prefix could not transition to its remaining prefill peak.");
+        // The initial phase owned complete holder/copy/export state, without
+        // borrowing credit from a presumed prefix hit. Only the actual published
+        // computed-token count now chooses the remaining prefill shape. Admit
+        // its net growth before Forward, preserving every live child charge.
+        PruneFinishedRequestOwners();
+        var peak = IncrementalPeak(RequestPeak(sequence));
+        var (joint, tokens) = ExecutionJointTarget(sequence);
+        IReadOnlyList<MemoryCharge>? limits = null;
+        var growth = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
+        if (growth.Host > 0 || growth.Device > 0)
+            limits = PrepareCapacity(() =>
+            {
+                var additional = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
+                return [new(HostPool, additional.Host), new(DevicePool, additional.Device)];
+            }, recoverExpertCache: false);
+        ResizeExecutionEnvelopes(envelope, peak, joint, tokens, limits);
+        _requestOwners[sequence.RequestId] = sequence;
+        _requestShapes[sequence.RequestId] = RequestShape(sequence);
         RecoverExpertCache(PhysicalConstraints(), additionalDeviceBytes: 0, "prefix-materialized");
     }
 
@@ -312,10 +384,25 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
         _experts!.Trim(_experts.CachedBytes);
         if (!envelope.TryResizeTotal(IncrementalPeak(RequestPeak(sequence))))
             throw new MemoryPressureException("The completed prefill could not transition to its bounded decode peak.");
+        _requestShapes[sequence.RequestId] = RequestShape(sequence);
         // All live requests and the joint graph already own their decode peaks
         // in the ledger. Reuse newly released prefill credit now, otherwise a
         // second arrival can disable CUDA experts for its entire generation.
         RecoverExpertCache(PhysicalConstraints(), additionalDeviceBytes: 0, "prefill-complete");
+    }
+
+    private void RecoverReleasedSequenceCapacity(IReadOnlyList<SequenceState> running)
+    {
+        if (_native!.CallbackError is { } error)
+            throw new InvalidOperationException("Optional expert recovery is disabled after a native accounting callback failure.", error);
+        // A sibling can keep generating for minutes after another request
+        // finishes or is cancelled. Its returned unused peak must become
+        // available to expert reuse now, not only when a new request arrives.
+        // Native holders and retained checkpoints still own their children;
+        // joint payloads also retain their own charge and capacity high water.
+        PruneFinishedRequestOwners();
+        if (running.Count == 0) ReleaseIdleJointCredit();
+        RecoverExpertCache(PhysicalConstraints(), additionalDeviceBytes: 0, "sequence-released");
     }
 
     private MemoryCharge[] IncrementalPeak(InferenceMemoryBytes peak)
@@ -348,6 +435,10 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
     /// never once per token. Re-sample after trimming; accounted cache allowance
     /// is deliberately not assumed to equal physically reclaimable VRAM.</summary>
     private IReadOnlyList<MemoryCharge> PrepareCapacity(InferenceMemoryBytes peak, bool recoverExpertCache = true)
+        => PrepareCapacity(() => IncrementalPeak(peak), recoverExpertCache);
+
+    private IReadOnlyList<MemoryCharge> PrepareCapacity(Func<IReadOnlyList<MemoryCharge>> estimate,
+        bool recoverExpertCache = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var model = _model ?? throw new InvalidOperationException("Unified model is not available for request admission.");
@@ -357,10 +448,17 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
         // reserving a second copy. Keep all accounted CUDA expert entries warm.
         _experts!.Trim(_experts.CachedBytes);
         var limits = PhysicalConstraints();
-        var needed = IncrementalPeak(peak);
+        var needed = estimate();
         long previousCacheBudget = _experts!.BudgetBytes;
         if (!Fits(needed, limits))
         {
+            // Preserve useful exact state and warm experts before destroying
+            // either cache. A retained holder already has charged host mirrors;
+            // only the bounded recurrent export scratch needs a new owner.
+            while (!Fits(needed, limits) && TryDemoteRetainedHostKv(limits))
+            {
+                limits = PhysicalConstraints(); needed = estimate();
+            }
             // Keep the largest optional cache that leaves the measured deficit.
             var ledger = Budget.Snapshot().ToDictionary(p => p.Pool);
             long free = Math.Max(0, limits.Single(c => c.Pool == DevicePool).Bytes
@@ -374,16 +472,16 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
                 long reduced = Math.Max(0, _experts.BudgetBytes - deficit - (128L << 20));
                 ResizeExpertCache(reduced >= _geometry.AllLayerExpertCacheMinimumBytes ? reduced : 0, limits);
             }
-            limits = PhysicalConstraints(); needed = IncrementalPeak(peak);
+            limits = PhysicalConstraints(); needed = estimate();
             if (!Fits(needed, limits))
             {
                 model.TrimIdleMemory();
-                limits = PhysicalConstraints(); needed = IncrementalPeak(peak);
+                limits = PhysicalConstraints(); needed = estimate();
             }
             if (!Fits(needed, limits))
             {
                 model.TrimUnifiedPrefixCheckpoints();
-                limits = PhysicalConstraints(); needed = IncrementalPeak(peak);
+                limits = PhysicalConstraints(); needed = estimate();
             }
             var afterTrim = Budget.Snapshot().Single(p => p.Pool == DevicePool);
             bool deviceStillFull = (decimal)needed.Single(c => c.Pool == DevicePool).Bytes
@@ -391,12 +489,13 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
             if (deviceStillFull && _experts!.BudgetBytes > 0)
             {
                 ResizeExpertCache(0, limits);
-                limits = PhysicalConstraints(); needed = IncrementalPeak(peak);
+                limits = PhysicalConstraints(); needed = estimate();
             }
             if (!Fits(needed, limits))
                 throw new MemoryPressureException("Unified request peak exceeds currently available RAM/commit/VRAM after optional cache reclamation. " +
                     string.Join("; ", needed.Select(c => $"{c.Pool}: additional={c.Bytes / 1048576.0:F0} MiB, " +
-                        $"constraint={limits.Single(p => p.Pool == c.Pool).Bytes / 1048576.0:F0} MiB")));
+                        $"constraint={limits.Single(p => p.Pool == c.Pool).Bytes / 1048576.0:F0} MiB"))
+                    + ". " + DescribeExecutionOwnership());
         }
         // Recover optional reuse at request boundaries when a smaller shape or
         // reduced external pressure leaves room. Never use accounted bytes as a
@@ -407,6 +506,47 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
             Console.WriteLine($"[unified-memory] request-boundary expert cache: {previousCacheBudget / 1048576.0:F0} -> " +
                 $"{_experts.BudgetBytes / 1048576.0:F0} MiB (physical capacity and request peak)");
         return limits;
+    }
+
+    private bool TryDemoteRetainedHostKv(IReadOnlyList<MemoryCharge> limits)
+    {
+        var model = _model!;
+        if (!model.SupportsUnifiedRetainedHostKvDemotion || model.UnifiedRetainedDeviceHolderCount == 0) return false;
+        long scratch = checked(model.GetUnifiedRetainedHostKvDemotionScratchBytes() + (32L << 20));
+        BudgetReservation? maintenance;
+        try { maintenance = Budget.TryReserve([new(HostPool, scratch), new(DevicePool, 0)], limits); }
+        catch (MemoryPressureException) { return false; } // No device state was touched.
+        if (maintenance == null) return false;
+        using (maintenance)
+        using (EnterAllocations(maintenance))
+        {
+            // Export/release errors propagate. In particular, a quarantined
+            // partial release must never be reported as successful reclamation.
+            int count = model.DemoteUnifiedRetainedHostKv(maximumHolders: 1);
+            if (count == 0) return false;
+            Console.WriteLine($"[unified-memory] pressure-demoted {count} retained complete holder(s) to charged host mirrors; physical capacity will be re-sampled.");
+            return true;
+        }
+        // A retained scratch pool block can outlive this closed root. Its child
+        // charge remains physical ownership and is never returned prematurely.
+    }
+
+    private string DescribeExecutionOwnership()
+    {
+        string Bytes(IReadOnlyList<MemoryCharge> charges) => string.Join(",", charges.Select(c => $"{c.Pool}={c.Bytes}"));
+        return "ledger=" + string.Join(";", Budget.Snapshot().Select(p =>
+            $"{p.Pool}(committed={p.Committed},reserved={p.Reserved},capacity={p.Capacity})"))
+            + "; joint(targetHost=" + _jointTarget.Host + ",targetDevice=" + _jointTarget.Device
+            + ",context=" + _jointContextHighWater + ",owned=" + Bytes(_jointEnvelope!.OwnedCharges)
+            + ",children=" + Bytes(_jointEnvelope.LiveChildCharges) + ")"
+            + "; requests=" + string.Join(";", _requestOwners.Values.Where(seq => seq.MemoryEnvelope != null).Select(seq =>
+            {
+                var shape = RequestShape(seq);
+                var target = IncrementalPeak(RequestPeak(seq));
+                return $"{seq.RequestId}(status={seq.Status},computed={seq.NumComputedTokens},prompt={seq.PromptTokens.Count},"
+                    + $"capacity={shape.Capacity},prefill={shape.Prefill},target={Bytes(target)},"
+                    + $"owned={Bytes(seq.MemoryEnvelope!.OwnedCharges)},children={Bytes(seq.MemoryEnvelope.LiveChildCharges)})";
+            }));
     }
 
     private void RecoverExpertCache(IReadOnlyList<MemoryCharge> limits, long additionalDeviceBytes, string phase)
@@ -507,6 +647,78 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
         catch { owned.Dispose(); throw; }
     }
 
+    private IDisposable EnterSequenceAllocations(SequenceState sequence)
+    {
+        var envelope = sequence.MemoryEnvelope
+            ?? throw new InvalidOperationException("Unified execution requires an admitted envelope.");
+        var shape = RequestShape(sequence);
+        // Prefix adoption may call this before publishing its final phase. The
+        // initial envelope already owns that shape; do not re-admit a clone.
+        if (_requestShapes.TryGetValue(sequence.RequestId, out var previous) && previous != shape)
+        {
+            PruneFinishedRequestOwners();
+            var peak = IncrementalPeak(RequestPeak(sequence));
+            var (joint, tokens) = ExecutionJointTarget(sequence);
+            var additional = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
+            if (additional.Host > 0 || additional.Device > 0)
+            {
+                // These are already incremental ledger charges. Adding pending
+                // trunk weights or the request's 64-MiB host margin again would
+                // evict expert reuse for space the owners already reserved.
+                var limits = PrepareCapacity(() =>
+                {
+                    var growth = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
+                    return [new(HostPool, growth.Host), new(DevicePool, growth.Device)];
+                }, recoverExpertCache: false);
+                ResizeExecutionEnvelopes(envelope, peak, joint, tokens, limits);
+            }
+            else ResizeExecutionEnvelopes(envelope, peak, joint, tokens);
+            _requestShapes[sequence.RequestId] = shape;
+        }
+        return EnterAllocations(envelope);
+    }
+
+    private (InferenceMemoryBytes Target, int ContextTokens) ExecutionJointTarget(SequenceState sequence)
+    {
+        int lanes = _requestOwners.Count + (_requestOwners.ContainsKey(sequence.RequestId) ? 0 : 1);
+        int tokens = Math.Max(RequestShape(sequence).Capacity, _jointContextHighWater);
+        foreach (var live in _requestOwners.Values) tokens = Math.Max(tokens, RequestShape(live).Capacity);
+        var joint = lanes >= 2 ? _geometry.JointDecodePeak(tokens, lanes) : _jointTarget;
+        return (new(Math.Max(joint.Host, _jointTarget.Host), Math.Max(joint.Device, _jointTarget.Device)), tokens);
+    }
+
+    private void PruneFinishedRequestOwners()
+    {
+        foreach (var stale in _requestOwners.Where(p => p.Value.Status.IsFinished()).Select(p => p.Key).ToArray())
+        {
+            _requestOwners.Remove(stale);
+            _requestShapes.Remove(stale);
+        }
+    }
+
+    internal static InferenceMemoryBytes ExecutionEnvelopeGrowth(BudgetReservation request,
+        IReadOnlyList<MemoryCharge> requestPeak, BudgetReservation joint, InferenceMemoryBytes jointTarget)
+    {
+        var holderOwned = request.OwnedCharges;
+        var arenaOwned = joint.OwnedCharges;
+        long Net(string pool, long arenaTarget) => checked(
+            Math.Max(requestPeak.Single(c => c.Pool == pool).Bytes, request.LiveChildCharges.Single(c => c.Pool == pool).Bytes)
+            - holderOwned.Single(c => c.Pool == pool).Bytes
+            + Math.Max(arenaTarget, joint.LiveChildCharges.Single(c => c.Pool == pool).Bytes)
+            - arenaOwned.Single(c => c.Pool == pool).Bytes);
+        return new(Math.Max(0, Net(HostPool, jointTarget.Host)), Math.Max(0, Net(DevicePool, jointTarget.Device)));
+    }
+
+    internal void ResizeExecutionEnvelopes(BudgetReservation request, IReadOnlyList<MemoryCharge> requestPeak,
+        InferenceMemoryBytes joint, int contextTokens, IReadOnlyList<MemoryCharge>? limits = null)
+    {
+        if (!Budget.TryResizeTotals([(_jointEnvelope!, [new(HostPool, joint.Host), new(DevicePool, joint.Device)]),
+            (request, requestPeak)], limits))
+            throw new MemoryPressureException("The next holder growth cannot fit the shared budget; generation was stopped before allocation.");
+        _jointTarget = joint;
+        _jointContextHighWater = contextTokens;
+    }
+
     private sealed class AllocationExecution : IDisposable
     {
         internal IDisposable? Native, Host;
@@ -524,6 +736,7 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
         _model?.Dispose(); _model = null;
         _jointArena?.Dispose(); _jointArena = null;
         _experts?.Dispose(); _experts = null;
+        _filePipeline?.Dispose(); _filePipeline = null;
         _native?.SetSharedJointEnvelope(null);
         _jointEnvelope?.Dispose(); _jointEnvelope = null;
         _native?.SetSharedExpertEnvelope(null);
@@ -556,8 +769,8 @@ public sealed partial class UnifiedMemoryModelSession : IDisposable
 /// Dispose before loading any replacement; allocation callbacks stay attached.</summary>
 public sealed class UnifiedMemoryModelLoadException : InvalidOperationException
 {
-    public UnifiedMemoryModelLoadException(UnifiedMemoryModelSession session, Exception inner)
+    public UnifiedMemoryModelLoadException(IUnifiedMemoryModelSession session, Exception inner)
         : base("Unified model construction failed with unreleased owners; cleanup must be retried.", inner)
         => UnreleasedSession = session;
-    public UnifiedMemoryModelSession UnreleasedSession { get; }
+    public IUnifiedMemoryModelSession UnreleasedSession { get; }
 }

@@ -156,9 +156,105 @@ namespace TensorSharp.Runtime.Scheduling
             (double)Interlocked.Read(ref _totalForwardTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
         public int RunningCount => _scheduler.RunningCount;
         public int WaitingCount => _scheduler.WaitingCount;
+        /// <summary>Actual live request handles, including submitted commands
+        /// not yet admitted by the worker. Historical completion counters are
+        /// telemetry and cannot determine cleanup readiness after refusal.</summary>
+        public int PendingRequestCount => _handles.Count;
+        /// <summary>Physical sequence releases still quarantined for retry.
+        /// Completion of a consumer stream does not settle these owners. This
+        /// query takes the model compute lock; bounded readiness checks should
+        /// first acquire that lock with TryEnter and inspect it reentrantly.</summary>
+        public int PendingSequenceReleaseCount
+        {
+            get { lock (_model.GpuComputeLock) return _failedSequenceReleases.Count; }
+        }
         public IReadOnlyList<TensorSharp.Memory.MemoryPoolSnapshot>? SnapshotMemoryUsage => _pool.Storage.MemoryUsage;
         public TensorSharp.Memory.MemorySchedulerStats? SnapshotResidencyStats => _pool.Storage.ResidencyStats;
         public object SnapshotSwapTimings => _executor.SwapMetrics.Snapshot();
+
+        /// <summary>Read-only startup qualification for an already configured
+        /// shared fused execution route. No new capabilities or allocations are
+        /// enabled by this query; accepted native execution is still required
+        /// to prove that a warmup actually exercised the requested width.</summary>
+        public string? JointDecodeWarmupDeclineReason(int width)
+        {
+            if (width < 2) return "joint warmup requires at least two requests";
+            var config = _scheduler.Config;
+            if (width > config.MaxNumRunningSequences || width > config.MaxNumBatchedTokens)
+                return "the configured running or batch-token limit cannot contain this cohort";
+            var options = config.ResolveExecutionOptions();
+            if (!options.PerSeqFusedEnabled || !options.BatchedFusedDecodeEnabled)
+                return "the configured fused holder or joint decode route is disabled";
+            if (config.MemoryAdmission is not { UsePerSequenceHolders: true,
+                EnterSerialExecution: not null, EnterBatchedExecution: not null })
+                return "joint warmup requires independent admitted holders and a shared allocation scope";
+            return _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true }
+                ? null : "the model has no independent fused holder route";
+        }
+
+        /// <summary>A startup-only cohort of exact request objects. Its decoders
+        /// wait for every member's prefill, so a short cache-hit request cannot
+        /// finish before a cold sibling initializes the requested joint graph.
+        /// Cancellation, preemption, foreign work or lack of admitted capacity
+        /// declines the cohort and restores ordinary scheduling.</summary>
+        public sealed class StartupPrefillCohort : IDisposable
+        {
+            private readonly Action _wake;
+            private int _holding = 1;
+            private string? _declineReason;
+            internal readonly HashSet<SequenceState> Members;
+            internal StartupPrefillCohort(IEnumerable<SequenceState> members, Action wake)
+            { Members = new(members, ReferenceEqualityComparer.Instance); _wake = wake; }
+            internal bool Holding => Volatile.Read(ref _holding) != 0;
+            public string? DeclineReason => Volatile.Read(ref _declineReason);
+            internal void Complete() => Interlocked.Exchange(ref _holding, 0);
+            internal void Decline(string reason)
+            {
+                Interlocked.CompareExchange(ref _declineReason, reason, null);
+                Interlocked.Exchange(ref _holding, 0);
+            }
+            public void Dispose()
+            {
+                // A timeout must not block on an in-flight native compute lock.
+                // The worker owns scheduler mutation and observes this flag on
+                // its next step, before scheduling any more forwards.
+                if (Interlocked.Exchange(ref _holding, 0) != 0)
+                    Interlocked.CompareExchange(ref _declineReason, "startup cohort ended before all prefills completed", null);
+                _wake();
+            }
+        }
+
+        /// <summary>Capture only a caller-owned, fully submitted startup cohort
+        /// while its private compute gate remains closed. Historical counters
+        /// cannot identify this scope; every live request must match the owner
+        /// predicate and belong to this exact generation.</summary>
+        public StartupPrefillCohort BeginStartupPrefillCohort(ComputeGate ownedGate,
+            int width, Predicate<SequenceState> ownsRequest)
+        {
+            ArgumentNullException.ThrowIfNull(ownedGate);
+            ArgumentNullException.ThrowIfNull(ownsRequest);
+            lock (_model.GpuComputeLock)
+            lock (_submissionGate)
+            {
+                string? decline = JointDecodeWarmupDeclineReason(width);
+                if (decline != null) throw new InvalidOperationException(decline);
+                if (_stopping || !ReferenceEquals(_computeGate, ownedGate) || ownedGate.IsOpen
+                    || _scheduler.RunningCount != 0 || _handles.Count != width || _failedSequenceReleases.Count != 0)
+                    throw new InvalidOperationException("Startup cohort no longer owns a closed, idle engine gate and its exact live request set.");
+                var members = new List<SequenceState>(width);
+                foreach (var handle in _handles.Values)
+                {
+                    var sequence = handle.Sequence;
+                    if (sequence.Status.IsFinished() || sequence.NumComputedTokens != 0
+                        || sequence.MaxNewTokens < 2 || !ownsRequest(sequence))
+                        throw new InvalidOperationException("Startup cohort contains a finished, already computed, foreign or too short request.");
+                    members.Add(sequence);
+                }
+                var cohort = new StartupPrefillCohort(members, () => OnComputeGateChanged(true));
+                _scheduler.BeginStartupPrefillCohort(cohort);
+                return cohort;
+            }
+        }
 
         /// <summary>
         /// Whether the step loop may run right now, or null for "always".
@@ -186,12 +282,31 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 lock (_submissionGate)
                 {
-                    var previous = Interlocked.Exchange(ref _computeGate, value);
-                    if (previous != null) previous.Changed -= OnComputeGateChanged;
-                    if (!_stopping && value != null) value.Changed += OnComputeGateChanged;
+                    ReplaceComputeGateUnderLock(value);
                 }
                 OnComputeGateChanged(value?.IsOpen ?? true);
             }
+        }
+
+        /// <summary>Install or restore a temporary gate without overwriting a
+        /// concurrently installed lifecycle gate. The same subscription and
+        /// worker wakeup rules as the property setter apply.</summary>
+        public bool TryReplaceComputeGate(ComputeGate? expected, ComputeGate? replacement)
+        {
+            lock (_submissionGate)
+            {
+                if (_stopping || !ReferenceEquals(_computeGate, expected)) return false;
+                ReplaceComputeGateUnderLock(replacement);
+            }
+            OnComputeGateChanged(replacement?.IsOpen ?? true);
+            return true;
+        }
+
+        private void ReplaceComputeGateUnderLock(ComputeGate? value)
+        {
+            var previous = Interlocked.Exchange(ref _computeGate, value);
+            if (previous != null) previous.Changed -= OnComputeGateChanged;
+            if (!_stopping && value != null) value.Changed += OnComputeGateChanged;
         }
 
         // Gate changes must also wake a worker waiting on a memory generation:
@@ -845,6 +960,22 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 _failedSequenceReleases[requestId] = ex;
                 _logger.LogWarning(ex, "Model release hook failed for sequence {RequestId}", requestId);
+                return;
+            }
+
+            if (!_shutdownCts.IsCancellationRequested
+                && (Volatile.Read(ref _computeGate)?.IsOpen ?? true)
+                && _scheduler.Config.MemoryAdmission?.AfterSequenceMemoryRelease is { } recover)
+            {
+                try { recover(_scheduler.GetRunningSequencesSnapshot()); }
+                catch (Exception ex)
+                {
+                    // Physical release succeeded. Optional cache recovery may
+                    // be retried at the next admission; never mark the model's
+                    // already released holder as a failed release or refund any
+                    // still-retained child allocation on this failure.
+                    _logger.LogWarning(ex, "Optional memory recovery failed after sequence {RequestId}", requestId);
+                }
             }
         }
 

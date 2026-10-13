@@ -23,6 +23,22 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(row['down_read_overlap_union_ns'], 100)
         self.assertEqual(row['down_read_overlap_sum_ns'], 150)
         self.assertEqual(row['down_copy_overlap_union_ns'], 110)
+        self.assertFalse(row['parallel_read_geometry_observed'])
+
+    def test_parallel_read_geometry_requires_more_jobs_than_transfers(self):
+        text = fixture().replace('chunks=4 ', 'chunks=4 read_jobs=8 max_read_bytes=1024 ')
+        result = tool.analyze(text)
+        self.assertTrue(result['parallel_read_geometry_observed'])
+        self.assertEqual(result['calls'][0]['read_jobs'], 8)
+        self.assertFalse(tool.analyze(text.replace('read_jobs=8', 'read_jobs=4'))['parallel_read_geometry_observed'])
+
+    def test_incomplete_or_invalid_parallel_read_geometry_rejected(self):
+        for fields in ('read_jobs=8', 'max_read_bytes=1024',
+                       'read_jobs=3 max_read_bytes=1024',
+                       'read_jobs=8 max_read_bytes=0',
+                       'read_jobs=8 max_read_bytes=16777217'):
+            with self.assertRaises(ValueError):
+                tool.analyze(fixture().replace('chunks=4 ', 'chunks=4 ' + fields + ' '))
 
     def test_missing_and_empty_rejected(self):
         for text in ('', fixture().rsplit('\n', 1)[0]):

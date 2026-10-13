@@ -22,6 +22,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private readonly ILogger _logger;
     private readonly Dictionary<SequenceState, RequestKey> _requests = new();
     private readonly Queue<string> _invalidated = new();
+    private readonly Queue<(string Key, PayloadFootprint Previous, PayloadFootprint Current)> _deviceDemotions = new(16);
     private readonly HashSet<long> _storeMisses = new();
     private readonly MatchPlan _plan = new();
     private string? _primaryKey;
@@ -610,6 +611,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     }
 
     public void OnPayloadInvalidated(string payloadKey, InvalidationReason reason) => _invalidated.Enqueue(payloadKey);
+    public void OnPayloadDeviceDemoted(string payloadKey, PayloadFootprint previous, PayloadFootprint current)
+        => _deviceDemotions.Enqueue((payloadKey, previous, current));
     public bool CanMaterialize(string payloadKey, int payloadTokens, int targetTokens)
         => _cacheModel.CanMaterialize(payloadKey, payloadTokens, targetTokens);
     public bool CanRewindPrimary(int payloadTokens, int targetTokens)
@@ -619,6 +622,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     {
         bool hadInvalidations = _invalidated.Count > 0;
         while (_invalidated.TryDequeue(out var key)) _tree.InvalidatePayload(key);
+        // Invalidations take precedence. A delayed transfer report cannot
+        // revive a removed payload or change a newer holder at the same node.
+        while (_deviceDemotions.TryDequeue(out var demotion))
+            _tree.TryApplyDeviceDemotion(demotion.Key, demotion.Previous, demotion.Current);
         int refused = _tree.FlushQueuedInvalidations();
         int released = _tree.Reclaim.Drain(ReleasePayloads);
         if (hadInvalidations || refused > 0 || released > 0) RetireEmptyScopes();

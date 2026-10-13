@@ -34,6 +34,14 @@ public sealed class RequestMemoryAdmission
     public Func<SequenceState, IReadOnlyList<MemoryCharge>> EstimatePeak { get; }
     public int MaxQueuedRequests { get; }
 
+    /// <summary>Optional first phase for a separately owned hybrid holder:
+    /// reserve its complete state/copy/export peak before prefix materialization,
+    /// without assuming a hit or reserving wide prefill computation. EstimatePeak
+    /// remains the no-hit execution ceiling check on submission. The required
+    /// AfterPrefixMaterialization boundary must physically admit and resize to
+    /// the actual remaining execution peak before any Forward is authorized.</summary>
+    public Func<SequenceState, IReadOnlyList<MemoryCharge>>? EstimateMaterializationPeak { get; init; }
+
     /// <summary>Optional fresh physical-capacity check once for a new eligible
     /// queue head, and again immediately before its reservation if it had to wait.
     /// Returns absolute per-pool capacity ceilings, not additional charges.
@@ -73,6 +81,14 @@ public sealed class RequestMemoryAdmission
     /// owned. Failure is isolated to this newly admitted destination.</summary>
     public Action<SequenceState>? AfterPrefixMaterialization { get; init; }
 
+    /// <summary>Optional cache-capacity recovery after model release, native
+    /// fences, prefix maintenance and disposal of a finished request's root
+    /// reservation. Called under the model compute lock with the gate open,
+    /// once per successful release, never before its physical owners settle.
+    /// Retained children remain charged. This is optional maintenance: a
+    /// failure does not reinterpret an already successful model release.</summary>
+    public Action<IReadOnlyList<SequenceState>>? AfterSequenceMemoryRelease { get; init; }
+
     /// <summary>Keep each admitted request in an independent model-owned holder.
     /// The executor enters that request's allocation envelope before binding or
     /// forwarding it, including a solo request. Holder work is serialized under
@@ -90,6 +106,9 @@ public sealed class RequestMemoryAdmission
 
     internal void ValidateConfiguration(SchedulerConfig config)
     {
+        if (EstimateMaterializationPeak != null && (!UsePerSequenceHolders || !HasPhysicalCheck
+            || !ReestimateAfterPhysicalCheck || AfterPrefixMaterialization == null))
+            throw new ArgumentException("Materialization admission requires fenced independently owned holders and an execution transition.", nameof(config));
         if (BeforeAdmission != null && BeforeAdmissionWithRunning != null)
             throw new ArgumentException("Configure only one physical admission callback.", nameof(config));
         if (EnterBatchedExecution != null && (!UsePerSequenceHolders || !HasPhysicalCheck))

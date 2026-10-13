@@ -93,6 +93,13 @@ class HttpCheckerTests(unittest.TestCase):
     def test_exact_answer_and_eos_pass(self):
         self.assertTrue(m.answer_gate(good_answer(), "42")["passed"])
 
+    def test_glm_status_requires_its_explicit_architecture_and_unified_owner(self):
+        body = {"loaded": "glm.gguf", "architecture": "glm5-next", "visionReady": True, "unifiedMemory": True}
+        m.require_model_status(body, "glm.gguf", True, "glm5-next")
+        for architecture in ("qwen4exp", "glm5next", "unknown"):
+            with self.subTest(architecture=architecture), self.assertRaises(ValueError):
+                m.require_model_status(body, "glm.gguf", True, architecture)
+
     def test_protocol_stop_without_eos_is_unknown_not_pass(self):
         row = good_answer(); del row["natural_eos_telemetry"]
         self.assertFalse(m.answer_gate(row, "42")["passed"])

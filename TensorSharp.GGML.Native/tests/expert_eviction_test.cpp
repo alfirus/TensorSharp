@@ -33,5 +33,16 @@ int main() {
     bool rejected = false;
     try { lfu.configure(4, 5, true); } catch (const std::invalid_argument&) { rejected = true; }
     require(rejected, "invalid geometry accepted");
+    lfu.configure(512, 16, true);
+    for (int i = 0; i < 31; ++i) lfu.observe(hot, 1);
+    lfu.grow_capacity(128);
+    require(lfu.epoch() == 256 && lfu.prefer(1, 20, 0, 1), "expansion lost hot frequencies or its aging window");
+    for (int i = 0; i < 256 * 8; ++i) lfu.observe(rare, 1);
+    require(lfu.prefer(0, 1000, 1, 1), "expanded cache no longer forgot stale routing");
+    rejected = false;
+    try { lfu.grow_capacity(513); } catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "expanded capacity exceeded frequency identity extent");
+    lru.grow_capacity(4096);
+    require(lru.epoch() == 0, "disabled frequency tracking was enabled by expansion");
     std::puts("PASS: bounded decaying frequencies, LRU ties, empty slots, saturation and routing shifts");
 }

@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -11,6 +12,11 @@ namespace tsg {
 class ExpertEvictionPolicy {
     std::vector<std::uint16_t> frequency_;
     unsigned epoch_ = 0, rows_ = 0;
+    static unsigned capacity_epoch(int capacity) {
+        unsigned epoch = 32;
+        while (epoch < 1024 && epoch / 2 < static_cast<unsigned>(capacity)) epoch *= 2;
+        return epoch;
+    }
 public:
     void configure(int experts, int capacity, bool enabled) {
         if (experts <= 0 || capacity <= 0 || capacity > experts)
@@ -21,8 +27,18 @@ public:
         frequency_.resize(experts, 0);
         // Power-of-two epoch in [32, 1024], about twice the number of slots.
         // Small caches forget old routing sooner; no model name is involved.
-        epoch_ = 32;
-        while (epoch_ < 1024 && epoch_ / 2 < static_cast<unsigned>(capacity)) epoch_ *= 2;
+        epoch_ = capacity_epoch(capacity);
+    }
+    // Expansion keeps both popularity and the current aging position. Only
+    // the longer capacity-dependent window changes; it cannot make routing
+    // history immortal or reset an old hot expert to zero frequency.
+    void grow_capacity(int capacity) {
+        if (capacity <= 0 || (epoch_ && static_cast<std::size_t>(capacity) > frequency_.size()))
+            throw std::invalid_argument("Invalid expanded eviction capacity");
+        if (!epoch_) return;
+        const auto next = capacity_epoch(capacity);
+        if (next < epoch_) throw std::invalid_argument("Eviction capacity expansion shortened its epoch");
+        epoch_ = next;
     }
     unsigned epoch() const { return epoch_; }
     void observe(const std::int32_t* ids, int count) {

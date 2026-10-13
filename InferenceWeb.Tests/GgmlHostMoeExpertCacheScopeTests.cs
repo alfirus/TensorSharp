@@ -7,15 +7,15 @@ public sealed class GgmlHostMoeExpertCacheScopeTests
 {
     private sealed class Native : IHostMoeExpertCacheScopeNative
     {
-        public int Begins, Updates, Trims, Ends;
+        public int Begins, Updates, Trims, Ends, MaxDecodeRows;
         public bool FailBegin, FailUpdate, FailTrim, FailEnd, Active;
         public long Budget;
-        public ulong Begin(long bytes, int maxRows, int layers)
+        public ulong Begin(long bytes, int maxRows, int layers, int maxDecodeRows)
         {
             Begins++;
             if (FailBegin) throw new InvalidOperationException("begin");
             Assert.False(Active);
-            Active = true; Budget = bytes;
+            Active = true; Budget = bytes; MaxDecodeRows = maxDecodeRows;
             return 17;
         }
         public long Update(ulong token, long bytes)
@@ -40,6 +40,38 @@ public sealed class GgmlHostMoeExpertCacheScopeTests
         { Assert.True(Active); return new(14, Budget, 20, 30, 40); }
     }
 
+    private sealed class GrowthNative : IHostMoeExpertCacheScopeNative
+    {
+        internal readonly Native Inner = new();
+        internal bool Enabled;
+        public ulong Begin(long bytes, int rows, int layers, int decodeRows) => Inner.Begin(bytes, rows, layers, decodeRows);
+        public ulong Begin(long bytes, int rows, int layers, int decodeRows, bool enabled)
+        { Enabled = enabled; return Begin(bytes, rows, layers, decodeRows); }
+        public long Update(ulong token, long bytes) => Inner.Update(token, bytes);
+        public long Trim(ulong token, long bytes) => Inner.Trim(token, bytes);
+        public long End(ulong token) => Inner.End(token);
+        public GgmlHostMoeExpertCacheUsage ReadUsage() => Inner.ReadUsage();
+    }
+
+    [Fact]
+    public void LegacyNativeCannotSilentlyEnableGrowthOrCreateAnUnreachableOwner()
+    {
+        var native = new Native();
+        Assert.Throws<NotSupportedException>(() => new GgmlHostMoeExpertCacheScope(100, 32, 48, native, 3, true));
+        Assert.Equal(0, native.Begins); Assert.Equal(0, native.Ends); Assert.False(native.Active);
+    }
+
+    [Fact]
+    public void GrowthIsOneAtomicBeginAndOrdinaryCallersStayDisabled()
+    {
+        var native = new GrowthNative();
+        using (var scope = new GgmlHostMoeExpertCacheScope(100, 32, 48, native, 3, true))
+        { Assert.True(scope.CapacityGrowthEnabled); Assert.True(native.Enabled); Assert.Equal(1, native.Inner.Begins); }
+        Assert.False(native.Inner.Active); Assert.Equal(1, native.Inner.Ends);
+        using var ordinary = new GgmlHostMoeExpertCacheScope(100, 32, 48, native, 3);
+        Assert.False(ordinary.CapacityGrowthEnabled); Assert.False(native.Enabled);
+    }
+
     [Theory]
     [InlineData(-1, 64, 48)]
     [InlineData(100, 0, 48)]
@@ -60,12 +92,36 @@ public sealed class GgmlHostMoeExpertCacheScopeTests
         Assert.False(native.Active); Assert.Equal(0, native.Ends);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(9)]
+    public void InvalidDecodePlanDoesNotEnterNative(int rows)
+    {
+        var native = new Native();
+        Assert.Throws<ArgumentOutOfRangeException>(() => new GgmlHostMoeExpertCacheScope(100, 32, 48, native, rows));
+        Assert.Equal(0, native.Begins);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(8)]
+    public void DecodePlanIsIndependentOfPrefillLimit(int rows)
+    {
+        var native = new Native();
+        using var scope = new GgmlHostMoeExpertCacheScope(100, 1, 48, native, rows);
+        Assert.Equal(rows, scope.MaxDecodeRows); Assert.Equal(rows, native.MaxDecodeRows);
+        Assert.Equal(1, scope.MaxPrefillRows); Assert.Equal(1, native.Begins);
+    }
+
     [Fact]
     public void UpdateAndTrimHaveSeparateCeilingSemantics()
     {
         var native = new Native();
         using var scope = new GgmlHostMoeExpertCacheScope(100, 128, 48, native);
         Assert.Equal(100, scope.MaximumBudgetBytes); Assert.Equal(128, scope.MaxPrefillRows); Assert.Equal(48, scope.LayerCount);
+        Assert.Equal(1, scope.MaxDecodeRows); Assert.Equal(1, native.MaxDecodeRows);
         Assert.Equal(11, scope.UpdateBudget(0)); Assert.Equal(0, scope.BudgetBytes);
         Assert.Equal(11, scope.UpdateBudget(100)); Assert.Equal(100, scope.BudgetBytes);
         Assert.Equal(13, scope.Trim(0)); Assert.Equal(100, scope.BudgetBytes);

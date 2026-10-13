@@ -126,14 +126,15 @@ namespace TensorSharp.Server.Hosting
             string sessionId,
             bool think,
             ILogger logger,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            int maxTokens = 1)
         {
             if (frames == null) throw new ArgumentNullException(nameof(frames));
 
             var clock = Stopwatch.StartNew();
             try
             {
-                JsonElement body = BuildRequest(sessionId, think);
+                JsonElement body = BuildRequest(sessionId, think, maxTokens);
                 string failure = null;
                 bool completed = false;
                 await foreach (object frame in frames(body, cancellationToken).ConfigureAwait(false))

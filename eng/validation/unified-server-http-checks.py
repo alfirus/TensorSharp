@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise an already-running unified-memory Qwen host; never starts a server.
+"""Exercise an already-running unified-memory chat host; never starts a server.
 
 Example (the server file logger must include RequestId scopes):
   python eng/validation/unified-server-http-checks.py --url http://127.0.0.1:18891 \
@@ -11,9 +11,9 @@ raw responses, queue samples, and only newly appended server logs are retained.
 Protocol 'stop' is NOT sufficient evidence of EOS: strict success also requires
 same-request server telemetry finishReason=eos. Cancellation similarly requires
 correlated server evidence, not just a closed client socket. No generated code
-is evaluated. Parallel submission tests overlapping clients and isolation; the
-initial adapter deliberately executes requests serially, so this is not proof
-of simultaneous GPU forwards. Reload success is functional scope-recreation
+is evaluated. Parallel submission tests overlapping clients and isolation;
+native fused-graph engagement requires the separate graph evidence checker.
+Reload success is functional scope-recreation
 evidence, not an independent zero-ledger/driver-memory measurement.
 Use --default-output-limit-check to add a small arithmetic request that omits
 both OpenAI output-limit fields and exercises the server's configured default.
@@ -76,9 +76,10 @@ def evidence_output_path(value, root=ROOT):
     return lexical.resolve()
 
 
-def require_model_status(body, model, require_unified=False):
-    require(isinstance(body, dict) and body.get("loaded") == model and body.get("architecture") == "qwen4exp"
-            and body.get("visionReady") is True, "Requested Qwen model and vision projector must already be loaded")
+def require_model_status(body, model, require_unified=False, architecture="qwen4exp"):
+    require(architecture in ("qwen4exp", "glm5-next", "glm5next"), "Unknown qualified architecture")
+    require(isinstance(body, dict) and body.get("loaded") == model and body.get("architecture") == architecture
+            and body.get("visionReady") is True, "Requested model architecture and vision projector must already be loaded")
     if require_unified:
         require(body.get("unifiedMemory") is True, "Server did not report unifiedMemory=true")
 
@@ -364,7 +365,7 @@ def run(args):
         report["image"] = {"path": str(image_path), "sha256": hashlib.sha256(image).hexdigest(), "expected": "4821"}
         status = client.call("initial-model", "/api/models")
         model = expect_json(status)
-        require_model_status(model, args.model, args.require_unified_status)
+        require_model_status(model, args.model, args.require_unified_status, args.architecture)
         report["initial_model"] = status
         idle, report["initial_queue"] = wait_idle(client, "initial-queue")
         require(idle, "Server must be idle before validation")
@@ -412,14 +413,14 @@ def run(args):
         reload_row = client.call("reload", "/api/models/load", {"model": args.model, "backend": "ggml_cuda"})
         report["reload"] = reload_row
         loaded = expect_json(reload_row)
-        require(loaded.get("ok") is True and loaded.get("model") == args.model and loaded.get("architecture") == "qwen4exp",
+        require(loaded.get("ok") is True and loaded.get("model") == args.model and loaded.get("architecture") == args.architecture,
                 "Reload was refused or loaded another model")
         require(isinstance(model.get("loadedMmProj"), str) and loaded.get("loadedMmProj") == model["loadedMmProj"],
                 "Reload changed or lost the startup projector")
         reloaded_status = client.call("reloaded-model", "/api/models")
         report["reloaded_model"] = reloaded_status
         reloaded_model = expect_json(reloaded_status)
-        require_model_status(reloaded_model, args.model, args.require_unified_status)
+        require_model_status(reloaded_model, args.model, args.require_unified_status, args.architecture)
         require(reloaded_model.get("loaded") == args.model and reloaded_model.get("visionReady") is True
                 and reloaded_model.get("loadedMmProj") == model["loadedMmProj"], "Reload lost the vision runtime")
         reset = client.call("reload-queue", "/api/queue/status")
@@ -482,6 +483,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--model", required=True, help="Exact currently hosted startup model filename")
+    parser.add_argument("--architecture", choices=("qwen4exp", "glm5-next", "glm5next"), default="qwen4exp")
     parser.add_argument("--image", required=True, help="card-0 PNG containing 4821")
     parser.add_argument("--server-log", help="Existing file logger with RequestId scopes; absent means EOS/cancellation unverified, never passing")
     parser.add_argument("--require-unified-status", action="store_true", help="Require initial and reloaded /api/models to report unifiedMemory=true; older servers without the field fail this check")

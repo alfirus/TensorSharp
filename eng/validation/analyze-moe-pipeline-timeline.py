@@ -56,6 +56,12 @@ def analyze(text):
         require(0 < pinned <= 16 << 20 and 0 < a < b, 'Invalid pinned bound or gate interval')
         total_ms = float(h['total_ms'])
         require(math.isfinite(total_ms) and total_ms > 0, 'Invalid total time')
+        require(('read_jobs' in h) == ('max_read_bytes' in h), 'Incomplete parallel-read geometry')
+        read_jobs = int(h['read_jobs']) if 'read_jobs' in h else None
+        max_read_bytes = int(h['max_read_bytes']) if 'max_read_bytes' in h else None
+        if read_jobs is not None:
+            require(read_jobs >= count and 0 < max_read_bytes <= 16 << 20,
+                    'Invalid parallel-read geometry')
         reads, copies = [], []
         parts = set()
         for index, span in enumerate(spans):
@@ -76,11 +82,14 @@ def analyze(text):
             value = float(h[key])
             require(math.isfinite(value) and abs(value - actual / 1e6) <= .000501, 'Logged overlap does not match raw intervals')
         rows.append({'seq': seq, 'chunks': count, 'pinned_bytes': pinned, 'total_ms': total_ms,
+                     'read_jobs': read_jobs, 'max_read_bytes': max_read_bytes,
+                     'parallel_read_geometry_observed': read_jobs is not None and read_jobs > count,
                      'gate_stream_interval_ns': [a, b],
                      'down_read_overlap_union_ns': duration_union(reads),
                      'down_copy_overlap_union_ns': duration_union(copies),
                      'down_read_overlap_sum_ns': read_sum, 'down_copy_overlap_sum_ns': copy_sum})
     return {'valid_intervals': True, 'calls': rows,
+            'parallel_read_geometry_observed': any(r['parallel_read_geometry_observed'] for r in rows),
             'read_compute_overlap_observed': any(r['down_read_overlap_union_ns'] > 0 for r in rows),
             'transfer_compute_overlap_observed': any(r['down_copy_overlap_union_ns'] > 0 for r in rows),
             'scope': 'Common steady-clock host callbacks delimit CUDA stream intervals including host submission gaps and callback overhead. Intersection proves concurrency with those intervals, not pure kernel activity or a quiet performance improvement. Read sums may overlap each other; union is reported separately.'}

@@ -21,12 +21,16 @@ int main() {
     using namespace tsg;
     HostMoeCacheConfiguration config({17, 48, 8});
     require(config.fast_budget() == 17 && config.settings().layers == 48 && config.settings().max_rows == 8);
-    for (auto value : {HostMoeCacheSettings{100, 0, 64}, {100, 48, 0}, {100, 48, 129}})
+    require(config.settings().max_decode_rows == 1);
+    require(!config.settings().capacity_growth && config.growth_generation() == 0);
+    for (auto value : {HostMoeCacheSettings{100, 0, 64}, {100, 48, 0}, {100, 48, 129},
+            {100, 48, 32, 0}, {100, 48, 32, 9}})
         require(config.begin(value, true) == 0);
     require(config.begin({100, 12, 64}, false) == 0); // A live legacy cache is never adopted.
-    const auto token = config.begin({100, 12, 64}, true);
+    const auto token = config.begin({100, 12, 1, 3}, true);
     require(token != 0 && config.owns(token) && config.fast_budget() == 100);
-    require(config.settings().layers == 12 && config.settings().max_rows == 64);
+    require(config.settings().layers == 12 && config.settings().max_rows == 1
+        && config.settings().max_decode_rows == 3);
     require(config.begin({200, 48, 128}, true) == 0);
     int trims = 0;
     std::size_t simulated_live = 90;
@@ -36,6 +40,7 @@ int main() {
     };
     require(!config.update(token + 1, 0, trim) && !config.update(token, 101, trim) && trims == 0);
     require(config.update(token, 40, trim) && simulated_live == 40 && config.fast_budget() == 40);
+    require(config.settings().max_decode_rows == 3);
     fails([&] { config.update(token, 10, [&](std::size_t, std::size_t) {
         simulated_live = 20; // Partial physical retirement need not be rolled back.
         throw std::runtime_error("injected trim failure");
@@ -43,16 +48,34 @@ int main() {
     require(config.fast_budget() == 40 && config.owns(token) && simulated_live == 20);
     require(config.update(token, 0, trim) && config.fast_budget() == 0 && simulated_live == 0);
     require(config.update(token, 100, trim) && config.fast_budget() == 100); // Regrow only within initial ceiling.
+    require(config.growth_generation() == 0); // Ordinary scoped callers never opt in.
     fails([&] { config.end(token, [] { throw std::runtime_error("injected release failure"); }); });
     require(config.owns(token) && config.fast_budget() == 100);
     bool released = false;
     require(!config.end(token + 1, [&] { released = true; }) && !released);
     require(config.end(token, [&] { released = true; }) && released);
     require(!config.owns(token) && config.fast_budget() == 17 && config.settings().layers == 48 && config.settings().max_rows == 8);
+    require(config.settings().max_decode_rows == 1);
     const auto second = config.begin({0, 1, 1}, true);
     require(second != 0 && second != token && config.fast_budget() == 0);
     require(!config.end(token, [] {}) && config.owns(second));
     require(config.end(second, [] {}) && config.fast_budget() == 17);
+
+    const auto growth = config.begin({100, 12, 32, 3, true}, true);
+    require(growth != 0 && config.settings().capacity_growth && config.growth_generation() == 1);
+    require(config.update(growth, 40, trim) && config.growth_generation() == 1);
+    fails([&] { config.update(growth, 100, [](std::size_t, std::size_t) {
+        throw std::runtime_error("growth trim failure");
+    }); });
+    require(config.fast_budget() == 40 && config.growth_generation() == 1);
+    require(config.update(growth, 100, trim) && config.growth_generation() == 2);
+    require(config.update(growth, 100, trim) && config.growth_generation() == 2);
+    require(config.update(growth, 0, trim) && config.growth_generation() == 2);
+    require(!config.update(growth + 1, 100, trim) && config.growth_generation() == 2);
+    require(config.update(growth, 100, trim) && config.growth_generation() == 3);
+    fails([&] { config.end(growth, [] { throw std::runtime_error("growth release failure"); }); });
+    require(config.owns(growth) && config.settings().capacity_growth && config.growth_generation() == 3);
+    require(config.end(growth, [] {}) && !config.settings().capacity_growth && config.growth_generation() == 0);
 
     // Concurrent clients use the production contract's one enclosing gate.
     // Only one may own settings; a loser cannot overwrite or restore that owner.

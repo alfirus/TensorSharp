@@ -16,6 +16,8 @@
 #include <limits>
 #include <string>
 #include "ggml.h"
+#include "../ggml_ops_moe_file_pipeline_plan.h"
+#include "../ggml_ops_moe_file_pipeline_config.h"
 
 extern "C" {
 const char* TSGgml_GetLastError();
@@ -29,6 +31,9 @@ int TSGgml_DetachSharedCacheBudget(void*);
 int TSGgml_BeginHostMoeExpertCacheScope(std::int64_t,int,int,std::uint64_t*);
 int TSGgml_TrimHostMoeExpertCacheScope(std::uint64_t,std::int64_t,std::int64_t*);
 int TSGgml_EndHostMoeExpertCacheScope(std::uint64_t,std::int64_t*);
+int TSGgml_BeginHostMoeFilePipelineScope(int,int,std::int64_t,std::int64_t,std::uint64_t*);
+int TSGgml_EndHostMoeFilePipelineScope(std::uint64_t);
+int TSGgml_HostMoeFilePipelineStats(std::int64_t*,std::int64_t*,std::int64_t*);
 int TSGgml_RegisterHostFileSource(const void*,std::int64_t,const char*,std::int64_t);
 int TSGgml_TestHostMoeFileSegment(float*,float*,int,int,int,int,int,const std::int32_t*,const float*,
     void*,int,std::int64_t,void*,int,std::int64_t,void*,int,std::int64_t);
@@ -80,7 +85,11 @@ struct Ledger {
         l.live-=i->second.bytes; (i->second.kind==2?l.device_live:l.host_live)-=i->second.bytes; l.tickets.erase(i);
     }
 };
+#if defined(TSG_TEST_HOST_MOE_FILE_BATCH_LARGE)
+constexpr int H=512,E=7,K=3,Q8=8;
+#else
 constexpr int H=256,E=7,K=3,Q8=8;
+#endif
 std::vector<std::uint8_t> weight(int seed) {
     std::vector<std::uint8_t> w(std::size_t(H)*H*E/32*34);
     for(std::size_t b=0;b<w.size()/34;++b) { w[b*34]=0; w[b*34+1]=0x20;
@@ -102,10 +111,12 @@ std::vector<std::uint8_t> mixed_weight(ggml_type type,int seed) {
 }
 int main(int argc,char** argv) {
     bool cuda=false,mixed=false;
-    int threshold_override=-1;
+    int threshold_override=-1,pipeline_override=-1;
     for(int i=1;i<argc;++i) {
         if(std::strcmp(argv[i],"--cuda")==0) cuda=true;
         else if(std::strcmp(argv[i],"--mixed")==0) mixed=true;
+        else if(std::strcmp(argv[i],"--pipeline-scope")==0 && i+1<argc
+            && (std::strcmp(argv[i+1],"0")==0 || std::strcmp(argv[i+1],"1")==0)) pipeline_override=std::atoi(argv[++i]);
         else if(std::strcmp(argv[i],"--threshold-override")==0 && i+1<argc
             && (std::strcmp(argv[i+1],"0")==0 || std::strcmp(argv[i+1],"128")==0)) threshold_override=std::atoi(argv[++i]);
         else { std::fprintf(stderr,"Unknown argument\n"); return 1; }
@@ -121,11 +132,14 @@ int main(int argc,char** argv) {
     } else env("TS_HOST_MOE_DEVICE_MIN_BATCH","0");
     env("TS_HOST_MOE_EXPERT_CACHE_MB","0");
     env("TS_HOST_MOE_PIN","0"); env("TS_CPU_MOE_THREADS","2");
-    Ledger ledger; std::uint64_t scope=0; bool attached=false;
+    Ledger ledger; std::uint64_t scope=0,pipeline_scope=0; bool attached=false;
     auto dir=std::filesystem::temp_directory_path()/std::filesystem::u8path(u8"tensorsharp-专家-file-batch");
     int result=0;
     try {
         require(TSGgml_IsBackendAvailable(cuda?3:2)==1,"required backend unavailable"); TSGgml_SetHostMoeThreads(2);
+        if(pipeline_override>=0)
+            require(TSGgml_BeginHostMoeFilePipelineScope(pipeline_override,64,1,16u<<20,&pipeline_scope)==1
+                && pipeline_scope!=0,"pipeline scope begin failed");
         std::filesystem::create_directories(dir);
         const int types[]={Q8,mixed?int(GGML_TYPE_IQ1_M):Q8,mixed?int(GGML_TYPE_Q4_0):Q8};
         auto gate=weight(1),up=mixed?mixed_weight(GGML_TYPE_IQ1_M,2):weight(2),down=mixed?mixed_weight(GGML_TYPE_Q4_0,3):weight(3);
@@ -136,8 +150,18 @@ int main(int argc,char** argv) {
         auto invalid=dir/"0.bin";
         require(TSGgml_RegisterHostFileSource(&ledger,gate.size()+1,invalid.u8string().c_str(),3)==0,"source extent beyond EOF accepted");
         const std::vector<int> shapes=threshold_override>=0 ? std::vector<int>{33,129}
+#if defined(TSG_TEST_HOST_MOE_FILE_BATCH_LARGE)
+            // Mixed IQ1/Q4 payloads are smaller; the all-seven-expert case
+            // exceeds the 1MiB read-job boundary without enlarging the fixture.
+            : mixed ? std::vector<int>{257} : std::vector<int>{128,257}
+#else
             : cuda ? std::vector<int>{32,33,37,77,100,127,128,129,257,512,513}
-            : std::vector<int>{1,8,31,129,257,512,513};
+            : std::vector<int>{1,8,31,129,257,512,513}
+#endif
+            ;
+#if defined(TSG_TEST_HOST_MOE_FILE_BATCH_LARGE)
+        require(cuda && pipeline_override==1,"large parallel-read fixture requires explicit CUDA pipeline scope");
+#endif
         for(int rows : shapes) {
             if(cuda && rows<=8) continue;
             std::vector<float> x(rows*H),ref(rows*H),out(rows*H),routes(rows*K);
@@ -151,6 +175,33 @@ int main(int argc,char** argv) {
                     : rows==513?2:rows==257?(E-1-r% E+k)%E:(r%2?2:5)+(k==2?1:0);
                 routes[r*K+k]=(k+1)/6.f;
             }
+#if defined(TSG_TEST_HOST_MOE_FILE_BATCH_LARGE)
+            // Independent expected geometry; the runner also requires native
+            // diagnostic read_jobs>chunks, proving that the actual v11 path
+            // selects multiple bounded source reads per DMA ring slot.
+            std::vector<std::int32_t> selected=ids;
+            std::sort(selected.begin(),selected.end());
+            selected.erase(std::unique(selected.begin(),selected.end()),selected.end());
+            std::array<std::size_t,3> expected_bytes{};
+            std::size_t payload=0;
+            for(int part=0;part<3;++part) {
+                expected_bytes[part]=all[part]->size()/E*selected.size();
+                payload+=(expected_bytes[part]+63)&~std::size_t(63);
+            }
+            const auto slot=tsg::host_moe_file_pipeline_slot_bytes(payload,16u<<20);
+            tsg::HostMoeFilePipelinePlan plan(slot);
+            for(int part=0;part<3;++part)
+                for(std::size_t i=0;i<selected.size();++i) {
+                    const auto stride=all[part]->size()/E;
+                    plan.append(part,selected[i]*stride,i*stride,stride);
+                }
+            plan.validate(expected_bytes);
+            std::size_t jobs=0;
+            for(std::size_t i=0;i<plan.transfers().size();++i) jobs+=plan.read_job_count(i,1u<<20);
+            require(slot>1u<<20 && jobs>plan.transfers().size(),"large fixture does not exercise intra-slot parallel reads");
+            std::printf("PARALLEL-READ-GEOMETRY rows=%d hidden=%d experts=%d source_bytes=%zu slot_bytes=%zu transfers=%zu read_jobs=%zu\n",
+                rows,H,E,payload,slot,plan.transfers().size(),jobs);
+#endif
             auto run=[&](std::vector<float>& y) {
 #if !defined(TSG_PUBLIC_API_ONLY)
                 if(rows<=8) return TSGgml_TestHostMoeFileSegment(x.data(),y.data(),rows,H,H,E,K,ids.data(),routes.data(),
@@ -211,7 +262,8 @@ int main(int argc,char** argv) {
                 TSGgml_TestHostMoeFileReadFailNext();
                 require(run(out)==0 && ledger.live==0,"failed file read leaked stream graph"); unchanged();
                 const char* pipeline=std::getenv("TS_HOST_MOE_FILE_PIPELINE");
-                const int last_stage=pipeline && std::strcmp(pipeline,"1")==0?3:2;
+                const int last_stage=(pipeline_override>=0 ? pipeline_override==1 && rows>=64
+                    : pipeline && std::strcmp(pipeline,"1")==0)?3:2;
                 for(int stage=1;stage<=last_stage;++stage) {
                     const auto drains=TSGgml_TestHostMoeFileStreamDrains();
                     TSGgml_TestHostMoeFileStreamFailNext(stage);
@@ -220,7 +272,34 @@ int main(int argc,char** argv) {
                 }
 #endif
                 auto original_gate=gate; std::fill(gate.begin(),gate.end(),0);
+#if defined(TSG_TEST_HOST_MOE_FILE_BATCH_LARGE)
+                // The ordinary oracle above has a different physical expert
+                // axis, which can select different vendor arithmetic. Compare
+                // the pipeline additionally against exactly the same compact
+                // graph and registered source bytes with its scope disabled.
+                std::vector<float> parallel_control(out.size());
+                require(TSGgml_EndHostMoeFilePipelineScope(pipeline_scope)==1,
+                    "parallel control failed to retire previous pipeline storage"); pipeline_scope=0; trim();
+                require(TSGgml_BeginHostMoeFilePipelineScope(0,64,1,16u<<20,&pipeline_scope)==1,
+                    "parallel control disabled scope failed");
+                require(run(parallel_control)==1,"identical compact disabled-pipeline control failed");
+                require(TSGgml_EndHostMoeFilePipelineScope(pipeline_scope)==1,
+                    "parallel control failed to retire its ring"); pipeline_scope=0; trim();
+                require(TSGgml_BeginHostMoeFilePipelineScope(1,64,1,16u<<20,&pipeline_scope)==1,
+                    "parallel control enabled scope failed");
+#endif
                 require(run(out)==1 && ledger.device_live>0 && ledger.host_live>0 && ledger.valid,"compact CUDA stream failed or uncharged"); compare(ref);
+#if defined(TSG_TEST_HOST_MOE_FILE_BATCH_LARGE)
+                require(std::memcmp(out.data(),parallel_control.data(),out.size()*sizeof(float))==0,
+                    "parallel reads changed the identical compact graph arithmetic");
+                std::printf("PARALLEL-COMPACT-EXACT rows=%d floats=%zu bitexact=1\n",rows,out.size());
+#endif
+                if(pipeline_override>=0) {
+                    std::int64_t calls=0,bytes=0,ring=0;
+                    require(TSGgml_HostMoeFilePipelineStats(&calls,&bytes,&ring)==1,"pipeline stats failed");
+                    require((pipeline_override==1 && rows>=64) ? ring>0 && ring<=16u<<20 && calls>0 && bytes>0
+                        : ring==0,"scoped pipeline threshold or disable was ignored");
+                }
                 const auto gpu_reference=out;
                 const auto calls=ledger.calls;
                 const auto live=ledger.live;
@@ -331,11 +410,12 @@ int main(int argc,char** argv) {
         if(cuda) std::printf("PASS: %d checks, PUBLIC API compact CUDA configured shapes, ordinary-CUDA oracle, bounded CPU quota/duplicate fallback, reuse/trim; host peak %lld device peak %lld bytes\n",checks,static_cast<long long>(ledger.host_peak),static_cast<long long>(ledger.device_peak));
         else std::printf("PASS: %d checks, PUBLIC API B1/8/31/129/257/512/513 CPU graph bitexact, quota/commit/retry/trim; host peak %lld bytes\n",checks,static_cast<long long>(ledger.peak));
 #else
-        if(cuda) std::printf("PASS: %d checks, compact CUDA N129/257/512/513 ordinary-CUDA oracle, bounded CPU quota/duplicate fallback, fault/drain/reuse/trim; host peak %lld device peak %lld bytes\n",checks,static_cast<long long>(ledger.host_peak),static_cast<long long>(ledger.device_peak));
+        if(cuda) std::printf("PASS: %d checks, compact CUDA configured batch shapes, ordinary-CUDA oracle, bounded CPU quota/duplicate fallback, fault/drain/reuse/trim; host peak %lld device peak %lld bytes\n",checks,static_cast<long long>(ledger.host_peak),static_cast<long long>(ledger.device_peak));
         else std::printf("PASS: %d checks, N1/8 dedicated decode and N129/257/512/513 CPU full-graph bitexact, host peak %lld bytes\n",checks,static_cast<long long>(ledger.peak));
 #endif
     } catch(const std::exception& e) { std::fprintf(stderr,"FAIL: %s; native=%s\n",e.what(),TSGgml_GetLastError()); result=1; }
     if(scope) { std::int64_t n=0; if(!TSGgml_EndHostMoeExpertCacheScope(scope,&n)) result=1; }
+    if(pipeline_scope && !TSGgml_EndHostMoeFilePipelineScope(pipeline_scope)) result=1;
     TSGgml_Shutdown();
     if(attached && !TSGgml_DetachSharedCacheBudget(&ledger)) result=1;
     std::error_code ec; std::filesystem::remove_all(dir,ec);

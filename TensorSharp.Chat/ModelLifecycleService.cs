@@ -24,7 +24,7 @@ namespace TensorSharp.Server
         private readonly Func<string, string, BackendType, UnifiedMemorySessionHandle> _createUnifiedSession;
         private UnifiedMemorySessionHandle _unifiedSession;
         private UnifiedMemorySessionHandle _pendingUnifiedSession;
-        private UnifiedMemoryModelSession _pendingFailedUnifiedSession;
+        private IUnifiedMemoryModelSession _pendingFailedUnifiedSession;
         private bool _unifiedMemoryEnabled;
 
         private ModelBase _model;

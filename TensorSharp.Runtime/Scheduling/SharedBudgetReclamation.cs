@@ -55,6 +55,20 @@ internal sealed class SharedBudgetReclamation
     private static bool Conflicts(IReadOnlyList<MemoryCharge> a, IReadOnlyList<MemoryCharge> b) =>
         a.Any(x => x.Bytes > 0 && b.Any(y => y.Bytes > 0 && x.Pool == y.Pool));
 
+    private static MemoryCharge[] NormalizeDemandPeak(IReadOnlyList<MemoryCharge> peak)
+    {
+        ArgumentNullException.ThrowIfNull(peak);
+        var totals = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var charge in peak)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(charge.Pool);
+            ArgumentOutOfRangeException.ThrowIfNegative(charge.Bytes);
+            totals[charge.Pool] = checked(totals.GetValueOrDefault(charge.Pool) + charge.Bytes);
+        }
+        return totals.Where(pair => pair.Value > 0).OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new MemoryCharge(pair.Key, pair.Value)).ToArray();
+    }
+
     private bool HasOlderConflict(Registration owner, IReadOnlyList<MemoryCharge> peak)
     {
         foreach (var demand in _demands)
@@ -96,6 +110,10 @@ internal sealed class SharedBudgetReclamation
             lock (group._gate)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
+                // Validate every original charge, including zero-byte pools,
+                // before changing a queue entry. FIFO/wait-only paths bypass
+                // TryReserve; this return value is not allocation permission.
+                _ = budget.CanEverFitConfiguredCeiling(peak);
                 if (_pending != null && !ReferenceEquals(_pending.Value.Request, request)) RemoveDemand();
                 if (waitOnly || group.HasOlderConflict(this, peak)) result = null;
                 else
@@ -108,10 +126,25 @@ internal sealed class SharedBudgetReclamation
                 {
                     if (RemoveDemand()) targets = group.Peers(this);
                 }
-                else if (_pending == null)
+                else
                 {
-                    _pending = group._demands.AddLast(new Demand(this, request, peak.ToArray()));
-                    targets = group.Peers(this);
+                    var currentPeak = NormalizeDemandPeak(peak);
+                    if (_pending == null)
+                    {
+                        _pending = group._demands.AddLast(new Demand(this, request, currentPeak));
+                        targets = group.Peers(this);
+                    }
+                    else if (!_pending.Value.Peak.SequenceEqual(currentPeak))
+                    {
+                        // A physical boundary can re-estimate the same request's
+                        // peak. Keep its FIFO position, but retire the old demand
+                        // so old leases stop and donors get one fresh attempt.
+                        // Equivalent charge ordering/splits/zeros do not wake peers
+                        // or reset bounded attempts in the same budget generation.
+                        group._attempts.Remove(_pending.Value);
+                        _pending.Value = new Demand(this, request, currentPeak);
+                        targets = group.Peers(this);
+                    }
                 }
             }
             SharedBudgetReclamation.Wake(targets);

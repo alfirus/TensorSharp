@@ -679,6 +679,16 @@ namespace TensorSharp.Server
                 cacheScope: cacheScope,
                 publicCheckpointBoundaries: publicCheckpointBoundaries);
 
+            // Explicit validation only: capture the actual final engine input,
+            // including host tools, context handling and media expansion. A
+            // separately rendered user question is not a same-input oracle.
+            // Leave this off for performance measurements and normal serving.
+            if (Environment.GetEnvironmentVariable("TS_VALIDATION_TOKEN_TRACE") == "1")
+                _logger.LogInformation(
+                    "generation.validation.input internal={InternalRequestId} session={SessionId} architecture={Architecture} compacted={HistoryCompacted} thinking={Thinking} maxNewTokens={MaxNewTokens} tokens={Tokens}",
+                    requestId, session?.Id ?? "(none)", arch, historyCompacted,
+                    enableThinking, effectiveMaxTokens, string.Join(",", seq.PromptTokens));
+
             bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
             if (historyCompacted)
                 yield return ChatStreamUpdate.Text(string.Empty) with { HistoryCompacted = true };
@@ -912,6 +922,11 @@ namespace TensorSharp.Server
             var generationTimings = GenerationTimingTelemetry.Log(_logger, requestId, session?.Id,
                 completion, promptTokenCount, kvCacheReusedTokens, generatedTokens.Count,
                 totalSw.ElapsedTicks, finishReason);
+
+            if (Environment.GetEnvironmentVariable("TS_VALIDATION_TOKEN_TRACE") == "1")
+                _logger.LogInformation(
+                    "generation.validation.output internal={InternalRequestId} finishReason={FinishReason} computedTokens={ComputedTokens} tokens={Tokens}",
+                    requestId, finishReason, seq.NumComputedTokens, string.Join(",", seq.OutputTokens));
 
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next

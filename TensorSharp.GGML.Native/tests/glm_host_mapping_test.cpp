@@ -161,10 +161,15 @@ static void test_mapping(const fs::path & directory) {
     require(tsg_glm_host::prefault_pages(mapped_bytes + 4095, 1, 4096) == 1, "single byte at page end stays in bounds");
     require(tsg_glm_host::prefault_pages(nullptr, 0, 4096) == 0, "empty warming set does not dereference null");
     require(std::memcmp(mapping.data(), expected.data(), expected.size()) == 0, "prefaulting must not modify weights");
+    const void* original_address = mapping.data();
+    require(mapping.trim_residency(), "quiescent read-only mapping residency hint accepted");
+    require(mapping.data() == original_address && mapping.size() == expected.size(), "trim preserves exact pointer and length");
+    require(std::memcmp(mapping.data(), expected.data(), expected.size()) == 0, "trim refaults every original file byte");
     const fs::path renamed = directory / "renamed.bin";
     fs::rename(file, renamed); // Windows requires FILE_SHARE_DELETE on live file handles
     require(std::memcmp(mapping.data(), expected.data(), expected.size()) == 0, "view survives rename and closed source handles");
     require(mapping.close() && mapping.close() && !mapping.data() && mapping.size() == 0, "close is idempotent");
+    require(mapping.trim_residency(), "empty mapping trim is idempotent");
     open_checked(mapping, renamed);
     require(mapping.close(), "reopen after close releases cleanly");
 

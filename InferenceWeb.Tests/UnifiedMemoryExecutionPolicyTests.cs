@@ -28,9 +28,10 @@ public sealed class UnifiedMemoryExecutionPolicyTests
     private static SequenceState Request(string id) => new(id, [1, 2, 3, 4], 3, 8, SamplingConfig.Greedy);
     private sealed class NoOpScope : IDisposable { public void Dispose() { } }
 
-    private static SchedulerConfig HolderConfig(RequestMemoryAdmission admission, bool joint = false) => new()
+    private static SchedulerConfig HolderConfig(RequestMemoryAdmission admission, bool joint = false, int lanes = 2,
+        int blocks = 64) => new()
     {
-        BlockSize = 8, NumBlocks = 64, MaxNumRunningSequences = 2,
+        BlockSize = 8, NumBlocks = blocks, MaxNumRunningSequences = lanes,
         MaxNumBatchedTokens = 8, MaxPrefillChunkSize = 4, SoloPrefillChunkSize = 8,
         PrefillChunkTokenLimit = 8, EnablePrefixCaching = false, StopRepetition = false,
         MemoryAdmission = admission,
@@ -158,6 +159,10 @@ public sealed class UnifiedMemoryExecutionPolicyTests
         public bool PauseOnSecondHolder;
         public int UnscopedBinds, JointGraphs;
         public bool EnableJoint;
+        public bool PauseOnTripleJoint;
+        public ManualResetEventSlim TripleJointForward { get; } = new();
+        public ManualResetEventSlim AllowTripleJointForward { get; } = new();
+        public List<int> JointWidths { get; } = new();
         public string? RefusePrepare;
         private BudgetReservation? _jointEnvelope, _jointAllocation;
         private SequenceState? _scope;
@@ -197,13 +202,20 @@ public sealed class UnifiedMemoryExecutionPolicyTests
         public bool TryForwardBatchedFusedDecodeSampled(IReadOnlyList<string> ids, int[] tokens, int[] positions, int[] next)
         {
             if (!EnableJoint) return false;
-            Assert.Null(_scope); Assert.NotNull(_jointEnvelope); Assert.Equal(2, ids.Count);
+            Assert.Null(_scope); Assert.NotNull(_jointEnvelope); Assert.InRange(ids.Count, 2, 8);
+            JointWidths.Add(ids.Count);
+            if (ids.Count == 3 && !TripleJointForward.IsSet)
+            {
+                TripleJointForward.Set();
+                if (PauseOnTripleJoint && !AllowTripleJointForward.Wait(TimeSpan.FromSeconds(4)))
+                    throw new TimeoutException("Triple joint barrier");
+            }
             _jointAllocation ??= _jointEnvelope!.TryTake([new("device", 48)])
                 ?? throw new MemoryPressureException("Missing shared graph reservation");
             if (JointGraphs == 0) _jointAllocation.Commit();
             JointGraphs++;
             for (int i = 0; i < ids.Count; ++i)
-            { Assert.True(Owners.ContainsKey(ids[i])); next[i] = ids[i] == "a" ? 5 : 6; }
+            { Assert.True(Owners.ContainsKey(ids[i])); next[i] = ExpectedToken(ids[i]); }
             return true;
         }
         public float[] Forward(int[] tokens)
@@ -221,8 +233,9 @@ public sealed class UnifiedMemoryExecutionPolicyTests
                     throw new TimeoutException("Second holder barrier");
             }
             ForwardOrder.Add(_bound!);
-            var logits = new float[8]; logits[_bound == "a" ? 5 : 6] = 10; return logits;
+            var logits = new float[8]; logits[ExpectedToken(_bound!)] = 10; return logits;
         }
+        private static int ExpectedToken(string id) => id == "a" ? 5 : id == "b" ? 6 : 7;
         public void OnSequenceReleased(string id)
         {
             if (Owners.Remove(id, out var owner)) { owner.Dispose(); ForwardOrder.Add("released:" + id); }
@@ -238,13 +251,48 @@ public sealed class UnifiedMemoryExecutionPolicyTests
         public void TruncateKVCache(int tokens) => throw new InvalidOperationException("Cannot rewind hybrid state");
         public void Dispose()
         {
-            AllowFirstForward.Set(); AllowSecondForward.Set();
+            AllowFirstForward.Set(); AllowSecondForward.Set(); AllowTripleJointForward.Set();
             foreach (var owner in Owners.Values) owner.Dispose(); Owners.Clear();
             _jointAllocation?.Dispose(); _jointAllocation = null;
         }
         public long ComputeKVBlockByteSize(int count) => 0;
         public bool TryExtractKVBlock(int start, int count, Span<byte> target) => false;
         public bool TryInjectKVBlock(int start, int count, ReadOnlySpan<byte> source) => false;
+    }
+
+    [Fact]
+    public async Task ThreeLargeAllowanceRequestsJoinOneDecodeCallAndCancellationPreservesBothNeighbours()
+    {
+        var budget = new MemoryBudget([new("device", 256)]);
+        using var joint = budget.Reserve([new("device", 48)]);
+        using var model = new HolderModel { EnableJoint = true, PauseOnTripleJoint = true };
+        var admission = new RequestMemoryAdmission(budget, _ => [new("device", 48)])
+        {
+            UsePerSequenceHolders = true, BeforeAdmissionWithRunning = (_, _) => [new("device", 256)],
+            EnterSerialExecution = model.Enter, EnterBatchedExecution = _ => model.EnterJoint(joint)
+        };
+        using var engine = new InferenceEngine(model, HolderConfig(admission, joint: true, lanes: 3, blocks: 8192));
+        using var cancellation = new CancellationTokenSource();
+        var first = engine.SubmitRequest(new SequenceState("a", [1, 2, 3, 4], 20000, 8, SamplingConfig.Greedy), cancellation.Token);
+        Assert.True(model.FirstForward.Wait(TimeSpan.FromSeconds(3)));
+        var second = engine.SubmitRequest(new SequenceState("b", [1, 2, 3, 4], 12, 8, SamplingConfig.Greedy));
+        var third = engine.SubmitRequest(new SequenceState("c", [1, 2, 3, 4], 12, 8, SamplingConfig.Greedy));
+        model.AllowFirstForward.Set();
+        Assert.True(model.TripleJointForward.Wait(TimeSpan.FromSeconds(3)));
+        cancellation.Cancel(); model.AllowTripleJointForward.Set();
+        await Task.WhenAll(first.Completion, second.Completion, third.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedAborted, first.Sequence.Status);
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, second.Sequence.Status);
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, third.Sequence.Status);
+        Assert.Contains(3, model.JointWidths);
+        Assert.Contains(2, model.JointWidths);
+        Assert.Equal(12, second.Sequence.OutputTokens.Count); Assert.Equal(12, third.Sequence.OutputTokens.Count);
+        Assert.All(first.Sequence.OutputTokens, token => Assert.Equal(5, token));
+        Assert.All(second.Sequence.OutputTokens, token => Assert.Equal(6, token));
+        Assert.All(third.Sequence.OutputTokens, token => Assert.Equal(7, token));
+        Assert.Empty(model.Owners);
+        engine.Dispose(); model.Dispose(); joint.Dispose();
+        Assert.Equal(256, budget.Snapshot().Single().Available);
     }
 
     [Fact]
