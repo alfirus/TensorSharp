@@ -63,6 +63,28 @@ public sealed class LocalizationTests : IDisposable
         try { Directory.Delete(_root, true); } catch { }
     }
 
+    [Fact]
+    public void LanguageChangesRefreshVisiblePagesWithoutMutatingTheDisabledNativeFlyout()
+    {
+        // This project cannot host UIKit. Guard the application-side trigger from the
+        // native crash report: ShellContent.Title -> BaseShellItem.PropertyChanged ->
+        // UIContainerCell.ReloadRow -> NSArray containing a null IndexPath. The native
+        // language validation tool also exercises the real picker and navigation.
+        string appRoot = Path.Combine(Repo, "TensorAgent", "src", "TensorAgent.Maui");
+        string shell = File.ReadAllText(Path.Combine(appRoot, "AppShell.cs"));
+        Assert.Contains("FlyoutBehavior = FlyoutBehavior.Disabled", shell);
+        Assert.DoesNotMatch(@"\bLoc\s*\.\s*Changed\s*\+=", shell);
+        Assert.DoesNotMatch(@"\bmain\s*\.\s*(?:Title\s*=|SetBinding\s*\()", shell);
+
+        // Removing the faulty hidden-cell refresh must not remove live localization
+        // from the destinations that the user actually sees.
+        foreach (string page in new[] { "MainPage.cs", "Pages/SessionsPage.cs", "Pages/ModelsPage.cs", "Pages/SettingsPage.cs", "Pages/AboutPage.cs" })
+        {
+            string source = File.ReadAllText(Path.Combine(appRoot, page));
+            Assert.Matches(@"\bLoc\s*\.\s*Changed\s*\+=", source);
+        }
+    }
+
     // =====================================================================================
     // which language
     // =====================================================================================

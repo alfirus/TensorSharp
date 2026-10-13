@@ -9,6 +9,7 @@ TensorSharp.Server.Host provides three API styles, a Jev-compatible decision end
 - **Jev-compatible** typed decisions (`/v1/systemone`, DiffusionGemma only)
 - **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`, `/api/skills`, `/api/image-edit`, `/api/image-edit/stream`, `/api/image-generate`, `/api/image-generate/stream`, `/api/video-generate`, `/api/video-generate/stream`)
 - **Utilities** (`/api/version`, `/api/queue/status`, `/health`)
+- **Personal knowledge** (`/api/knowledge`, opt-in with `TS_KNOWLEDGE_DIRECTORY`)
 
 Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The projector is **not auto-detected** by `TensorSharp.Server.Host`. The Web UI and compatibility endpoints expose only that startup model/projector pair; `/api/models/load` can reload the same pair on a supported backend, but it cannot choose a model on a model-less server or switch to another file at runtime.
 
@@ -24,6 +25,77 @@ curl http://127.0.0.1:5000/api/embed -H 'Content-Type: application/json' \
 ```
 
 See the [embedding guide](../docs/embeddings.md) for all fields, token-ID inputs, `base64`, `dimensions`, truncation, and retrieval quality.
+
+## Personal knowledge library
+
+This feature and response steering describe source after the `v2026.10.10` tag;
+use a source build until a release includes them. Enable a persistent library
+before starting the chat server (replace the paths and backend for your host):
+
+```bash
+export TS_KNOWLEDGE_DIRECTORY=/absolute/path/to/library
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model /absolute/path/to/chat-model.gguf --backend ggml_metal \
+  --host 127.0.0.1 --port 5001
+```
+
+TensorAgent enables its own library automatically and provides a collection
+manager in **Menu → Knowledge**. The standalone browser UI supports chat and
+steering; manage its collections through the API. The library adds no standalone
+user-authentication system, and collection IDs are scope rather than credentials.
+
+Create a collection, replace `COLLECTION_ID` below with the returned
+`collection.id`, then import one file per standalone upload request. The example
+uses the hosted filename's basename, `chat-model`, in the inference request:
+
+```bash
+curl http://127.0.0.1:5001/api/knowledge/collections \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Project references","description":"Local source material"}'
+
+curl http://127.0.0.1:5001/api/knowledge/collections/COLLECTION_ID/documents \
+  -F 'file=@/absolute/path/to/notes.md'
+
+curl http://127.0.0.1:5001/api/knowledge/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"launch requirements","collectionIds":["COLLECTION_ID"],"limit":4,"maxCharacters":6000}'
+
+curl http://127.0.0.1:5001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"chat-model","messages":[{"role":"user","content":"Summarize the launch requirements and cite your sources."}],"knowledgeCollections":["COLLECTION_ID"],"max_tokens":512,"stream":false}'
+```
+
+Use `collectionIds` in search/read bodies and `knowledgeCollections` in inference
+bodies, with that exact camel case in every supported protocol. The inference
+field selects at most 32 collections on `/api/chat`, `/v1/chat/completions`,
+`/v1/responses`, `/api/chat/ollama`, and `/api/generate`. The last supports
+retrieval without an agent loop. Missing or empty selection supplies no knowledge;
+invalid or deleted selections are rejected. It is not automatically available on
+every `/v1` endpoint. Uploading a source alone does not select it for inference.
+
+When tools are available, `knowledge_list`, `knowledge_search`, `knowledge_read`
+and `knowledge_open` refine evidence within the selected scope. Subagents inherit
+the scope. With code tools, `knowledge_open` can copy the complete original to
+the invoking agent's private workspace for calculations. `tool_choice: "none"`
+on compatible chat requests suppresses tools while retaining retrieval.
+
+OpenAI/Ollama responses add `knowledge_sources`, `knowledge_citation_repairs`,
+`knowledge_tool_steps` and `knowledge_tool_steps_truncated`. Streaming attaches
+them to the terminal Chat Completions chunk, `response.completed.response`, or
+Ollama `done: true` record. Sources describe citations used in the answer, rather
+than every search hit; they do not prove every generated claim. Citation
+normalization buffers final answer text before standard append-only deltas, so
+reasoning and tool activity may arrive before the first answer text. Structured
+outputs retain their schema-constrained content and expose sources as metadata.
+
+The [knowledge guide](../docs/knowledge-system.md) covers extraction statuses,
+local PDF OCR, optional embeddings, paginated listing, reindexing, versioned
+original downloads and all management routes. Images and sampled video require a
+compatible loaded vision model; audio can use a loaded audio tower or a configured
+`TS_JEV_TRANSCRIPTION_URL` companion. Reindex metadata-only sources after enabling
+the required capability.
+TensorAgent additionally supports batched files, recursive folders, saved-chat
+imports, collection rename, filters and safe previews.
 
 ## Current Contract
 
@@ -1068,6 +1140,26 @@ report how much was reused). Omit `sessionId` or pass `null` to use the shared
 `__default__` Web UI session. Pass `newChat: true` to clear tracked history
 before the next request without disposing the session.
 
+### Steering an active response
+
+The browser composer remains usable during reasoning or answering. Sending a
+new instruction interrupts the current response and continues from its partial
+answer and the new message; **Stop** interrupts without sending guidance.
+
+For a custom standalone Web UI client, send a new `/api/chat` request with the
+same dedicated `sessionId`, `replaceActive: true`, and your current `messages`
+including the last user instruction. Retain the partial assistant content you
+want the replacement to use. The service cancels the prior producer and queued
+replacements, then waits for generation, transcript and tool cleanup before
+preparing the new prompt. `replaceActive` on the shared default session returns
+HTTP 400; obtain a dedicated ID from `POST /api/sessions` first.
+
+TensorAgent's loopback endpoint uses `steer: true` with a final user message and
+reconstructs accepted conversation history after the interrupted turn unwinds.
+It may emit `steeringMessages` containing that canonical message list before
+generation frames. This app-specific field is separate from the standalone
+`replaceActive` contract; OpenAI/Ollama APIs have no equivalent steering flag.
+
 ### Streaming Chat
 
 ```bash
@@ -1091,6 +1183,8 @@ Event shapes:
 | `replace`, `diffusionStep`, `diffusionTotal`, `preview` | each DiffusionGemma denoising preview and final replacement | replace the whole assistant message body instead of appending a token |
 | `replace` alone | when text already streamed as the answer proves to be reasoning (Nemotron-H Reasoning-128K closing a reasoning block its thinking-off prompt had closed) | the whole answer of the turn so far, every round included; it follows the `thinking` frame that carries the reasoning, and later `token` frames append to it |
 | `thinking` | each parsed reasoning chunk (only when the model emits one) | streaming chain-of-thought |
+| `knowledgeSources` | after citation normalization on a selected-knowledge request | authoritative source identity/location objects for citations used in the final answer |
+| `replace`, then `knowledgeCitationRepairs` | when a selected-knowledge answer needs a supported local citation repair | replace the complete answer and report the repair count; this also applies outside DiffusionGemma |
 | `tool_calls` | when the model emits a caller-defined tool call | array of `{name, arguments}`; built-in skill/code calls are executed in process instead |
 | `tool_progress`, `tool`, `text`, `seconds`, `detail`, `agents` | while an in-process skill/code/agent call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished`. While `wait_agent` is `running`, `agents` is a snapshot of every sub-agent in the request (`agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`, `tool_status`, `detail`, `result`, `error`); otherwise it is `null` |
 | `skill_step`, `agent_id`, `skill`, `detail`, `ok`, `round`, `files` | after each in-process skill, code or agent tool call finishes | completion metadata for the tool, target and result; `agent_id` names the agent that made the call (`/root` for the main conversation); produced artifacts appear as optional `{name, bytes, url}` entries in `files` |

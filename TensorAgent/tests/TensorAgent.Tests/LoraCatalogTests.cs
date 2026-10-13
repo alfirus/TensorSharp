@@ -150,11 +150,11 @@ public sealed class LoraCatalogTests : IDisposable
     /// <summary>
     /// Qwen-Image 2.1 Turbo is step-distilled already, and the engine refuses a plug-in that
     /// brings a second schedule: no speed plug-in applies to a Turbo entry. A plug-in reaches a
-    /// Turbo entry only by naming it (<see cref="CatalogLora.AlsoFor"/>), which is done for the
-    /// style plug-ins a real picture validated there: Film Stills and Grainscape.
+    /// Turbo entry only by naming it (<see cref="CatalogLora.AlsoFor"/>). These planner checks
+    /// cover both quantizations; real-image validation is separately recorded in the model doc.
     /// </summary>
     [Fact]
-    public void ATurboEntryIsOfferedOnlyThePlugInsValidatedOnItAndNeverASpeedOne()
+    public void ATurboEntryOffersCompatibleAdaptersWithoutASecondSchedule()
     {
         string[] turbos = ModelCatalog.BuiltIn
             .Where(m => m.Family == CatalogFamily.QwenImage && m.ImageVariant == QwenImageVariant.Turbo).Select(m => m.Id).ToArray();
@@ -168,9 +168,9 @@ public sealed class LoraCatalogTests : IDisposable
         }
         foreach (string id in turbos)
         {
-            Assert.Equal(new[] { Film, Grain }, LoraCatalog.For(id).Select(l => l.Id));
+            Assert.Equal(new[] { Film, Grain, Casual, Voxel }, LoraCatalog.For(id).Select(l => l.Id));
             // What the LoRA sheet lists while that entry is loaded.
-            Assert.Equal(new[] { Film, Grain }, LoraCatalog.Offered(ModelCatalog.Find(id), ModelCatalog.BuiltIn).Select(l => l.Id));
+            Assert.Equal(new[] { Film, Grain, Casual, Voxel }, LoraCatalog.Offered(ModelCatalog.Find(id), ModelCatalog.BuiltIn).Select(l => l.Id));
         }
         // The base model, a chat model or nothing loaded: every plug-in of an offered model.
         Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn));
@@ -202,6 +202,29 @@ public sealed class LoraCatalogTests : IDisposable
         Assert.Equal(new[] { "Viggle Turbo", "Film Stills" },
             LoraSelection.Plan(new[] { new ImageLoraChoice(Viggle, 1f), new ImageLoraChoice(Film, 0.7f) },
                 LoraCatalog.QwenImage, store, editing: false, out _)!.Names);
+    }
+
+    [Theory]
+    [InlineData("qwen-image-2.1-turbo-adq4k")]
+    [InlineData("qwen-image-2.1-turbo-q8")]
+    public void NewTurboAdaptersKeepTheirStrengthsAndVoxelRequiresAPhoto(string modelId)
+    {
+        LoraStore store = StoreWith(Casual, Voxel);
+        var choices = new[] { new ImageLoraChoice(Casual, 0.8f), new ImageLoraChoice(Voxel, 1f) };
+
+        LoraPlan picture = LoraSelection.Plan(choices, modelId, store, editing: false, out string? error)!;
+        Assert.Null(error);
+        Assert.Equal(new[] { "Casual Phone Photo" }, picture.Names);
+        Assert.Equal(0.8f, Assert.Single(picture.Specs).Scale);
+
+        LoraPlan edit = LoraSelection.Plan(choices, modelId, store, editing: true, out error)!;
+        Assert.Null(error);
+        Assert.Equal(new[] { "Casual Phone Photo", "Voxel Style" }, edit.Names);
+        Assert.Equal(new float?[] { 0.8f, 1f }, edit.Specs.Select(s => s.Scale));
+        // Style/edit adapters must never override official Turbo's own eight-step schedule.
+        Assert.All(edit.Specs, spec => Assert.Null(spec.ConfigPath));
+        Assert.Equal("lbxstyle", LoraCatalog.Find(Casual)!.Trigger);
+        Assert.Equal("Transform the image into a voxel style", LoraCatalog.Find(Voxel)!.Trigger);
     }
 
     [Fact]
@@ -363,6 +386,8 @@ public sealed class LoraCatalogTests : IDisposable
     private const string Pruna = "qwen-image-2.1-pruna-8step";
     private const string Film = "qwen-image-2.1-film-stills";
     private const string Grain = "qwen-image-2.1-grainscape";
+    private const string Casual = "qwen-image-2.1-casual-phone";
+    private const string Voxel = "qwen-image-2.1-voxel-style";
 
     [Fact]
     public void AChoiceIsCheckedAndNormalisedBeforeItIsSaved()

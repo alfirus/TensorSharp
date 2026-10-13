@@ -259,6 +259,10 @@ namespace TensorSharp.Runtime
     /// </summary>
     public interface IOutputParser : IOutputProtocolParser
     {
+        /// <summary>For channel-based reasoning budgets, identifies buffered reasoning
+        /// tokens (including incomplete UTF-8 pieces) before visible text is emitted.</summary>
+        bool IsThinkingChannelOpen => false;
+
         /// <summary>Prime parser state when the prompt already opened a channel.
         /// Call before the first generated piece, after Init.</summary>
         void SetGenerationPromptSuffix(string? suffix) { }
@@ -2484,6 +2488,7 @@ namespace TensorSharp.Runtime
         private readonly StringBuilder _buffer = new();
         private readonly StringBuilder _toolArgs = new();
         private string? _currentRecipient;
+        public bool IsThinkingChannelOpen => _state == MState.ParsingContent && _currentRecipient == "self";
         private int _callIndex;
 
         private const string MsgStartTag = "<|start|>";
@@ -2514,6 +2519,18 @@ namespace TensorSharp.Runtime
             // token the model emits belongs to that message's HEADER (" to=self" or
             // straight to "<|message|>"). Start mid-header rather than hunting for
             // a <|start|> that has already been consumed by the prompt.
+        }
+
+        public void SetGenerationPromptSuffix(string? suffix)
+        {
+            // The thinking-off, tool-free prompt can finish the answer header before
+            // sampling. Its first generated letter is then content, not a partial
+            // routing header to buffer until the next control tag or stream end.
+            if (string.Equals(suffix, " to=user<|message|>", StringComparison.Ordinal))
+            {
+                _currentRecipient = "user";
+                _state = MState.ParsingContent;
+            }
         }
 
         public ParsedOutput Add(string text, bool done)

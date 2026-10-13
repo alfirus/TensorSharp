@@ -13,6 +13,7 @@
 // assistant tokens across turns.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Globalization;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -252,6 +253,10 @@ namespace TensorSharp.Server
     /// </summary>
     internal sealed class ChatTurnContext
     {
+        /// <summary>Optional host budget for brief retrieval planning. Does not reduce answer tokens
+        /// or override an explicitly configured TS_THINKING_BUDGET.</summary>
+        public int? ThinkingTokenLimit { get; set; }
+
         /// <summary>The engine cache scope (<see cref="SequenceState.CacheScope"/>), set by
         /// the first generation of the turn.</summary>
         public string CacheScope { get; set; }
@@ -642,12 +647,14 @@ namespace TensorSharp.Server
             var cfg = samplingConfig ?? SamplingConfig.Default;
             // A family whose prompt opens the block with thinking off too is budgeted as if asked.
             bool budgetThinking = ReasonsWhetherAsked(arch, enableThinking);
-            int thinkingBudget = ThinkingBudgetFor(effectiveMaxTokens, budgetThinking);
+            int thinkingBudget = ThinkingBudgetFor(effectiveMaxTokens, budgetThinking, turnContext.ThinkingTokenLimit);
             // With thinking off only a family whose model opens its channel itself is
             // given a (small) cap; WithThinkingBudget ignores it for every other family.
             int channelBudget = budgetThinking ? thinkingBudget : UnrequestedThinkingBudgetFor(effectiveMaxTokens);
+            string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking,
+                model.Config.ChatTemplate);
             cfg = WithThinkingBudget(cfg, model.Tokenizer, arch, channelBudget, out bool samplingEndsThinking,
-                budgetThinking, inputTokens);
+                budgetThinking, inputTokens, recordedSuffix, tools?.Count > 0);
 
             // Where the prompt every conversation on this host shares ends, so the
             // engine can checkpoint its state there once and start the next new chat
@@ -672,8 +679,6 @@ namespace TensorSharp.Server
                 cacheScope: cacheScope,
                 publicCheckpointBoundaries: publicCheckpointBoundaries);
 
-            string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking,
-                model.Config.ChatTemplate);
             bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
             if (historyCompacted)
                 yield return ChatStreamUpdate.Text(string.Empty) with { HistoryCompacted = true };
@@ -727,12 +732,16 @@ namespace TensorSharp.Server
             // trained budget-end token close reasoning in the sampler instead,
             // leaving the remaining allowance available for an answer.
             //
-            // Detected from the decoded text rather than the parser, because the parser
-            // runs a layer above this loop: while thinking is open the close marker has
-            // not appeared, and every reasoning family this host serves closes with
-            // </think>. A family that does not is simply never capped, which is the
-            // safe direction to be wrong in.
-            StringBuilder thinkingScan = thinkingBudget > 0 && !samplingEndsThinking ? new StringBuilder() : null;
+            // Tag-based protocols close with </think>. Message-channel protocols
+            // opt into their own parser below so visible answer/tool tokens cannot
+            // accidentally consume the reasoning budget.
+            int parsedThinkingBudget = budgetThinking ? thinkingBudget
+                : turnContext.ThinkingTokenLimit.HasValue ? channelBudget : 0;
+            ThinkingBudgetChannelCounter thinkingChannels = parsedThinkingBudget > 0 && !samplingEndsThinking
+                && ChatProtocolRegistry.For(arch)?.ThinkingBudgetUsesOutputParser == true
+                ? new ThinkingBudgetChannelCounter(arch, enableThinking, tools, recordedSuffix) : null;
+            StringBuilder thinkingScan = thinkingBudget > 0 && !samplingEndsThinking && thinkingChannels == null
+                ? new StringBuilder() : null;
             bool thinkingClosed = false;
             int thinkingTokens = 0;
             bool wasCancelled = false;
@@ -811,7 +820,14 @@ namespace TensorSharp.Server
                     finishReason = "stop_sequence";
                 }
 
-                if (thinkingScan != null && !thinkingClosed)
+                if ((cfg.MessageThinkingBudget != null && cfg.Grammar?.IsActive != true
+                        && seq.MessageThinkingBudgetExhaustedAt(generatedTokens.Count))
+                    || thinkingChannels?.Observe(piece, parsedThinkingBudget) == true)
+                {
+                    stopRequested = true;
+                    finishReason = "thinking_budget";
+                }
+                else if (thinkingScan != null && !thinkingClosed)
                 {
                     if (piece.Length > 0)
                         thinkingScan.Append(piece);
@@ -1282,6 +1298,8 @@ namespace TensorSharp.Server
         {
             if (string.IsNullOrEmpty(recordedSuffix))
                 return false;
+            if (recordedSuffix == ChatProtocolRegistry.For(arch)?.DirectAnswerGenerationSuffix)
+                return true;
             if (arch == "gemma4")
                 return recordedSuffix.EndsWith("<|channel>thought\n", StringComparison.Ordinal);
             return OutputParserFactory.ThinkingOffReplyMayReason(arch, chatTemplate, sampling);
@@ -1510,14 +1528,18 @@ namespace TensorSharp.Server
             ITokenizer tokenizer, List<int> promptTokens, string arch, bool enableThinking, string chatTemplate = null)
         {
             string suffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, enableThinking, chatTemplate);
+            string directAnswerSuffix = ChatProtocolRegistry.For(arch)?.DirectAnswerGenerationSuffix;
             // DiffusionGemma renders through the same channel-priming template family.
             bool gemma = arch == "gemma4" || arch == "diffusion-gemma" || arch == "diffusion_gemma";
-            if ((!gemma && string.IsNullOrEmpty(suffix)) || promptTokens == null || promptTokens.Count == 0 || tokenizer == null)
+            if ((!gemma && string.IsNullOrEmpty(suffix) && string.IsNullOrEmpty(directAnswerSuffix))
+                || promptTokens == null || promptTokens.Count == 0 || tokenizer == null)
                 return string.Empty;
             try
             {
                 int take = Math.Min(promptTokens.Count, 64);
                 string tail = tokenizer.Decode(promptTokens.GetRange(promptTokens.Count - take, take));
+                if (!string.IsNullOrEmpty(directAnswerSuffix) && tail.EndsWith(directAnswerSuffix, StringComparison.Ordinal))
+                    return directAnswerSuffix;
                 if (gemma)
                 {
                     // A publisher template may prime a channel, and older tracked
@@ -1531,7 +1553,7 @@ namespace TensorSharp.Server
                         return openChannel;
                     return string.Empty;
                 }
-                if (EndsWithFraming(tail, suffix))
+                if (!string.IsNullOrEmpty(suffix) && EndsWithFraming(tail, suffix))
                     return suffix;
                 string otherSuffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, !enableThinking, chatTemplate);
                 if (!string.IsNullOrEmpty(otherSuffix) && EndsWithFraming(tail, otherSuffix))
@@ -2057,7 +2079,7 @@ namespace TensorSharp.Server
             && index >= 0
             && index < history.Count
             && IsUserRole(history[index]?.Role)
-            && history[index] is not Skills.SkillChatLoop.HostCompletionCorrectionMessage
+            && history[index] is not HostContinuationMessage
             && !IsSyntheticToolResult(history, index);
 
         private static bool IsSyntheticToolResult(IReadOnlyList<ChatMessage> history, int index)
@@ -2660,7 +2682,7 @@ namespace TensorSharp.Server
         /// for a deployment that would rather have long reasoning than a guaranteed answer.
         /// </para>
         /// </summary>
-        internal static int ThinkingBudgetFor(int maxTokens, bool enableThinking)
+        internal static int ThinkingBudgetFor(int maxTokens, bool enableThinking, int? turnLimit = null)
         {
             if (!enableThinking || maxTokens <= 0)
                 return 0;
@@ -2677,7 +2699,8 @@ namespace TensorSharp.Server
             if (maxTokens < 512)
                 return 0;
 
-            return (int)(maxTokens * 0.75);
+            int budget = (int)(maxTokens * 0.75);
+            return turnLimit is > 0 ? Math.Min(budget, turnLimit.Value) : budget;
         }
 
         /// <summary>
@@ -2709,10 +2732,29 @@ namespace TensorSharp.Server
 
         internal static SamplingConfig WithThinkingBudget(SamplingConfig config, ITokenizer tokenizer,
             string architecture, int tokenBudget, out bool installed,
-            bool enableThinking = true, IReadOnlyList<int> promptTokens = null)
+            bool enableThinking = true, IReadOnlyList<int> promptTokens = null, string generationSuffix = null,
+            bool toolsAvailable = false)
         {
             installed = false;
             var protocol = ChatProtocolRegistry.For(architecture);
+            string transition = toolsAvailable ? protocol?.ThinkingBudgetToolTransitionText
+                : protocol?.ThinkingBudgetTransitionText;
+            if (transition != null && tokenBudget > 0
+                && tokenizer != null && config.Grammar?.IsActive != true)
+            {
+                // Do not treat literal spellings as protocol tokens. Unsupported or
+                // EOS framing retains the existing parser-based hard-stop fallback.
+                if (TryTokenizeThinkingTransition(tokenizer, transition, out var ids))
+                {
+                    SamplingConfig messageConfig = config.Clone();
+                    messageConfig.Grammar = config.Grammar?.Fork();
+                    messageConfig.ThinkingBudget = null;
+                    messageConfig.MessageThinkingBudget = new MessageThinkingTokenBudget(tokenBudget, tokenizer,
+                        architecture, generationSuffix, ids);
+                    installed = true;
+                    return messageConfig;
+                }
+            }
             string end = protocol?.ThinkingBudgetEndToken;
             if (end == null || tokenizer == null || config.Grammar?.IsActive == true)
                 return config;
@@ -2747,6 +2789,7 @@ namespace TensorSharp.Server
             // may reuse one delayed-grammar config across concurrent requests.
             SamplingConfig result = config.Clone();
             result.Grammar = config.Grammar?.Fork();
+            result.MessageThinkingBudget = null;
             // A channel the request did not ask for closes at a line break (see
             // ThinkingTokenBudget.CloseAtBoundary); a requested one keeps its exact budget.
             Func<int, bool> boundary = enableThinking ? null : EndsLine(tokenizer);
@@ -2756,6 +2799,27 @@ namespace TensorSharp.Server
                 closingTokenIds: enableThinking ? ClosingTextTokens(tokenizer, protocol.ThinkingBudgetClosingText, id) : null);
             installed = true;
             return result;
+        }
+
+        private static bool TryTokenizeThinkingTransition(ITokenizer tokenizer, string transition, out List<int> ids)
+        {
+            ids = null;
+            try
+            {
+                int end = TrainedSingleToken(tokenizer, "<|eom|>");
+                int start = TrainedSingleToken(tokenizer, "<|start|>");
+                int message = TrainedSingleToken(tokenizer, "<|message|>");
+                if (end < 0 || start < 0 || message < 0) return false;
+                var encoded = tokenizer.Encode(transition, addSpecial: false);
+                if (encoded == null || encoded.Count is < 3 or > 128
+                    || encoded[0] != end || encoded[1] != start
+                    || (transition.EndsWith("<|message|>", StringComparison.Ordinal) && encoded[^1] != message)
+                    || encoded.Any(id => id < 0 || id >= tokenizer.VocabSize || tokenizer.IsEos(id))
+                    || !string.Equals(tokenizer.Decode(encoded), transition, StringComparison.Ordinal)) return false;
+                ids = encoded;
+                return true;
+            }
+            catch (Exception error) when (error is not OutOfMemoryException and not StackOverflowException) { return false; }
         }
 
         private static Func<int, bool> EndsLine(ITokenizer tokenizer) => token =>

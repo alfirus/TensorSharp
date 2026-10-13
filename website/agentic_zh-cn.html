@@ -34,7 +34,8 @@
     <thead><tr><th>工作类型</th><th>应用提供的能力</th></tr></thead>
     <tbody>
       <tr><td>文本与多模态聊天</td><td>使用支持的文本模型进行本地问答、推理与工具调用；照片、视频、音频和文件支持取决于所加载模型。</td></tr>
-      <tr><td>图像生成与编辑</td><td><a href="models-image_zh-cn.html">Qwen-Image 2.1</a> 按描述生成图像，结合可选参考图编辑一张照片，并支持涂选区域、保留区域外像素。可比较结果或再次编辑，并从十二个 LoRA 插件中选择，包括四个加速适配器。目录要求 24 GB 内存档位。</td></tr>
+      <tr><td>个人知识库</td><td>导入文件、嵌套文件夹和已保存聊天，按聊天选择集合，检索带位置的证据并打开保留原文件。文档提取、PDF OCR、媒体派生文本与可选语义检索各有覆盖限制。<a href="knowledge_zh-cn.html">知识库指南 →</a></td></tr>
+      <tr><td>图像生成与编辑</td><td><a href="models-image_zh-cn.html">Qwen-Image 2.1</a> 按描述生成图像，结合可选参考图编辑一张照片，并支持涂选区域、保留区域外像素。可比较结果或再次编辑；基础版提供十四个 LoRA 插件，其中四个为加速适配器。Turbo 有固定 8 步配方，仅提供兼容风格/编辑插件；AD-Q4_K 与基础版为 24 GB 档位，Turbo Q8_0 为 32 GB。</td></tr>
       <tr><td>带声音的视频</td><td><a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3</a> 根据文字、关键帧或参考素材生成短片与配乐；TensorAgent 的 Apple 媒体实现将音频写入 MP4。目录要求 32 GB 内存档位。Windows 音视频生成尚未验证。</td></tr>
       <tr><td>文件、代码与浏览器工作</td><td>技能、工作区文件工具、命令执行与有界子智能体可创建供下载的产物。桌面版包含 Playwright 浏览器技能。iOS 使用嵌入运行时，不能启动浏览器进程；桌面命令和网络访问遵循 Sandbox 设置。</td></tr>
     </tbody>
@@ -43,6 +44,7 @@
   <p id="languages">界面、原生页面及分享扩展支持<strong>英语、简体中文、繁体中文、日语、韩语、西班牙语、法语与德语</strong>。设置 → 语言可覆盖系统语言。这会改变界面语言；模型能理解和生成的语言由所加载模型决定。</p>
   <p>使用硬件键盘时按 <kbd>Enter</kbd> 发送，<kbd>Shift</kbd>+<kbd>Enter</kbd> 换行。完成的文本轮次显示 token 数、耗时和吞吐；图像与视频轮次显示去噪进度。</p>
 
+  <p>生成时可以发送新指令引导回答：当前生成中断，已产生的回答保留，新指令在清理完成后继续。知识库与回答引导需要 <code>v2026.10.10</code> 后的构建。<a href="tensoragent_zh-cn.html#steering">使用说明 →</a></p>
   <h2 id="ios">iPhone 与 iPad 上的 TensorAgent</h2>
   <p><strong>TensorAgent</strong> 将本地聊天与智能体体验打包为 .NET MAUI iOS/iPadOS 应用。引擎以 iOS <code>.xcframework</code> 静态链接，在真机上使用 <code>ggml_metal</code>，真机上的备选后端是 <code>ggml_cpu</code>，模拟器上也只有 <code>ggml_cpu</code>；iOS 端不构建 MLX。应用与服务端共享与宿主无关的聊天流水线（<code>TensorSharp.Chat</code>）；由于 iOS 没有 ASP.NET Core runtime pack，UI 通过进程内 loopback server 提供。共享的是 API 而不是页面：手机上是它自己的页面，按拇指而不是鼠标与宽窗口来排布，但绑定同一套 <code>WebUiChatService</code> 与 <code>SkillsService</code> 路由。</p>
   <figure class="page-shot phone">
@@ -71,7 +73,8 @@
   <p>同一个 <code>AgentAppHost</code> 也能运行在 macOS、Linux 与 Windows 上。在这些平台上，<code>AgentExecutionMode.Auto</code>（或 <code>Process</code>）会以原生进程、在桌面 OS 沙箱中运行命令与技能脚本，而不是使用内嵌运行时。设置了 <code>networkHosts</code> 白名单时，这一桌面后端会拒绝需要联网的启动，而不是放宽它无法强制执行的访问范围。</p>
   <h3 id="desktop">Mac 与 Windows 上的 TensorAgent</h3>
   <p><a href="tensoragent_zh-cn.html#install-macos">macOS 安装</a> · <a href="tensoragent_zh-cn.html#install-windows">Windows 安装</a> · <a href="tensoragent_zh-cn.html#first-run">选择第一个模型</a> · <a href="tensoragent_zh-cn.html#tools">配置代码与浏览器工具</a></p>
-  <p>同一个项目还能构建桌面版 TensorAgent：Mac 应用（Mac Catalyst）与 Windows 应用（WinUI）。桌面应用保留同一个页面、模型目录、会话与技能，并以桌面的约束取代手机的约束。在 Mac 上，模型目录还提供五个手机内存装不下的模型：4 位量化的 Qwen3.8 27B 与 Muse-Glimmer 30B（32 GB）；Qwen-Image 2.1（24 GB），它可以按描述生成图片，或修改附上的照片，并可在对话中选用十二个 LoRA 插件（其中四个把 40 步缩短到 4 至 8 步）；以两个检查点提供的 MiniMax-H3（32 GB），它可以按描述、从一张起始照片，或围绕要出现在画面中的照片、视频片段与录音，生成带原声的短视频；以及 2 位量化的 Qwen3.8 Flash Next（48 GB），一个 125B 的混合专家模型（每个 token 约激活 6B），它 78.9 GB 的文件比 48 GB Mac 的内存还大：在这样的 Mac 上，引擎只让其中 18.3 GB 常驻，其余部分（n-gram 表与 33 层的专家）在 token 需要时从 SSD 读取。引擎是桌面版 <code>GgmlOps</code> 库（Mac 上使用 <code>ggml_metal</code>；Windows 上在引擎包含且机器能运行时使用 CUDA 或 Vulkan）。模型编写的代码以真实的 <code>bash</code>、<code>python3</code>、<code>node</code> 与浏览器进程运行：在 Mac 上由 Seatbelt 约束；在 Windows 上只有打开<strong>不使用沙箱运行</strong>后才会运行，因为 Windows 无法约束它们。因此所有技能都随应用发布，包括 Playwright 技能。引擎使用桌面内存默认值（三个大型对话模型沿用手机的缓存预算，这让 Qwen3.8 27B 下的应用内存占用保持在 8.8 GB，而不是 18.8 GB）；生成过程在其他窗口之后仍会继续，模型工作期间会阻止 App Nap 与闲置睡眠。在 M5 Pro 上以 Gemma 4 E2B 实测，Mac 应用的解码速度与运行在 CoreCLR 上的同一份宿主代码相差不到 3%，每一轮的首个 token 约晚 60&nbsp;毫秒，因为 .NET 以 Mono 运行 Mac Catalyst 应用。Windows Debug 与 Release 版于 2026-10-01 在 Windows x64、RTX 3080 Laptop 上构建并运行，检查了聊天、文件、代码工具、合成视觉问答、取消和会话恢复。这不覆盖目录下载、原生选择器、音视频生成、所有模型/后端或长时间运行；确切覆盖范围与显式跳过项见 TensorAgent README。</p>
+  <p>同一个项目构建 Mac Catalyst 与 Windows WinUI 桌面 TensorAgent，共享页面、会话、技能与可搜索的模型家族目录。当前目录共 38 个条目，包含较大的 Gemma/Qwen、Muse-Glimmer、GPT OSS、Nemotron、Mistral、Hunyuan、DiffusionGemma、DeepSeek 与 GLM，以及 Qwen-Image 2.1/Turbo 和两个 MiniMax-H3 检查点。系统内存档位决定是否可加载，新增条目大多仍为实验性；元数据、哈希与容量检查不能证明所有模型/设备推理通过。Qwen-Image 2.1 Turbo 提供 AD-Q4_K（24 GB）与 Q8_0（32 GB）两种固定 8 步条目。Qwen3.8 Flash Next 提供 48 GB 的 UD-Q2_K_XL 和实验性 32 GB UD-IQ1_M 条目，使用映射 n-gram/专家权重按需读取；实际性能取决于内存、GPU 与 SSD。</p>
+  <p>桌面使用 <code>GgmlOps</code>（Mac 为 <code>ggml_metal</code>，Windows 按构建/设备能力选择后端）。代码与浏览器技能运行真实进程；Mac 使用 Seatbelt，Windows 需启用<strong>不使用沙箱运行</strong>。后台窗口中的生成继续运行，工作期间阻止 App Nap 与闲置睡眠。缓存按目录预算分配，lean-cache 条目采用保守分配；较早一次 Qwen3.8 27B 测量中，应用内存从 18.8 GB 降到 8.8 GB。在 M5 Pro / Gemma 4 E2B 上，Mac 应用的解码速度与同一份 CoreCLR 宿主代码相差不到 3%，首 token 约晚 60 毫秒；这是特定模型/设备的测量。2026-10-01 的 Windows x64 / RTX 3080 Laptop Debug 与 Release 检查覆盖特定聊天、文件、代码、合成视觉、取消与恢复，不覆盖目录下载、原生选择器、音视频生成、所有模型/后端或长时间运行。确切记录见 TensorAgent README。</p>
   <figure class="page-shot">
     <img src="assets/screenshots/tensoragent-mac.png" alt="Mac 上的 TensorAgent：Qwen-Image 2.1 将 TensorSharp 横幅背景改为深蓝色星空并保留文字，结果下方提供比较原图和再次编辑按钮" width="3018" height="1900" loading="lazy">
     <figcaption>Qwen-Image 2.1（Q4_K_M）在原生 Mac 应用中运行于 <code>ggml_metal</code>，机器为 48 GB 内存的 Apple M5 Pro。保存的图像编辑会话将横幅背景改为深蓝色星空并保留文字；<strong>比较原图</strong>和<strong>再次编辑</strong>可查看与继续编辑。截图于 2026-10-02 从当前 Release 应用捕获，不是一次新的推理计时测量。</figcaption>

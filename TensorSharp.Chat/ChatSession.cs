@@ -40,6 +40,9 @@ namespace TensorSharp.Server
         /// </summary>
         internal ConversationTranscriptStore Transcripts { get; }
 
+        /// <summary>Dedicated Web UI requests wait for prior cancellation and recording.</summary>
+        internal TensorSharp.Chat.WebUiTurnCoordinator WebUiTurns { get; } = new();
+
         /// <summary>Number of conversation positions with a recorded assistant turn
         /// (diagnostics and tests).</summary>
         public int TrackedTurnCount => Transcripts.Count;

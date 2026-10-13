@@ -14,6 +14,8 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.Knowledge;
+using TensorSharp.Server.Knowledge;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.RequestParsers;
 using TensorSharp.Server.Responses;
@@ -38,6 +40,7 @@ namespace TensorSharp.Server.ProtocolAdapters;
 public sealed class OpenAIResponsesAdapter
 {
     private readonly ModelService _svc;
+    private readonly KnowledgeStore? _knowledge;
     private readonly ServerHostingOptions _options;
     private readonly UploadStoragePolicy _uploads;
     private readonly SkillRegistry _skills;
@@ -59,7 +62,20 @@ public sealed class OpenAIResponsesAdapter
         SessionWorkspaceManager workspaces,
         ILoggerFactory loggerFactory,
         IResponsesStore store)
+        : this(svc, options, uploads, skills, codeRunner, workspaces, loggerFactory, store, null) { }
+
+    public OpenAIResponsesAdapter(
+        ModelService svc,
+        ServerHostingOptions options,
+        UploadStoragePolicy uploads,
+        SkillRegistry skills,
+        ICodeRunner? codeRunner,
+        SessionWorkspaceManager workspaces,
+        ILoggerFactory loggerFactory,
+        IResponsesStore store,
+        KnowledgeStore? knowledge = null)
     {
+        _knowledge = knowledge;
         _svc = svc ?? throw new ArgumentNullException(nameof(svc));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
@@ -124,6 +140,9 @@ public sealed class OpenAIResponsesAdapter
         int maxOutputTokens = _options.ResolveMaxTokens(requestedOutputTokens);
 
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
+        var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
+            reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
+        if (knowledge == null) return;
         List<ChatMessage> messages;
         try
         {
@@ -143,6 +162,9 @@ public sealed class OpenAIResponsesAdapter
             return;
         }
         var tools = ToolFunctionParser.ParseOpenAIResponses(body);
+        bool toolsDisabled = body.TryGetProperty("tool_choice", out var toolChoice)
+            && toolChoice.ValueKind == JsonValueKind.String && toolChoice.GetString() == "none";
+        if (toolsDisabled) tools = null;
         // Same contract as /v1/chat/completions: a block-diffusion model has no
         // tool-call loop, so tools are refused up front rather than answered with prose.
         if (_svc.IsDiffusionModel && tools is { Count: > 0 })
@@ -194,14 +216,16 @@ public sealed class OpenAIResponsesAdapter
             return;
 
         using RequestWorkspaceLease? workspaceLease = RequestWorkspaceLease.Acquire(
-            _workspaces, _codeRunner, _svc.Architecture, allowTools: responseFormat == null);
+            _workspaces, _codeRunner, _svc.Architecture, allowTools: responseFormat == null && !toolsDisabled);
 
         var skillPlan = SkillRequestPlan.Create(
             _skills, requestedSkills, SkillSelectionParser.ParseDiscovery(body), tools,
             _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills,
-            allowTools: responseFormat == null, codeRunner: _codeRunner,
+            allowTools: responseFormat == null && !toolsDisabled, codeRunner: _codeRunner,
             workspace: workspaceLease?.Workspace, logger: logger,
-            multiAgent: SkillSelectionParser.ParseMultiAgent(body));
+            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope);
+
+        knowledge.Plan = skillPlan;
 
         if (unknownSkills.Count > 0)
         {
@@ -226,17 +250,21 @@ public sealed class OpenAIResponsesAdapter
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered);
         }
 
+        inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
+            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxOutputTokens, effectiveTools, enableThinking)).ConfigureAwait(false);
+        if (inferenceMessages == null) return;
+
         if (stream)
         {
             await StreamResponseAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
                 inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
-                skillPlan, logger).ConfigureAwait(false);
+                skillPlan, logger, knowledge).ConfigureAwait(false);
         }
         else
         {
             await CompleteSyncAsync(ctx, requestId, modelName!, instructions, maxOutputTokens,
                 inferenceMessages, samplingConfig, effectiveTools, enableThinking, responseFormat, store,
-                skillPlan, logger).ConfigureAwait(false);
+                skillPlan, logger, knowledge).ConfigureAwait(false);
         }
     }
 
@@ -297,7 +325,8 @@ public sealed class OpenAIResponsesAdapter
         StructuredOutputFormat? responseFormat,
         bool store,
         SkillRequestPlan? skillPlan,
-        ILogger skillLogger)
+        ILogger skillLogger,
+        KnowledgeProtocolRequest knowledge)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -313,6 +342,7 @@ public sealed class OpenAIResponsesAdapter
         await foreach (var update
             in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking, skillPlan, skillLogger).ConfigureAwait(false))
         {
+            knowledge.Observe(update);
             if (!update.Done)
             {
                 collector.Add(update);
@@ -344,14 +374,14 @@ public sealed class OpenAIResponsesAdapter
                 await WriteErrorAsync(ctx, 422, normalized.ErrorMessage, normalized.Errors, "invalid_response_error").ConfigureAwait(false);
                 return;
             }
-            output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), normalized.NormalizedContent, itemStatus));
+            output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), knowledge.Normalize(normalized.NormalizedContent, structured: true), itemStatus));
         }
         else if (useParser || collector.IsParsed)
         {
             var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools);
 
             if (!string.IsNullOrEmpty(parsed.Content))
-                output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), parsed.Content, itemStatus));
+                output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), knowledge.Normalize(parsed.Content), itemStatus));
 
             if (parsed.ToolCalls != null)
                 foreach (var call in parsed.ToolCalls)
@@ -360,13 +390,13 @@ public sealed class OpenAIResponsesAdapter
         }
         else
         {
-            output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), rawOutput, itemStatus));
+            output.Add(OpenAIResponsesFactory.OutputMessageItem(OpenAIResponsesFactory.NewMessageItemId(), knowledge.Normalize(rawOutput), itemStatus));
         }
 
-        var response = OpenAIResponsesFactory.Response(
+        var response = knowledge.WithSources(OpenAIResponsesFactory.Response(
             requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
             store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
-            incompleteReason: incompleteReason);
+            incompleteReason: incompleteReason));
 
         string json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls);
         if (store)
@@ -391,7 +421,8 @@ public sealed class OpenAIResponsesAdapter
         StructuredOutputFormat? responseFormat,
         bool store,
         SkillRequestPlan? skillPlan,
-        ILogger skillLogger)
+        ILogger skillLogger,
+        KnowledgeProtocolRequest knowledge)
     {
         SseWriter.ApplyHeaders(ctx.Response);
 
@@ -429,11 +460,17 @@ public sealed class OpenAIResponsesAdapter
         // SkillChatLoop). `parser` is bypassed for those, so it must not be flushed
         // at the end either.
         bool sawParsedUpdate = false;
+        var knowledgeAnswer = knowledge.Enabled ? new StringBuilder() : null;
 
-        async Task EmitDeltaAsync(string chunk)
+        async Task EmitDeltaAsync(string chunk, bool flushKnowledge = false)
         {
             if (string.IsNullOrEmpty(chunk))
                 return;
+            if (knowledgeAnswer != null && !flushKnowledge)
+            {
+                knowledgeAnswer.Append(chunk);
+                return;
+            }
 
             if (messageItemId == null)
             {
@@ -452,6 +489,7 @@ public sealed class OpenAIResponsesAdapter
         await foreach (var update
             in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxOutputTokens, ctx.RequestAborted, samplingConfig, tools, enableThinking, skillPlan, skillLogger).ConfigureAwait(false))
         {
+            knowledge.Observe(update);
             if (!update.Done)
             {
                 // Text a parser holds sends nothing for as long as it is held.
@@ -539,6 +577,9 @@ public sealed class OpenAIResponsesAdapter
             await EmitDeltaAsync(finalParsed.Content).ConfigureAwait(false);
         }
 
+        if (knowledgeAnswer != null)
+            await EmitDeltaAsync(knowledge.Normalize(knowledgeAnswer.ToString(), structured: responseFormat != null), flushKnowledge: true).ConfigureAwait(false);
+
         if (messageItemId != null)
         {
             await SseWriter.WriteNamedEventAsync(ctx.Response, "response.output_text.done",
@@ -565,10 +606,10 @@ public sealed class OpenAIResponsesAdapter
             outputIndex++;
         }
 
-        var response = OpenAIResponsesFactory.Response(
+        var response = knowledge.WithSources(OpenAIResponsesFactory.Response(
             requestId, _svc.LoadedModelName, status, instructions, maxOutputTokens, output,
             store, samplingConfig, promptTokens, evalTokens, kvReusedTokens,
-            incompleteReason: incompleteReason);
+            incompleteReason: incompleteReason));
 
         if (store)
             _store.Store(new StoredResponse { Id = requestId, Json = JsonSerializer.Serialize(response, JsonOptions.IgnoreNulls) });

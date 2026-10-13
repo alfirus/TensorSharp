@@ -15,6 +15,7 @@ using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.AgentHost.Knowledge;
 using TensorSharp.Server.Hosting;
 
 namespace TensorSharp.Server.Skills
@@ -105,6 +106,11 @@ namespace TensorSharp.Server.Skills
         /// unverified success text reaches the client.
         /// </summary>
         internal WorkspaceArtifactCompletionRequirement CompletionRequirement { get; set; }
+
+        /// <summary>Explicit terminal recovery after a knowledge turn exhausted reasoning
+        /// without an answer. Only the final answer generation remains; ordinary retrieval
+        /// completion does not set this and continues to permit requested code work.</summary>
+        internal bool KnowledgeAnswerRecovery { get; set; }
 
         /// <summary>
         /// Each attachment's upload path to the name the code tools stage it under, set by
@@ -268,11 +274,28 @@ namespace TensorSharp.Server.Skills
             SessionWorkspace? workspace = null,
             WorkspaceFileCapture? captureProducedFiles = null,
             ILogger? logger = null,
-            bool? multiAgent = null)
+            bool? multiAgent = null,
+            KnowledgeToolScope? knowledge = null)
         {
             SkillRequestPlan plan = CreateCore(registry, requestedSkills, discovery, clientTools,
                 architecture, contextTokens, options, out unknown, allowTools, codeRunner,
                 codeInputFiles, workspace, captureProducedFiles, logger);
+            // Retrieval remains available when skills and code execution are disabled.
+            // The read-only capability carries only the collections explicitly selected
+            // by this request; neither the model nor a child agent can widen it.
+            if (unknown.Count == 0 && knowledge != null && allowTools
+                && SkillCapabilities.For(architecture).ToolsRendered)
+            {
+                plan ??= new SkillRequestPlan(SkillPlan.Empty, Array.Empty<Skill>(),
+                    new SkillToolContext(Array.Empty<Skill>()) { Workspace = workspace },
+                    clientTools?.ToList() ?? new List<ToolFunction>(),
+                    new SkillAgentLoopOptions { MaxRounds = RoundsFor(options, false),
+                        ToolResultsAreRendered = SkillCapabilities.For(architecture).ToolResultsRendered },
+                    toolsOffered: true, clientTools);
+                plan.ToolContext.Knowledge = knowledge;
+                plan = new SkillRequestPlan(plan.Prompt, plan.Selected, plan.ToolContext,
+                    KnowledgeTools.Merge(plan.Tools), plan.LoopOptions, toolsOffered: true, plan.ClientTools);
+            }
             if (unknown.Count > 0 || !allowTools || multiAgent == false
                 || options?.MultiAgent is not { Enabled: true } agents
                 || !SkillCapabilities.For(architecture).ToolsRendered)

@@ -38,6 +38,10 @@ namespace TensorSharp.Runtime
         private bool _thinkingScanStarted;
         private bool _channelOpen;
         private int _channelStart;
+        private MessageThinkingTokenBudget.Tracker? _messageThinkingTracker;
+        internal bool MessageThinkingBudgetExhausted => _messageThinkingTracker?.Exhausted == true;
+        internal bool MessageThinkingBudgetExhaustedAt(int observedOutputCount) =>
+            _messageThinkingTracker?.ExhaustedAt(observedOutputCount) == true;
 
         public TokenSampler(SamplingConfig config) : this(config, null) { }
 
@@ -176,6 +180,9 @@ namespace TensorSharp.Runtime
         internal bool TryGetForcedThinkingToken(IList<int>? tokens, out int token)
         {
             token = -1;
+            if (_config.MessageThinkingBudget is { } messageBudget)
+                return (_messageThinkingTracker ??= messageBudget.CreateTracker()).TryGetForcedToken(
+                    tokens, _config.Grammar?.IsActive == true, out token);
             var budget = _config.ThinkingBudget;
             if (budget == null) return false;
             int count = tokens?.Count ?? 0;
@@ -228,6 +235,9 @@ namespace TensorSharp.Runtime
         /// this neither appends a token nor advances a grammar or model cache.</summary>
         internal bool TryRequestThinkingClosure(IList<int> tokens)
         {
+            if (_config.MessageThinkingBudget is { } messageBudget)
+                return (_messageThinkingTracker ??= messageBudget.CreateTracker()).RequestClosure(
+                    tokens, _config.Grammar?.IsActive == true);
             var budget = _config.ThinkingBudget;
             if (budget?.CloseOnRepetition != true || _config.Grammar?.IsActive == true)
                 return false;

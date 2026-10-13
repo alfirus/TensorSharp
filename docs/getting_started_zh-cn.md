@@ -149,6 +149,23 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 
 使用 `cpu` 运行 100% 纯 C# 推理，无需原生推理库；或选择原生 GGML 的 `ggml_cpu`、`ggml_metal`、`ggml_cuda`。聊天与嵌入服务分别运行。完整的 Snowflake 下载、批处理、维数缩减、C# API、分词与性能验证见[嵌入指南](embeddings_zh-cn.md)。
 
+## 将文件复用为知识库
+
+`v2026.10.10` 标签之后的当前源码新增个人知识集合与回答调整功能；在包含这些改动的发布出现前需从源码构建。在 TensorAgent 打开 **☰ → 知识库**，创建集合后上传文件或文件夹，或通过 **添加聊天** 导入已保存对话、可用附件和生成文件的快照。检查每个来源的抽取状态，再选择 **在此聊天中使用** 后提问；上传本身不会选择集合。回答中的引用可打开保留的原文件及相关片段。
+
+知识库支持文本、代码、数据集、部分 Office 内容和本地 PDF OCR。图像与视频采样帧需要已加载的兼容视觉模型；音频可使用已加载的音频塔或已配置的 `TS_JEV_TRANSCRIPTION_URL` 转录伴随服务。能力变化后可对原文件 **重新索引**。默认使用 BM25 检索，可选 GGUF 嵌入模型提供语义检索。覆盖范围、限制与引用详见[知识库指南](knowledge-system_zh-cn.md)。
+
+独立服务通过 `TS_KNOWLEDGE_DIRECTORY` 启用同一存储：
+
+```bash
+export TS_KNOWLEDGE_DIRECTORY="$HOME/TensorSharpKnowledge"
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal \
+  --host 127.0.0.1 --port 5001
+```
+
+请使用主机上可用的后端。通过 `/api/knowledge` 管理来源，并在支持的聊天请求中以 `knowledgeCollections` 传入集合 ID；见 [API 示例](../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md#个人知识库)。独立服务的浏览器界面支持回答调整，TensorAgent 则提供集合管理界面。CLI、TensorAgent 或服务端浏览器界面正在推理或回答时，可发送新指令中断并继续；**停止** 或 CLI 的 Ctrl+C 可单独中止。重定向的 CLI 输入仍按顺序完成各轮。
+
 ## 选择后端
 
 后端支持取决于模型架构。嵌入模型支持纯 C# `cpu` 与原生 `ggml_cpu`、`ggml_metal`、`ggml_cuda`；其他模型的限制见[状态矩阵](PROJECT_STATUS_zh-cn.md#状态矩阵)。

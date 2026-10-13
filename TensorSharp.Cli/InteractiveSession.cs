@@ -15,6 +15,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Cli.Logging;
 using TensorSharp.Models;
@@ -125,15 +126,10 @@ namespace TensorSharp.Cli
             = new List<(string Path, string Content)>();
         private bool _pendingIsVideo;
 
-        // Single-shot cancellation token for the in-flight generation. Replaced
-        // each turn so a previous Ctrl+C doesn't leak into later turns.
-        private CancellationTokenSource _generationCts;
-        // Goes high when the user types /exit or /quit (or hits Ctrl+C twice at
-        // the prompt). The outer loop checks this flag after each iteration.
-        private bool _shouldExit;
-        // Tracks whether we are currently streaming a response. Ctrl+C while
-        // generating cancels generation; Ctrl+C at the prompt exits.
-        private bool _isGenerating;
+        private volatile InteractiveChatLoop _chatLoop;
+        // Commands run on the session loop; Ctrl+C arrives on a console event
+        // thread, including during startup before the loop is installed.
+        private volatile bool _shouldExit;
 
         // Maximum number of bytes we will inline from a single /text upload. The
         // model will still reject anything that overflows its context window, but
@@ -194,7 +190,12 @@ namespace TensorSharp.Cli
             _systemPrompt = string.IsNullOrWhiteSpace(prompt) ? null : prompt;
         }
 
-        public void Run()
+        public void Run() => RunWithInput(Console.In, !Console.IsInputRedirected);
+
+        internal void RunWithInput(TextReader input, bool allowSteering)
+            => RunWithInput(() => Task.Run(() => ReadUserInput(input)), allowSteering);
+
+        internal void RunWithInput(Func<Task<string>> readInput, bool allowSteering)
         {
             // Make sure we own a clean KV state before we start so a previous
             // RunInference call (e.g. when the same Main invocation also did a
@@ -208,31 +209,24 @@ namespace TensorSharp.Cli
                 PrintBanner();
                 WarmSystemPrefix();
 
-                while (!_shouldExit)
+                if (!_shouldExit)
                 {
-                    string input = ReadUserInput();
-                    if (input == null)
-                    {
-                        Console.WriteLine();
-                        break;
-                    }
-
-                    string trimmed = input.Trim();
-                    if (trimmed.Length == 0)
-                        continue;
-
-                    if (trimmed.StartsWith("/"))
-                    {
-                        HandleCommand(trimmed);
-                        continue;
-                    }
-
-                    RunTurn(input);
+                    _chatLoop = new InteractiveChatLoop();
+                    _chatLoop.RunAsync(
+                        readInput,
+                        RunTurn,
+                        command => { HandleCommand(command); return _shouldExit; },
+                        () => Console.Write(BuildInputPrompt()),
+                        // A piped transcript is a sequence of complete turns. Reading
+                        // ahead would interpret its prerecorded follow-ups as interrupts.
+                        allowSteering: allowSteering).GetAwaiter().GetResult();
+                    Console.WriteLine();
                 }
             }
             finally
             {
                 Console.CancelKeyPress -= cancelHandler;
+                _chatLoop = null;
                 _inference?.Dispose();
                 _inference = null;
                 // If /model or /backend swapped in a fresh ModelBase, the
@@ -253,13 +247,10 @@ namespace TensorSharp.Cli
 
         // ---- Prompt + I/O ----------------------------------------------------
 
-        private string ReadUserInput()
+        private string ReadUserInput(TextReader input)
         {
-            string prompt = BuildInputPrompt();
-            Console.Write(prompt);
-
             if (!_multilineInput)
-                return Console.ReadLine();
+                return input.ReadLine();
 
             // Multi-line mode: keep accepting lines until the user enters a
             // line that is exactly ".". This mirrors the well-known shell
@@ -267,7 +258,7 @@ namespace TensorSharp.Cli
             var sb = new StringBuilder();
             while (true)
             {
-                string line = Console.ReadLine();
+                string line = input.ReadLine();
                 if (line == null)
                     return sb.Length == 0 ? null : sb.ToString();
                 if (line == ".")
@@ -302,6 +293,7 @@ namespace TensorSharp.Cli
             Console.WriteLine($"Thinking: {(_enableThinking ? "on" : "off")}");
             PrintSampling(prefix: "Sampling: ");
             Console.WriteLine("Type /help to see all available commands. Use /exit or Ctrl+D to leave.");
+            Console.WriteLine("Type a new prompt and press Enter during a reply to steer it. /cancel stops the reply.");
             Console.WriteLine("===============================");
         }
 
@@ -393,7 +385,13 @@ namespace TensorSharp.Cli
                     SetSeed(arg);
                     break;
                 case "/stop":
-                    AddStopSequence(arg);
+                    if (arg.Length == 0)
+                        Console.WriteLine("[generation stopped]");
+                    else
+                        AddStopSequence(arg);
+                    break;
+                case "/cancel":
+                    Console.WriteLine("[generation stopped]");
                     break;
                 case "/clearstop":
                 case "/stop-clear":
@@ -468,6 +466,7 @@ namespace TensorSharp.Cli
             Console.WriteLine("Conversation:");
             Console.WriteLine("  /help, /?              Show this message.");
             Console.WriteLine("  /exit, /quit           Leave the session.");
+            Console.WriteLine("  /cancel, /stop         Stop the current reply without sending a new prompt.");
             Console.WriteLine("  /reset, /new           Start a new chat; retain the shared system prefix.");
             Console.WriteLine("  /history               Print the current conversation history.");
             Console.WriteLine("  /save <file>           Write the conversation transcript to a file.");
@@ -513,6 +512,9 @@ namespace TensorSharp.Cli
             Console.WriteLine("                         leading system message, so the KV cache no longer matches.");
             Console.WriteLine();
             Console.WriteLine("Plain text without a leading slash is sent to the model as the next user turn.");
+            Console.WriteLine("During a reply, type a new prompt and press Enter to steer the answer immediately.");
+            Console.WriteLine("The partial reply is kept in history; commands also interrupt before taking effect.");
+            Console.WriteLine("Redirected stdin runs each complete turn in order; multiline prompts end with '.'.");
             Console.WriteLine("Press Ctrl+C while generating to interrupt; press Ctrl+C at the prompt to exit.");
         }
 
@@ -1171,15 +1173,12 @@ namespace TensorSharp.Cli
 
         // ---- Inference -------------------------------------------------------
 
-        private void RunTurn(string userText)
+        private void RunTurn(string userText, CancellationToken cancellationToken)
         {
             var renderHistory = BuildRenderHistory(userText);
 
             try
             {
-                _generationCts = new CancellationTokenSource();
-                _isGenerating = true;
-
                 // One pass normally; more when the model asks to read skill content
                 // first. Each extra pass is a full generation, so the round budget is
                 // what stops a model that keeps mis-naming a file from looping forever,
@@ -1190,7 +1189,8 @@ namespace TensorSharp.Cli
                     : 1;
                 for (int round = 1; round <= maxRounds; round++)
                 {
-                    List<ToolCall> toolCalls = Stream(renderHistory, _generationCts.Token);
+                    List<ToolCall> toolCalls = Stream(renderHistory, cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
 
                     // Three ways. The caller's own tools are shown, as the --tools
                     // contract has always promised; a name NOBODY declared is answered
@@ -1216,11 +1216,13 @@ namespace TensorSharp.Cli
                             call.Name));
                     }
 
-                    _generationCts.Token.ThrowIfCancellationRequested();
+                    cancellationToken.ThrowIfCancellationRequested();
 
                     foreach (var call in skillCalls)
                     {
-                        var result = SkillTools.Execute(call, _skillToolContext);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var result = SkillTools.Execute(call, _skillToolContext,
+                            cancellationToken: cancellationToken);
                         Console.WriteLine(
                             $"[skill] {call.Name} {result.SkillId ?? "?"} {result.ResourcePath ?? string.Empty}"
                             + (result.Ok ? string.Empty : " (failed)"));
@@ -1247,7 +1249,7 @@ namespace TensorSharp.Cli
                             "Error: the limit on tool calls for this turn has been reached. Answer now "
                             + "using what you have already read, and say which part you could not check.",
                             null));
-                        Stream(BuildRenderHistoryForContinuation(), _generationCts.Token);
+                        Stream(BuildRenderHistoryForContinuation(), cancellationToken);
                         break;
                     }
 
@@ -1265,12 +1267,6 @@ namespace TensorSharp.Cli
                 Console.WriteLine($"[error] {ex.Message}");
                 _log.LogError(LogEventIds.ChatFailed, ex,
                     "Interactive turn failed: {Error}", ex.Message);
-            }
-            finally
-            {
-                _isGenerating = false;
-                _generationCts?.Dispose();
-                _generationCts = null;
             }
         }
 
@@ -1456,8 +1452,7 @@ namespace TensorSharp.Cli
         {
             // Materialise the current turn's user message (including any pending
             // attachments) and append it to the running tracked history. The
-            // assistant turn is added once generation completes so a Ctrl+C
-            // mid-turn doesn't leave a dangling user message in the history.
+            // partial assistant turn is retained when generation is interrupted.
             string composedContent = ComposeUserContent(userText);
             var userMsg = new ChatMessage
             {
@@ -1471,6 +1466,13 @@ namespace TensorSharp.Cli
                 IsVideo = _pendingIsVideo,
             };
             _history.Add(userMsg);
+            // These attachments belong to the submitted user message even if an
+            // interruption arrives before prefill starts. A steering prompt must
+            // not submit them a second time.
+            _pendingImages.Clear();
+            _pendingAudios.Clear();
+            _pendingTextFiles.Clear();
+            _pendingIsVideo = false;
 
             var rendered = new List<ChatMessage>();
             // ONE leading system message carrying both, never two: several chat
@@ -1774,13 +1776,6 @@ namespace TensorSharp.Cli
                 generatedTokens.Count, promptTokenCount, planKind, prefillMs,
                 result.DecodeMs, tokensPerSec, firstTokenMs, finishReason);
 
-            // Drop pending attachments on success - they belonged to the
-            // user turn we just submitted.
-            _pendingImages.Clear();
-            _pendingAudios.Clear();
-            _pendingTextFiles.Clear();
-            _pendingIsVideo = false;
-
             // Append assistant entry to history with raw output tokens so the
             // next turn's renderer can splice them in.
             _history.Add(new ChatMessage
@@ -1792,8 +1787,12 @@ namespace TensorSharp.Cli
                 // rather than as prose, and so RawOutputTokens still splices: without the
                 // tokens, every skill round-trip would re-tokenize the whole conversation
                 // and re-prefill it.
-                ToolCalls = turnToolCalls.Count > 0 ? new List<ToolCall>(turnToolCalls) : null,
-                RawOutputTokens = new List<int>(generatedTokens),
+                ToolCalls = !cancellationToken.IsCancellationRequested && turnToolCalls.Count > 0
+                    ? new List<ToolCall>(turnToolCalls) : null,
+                // A cancelled reasoning/tool block may lack its closing delimiter.
+                // Render the parsed partial message afresh for the next prompt.
+                RawOutputTokens = cancellationToken.IsCancellationRequested
+                    ? null : new List<int>(generatedTokens),
                 RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
             });
 
@@ -1906,18 +1905,16 @@ namespace TensorSharp.Cli
             // second Ctrl+C while the prompt is idle.
             e.Cancel = true;
 
-            if (_isGenerating && _generationCts != null)
+            if (_chatLoop?.InterruptOrExit() == true)
             {
-                _generationCts.Cancel();
                 return;
             }
 
-            // Idle press at the prompt -> exit. We can't unblock the running
-            // Console.ReadLine(), so we just flag the intent and the next loop
-            // iteration will quit.
+            // The loop's exit signal wakes an idle wait even while the single
+            // console reader remains blocked in the background until process exit.
             _shouldExit = true;
             Console.WriteLine();
-            Console.WriteLine("[exiting] press Enter to confirm, or run /exit to leave.");
+            Console.WriteLine("[exiting]");
         }
 
         private static int FindValidUtf8Length(List<byte> bytes)

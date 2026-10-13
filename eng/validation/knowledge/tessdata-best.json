@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/tesseract-ocr/tessdata_best",
+  "revision": "e12c65a915945e4c28e237a9b52bc4a8f39a0cec",
+  "license": "Apache-2.0",
+  "profile": "best",
+  "files": [
+    {
+      "language": "eng",
+      "sha256": "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba",
+      "bytes": 15400601
+    },
+    {
+      "language": "chi_sim",
+      "sha256": "4fef2d1306c8e87616d4d3e4c6c67faf5d44be3342290cf8f2f0f6e3aa7e735b",
+      "bytes": 13077423
+    },
+    {
+      "language": "chi_sim_vert",
+      "sha256": "ea672a78157199c333aa12ec4e74550077689b545df5fc770903716850c8b2e5",
+      "bytes": 13077507
+    },
+    {
+      "language": "chi_tra",
+      "sha256": "1aa60488574cafa69486d919284f079ca9b68fcc7f6ad8dc1ff1b318dfd97028",
+      "bytes": 12985735
+    },
+    {
+      "language": "chi_tra_vert",
+      "sha256": "bbe518f94b9e3852109113507357bfe7e257834d88d2d1ead44178046bcd2181",
+      "bytes": 12985521
+    }
+  ]
+}

@@ -1,0 +1,205 @@
+name: Portable PDF OCR validation
+
+# Manual validation lane. Defining this workflow is not evidence of a Windows run.
+# No chat models, GPUs, secrets, releases, or modified upstream ggml checkout.
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: Sequential warm OCR samples (1-20)
+        type: number
+        default: 3
+        required: true
+      data-profile:
+        description: Pinned OCR model data (best favors accuracy; fast favors speed)
+        type: choice
+        options: [best, fast]
+        default: best
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  managed-pdf:
+    # Exercise first-use provisioning itself. Do not install Poppler, Tesseract,
+    # language files, or a package manager outside the production provisioner.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      TENSORSHARP_GGML_NATIVE_SKIP: 'true'
+      TENSORSHARP_GGML_NATIVE_ENABLE_CUDA: 'OFF'
+      TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN: 'OFF'
+      TENSORSHARP_CUDNN: 'OFF'
+      DOTNET_NOLOGO: 'true'
+      PDF_SAMPLES: ${{ inputs.samples }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.302
+
+      - name: Test managed setup and process isolation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts/knowledge/managed-ci | Out-Null
+          dotnet --info > artifacts/knowledge/managed-ci/dotnet-info.log
+          dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release `
+            --filter 'FullyQualifiedName~PdfOcrProvisionerTests|FullyQualifiedName~PortablePdfProcessRunnerTests|FullyQualifiedName~KnowledgePdfFixtureTests' `
+            --logger 'trx;LogFileName=tests.trx' --results-directory artifacts/knowledge/managed-ci `
+            2>&1 | Tee-Object -FilePath artifacts/knowledge/managed-ci/tests.log
+          if ($LASTEXITCODE -ne 0) { throw 'Managed setup tests failed' }
+          [xml] $trx = Get-Content -Raw artifacts/knowledge/managed-ci/tests.trx
+          $counters = $trx.TestRun.ResultSummary.Counters
+          if ([int]$counters.executed -eq 0 -or [int]$counters.failed -ne 0 -or [int]$counters.notExecuted -ne 0) {
+            throw 'Managed setup tests must execute without failures or skips'
+          }
+
+      - name: Build real managed OCR benchmark
+        shell: pwsh
+        run: |
+          dotnet build eng/validation/PortablePdfBench/PortablePdfBench.csproj -c Release `
+            2>&1 | Tee-Object -FilePath artifacts/knowledge/managed-ci/build.log
+          if ($LASTEXITCODE -ne 0) { throw 'Managed OCR benchmark build failed' }
+
+      - name: Benchmark fresh setup and reuse from a second process
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'artifacts/knowledge/managed-ci'
+          # A fresh path with spaces checks native installer argument/path handling.
+          # Never restore this cache: the cold run must download pinned assets itself.
+          $cache = Join-Path $env:RUNNER_TEMP ('TensorSharp OCR ' + [guid]::NewGuid().ToString('N'))
+          if (Test-Path -LiteralPath $cache) { throw 'Cold OCR cache unexpectedly exists' }
+          $results = @()
+          $coldMarkerHash = $null
+          foreach ($run in @('cold', 'reuse')) {
+            $destination = Join-Path $output $run
+            dotnet run --project eng/validation/PortablePdfBench/PortablePdfBench.csproj `
+              -c Release --no-build -- --managed true --cache "$cache" `
+              --output "$destination" --samples "$env:PDF_SAMPLES" `
+              2>&1 | Tee-Object -FilePath (Join-Path $output ($run + '.log'))
+            $results += [pscustomobject]@{ run = $run; exitCode = $LASTEXITCODE }
+            $marker = Join-Path $cache 'ready.json'
+            if ($run -eq 'cold' -and (Test-Path -LiteralPath $marker)) {
+              $coldMarkerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $marker).Hash
+              Copy-Item -LiteralPath $marker -Destination (Join-Path $output 'ready-cold.json')
+            }
+          }
+          $results | ConvertTo-Json | Set-Content (Join-Path $output 'exit-codes.json')
+          if (@($results | Where-Object exitCode -ne 0).Count -ne 0) {
+            throw 'Managed OCR cold/reuse benchmark failed; inspect both retained reports'
+          }
+          $cold = Get-Content -Raw (Join-Path $output 'cold/report.json') | ConvertFrom-Json
+          $reuse = Get-Content -Raw (Join-Path $output 'reuse/report.json') | ConvertFrom-Json
+          if ($cold.status -ne 'passed' -or $reuse.status -ne 'passed' -or -not $cold.managed -or -not $reuse.managed) {
+            throw 'Both real managed benchmark reports must pass'
+          }
+          if (@($cold.setupEvents | Where-Object State -eq 'downloading').Count -eq 0) {
+            throw 'Cold setup did not exercise production downloads'
+          }
+          if (@($reuse.setupEvents | Where-Object State -eq 'downloading').Count -ne 0 -or
+              @($reuse.setupEvents | Where-Object Stage -eq 'Installing the private OCR runtime.').Count -ne 0) {
+            throw 'Second process unexpectedly downloaded or reinstalled the OCR runtime'
+          }
+          $reuseMarkerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $cache 'ready.json')).Hash
+          if (-not $coldMarkerHash -or $reuseMarkerHash -ne $coldMarkerHash) { throw 'Published runtime changed during reuse' }
+          [pscustomobject]@{
+            coldSetupMilliseconds = $cold.setupMilliseconds
+            reuseSetupMilliseconds = $reuse.setupMilliseconds
+            coldWarmP50Ms = $cold.warmP50Ms
+            coldWarmP95Ms = $cold.warmP95Ms
+            reuseWarmP50Ms = $reuse.warmP50Ms
+            reuseWarmP95Ms = $reuse.warmP95Ms
+            readyMarkerSha256 = $reuseMarkerHash
+            note = 'Fresh production downloads, then same-cache preparation in a separate process. Network remains available during reuse; this is not an offline-network test.'
+          } | ConvertTo-Json | Set-Content (Join-Path $output 'setup-comparison.json')
+
+      - name: Retain actual managed results, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: managed-pdf-${{ matrix.os }}
+          path: artifacts/knowledge/managed-ci
+          if-no-files-found: warn
+
+  portable-pdf:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TENSORSHARP_GGML_NATIVE_SKIP: 'true'
+      TENSORSHARP_GGML_NATIVE_ENABLE_CUDA: 'OFF'
+      TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN: 'OFF'
+      TENSORSHARP_CUDNN: 'OFF'
+      DOTNET_NOLOGO: 'true'
+      PDF_DATA_PROFILE: ${{ inputs.data-profile }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.302
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Linux OCR tools
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils tesseract-ocr
+          echo "PDF_RENDERER=$(command -v pdftoppm)" >> "$GITHUB_ENV"
+          echo "PDF_OCR=$(command -v tesseract)" >> "$GITHUB_ENV"
+
+      - name: Install pinned community Windows OCR builds
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install poppler --version=26.7.0 --yes --no-progress
+          if ($LASTEXITCODE -notin @(0, 3010)) { throw 'Poppler installation failed' }
+          choco install tesseract --version=5.5.3.20260724 --yes --no-progress
+          if ($LASTEXITCODE -notin @(0, 3010)) { throw 'Tesseract installation failed' }
+          $renderers = @(Get-ChildItem "$env:ChocolateyInstall/lib/poppler/tools" -Recurse -File -Filter pdftoppm.exe)
+          if ($renderers.Count -ne 1) { throw 'Expected one installed pdftoppm.exe' }
+          $ocr = Join-Path $env:ProgramFiles 'Tesseract-OCR/tesseract.exe'
+          if (-not (Test-Path -LiteralPath $ocr -PathType Leaf)) { throw 'Tesseract executable missing' }
+          "PDF_RENDERER=$($renderers[0].FullName)" >> $env:GITHUB_ENV
+          "PDF_OCR=$ocr" >> $env:GITHUB_ENV
+
+      - name: Prepare hash-pinned official language data
+        shell: pwsh
+        run: |
+          python eng/validation/knowledge/prepare_tessdata.py `
+            --output artifacts/knowledge/portable-ci/tessdata --data-profile "$env:PDF_DATA_PROFILE"
+          if ($LASTEXITCODE -ne 0) { throw 'Language data verification failed' }
+
+      - name: Run actual OCR tests and benchmark
+        shell: pwsh
+        env:
+          PDF_SAMPLES: ${{ inputs.samples }}
+        run: |
+          python eng/validation/knowledge/run_portable_pdf_validation.py `
+            --output artifacts/knowledge/portable-ci/results `
+            --pdftoppm "$env:PDF_RENDERER" --tesseract "$env:PDF_OCR" `
+            --tessdata artifacts/knowledge/portable-ci/tessdata `
+            --data-profile "$env:PDF_DATA_PROFILE" `
+            --languages eng+chi_sim --samples "$env:PDF_SAMPLES"
+          if ($LASTEXITCODE -ne 0) { throw 'Portable PDF validation failed' }
+
+      - name: Retain actual results, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-pdf-${{ matrix.os }}-${{ inputs.data-profile }}
+          path: artifacts/knowledge/portable-ci/results
+          if-no-files-found: warn

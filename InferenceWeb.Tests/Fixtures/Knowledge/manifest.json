@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "provenance": "Original synthetic content authored for TensorSharp validation; no external documents, personal data, or runtime-service dependencies.",
+  "generator": "eng/validation/knowledge/create_pdf_fixtures.py",
+  "generatorEnvironment": {
+    "python": "3.12.14",
+    "pillow": "12.3.0",
+    "reportlab": "4.4.9",
+    "latinFont": {
+      "name": "DejaVuSans.ttf",
+      "sha256": "7da195a74c55bef988d0d48f9508bd5d849425c1770dba5d7bfc6ce9ed848954"
+    },
+    "cjkFont": {
+      "name": "Songti.ttc",
+      "sha256": "dd2f0628d302f322a2e9c3cf3253d5e73f418275e1f1421c84a7c65ce5a87777"
+    }
+  },
+  "pageRaster": {
+    "width": 1200,
+    "height": 1600,
+    "mode": "RGB",
+    "pdfPagePoints": [
+      600,
+      800
+    ]
+  },
+  "files": [
+    {
+      "fileName": "scanned-four-pages.pdf",
+      "sha256": "17ab3d11fa6c4a4017a5e11bbb7fa55f50ec580854a9c34f2ca9f92ef04c5230",
+      "pages": [
+        {
+          "page": 1,
+          "selectableText": false,
+          "imageCount": 1,
+          "query": "Cedar observation code",
+          "expectedCode": "CEDAR-4821",
+          "expectedTotal": "46",
+          "expectedText": "CEDAR FIELD LOG\nCedar observation code\nCEDAR-4821\nRecord the four-digit identifier exactly.\nThe sensor total is 46 units.\nSensor | Reading\nNorth | 17\nSouth | 29\nTotal | 46"
+        },
+        {
+          "page": 2,
+          "selectableText": false,
+          "imageCount": 1,
+          "query": "Orbit inventory code",
+          "expectedCode": "ORBIT-7356",
+          "expectedTotal": "43",
+          "expectedText": "ORBIT INVENTORY\nOrbit inventory code\nORBIT-7356\nInventory belongs to the Orbit workshop.\nThe listed stock total is 43 items.\nItem | Quantity\nAmber bolts | 12\nBlue clamps | 31\nTotal | 43"
+        },
+        {
+          "page": 3,
+          "selectableText": false,
+          "imageCount": 1,
+          "query": "Harbor dispatch code",
+          "expectedCode": "HARBOR-9064",
+          "expectedTotal": "42",
+          "expectedText": "HARBOR DISPATCH\nHarbor dispatch code\nHARBOR-9064\nTwo routes share one dispatch code.\nThe shipment contains 42 crates.\nRoute | Crates\nWest pier | 24\nEast pier | 18\nTotal | 42"
+        },
+        {
+          "page": 4,
+          "selectableText": false,
+          "imageCount": 1,
+          "query": "Bamboo inspection code",
+          "expectedCode": "BAMBOO-2187",
+          "expectedTotal": "45",
+          "expectedText": "BAMBOO CHECKLIST\nBamboo inspection code\nBAMBOO-2187\nThe checklist covers 45 inspections.\nNine checks remain pending.\nCheck | Count\nPassed | 36\nPending | 9\nTotal | 45\n竹林项目：蓝色箱子有二十七个。",
+          "chineseExpected": [
+            "竹林",
+            "蓝色",
+            "二十七"
+          ]
+        }
+      ]
+    },
+    {
+      "fileName": "mixed-two-pages.pdf",
+      "sha256": "c4f87f6bab2fb22c8bf3d9de033d6c2c3f0809cd8a7def39369ab9861c6ffb9b",
+      "pages": [
+        {
+          "page": 1,
+          "selectableText": true,
+          "imageCount": 0,
+          "query": "Juniper selectable code",
+          "expectedCode": "JUNIPER-5643"
+        },
+        {
+          "page": 2,
+          "selectableText": true,
+          "selectableExpected": "SCANNED ATTACHMENT WITH SELECTABLE HEADING",
+          "imageCount": 2,
+          "pdfPagePoints": [
+            600,
+            860
+          ],
+          "query": "Orbit inventory code",
+          "expectedCode": "ORBIT-7356",
+          "expectedTotal": "43"
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Clean, upright, high-contrast synthetic raster pages; not a representative real-world scanning/OCR benchmark.",
+    "Chinese is a separately reported supplementary case, never assumed covered by English success.",
+    "Regeneration bytes depend on recorded fonts and dependency versions; committed PDF hashes identify the actual fixtures."
+  ]
+}

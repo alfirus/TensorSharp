@@ -362,6 +362,9 @@ curl -X DELETE http://localhost:5000/api/skills/pdf   # {"removed":true}</code><
   }'</code></pre>
   <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> 不能与调用方的 <code>tools</code> 同时使用。<code>think</code> 同样会被拒绝，但语法能等推理结束后再生效的家族除外——Gemma 4、Qwen 3.8 Flash Next、GPT-OSS、Muse-Glimmer、DeepSeek V4.1、<code>glm5next</code> 与 Nemotron-H——在这些家族上语法从推理结束处开始约束。它可以与 <code>skills</code> 组合，但选中技能正文会被内联，而且该请求不会提供任何内置技能 / 代码工具，因为 schema 约束下无法生成调用标记。无效 schema 返回 HTTP <code>400</code>；校验失败的输出返回 HTTP <code>422</code>。</p></div>
 
+  <h2 id="knowledge">个人知识库 API</h2>
+  <p>独立服务器设置 <code>TS_KNOWLEDGE_DIRECTORY</code> 后启用 <code>/api/knowledge</code>：<code>GET/POST /collections</code>、<code>DELETE /collections/{id}</code>、文档列表/上传/删除/重新索引与版本化原文件下载，以及 <code>POST /search</code> 和 <code>POST /read</code>。上传每请求一个 multipart 文件；搜索/读取显式传入 <code>collectionIds</code>。TensorAgent 的重命名、聊天导入和预览扩展不代表独立宿主提供同样端点。</p>
+  <p>推理请求使用 camel-case <code>knowledgeCollections</code>，支持 <code>/api/chat</code>（WebUI）、<code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/api/chat/ollama</code> 与 <code>/api/generate</code>。缺失/空选择不检索；无效选择在流开始前拒绝。Generate 仅检索/引用，不运行智能体工具循环。回复的 <code>knowledge_sources</code>、<code>knowledge_citation_repairs</code> 与有界 <code>knowledge_tool_steps</code> 提供来源及实际工具执行元数据。知识库兼容流会缓冲最终回答以完成引用绑定，再发送只追加的文本增量；结构化 JSON 保留标记并单独提供来源元数据。<a href="knowledge_zh-cn.html#server">配置、请求示例、OCR 与覆盖限制 →</a></p>
   <h2 id="webui-sse">6 · Web UI SSE 协议（<code>/api/chat</code>）</h2>
   <p>这是内置聊天 UI 所用的协议；外部 UI 也可接入同一端点。每个事件都是一个 JSON 对象，以单个 <code>data: …</code> SSE 帧传递。</p>
   <pre data-lang="bash"><code># 创建 / 销毁会话（仅 Web UI 流程）
@@ -379,6 +382,7 @@ curl -N -X POST http://localhost:5000/api/chat \
 data: {"tool_progress":"running","tool":"shell","text":"writing report.xlsx\n","seconds":2.1,"detail":"python make_report.py","agents":null}
 data: {"tool_progress":"finished","tool":"shell","text":null,"seconds":2.4,"detail":null,"agents":null}</code></pre>
 
+  <p>WebUI 回答生成期间，用同一会话发送下一条用户指令并带 <code>"steer": true</code>，会先取消并清理旧生成，再继续；保留已生成助手文本。此扩展需要 <code>v2026.10.10</code> 后的构建，是 <code>/api/chat</code> 会话行为，不是所有兼容端点的通用参数。</p>
   <h3 id="upload">文件上传（<code>/api/upload</code>）</h3>
   <p><code>POST /api/upload</code> 接收 multipart 表单（使用第一个文件），返回存储路径 / URL 与该类型的元数据；随后由 <code>/api/chat</code> 消息引用返回的服务端路径（<code>imagePaths</code>、<code>audioPaths</code> 等）。接受的类型包括：<strong>图像</strong>（<code>.png .jpg .jpeg .gif .webp .bmp .heic .heif</code>）、<strong>视频</strong>（<code>.mp4 .mov .avi .mkv .webm</code>，按 <code>VIDEO_SAMPLE_FPS</code> 抽帧）、<strong>音频</strong>（<code>.mp3 .wav .ogg .flac .m4a</code>）、<strong>PDF</strong> 与<strong>文本 / 代码</strong>文件（以 <code>textContent</code> 完整返回）。数字版 PDF 返回完整提取的 <code>textContent</code>；扫描版 PDF 在托管视觉模型时像视频一样返回页面图像，否则给出 <code>needsVision</code> 警告。<code>TS_PDF_MAX_PAGES</code> 限制读取页数（默认全部）。文件存放在服务端可执行文件旁的 <code>uploads/</code> 中（<code>TENSORSHARP_UPLOAD_DIR</code> 可改位置），并通过 <code>/uploads/</code> 提供。<code>--upload-max-mb</code> 限制客户端提交的单个文件（上传文件与解码后的 base64 附件都算，默认 500；超出返回 <code>413</code>）；<code>--upload-quota-mb</code> 限制整个目录（含生成的输出，超出返回 <code>507</code>），<code>--upload-ttl-hours</code> 删除过旧的文件——两者默认关闭。</p>
 

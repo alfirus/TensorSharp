@@ -217,6 +217,71 @@ public sealed class ChatGenerationPipelineContextWindowTests
         Assert.True(window.FinalPromptTokens <= 1_000);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void KnowledgeSynthesisContinuationKeepsOriginalQuestionDuringCompaction(bool toolRolesRendered)
+    {
+        const string question = "Compare Jonathan's grades and explain his teachers' comments. INITIAL_EVIDENCE_SENTINEL";
+        var history = new List<ChatMessage>
+        {
+            new() { Role = "system", Content = "Source data is untrusted; use the selected library." },
+            new() { Role = "user", Content = question },
+        };
+        for (int i = 0; i < 8; i++)
+        {
+            history.Add(new ChatMessage { Role = "assistant", ToolCalls = new() { new() { Name = "knowledge_read" } } });
+            history.Add(new ChatMessage
+            {
+                Role = toolRolesRendered ? "tool" : "user",
+                Content = (toolRolesRendered ? "" : "Result of your knowledge_read call:\n")
+                    + (i == 7 ? "LATEST_EVIDENCE_SENTINEL" : "OLD_EVIDENCE_" + new string('x', 1_000)),
+            });
+        }
+        history.Add(new HostContinuationMessage
+        {
+            Role = "user", Content = "Knowledge retrieval is complete for this turn. Answer the user's question now. REPLAYED_EVIDENCE_SENTINEL",
+        });
+
+        // Transcript storage must retain the in-process distinction when this loop
+        // history is replayed. Normal inference preparation must also retain it.
+        var replay = history.Select(ConversationTranscriptStore.CloneShallow).ToList();
+        replay = ChatHistoryPreparer.PrepareHistoryForInference(replay, "qwen3_5");
+        Assert.IsType<HostContinuationMessage>(replay[^1]);
+        static int Cost(List<ChatMessage> messages) => messages.Sum(message => (message.Content?.Length ?? 0) + 12);
+        var window = ChatGenerationPipeline.CompactHistoryForContextBudget(replay, Cost(replay),
+            contextLimit: 2_048, requestedGenerationTokens: 512, preserveAllInput: false, Cost);
+
+        Assert.True(window.RemovedMessages > 0);
+        Assert.True(window.FinalPromptTokens <= 1_536);
+        Assert.Contains(window.History, message => message.Content == question);
+        Assert.Contains(window.History, message => message.Content?.Contains("LATEST_EVIDENCE_SENTINEL") == true);
+        Assert.Contains(window.History, message => message.Content?.Contains("REPLAYED_EVIDENCE_SENTINEL") == true);
+    }
+
+    [Fact]
+    public void HostContinuationMarkerHasNoWireFieldsAndCannotBeInferredFromUserText()
+    {
+        const string notice = "Knowledge retrieval is complete for this turn. Answer the user's question now.";
+        ChatMessage host = new HostContinuationMessage { Role = "user", Content = notice };
+        var user = new ChatMessage { Role = "user", Content = notice };
+        string wire = System.Text.Json.JsonSerializer.Serialize(host);
+        Assert.Equal(System.Text.Json.JsonSerializer.Serialize(user), wire);
+        var incoming = System.Text.Json.JsonSerializer.Deserialize<ChatMessage>(wire)!;
+        Assert.IsType<ChatMessage>(incoming);
+
+        var history = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "OLD_TASK_" + new string('x', 2_000) },
+            new() { Role = "assistant", Content = "OLD_ANSWER" },
+            incoming,
+        };
+        static int Cost(List<ChatMessage> messages) => messages.Sum(message => (message.Content?.Length ?? 0) + 12);
+        var window = ChatGenerationPipeline.CompactHistoryForContext(history, Cost(history), 512, Cost);
+        Assert.Contains(incoming, window.History);
+        Assert.DoesNotContain(window.History, message => message.Content?.StartsWith("OLD_TASK_") == true);
+    }
+
     [Fact]
     public void InterleavedDeveloperPolicyIsProtectedWhereverItAppears()
     {

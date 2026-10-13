@@ -23,6 +23,26 @@ request still carries the five coordination tools with `--no-skills` and without
 `--code-exec`. The operator grants
 execution surfaces at startup; there is no interactive per-command approval queue.
 
+## Skills with personal knowledge
+
+Current source also provides [personal knowledge collections](knowledge-system.md)
+in TensorAgent and the standalone server. Select collections explicitly with
+`knowledgeCollections` on a supported chat request; selecting a skill does not
+select library sources. Retrieval works without skills or code execution. A
+tool-capable model can use `knowledge_list`, `knowledge_search`, `knowledge_read`
+and `knowledge_open` alongside its skills, within the collection scope the caller
+granted. Source contents remain untrusted reference data rather than instructions.
+
+With code tools enabled, `knowledge_open` can place a complete retained original
+in the invoking agent's private workspace. This supports calculations on an
+entire CSV or processing a full document instead of treating retrieved excerpts
+as complete data. Ordinary retrieval ends at its evidence and call limits, or
+after an approved complete-document snapshot; code and artifact tools can still
+finish the requested deliverable. Subagents inherit the selected collections and
+request thinking-token limit, with separate conversations and workspaces.
+Knowledge support and active response steering were added after `v2026.10.10`;
+use a source build until a release includes them.
+
 ## What a skill is
 
 A skill is a directory whose name *is* the skill's name:

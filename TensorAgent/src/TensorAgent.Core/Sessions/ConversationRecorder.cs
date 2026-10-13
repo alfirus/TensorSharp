@@ -36,6 +36,7 @@ public sealed class ConversationRecorder
 {
     private readonly ConversationStore _store;
     private readonly ConcurrentDictionary<string, string> _sessionToConversation = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _acceptedShareIds = new(StringComparer.Ordinal);
     private int _binds;
     private string? _current;
 
@@ -138,7 +139,7 @@ public sealed class ConversationRecorder
         string sessionId, string content, string? thinking = null,
         IReadOnlyList<StoredArtifact>? artifacts = null, string? imageUrl = null,
         string? videoUrl = null, string? audioUrl = null, StoredTurnStats? stats = null,
-        ImageTurnRecord? image = null)
+        ImageTurnRecord? image = null, IReadOnlyList<JsonElement>? knowledgeSources = null)
     {
         // Image/video completion frames carry zero-token placeholder counters. Keep
         // actual LLM counters when a text turn also produced media through a tool.
@@ -169,6 +170,7 @@ public sealed class ConversationRecorder
                 // the answer (a small model repeats a link erratically), so it is written
                 // down here or it is lost the moment the user opens another chat.
                 Artifacts = artifacts is { Count: > 0 } ? new List<StoredArtifact>(artifacts) : null,
+                KnowledgeSources = knowledgeSources is { Count: > 0 } ? knowledgeSources.Select(source => source.Clone()).ToList() : null,
                 ImageUrl = string.IsNullOrEmpty(imageUrl) ? null : imageUrl,
                 VideoUrl = string.IsNullOrEmpty(videoUrl) ? null : videoUrl,
                 AudioUrl = string.IsNullOrEmpty(videoUrl) || string.IsNullOrEmpty(audioUrl) ? null : audioUrl,
@@ -181,6 +183,72 @@ public sealed class ConversationRecorder
         {
             // Same reasoning as Record: a lost transcript must not cost the answer.
         }
+    }
+
+    /// <summary>
+    /// Build a steering turn after the interrupted response has been saved. The
+    /// page may have missed tokens while the user typed, so the durable transcript
+    /// supplies the prefix and the request supplies only the newest user message.
+    /// </summary>
+    public JsonElement SteeringRequest(string sessionId, JsonElement body)
+    {
+        if (!body.TryGetProperty("messages", out JsonElement messages)
+            || messages.ValueKind != JsonValueKind.Array || messages.GetArrayLength() == 0)
+            throw new ArgumentException("Steering requires a user message.", nameof(body));
+        JsonElement guidance = messages[messages.GetArrayLength() - 1];
+        if (guidance.ValueKind != JsonValueKind.Object
+            || !guidance.TryGetProperty("role", out JsonElement role) || role.GetString() != "user")
+            throw new ArgumentException("Steering requires a user message.", nameof(body));
+
+        Conversation? conversation = ConversationFor(sessionId) is { } id ? _store.Load(id) : null;
+        using var output = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(output))
+        {
+            writer.WriteStartObject();
+            foreach (JsonProperty property in body.EnumerateObject())
+            {
+                if (property.Name == "messages")
+                    continue;
+                if (property.Name == "shareIds" && property.Value.ValueKind == JsonValueKind.Array)
+                {
+                    // The retired reader may never have received the headers that
+                    // acknowledged a shared draft. Its accepted request already owns
+                    // that draft, so a continuation must not lease it a second time.
+                    writer.WritePropertyName("shareIds");
+                    writer.WriteStartArray();
+                    foreach (JsonElement shared in property.Value.EnumerateArray())
+                        if (shared.ValueKind != JsonValueKind.String || !_acceptedShareIds.ContainsKey(shared.GetString()!))
+                            shared.WriteTo(writer);
+                    writer.WriteEndArray();
+                }
+                else
+                    property.WriteTo(writer);
+            }
+            writer.WritePropertyName("messages");
+            writer.WriteStartArray();
+            if (conversation?.Messages is { Count: > 0 } saved)
+            {
+                foreach (StoredMessage message in saved)
+                    JsonSerializer.Serialize(writer, message, ConversationStore.Json);
+                // Cancellation can happen before the original request's acceptance
+                // hook, with an older conversation already saved. Keep that unsaved
+                // incoming suffix as well as the user's newest guidance.
+                for (int i = saved.Count; i < messages.GetArrayLength() - 1; i++)
+                    messages[i].WriteTo(writer);
+            }
+            else
+            {
+                // During the first prefill, acceptance may not have recorded the
+                // request yet. Preserve its original question from the sent prefix.
+                for (int i = 0; i < messages.GetArrayLength() - 1; i++)
+                    messages[i].WriteTo(writer);
+            }
+            guidance.WriteTo(writer);
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
+        using JsonDocument document = JsonDocument.Parse(output.ToArray());
+        return document.RootElement.Clone();
     }
 
     /// <summary>
@@ -199,7 +267,8 @@ public sealed class ConversationRecorder
     /// generation that produced it.
     /// </para>
     /// </summary>
-    public void Record(string sessionId, JsonElement body)
+    /// <param name="accepted">False for queued guidance persisted before its cancelled producer starts; shared drafts remain pending.</param>
+    public void Record(string sessionId, JsonElement body, bool accepted = true)
     {
         try
         {
@@ -241,6 +310,12 @@ public sealed class ConversationRecorder
                 conversation.ModelId = name;
             if (body.TryGetProperty("think", out JsonElement think) && think.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 conversation.Think = think.GetBoolean();
+            // Omission never inherits a different conversation's library scope.
+            conversation.KnowledgeCollections = body.TryGetProperty("knowledgeCollections", out JsonElement collections)
+                && collections.ValueKind == JsonValueKind.Array
+                ? collections.EnumerateArray().Where(item => item.ValueKind == JsonValueKind.String)
+                    .Select(item => item.GetString()!).Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal).ToList()
+                : new List<string>();
             if (body.TryGetProperty("skills", out JsonElement skills) && skills.ValueKind == JsonValueKind.Array)
             {
                 conversation.Skills.Clear();
@@ -259,6 +334,10 @@ public sealed class ConversationRecorder
             }
 
             _store.Save(conversation);
+            if (accepted && body.TryGetProperty("shareIds", out JsonElement shared) && shared.ValueKind == JsonValueKind.Array)
+                foreach (JsonElement item in shared.EnumerateArray())
+                    if (item.ValueKind == JsonValueKind.String && item.GetString() is { Length: > 0 } shareId)
+                        _acceptedShareIds.TryAdd(shareId, 0);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
         {

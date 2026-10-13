@@ -713,6 +713,13 @@ namespace TensorSharp.Runtime
                 text = StripEmptyThinkBlockBeforePlaceholders(text);
             }
 
+            // Remove any history-only routing header BEFORE restoring the actual
+            // generation suffix. Muse may now prefill its direct-answer header;
+            // stripping afterward would erase that recorded boundary too.
+            string? headerAnchor = GetTemplateAssistantHeaderAnchor(architecture);
+            if (!string.IsNullOrEmpty(headerAnchor))
+                text = StripTemplateAssistantHeaders(text, headerAnchor);
+
             // What this request's generation prompt would end with is the fallback;
             // a turn the transcript tracked knows what ITS prompt ended with, and that
             // is what the cache holds in front of its raw tokens.
@@ -724,13 +731,6 @@ namespace TensorSharp.Runtime
                 anyRecordedSuffix = !string.IsNullOrEmpty(recordedSuffixes[i]);
             if (!string.IsNullOrEmpty(suffix) || anyRecordedSuffix)
                 text = InjectSuffixBeforePlaceholders(text, suffix, recordedSuffixes);
-
-            // The mirror image of the suffix injection: some templates emit MORE assistant
-            // framing for a past turn than the generation prompt did, and the raw tokens
-            // already contain their own. See GetTemplateAssistantHeaderAnchor.
-            string? headerAnchor = GetTemplateAssistantHeaderAnchor(architecture);
-            if (!string.IsNullOrEmpty(headerAnchor))
-                text = StripTemplateAssistantHeaders(text, headerAnchor);
 
             // Reproduce the exact whitespace that preceded each raw generation. Prompt
             // tails are structural: Gemma 4's ordinary generation prompt ends in a newline,

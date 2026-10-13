@@ -324,6 +324,27 @@ namespace TensorSharp.Server
         /// </summary>
         public int ModelContextTokens => _lifecycle.Model?.Config?.DeclaredContextLength ?? 0;
 
+        /// <summary>Approve optional knowledge expansion against the real rendered
+        /// text prompt, preserving the requested reply budget. Media expansion needs
+        /// GPU preparation and therefore stays on the ordinary retrieval path.</summary>
+        internal bool KnowledgePromptFits(List<ChatMessage> messages, int maxTokens,
+            List<ToolFunction>? tools, bool enableThinking)
+        {
+            var model = Model;
+            if (model == null || model.IsRetiring || model.MaxContextLength <= 0
+                || messages.Any(message => message.ImagePaths is { Count: > 0 }
+                    || message.AudioPaths is { Count: > 0 })) return false;
+            var engine = _engineHost.TryGetEngine();
+            if (engine == null || !ReferenceEquals(model, Model)) return false;
+            var capacity = engine.PoolStats;
+            long contextLimit = Math.Min(model.MaxContextLength, (long)capacity.totalBlocks * capacity.blockSize);
+            long promptLimit = contextLimit - Math.Max(1, maxTokens) - 1024;
+            if (promptLimit <= 0) return false;
+            var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
+            return renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, messages,
+                model.Config.Architecture, addGenerationPrompt: true, tools: tools, enableThinking: enableThinking).Count <= promptLimit;
+        }
+
         /// <summary>
         /// Session-aware chat with Agent Skills.
         ///
@@ -354,18 +375,21 @@ namespace TensorSharp.Server
                 List<ToolFunction>? tools,
                 bool enableThinking,
                 SkillRequestPlan? skills,
-                ILogger logger = null)
+                ILogger logger = null,
+                int? thinkingTokenLimit = null)
         {
             if (skills == null || !skills.ToolsOffered)
             {
                 return _generation.ChatStreamWithMetricsAsync(
-                    session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
+                    session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking,
+                    thinkingTokenLimit.HasValue ? new ChatTurnContext { ThinkingTokenLimit = thinkingTokenLimit } : null);
             }
 
             // One turn, many generations: every round of the loop runs in the cache scope
             // its first round resolved, so round two continues round one's state even on
             // a shared session where the scope is proved from history.
-            var turn = new ChatTurnContext { StagedAttachmentNames = skills.StagedAttachmentNames };
+            var turn = new ChatTurnContext
+            { StagedAttachmentNames = skills.StagedAttachmentNames, ThinkingTokenLimit = thinkingTokenLimit };
 
             // Sampling for a turn that can run code. The runner decides, because it is
             // what knows the operator's configuration; SamplingConfig.ForCodingTurn then
@@ -375,6 +399,8 @@ namespace TensorSharp.Server
             // and is shared across every request.
             SamplingConfig turnSampling =
                 skills.ToolContext?.CodeRunner?.ForCodingTurn(samplingConfig) ?? samplingConfig;
+            turnSampling = SamplingForBoundedKnowledgePlanning(Architecture, turnSampling,
+                skills.ToolContext?.Knowledge != null, enableThinking, thinkingTokenLimit);
 
             SkillChatGeneration generate =
                 (turnMessages, turnTools, ct) => _generation.ChatStreamWithMetricsAsync(
@@ -394,6 +420,22 @@ namespace TensorSharp.Server
                 generate,
                 logger,
                 cancellationToken);
+        }
+
+        internal static SamplingConfig SamplingForBoundedKnowledgePlanning(string architecture,
+            SamplingConfig sampling, bool hasKnowledge, bool enableThinking, int? thinkingTokenLimit)
+        {
+            if (ChatProtocolRegistry.For(architecture)?.Id != "muse-glimmer"
+                || !hasKnowledge || !enableThinking || thinkingTokenLimit is not > 0
+                || !string.IsNullOrWhiteSpace(sampling?.ReasoningEffort))
+                return sampling;
+            // The template's default high effort works against an explicitly
+            // bounded retrieval plan. Preserve deliberate effort choices and every
+            // other request setting, including an independent grammar constraint.
+            var result = sampling?.Clone() ?? new SamplingConfig();
+            result.ReasoningEffort = "medium";
+            result.Grammar = sampling?.Grammar?.Fork();
+            return result;
         }
 
         internal static SamplingConfig SamplingForDeepSeek41SkillRound(string architecture,

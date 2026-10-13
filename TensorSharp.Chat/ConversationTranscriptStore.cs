@@ -12,6 +12,7 @@ using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using TensorSharp.AgentHost.Knowledge;
 
 namespace TensorSharp.Server
 {
@@ -619,31 +620,39 @@ namespace TensorSharp.Server
             message.ContentCacheBreakpoints.Sort();
         }
 
-        internal static ChatMessage CloneShallow(ChatMessage src) => new()
+        internal static ChatMessage CloneShallow(ChatMessage src)
         {
-            Role = src.Role,
-            Content = src.Content,
-            ImagePaths = src.ImagePaths,
-            ImageTimestamps = src.ImageTimestamps,
-            AudioPaths = src.AudioPaths,
-            TextFilePaths = src.TextFilePaths,
-            TextFileNames = src.TextFileNames,
-            HasFileBackedTextAttachments = src.HasFileBackedTextAttachments,
-            AttachmentPaths = src.AttachmentPaths,
-            AttachmentNames = src.AttachmentNames,
-            IsVideo = src.IsVideo,
-            ToolCalls = src.ToolCalls,
-            ToolCallId = src.ToolCallId,
-            Thinking = src.Thinking,
-            RawOutputTokens = src.RawOutputTokens,
-            RawPromptTrailingWhitespace = src.RawPromptTrailingWhitespace,
-            RawGenerationSuffix = src.RawGenerationSuffix,
-            CacheControl = src.CacheControl != null
+            ChatMessage copy = src switch
+            {
+                KnowledgeEvidenceReplayMessage => new KnowledgeEvidenceReplayMessage(),
+                KnowledgeToolResultMessage => new KnowledgeToolResultMessage(),
+                HostContinuationMessage => new HostContinuationMessage(),
+                _ => new ChatMessage(),
+            };
+            copy.Role = src.Role;
+            copy.Content = src.Content;
+            copy.ImagePaths = src.ImagePaths;
+            copy.ImageTimestamps = src.ImageTimestamps;
+            copy.AudioPaths = src.AudioPaths;
+            copy.TextFilePaths = src.TextFilePaths;
+            copy.TextFileNames = src.TextFileNames;
+            copy.HasFileBackedTextAttachments = src.HasFileBackedTextAttachments;
+            copy.AttachmentPaths = src.AttachmentPaths;
+            copy.AttachmentNames = src.AttachmentNames;
+            copy.IsVideo = src.IsVideo;
+            copy.ToolCalls = src.ToolCalls;
+            copy.ToolCallId = src.ToolCallId;
+            copy.Thinking = src.Thinking;
+            copy.RawOutputTokens = src.RawOutputTokens;
+            copy.RawPromptTrailingWhitespace = src.RawPromptTrailingWhitespace;
+            copy.RawGenerationSuffix = src.RawGenerationSuffix;
+            copy.CacheControl = src.CacheControl != null
                 ? new CacheControlMarker { Type = src.CacheControl.Type }
-                : null,
-            ContentCacheBreakpoints = src.ContentCacheBreakpoints != null
+                : null;
+            copy.ContentCacheBreakpoints = src.ContentCacheBreakpoints != null
                 ? new List<int>(src.ContentCacheBreakpoints)
-                : null,
-        };
+                : null;
+            return copy;
+        }
     }
 }

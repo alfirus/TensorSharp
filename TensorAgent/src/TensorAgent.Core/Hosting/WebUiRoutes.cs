@@ -136,8 +136,21 @@ public static partial class WebUiRoutes
             // The request STARTS the turn and then reads it exactly as a later reader
             // would. Its own token is deliberately not handed to the generation: the
             // whole point is that this connection going away is not the turn ending.
-            string id = turns.Start(
-                TurnKeyFor(body, recorder), token => Guarded(chatFrames(body, token)));
+            string? sessionId = body.ValueKind == JsonValueKind.Object
+                && body.TryGetProperty("sessionId", out JsonElement session) && session.ValueKind == JsonValueKind.String
+                    ? session.GetString() : null;
+            bool steering = body.ValueKind == JsonValueKind.Object
+                && body.TryGetProperty("steer", out JsonElement steer) && steer.ValueKind == JsonValueKind.True;
+            if (steering && (!body.TryGetProperty("messages", out JsonElement messages)
+                || messages.ValueKind != JsonValueKind.Array || messages.GetArrayLength() == 0
+                || messages[messages.GetArrayLength() - 1].ValueKind != JsonValueKind.Object
+                || !messages[messages.GetArrayLength() - 1].TryGetProperty("role", out JsonElement role)
+                || role.ValueKind != JsonValueKind.String || role.GetString() != "user"))
+                return LoopbackResponse.Json(new { error = "Steering requires a user message." }, 400);
+            string key = TurnKeyFor(body, recorder);
+            string id = steering
+                ? turns.StartSteered(key, token => SteeringFrames(body, sessionId, recorder, chatFrames, token), sessionId)
+                : turns.Start(key, token => Guarded(chatFrames(body, token)), sessionId);
             return LoopbackResponse.Sse(
                 turns.WatchAsync(id, 0, CancellationToken.None),
                 request.Cancellation,
@@ -214,6 +227,7 @@ public static partial class WebUiRoutes
                 messages = conversation.Messages,
                 think = conversation.Think,
                 skills = conversation.Skills,
+                knowledgeCollections = conversation.KnowledgeCollections,
                 skillsExplicit = conversation.SkillsExplicit,
                 modelId = conversation.ModelId,
                 // The answer a previous page left running here, if there is one. Sent
@@ -846,6 +860,7 @@ public static partial class WebUiRoutes
         var content = new StringBuilder();
         var thinking = new StringBuilder();
         var artifacts = new List<StoredArtifact>();
+        var knowledgeSources = new List<JsonElement>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         string? sessionId = null;
         string? imageUrl = null, videoUrl = null, audioUrl = null;
@@ -861,6 +876,7 @@ public static partial class WebUiRoutes
             // only way to stay honest about what was actually sent.
             using JsonDocument document = JsonDocument.Parse(JsonSerializer.Serialize(frame, SseFraming.JsonOptions));
             JsonElement root = document.RootElement;
+            CollectKnowledgeSources(root, knowledgeSources);
             if (root.TryGetProperty("done", out JsonElement done) && done.ValueKind == JsonValueKind.True)
                 stats = StoredTurnStats.FromDoneFrame(root);
             if (root.TryGetProperty("token", out JsonElement token) && token.GetString() is { } piece)
@@ -893,7 +909,15 @@ public static partial class WebUiRoutes
         }
 
         if (sessionId is not null)
-            recorder.Complete(sessionId, content.ToString(), thinking.ToString(), artifacts, imageUrl, videoUrl, audioUrl, stats, image);
+            recorder.Complete(sessionId, content.ToString(), thinking.ToString(), artifacts, imageUrl, videoUrl, audioUrl, stats, image, knowledgeSources);
+    }
+
+    internal static void CollectKnowledgeSources(JsonElement frame, List<JsonElement> destination)
+    {
+        if (!frame.TryGetProperty("knowledgeSources", out var sources) || sources.ValueKind != JsonValueKind.Array) return;
+        destination.Clear();
+        foreach (var source in sources.EnumerateArray().Take(50))
+            if (source.ValueKind == JsonValueKind.Object) destination.Add(source.Clone());
     }
 
     /// <summary>
@@ -943,6 +967,38 @@ public static partial class WebUiRoutes
         if (session.Length > 0 && recorder?.ConversationFor(session) is { Length: > 0 } conversation)
             return conversation;
         return session.Length > 0 ? "session:" + session : "chat";
+    }
+
+    private static async IAsyncEnumerable<object> SteeringFrames(
+        JsonElement body, string? sessionId, ConversationRecorder? recorder,
+        Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> chatFrames,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken token)
+    {
+        JsonElement request = sessionId is not null && recorder is not null
+            ? recorder.SteeringRequest(sessionId, body) : body;
+        // Persist accepted guidance even if another steering message arrived while
+        // the predecessor was unwinding. The next continuation then includes both.
+        if (token.IsCancellationRequested)
+        {
+            if (sessionId is not null)
+                recorder?.Record(sessionId, request, accepted: false);
+            token.ThrowIfCancellationRequested();
+        }
+        bool announced = false;
+        await foreach (object frame in Guarded(chatFrames(request, token)).WithCancellation(token).ConfigureAwait(false))
+        {
+            if (!announced)
+            {
+                // The underlying service has now passed its preflight and accepted
+                // the request. Preserve refusal status codes by emitting nothing
+                // until that point, just as the ordinary chat route does.
+                if (sessionId is not null)
+                    recorder?.Record(sessionId, request);
+                announced = true;
+                yield return new { steeringMessages = request.GetProperty("messages") };
+            }
+            yield return frame;
+        }
     }
 
     /// <summary>One turn, as the page reads it. Null stays null: "there is nothing running".</summary>

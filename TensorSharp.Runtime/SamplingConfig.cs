@@ -135,6 +135,9 @@ namespace TensorSharp.Runtime
         /// <summary>Optional immutable policy that closes an open reasoning
         /// channel at its budget and continues within MaxTokens.</summary>
         public ThinkingTokenBudget? ThinkingBudget { get; set; }
+        /// <summary>Optional immutable budget for message-routed reasoning; sampler
+        /// state remains private to each sequence, like the ordinary tag budget.</summary>
+        public MessageThinkingTokenBudget? MessageThinkingBudget { get; set; }
 
         /// <summary>
         /// The OpenAI <c>reasoning_effort</c> the request asked for (<c>low</c>,
@@ -263,6 +266,7 @@ namespace TensorSharp.Runtime
                 StopSequences = StopSequences != null ? new List<string>(StopSequences) : null,
                 FirstTokenAllowList = FirstTokenAllowList,
                 ThinkingBudget = ThinkingBudget,
+                MessageThinkingBudget = MessageThinkingBudget,
                 ReasoningEffort = ReasoningEffort,
             };
         }

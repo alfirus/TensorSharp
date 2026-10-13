@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System.Text;
+using System.Net.Http.Headers;
 
 namespace TensorAgent.Core.Hosting;
 
@@ -96,8 +97,12 @@ public static class MultipartFormReader
                 }
 
                 string disposition = headers.TryGetValue("Content-Disposition", out string? d) ? d : string.Empty;
-                string name = ParseParam(disposition, "name") ?? string.Empty;
-                string? fileName = ParseParam(disposition, "filename");
+                if (!ContentDispositionHeaderValue.TryParse(disposition, out var parsedDisposition)
+                    || !parsedDisposition.DispositionType.Equals("form-data", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("multipart content disposition is missing or invalid");
+                string name = UnescapeQuotedParameter(parsedDisposition, "name", parsedDisposition.Name) ?? string.Empty;
+                string? fileName = parsedDisposition.FileNameStar
+                    ?? UnescapeQuotedParameter(parsedDisposition, "filename", parsedDisposition.FileName);
                 string partType = headers.TryGetValue("Content-Type", out string? t) ? t : "application/octet-stream";
 
                 if (fileName is null)
@@ -121,7 +126,7 @@ public static class MultipartFormReader
                     form.Files.Add(new MultipartFile
                     {
                         FieldName = name,
-                        FileName = Path.GetFileName(fileName),
+                        FileName = Path.GetFileName(fileName.Replace('\\', '/')),
                         ContentType = partType,
                         TempPath = temp,
                         Length = length,
@@ -144,24 +149,25 @@ public static class MultipartFormReader
 
     private static string? GetBoundary(string contentType)
     {
-        foreach (string part in contentType.Split(';'))
-        {
-            string p = part.Trim();
-            if (p.StartsWith("boundary=", StringComparison.OrdinalIgnoreCase))
-                return p["boundary=".Length..].Trim('"');
-        }
-        return null;
+        if (!MediaTypeHeaderValue.TryParse(contentType, out var parsed)) return null;
+        string? value = parsed.Parameters.FirstOrDefault(parameter => parameter.Name.Equals("boundary", StringComparison.OrdinalIgnoreCase))?.Value;
+        return value is { Length: >= 2 } && value[0] == '"' && value[^1] == '"' ? value[1..^1] : value;
     }
 
-    private static string? ParseParam(string header, string name)
+    private static string? UnescapeQuotedParameter(ContentDispositionHeaderValue header, string name, string? value)
     {
-        foreach (string part in header.Split(';'))
+        string? raw = header.Parameters.FirstOrDefault(parameter => parameter.Name.Equals(name, StringComparison.OrdinalIgnoreCase))?.Value;
+        if (value is null || raw is not { Length: >= 2 } || raw[0] != '"' || raw[^1] != '"' || !raw.Contains('\\')) return value;
+        // The framework removes outer quotes and decodes RFC 5987/MIME names, but
+        // leaves quoted pairs intact. Only unwrap pairs from a literal quoted value.
+        if (value != raw[1..^1]) return value;
+        var unescaped = new StringBuilder(value.Length);
+        for (int index = 0; index < value.Length; index++)
         {
-            string p = part.Trim();
-            if (p.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
-                return p[(name.Length + 1)..].Trim('"');
+            if (value[index] == '\\' && index + 1 < value.Length) index++;
+            unescaped.Append(value[index]);
         }
-        return null;
+        return unescaped.ToString();
     }
 
     /// <summary>Byte-level reader with delimiter search over a rolling buffer.</summary>

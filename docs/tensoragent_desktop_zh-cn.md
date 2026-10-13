@@ -10,6 +10,8 @@ TensorAgent 在你的电脑上运行 AI 模型。本指南介绍 Mac 和 Windows
 
 在发布页面展开 **Assets**，选择以 `tensoragent-desktop-` 开头的文件。桌面安装包由更新后的 **Release Binaries** 工作流发布；更新之前的发布可能只有 CLI / Server 归档。如果最新发布没有 Desktop 资源，该版本暂时没有桌面下载：可按[源码构建说明](../TensorAgent/README.md#on-the-desktop-macos-and-windows)构建，或等待下次包含桌面安装包的发布。CLI 和 Server 归档是另外的应用。
 
+知识库与回答调整功能对应 `v2026.10.10` 标签之后的当前源码。在包含这些改动的发布出现前，需从源码构建；已有桌面安装包不代表其中已包含这些功能。
+
 ## 1. 选择下载文件
 
 下表中的 `<version>` 是去掉开头 `v` 的发布标签。例如，`v2026.10.03` 对应文件名中的 `2026.10.03`；此处仅举例，不表示该发布已经存在。
@@ -70,6 +72,8 @@ Get-FileHash ".\tensoragent-desktop-VERSION-win-x64-cpu.msi" -Algorithm SHA256
 
 下载中断会保留部分文件，回到“模型”选择 **继续** 或 **重试**。应用会在使用前校验模型文件；使用内置目录时无需手动下载 GGUF。
 
+模型正在推理或回答时，仍可输入并发送新指令，例如 `请重点介绍安装步骤。`。输入框会显示 **调整回答**；发送后中断当前回复，并结合对话、已生成的部分回答和新指令继续。**停止** 仍可单独中止回复。连续发送的指令会等待前一轮生成和工具清理完成，再启动下一轮。
+
 ## 4. 使用附件、技能与生成文件
 
 **询问文件或图片。** 通过 **+ → 文件** 或 **照片** 选择内容，等待上传完成，再发送具体问题。理解图片需要当前模型支持图像输入，并已安装视觉文件。卡片显示“文本已就绪 · 视觉文件未下载”时，选择 **添加视觉** 或 **启用视觉**，下载完成后再次选择 **使用**。音频和视频输入也取决于模型及平台，请查看卡片。
@@ -84,7 +88,19 @@ Get-FileHash ".\tensoragent-desktop-VERSION-win-x64-cpu.msi" -Algorithm SHA256
 
 **生成视频。** 下载并 **使用 MiniMax-H3**，描述短视频，或附上作为起始画面的照片。**MiniMax-H3 References** 支持参考照片、视频和录音。这些任务需要较高的桌面内存档位。Mac 应用已有媒体生成实测，Windows 图像 / 音频 / 视频生成尚未验证。详见[模型与验证说明](../TensorAgent/README.md#what-has-not-been-verified)。
 
-## 5. 配置可选代码工具
+## 5. 建立并使用知识库
+
+1. 打开 **☰ → 知识库**，输入集合名称并选择 **创建**。
+2. 选择 **上传文件** 或 **上传文件夹**；嵌套文件保留相对路径。**添加聊天** 可导入选中的已保存对话、可用附件和生成文件；导入的是快照，对话变化后需要再次导入以更新。
+3. 检查抽取状态和警告，再搜索集合核对片段。`Ready`、`Partial` 和 `MetadataOnly` 表示实际建立了什么索引；保留原文件并不表示全部内容都已理解。
+4. 选择 **在此聊天中使用**。已选集合显示在输入框上方；上传本身不会选择集合。新聊天不选择任何集合，重新打开已保存聊天会恢复其选择。
+5. 提问时会自动检索相关片段。支持工具的模型还可继续搜索、读取周边内容；开启代码工具时可打开完整原文件进行计算。回答中的来源链接和检索来源列表可打开引用预览及原文件。
+
+文本、代码、CSV/TSV、JSON、HTML、字幕与部分 Office 内容无需聊天模型即可导入。PDF 保留文本层，并对扫描或含图片页面执行本地 OCR：支持的 Mac 使用 Apple Vision，Windows 自动准备 Poppler/Tesseract。首次便携 OCR 配置需要联网，之后识别在本地完成。图像与视频采样帧需要已加载的兼容视觉模型；音频可使用已加载的音频塔或已配置的 `TS_JEV_TRANSCRIPTION_URL` 转录伴随服务。启用相应能力后，对已有仅元数据来源选择 **重新索引**，即可从保留的原文件提取内容。
+
+默认使用本地 BM25 检索，可通过可选 GGUF 嵌入模型增加语义检索。抽取与生成的回答可能遗漏或误读细节，重要引用应核对原文。子代理继承同一集合选择，不能自行扩大范围。格式、预览、配额、OCR、嵌入配置与 API 示例见[知识库指南](knowledge-system_zh-cn.md)。
+
+## 6. 配置可选代码工具
 
 本地聊天与推理不需要 Python 或 Node。桌面技能使用电脑上安装的程序；桌面安装包**不包含 Python、Node、npm 或浏览器**。按任务需求从官方 [Python](https://www.python.org/downloads/) 与 [Node.js](https://nodejs.org/en/download) 页面安装，把程序加入 `PATH` 后重启 TensorAgent。Mac 应用读取登录 shell 的 `PATH`，Windows 使用进程环境。Python 文档技能还可能需要 `python-docx`、`python-pptx` 或 `openpyxl` 等包。技能说明和缺失工具报错会提示具体依赖；安装应用并不意味着所有内置技能的工具都已就绪。
 
@@ -108,12 +124,13 @@ macOS 使用 TensorSharp 的 Seatbelt 配置限制子进程，只允许写入聊
 | 内容 | macOS | Windows |
 |---|---|---|
 | 设置、保存的聊天、已安装技能 | `~/Library/Application Support/TensorAgent` | `%LOCALAPPDATA%\TensorAgent\Data` |
+| 知识库原文件与索引 | `~/Library/Application Support/TensorAgent/knowledge` | `%LOCALAPPDATA%\TensorAgent\Data\knowledge` |
 | 默认模型、LoRA、上传、工作区、产物与日志 | `~/Library/Caches/TensorAgent` | `%LOCALAPPDATA%\TensorAgent\Cache` |
 | 警告 / 错误日志 | `~/Library/Caches/TensorAgent/logs/errors.log` | `%LOCALAPPDATA%\TensorAgent\Cache\logs\errors.log` |
 
 **设置 → 存储** 显示有效模型路径和数量。迁移模型时，等下载 / 导入完成后关闭应用，把原目录内的 `<catalog-id>` 模型子文件夹复制到新目录，再打开应用并保存新目录的完整路径。应用不会自动移动模型；**使用默认文件夹** 可恢复默认路径。LoRA 和其他缓存仍留在原缓存位置。
 
-备份时先关闭 TensorAgent，再复制数据文件夹及需保留的生成文件。如果希望已保存聊天中的上传文件和产物链接继续有效，还需备份缓存。自定义模型文件夹需要另外复制，以免再次下载权重。**模型 → 删除** 移除模型；**设置 → 删除所有聊天** 移除聊天及关联工作。删除无法撤销。
+备份时先关闭 TensorAgent，再复制数据文件夹及需保留的生成文件。如果希望已保存聊天中的上传文件和产物链接继续有效，还需备份缓存。自定义模型文件夹需要另外复制，以免再次下载权重。**模型 → 删除** 移除模型；**设置 → 删除所有聊天** 移除聊天及关联工作。已导入知识库的原文件保留在独立数据目录中，需在 **知识库** 中删除对应来源。删除无法撤销。
 
 ## 更新或卸载
 
@@ -127,7 +144,7 @@ Mac 卸载时把 **TensorAgent.app** 移到废纸篓；Windows 使用 **设置 �
 
 | 问题 | 可以尝试 |
 |---|---|
-| Assets 中没有 `tensoragent-desktop-` 文件 | 该发布早于桌面打包支持。检查所有发布，或在包含安装包的发布出现前从源码构建。 |
+| Assets 中没有 `tensoragent-desktop-` 文件 | 该发布没有桌面安装包。检查其他发布或成功的打包运行，或在包含安装包的发布出现前从源码构建。 |
 | Mac 应用打不开 | 确认 Apple Silicon 和 macOS 14+，核对校验值，按上文 Apple 的可信应用流程打开。源码构建的系统下限可能不同。 |
 | Windows 聊天窗口空白 | 安装 / 更新 WebView2 Evergreen Runtime，重新打开，并确认完整安装或解压所有文件。 |
 | CUDA 包无法启动或加载模型 | 检查 NVIDIA 驱动及 GPU 兼容性，试用 CPU 包以区分 GPU 与应用问题；不要混用两个版本的文件。 |

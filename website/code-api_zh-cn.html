@@ -21,8 +21,8 @@
   <p><strong>句向量编码器：</strong>Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2，支持纯 C# CPU 与原生 GGML CPU/Metal/CUDA，通过 <code>--embeddings</code> 提供兼容 OpenAI/Ollama 的 API。 <a href="embeddings_zh-cn.html">嵌入模型、支持的后端与验证 →</a></p>
 
   <h2 id="packages">项目与包边界</h2>
-  <p>仓库按可发布包边界拆分。源码树的发布集合是下表的全部 <strong>13</strong> 个包，由 <code>eng/verify-packages.ps1</code> 校验，并作为发布流水线的门禁。</p>
-  <p>包版本对应各自的发布标签。在 <code>v2026.09.01</code> 后合入的功能——包括 Qwen-Image-2.1、蒙版编辑与 LoRA 插件、Jev 端点、DiffusionGemma 图像输入与子智能体——需要当前源码构建。使用这些 API 时请引用源码项目。</p>
+  <p>仓库按可发布包边界拆分。源码树的发布集合是下表的全部 <strong>14</strong> 个包，由 <code>eng/verify-packages.ps1</code> 校验，并作为发布流水线的门禁。</p>
+  <p>包版本与内容对应选定的发布标签。个人知识库与回答引导在 <code>v2026.10.10</code> 后合入，需要包含它们的新构建；使用未发布 API 时请引用当前源码项目。发布流程可打包下表项目，不代表已检查某次发行的全部 NuGet 包或安装资产。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>项目 / 包</th><th>命名空间</th><th>职责</th></tr></thead>
@@ -34,6 +34,7 @@
       <tr><td><code>TensorSharp.Backends.GGML</code></td><td><code>TensorSharp.GGML</code></td><td>GGML 支撑的执行与原生互操作。</td></tr>
       <tr><td><code>TensorSharp.Backends.Cuda</code></td><td><code>TensorSharp.Cuda</code></td><td>直接 CUDA 分配器、存储、cuBLAS GEMM、PTX 内核、量化 CUDA 运算。</td></tr>
       <tr><td><code>TensorSharp.Backends.MLX</code></td><td><code>TensorSharp.MLX</code></td><td>Apple Silicon MLX 后端（mlx-c / Metal）。</td></tr>
+      <tr><td><code>TensorSharp.Knowledge</code></td><td><code>TensorSharp.Knowledge</code></td><td>独立个人存储、原文件、文档提取、版本化片段、BM25 与可选嵌入检索。<a href="knowledge_zh-cn.html">知识库指南</a>。</td></tr>
       <tr><td><code>TensorSharp.Chat</code></td><td><code>TensorSharp.Chat</code></td><td>与宿主无关的聊天流水线——<code>ModelService</code>、会话、生成、技能循环、Web UI 请求/流式契约。不依赖 ASP.NET Core；由服务器、CLI 与 iOS 应用共用。</td></tr>
       <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core 库：OpenAI/Ollama 适配器、基于 TensorSharp.Chat 的 HTTP 传输、Web UI 资源。它是库——单独构建不产生可执行文件。</td></tr>
       <tr><td><code>TensorSharp.Server.Host</code></td><td><code>TensorSharp.Server.Host</code></td><td>基于该库的可运行 Web 应用：<code>Program.cs</code>、宿主装配、<code>wwwroot/</code> 与命令行。实际运行的是它。</td></tr>
@@ -45,8 +46,9 @@
   </div>
   <p>典型嵌入场景只需引用 <code>TensorSharp.Models.csproj</code>；它已引用 Core、Runtime 与各后端项目。若你的应用与 TensorSharp checkout 同级：</p>
   <pre data-lang="bash"><code>dotnet add reference ../TensorSharp/TensorSharp.Models/TensorSharp.Models.csproj</code></pre>
-  <div class="callout warn"><div class="ic">📦</div><p>NuGet 包是 <code>v2026.09.01</code> 发布时的快照；需要当前实现时请使用项目引用。源码构建默认编译原生 GGML/MLX；开发托管 CPU 路径时传入 <code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true</code>，或按<a href="backends_zh-cn.html#native-build">后端</a>页面构建原生库。</p></div>
+  <div class="callout warn"><div class="ic">📦</div><p>使用所选版本的发布说明核对包内功能；需要标签之后的实现时使用当前项目引用。源码构建默认编译原生 GGML/MLX；开发托管 CPU 路径时传入 <code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true</code>，或按<a href="backends_zh-cn.html#native-build">后端</a>页面构建原生库。</p></div>
 
+  <p><strong>知识库 SDK：</strong><code>KnowledgeStore</code>、<code>KnowledgeOptions</code>、<code>IKnowledgeExtractor</code> 与 <code>IKnowledgeEmbeddingProvider</code> 位于独立项目；Chat 层的 <code>KnowledgeRuntime.CreateStore</code> 接入加载模型、GGUF 编码器与 OCR。应用须显式提供选择范围与认证边界。<a href="knowledge_zh-cn.html#server">宿主配置 →</a></p>
   <h2 id="quickstart">最小示例 —— 加载、生成、解码</h2>
   <p>每个模型都以相同方式加载：<code>ModelBase.Create()</code> 读取 GGUF 元数据并实例化正确的架构。从这里开始你做分词、运行前向、采样并解码。</p>
   <pre data-lang="csharp"><code>using System;

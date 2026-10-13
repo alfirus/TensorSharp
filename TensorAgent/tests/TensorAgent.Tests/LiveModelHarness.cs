@@ -18,6 +18,7 @@ using TensorAgent.Core.Settings;
 using TensorAgent.Core.Python;
 using TensorAgent.Core.Shell;
 using TensorSharp.AgentHost.Skills;
+using Microsoft.Extensions.Logging;
 
 namespace TensorAgent.Tests;
 
@@ -350,7 +351,8 @@ public abstract class LiveModelHarness : IDisposable
         string weights,
         bool skills = false,
         bool interpreter = false,
-        int maxTokens = 64)
+        int maxTokens = 64,
+        ILoggerFactory? loggerFactory = null)
     {
         var paths = new AgentPaths(Path.Combine(_root, "data"), Path.Combine(_root, "cache"))
         {
@@ -383,7 +385,7 @@ public abstract class LiveModelHarness : IDisposable
         // here before the model is constructed.
         EngineMemoryPolicy.Apply(model, chosen);
 
-        _host = new AgentAppHost(paths);
+        _host = new AgentAppHost(paths, loggerFactory: loggerFactory);
         _host.Options.RepointHostedModel(hostedModelPath, _host.Options.StartupMmProjPath);
         // The test below deliberately owns the one load through /api/models/load.
         // AgentAppHost.Start would also schedule its remembered-model load, which

@@ -9,6 +9,7 @@ TensorSharp.Server.Host 提供三种 API 风格、一个兼容 Jev 的判定端�
 - **兼容 Jev** 的类型化判定（`/v1/systemone`，仅限 DiffusionGemma）
 - **Web UI**（`/api/chat`、`/api/sessions`、`/api/models`、`/api/models/load`、`/api/upload`、`/api/skills`、`/api/image-edit`、`/api/image-edit/stream`、`/api/image-generate`、`/api/image-generate/stream`、`/api/video-generate`、`/api/video-generate/stream`）
 - **工具型接口**（`/api/version`、`/api/queue/status`、`/health`）
+- **个人知识库**（`/api/knowledge`，通过 `TS_KNOWLEDGE_DIRECTORY` 启用）
 
 启动服务时通过 `--model` 指定承载的模型文件，必要时通过 `--mmproj` **显式**指定多模态投影器；`TensorSharp.Server.Host` 不会自动探测投影器。Web UI 与兼容接口仅暴露启动时指定的模型 / 投影器组合；`/api/models/load` 可以用受支持的后端重新加载同一组合，但无模型启动时不能用它选择模型，也不能在运行时切换到其他文件。
 
@@ -24,6 +25,46 @@ curl http://127.0.0.1:5000/api/embed -H 'Content-Type: application/json' \
 ```
 
 完整字段、token ID 输入、`base64`、`dimensions`、截断规则和检索质量见[嵌入指南](../docs/embeddings_zh-cn.md)。
+
+## 个人知识库
+
+本功能与回答调整对应 `v2026.10.10` 标签之后的源码；在包含这些改动的发布出现前需从源码构建。启动聊天服务前启用持久知识库，并替换以下路径与后端：
+
+```bash
+export TS_KNOWLEDGE_DIRECTORY=/absolute/path/to/library
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model /absolute/path/to/chat-model.gguf --backend ggml_metal \
+  --host 127.0.0.1 --port 5001
+```
+
+TensorAgent 会自动启用自己的知识库，并在 **菜单 → 知识库** 提供集合管理器。独立服务的浏览器界面支持聊天与调整回答，集合通过 API 管理。知识库不新增独立用户认证机制，集合 ID 表示范围而非凭据。
+
+创建集合后，将下文的 `COLLECTION_ID` 替换为返回的 `collection.id`；独立服务每个上传请求只接受一个文件。推理示例使用已托管文件的 basename `chat-model`：
+
+```bash
+curl http://127.0.0.1:5001/api/knowledge/collections \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"项目参考","description":"本地来源材料"}'
+
+curl http://127.0.0.1:5001/api/knowledge/collections/COLLECTION_ID/documents \
+  -F 'file=@/absolute/path/to/notes.md'
+
+curl http://127.0.0.1:5001/api/knowledge/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"发布要求","collectionIds":["COLLECTION_ID"],"limit":4,"maxCharacters":6000}'
+
+curl http://127.0.0.1:5001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"chat-model","messages":[{"role":"user","content":"总结发布要求并引用来源。"}],"knowledgeCollections":["COLLECTION_ID"],"max_tokens":512,"stream":false}'
+```
+
+搜索 / 读取请求使用 `collectionIds`，推理请求使用 `knowledgeCollections`，所有支持的协议都保持同一驼峰写法。推理字段可选择最多 32 个集合，支持 `/api/chat`、`/v1/chat/completions`、`/v1/responses`、`/api/chat/ollama` 与 `/api/generate`；最后一个仅检索，不运行智能体工具循环。省略或空选择不提供知识，无效或已删除的选择会被拒绝。并非所有 `/v1` 端点都自动支持知识库，上传也不会自动选择来源。
+
+有工具能力时，`knowledge_list`、`knowledge_search`、`knowledge_read` 与 `knowledge_open` 可在所选范围内精化证据，子智能体继承同一范围。启用代码工具后，`knowledge_open` 可将完整原文件复制到调用者的私有工作区用于计算。兼容聊天请求的 `tool_choice: "none"` 会关闭工具，但保留检索。
+
+OpenAI / Ollama 响应附加 `knowledge_sources`、`knowledge_citation_repairs`、`knowledge_tool_steps` 与 `knowledge_tool_steps_truncated`。流式响应在 Chat Completions 末尾 chunk、`response.completed.response` 或 Ollama 的 `done: true` 记录中附加这些字段。来源描述回答中实际引用的证据，不包含所有命中，也不证明每条生成结论。兼容协议在引用规范化完成前缓冲最终正文，再发送标准追加式 delta，因此推理或工具活动可能早于首个正文片段到达。结构化输出保留 schema 约束内容，并通过独立元数据提供来源。
+
+抽取状态、本地 PDF OCR、可选嵌入模型、分页列表、重建索引、版本化原文件下载及全部管理路由见[知识库指南](../docs/knowledge-system_zh-cn.md)。图像与视频采样帧需要已加载的兼容视觉模型；音频可使用已加载的音频塔或已配置的 `TS_JEV_TRANSCRIPTION_URL` 转录伴随服务。启用相应能力后可对仅元数据来源重建索引。TensorAgent 还支持批量文件、递归文件夹、保存的聊天导入、集合重命名、筛选与安全预览。
 
 ## 当前契约
 
@@ -1015,6 +1056,14 @@ curl -X DELETE http://localhost:5000/api/sessions/a3b1c2...
 享的 `__default__` Web UI 会话；传入 `newChat: true` 会在下一轮前清除跟踪历史，
 无需销毁会话。
 
+### 调整正在生成的回答
+
+模型推理或回答时，浏览器输入框仍可使用。发送新指令会中断当前回复，并结合部分回答和新消息继续；**停止** 可单独中止，不发送新指令。
+
+自定义独立 Web UI 客户端应在新的 `/api/chat` 请求中传入同一独立 `sessionId`、`replaceActive: true`，以及包含最新用户指令的 `messages`；同时保留希望后续生成使用的部分 assistant 内容。服务会取消前一轮及已排队的替换请求，等待生成、对话记录和工具清理完成后才准备新提示。在共享默认会话使用 `replaceActive` 会返回 HTTP 400，需先通过 `POST /api/sessions` 获取独立会话 ID。
+
+TensorAgent 的回环端点使用 `steer: true`，要求最后一条消息为用户消息，并在前一轮结束后重建已接受的对话历史。它可能在生成帧之前发出 `steeringMessages`，包含规范消息列表。这个应用专用字段与独立服务的 `replaceActive` 契约不同；OpenAI / Ollama 接口没有等价的调整标记。
+
 ### 流式聊天
 
 ```bash
@@ -1038,6 +1087,8 @@ curl -N -X POST http://localhost:5000/api/chat \
 | `replace`、`diffusionStep`、`diffusionTotal`、`preview` | 每个 DiffusionGemma 去噪预览与最终替换 | 替换整条 assistant 消息，而不是追加 token |
 | 单独的 `replace` | 已作为答案流式发送的文本被证实是推理时（Nemotron-H Reasoning-128K 在关闭思考的 prompt 已关闭推理块后，又自己写出 `</think>`） | 本轮到目前为止的完整答案，包含所有工具轮次；它跟在携带这段推理的 `thinking` 帧之后，之后的 `token` 帧在其后追加 |
 | `thinking` | 解析到的思维链片段（仅当模型输出含思维链时） | 流式思维链 |
+| `knowledgeSources` | 选择知识库的请求完成引用规范化后 | 最终回答实际引用来源的权威身份与位置对象 |
+| `replace`，随后 `knowledgeCitationRepairs` | 选择知识库的回答需要受支持的本地引用修复时 | 替换完整回答并报告修复次数，不限于 DiffusionGemma |
 | `tool_calls` | 模型输出调用者定义的工具调用 | `{name, arguments}` 数组；内置技能/代码调用改由服务端进程内执行 |
 | `tool_progress`、`tool`、`text`、`seconds`、`detail`、`agents` | 进程内技能/代码/子智能体调用正在写出或运行时 | 短暂的实时活动：阶段为 `writing`、`running` 或 `finished`；内置 Web UI 只保留有界的当前尾部，并在 `finished` 时清除。`wait_agent` 处于 `running` 时，`agents` 是本请求中所有子智能体的快照（`agent_id`、`parent_id`、`task`、`agent_type`、`status`、`tool`、`tool_status`、`detail`、`result`、`error`），其他情况下为 `null` |
 | `skill_step`、`agent_id`、`skill`、`detail`、`ok`、`round`、`files` | 每次进程内技能、代码或子智能体工具调用完成后 | 工具、目标与结果的完成元数据；`agent_id` 指明发起调用的智能体（主对话为 `/root`）；生成的制品以可选的 `{name, bytes, url}` 条目出现在 `files` 中 |

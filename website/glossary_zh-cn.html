@@ -44,6 +44,8 @@
       <tr><td><strong>AllReduce</strong></td><td>并行组中每张 GPU 把自己的部分结果与其他 GPU 相加的集合通信步骤，结束后所有 GPU 持有相同的值。TensorSharp 在每次行并行投影之后执行它。</td></tr>
       <tr><td><strong>节点 / rank</strong></td><td>在分布式运行中，<em>节点</em>指一台机器，<em>rank</em> 指某张 GPU 在并行组中的位置。全局并行度 = 本机 GPU 数 × 节点数。</td></tr>
       <tr><td><strong>投影器（mmproj）</strong></td><td>一个配套文件，让多模态模型能理解图像/音频。用 <code>--mmproj</code> 传入；给出图像、音频或视频时，CLI 也能按文件名在模型旁找到它，但服务器不会自动查找。Qwen-Image-2.1 是两种宿主上的例外：除非用 <code>--qwen-image-mmproj</code> 指定，模型会在 DiT 所在目录中查找它的 Qwen3-VL-8B 投影器。</td></tr>
+      <tr><td><strong>知识集合 / RAG</strong></td><td>从显式选择的本地集合中检索证据，再供模型回答使用。TensorSharp 保留原文件、来源位置与版本化引用；默认 BM25，可选嵌入和重排。检索与引用不保证答案正确。<a href="knowledge_zh-cn.html">知识库指南 →</a></td></tr>
+      <tr><td><strong>回答引导</strong></td><td>生成时发送新指令，停止当前生成、保留已产生文本，再继续新一轮。TensorAgent、服务器 Chat UI 与交互 CLI 支持；不能撤销已执行的工具动作。</td></tr>
       <tr><td><strong>采样（Sampling）</strong></td><td>如何从模型的概率中选取下一个 token。<em>温度</em>、<em>top-p</em> 与 <em>top-k</em> 控制创造性与确定性的平衡。→ <a href="http-api_zh-cn.html#sampling">采样</a></td></tr>
     </tbody>
   </table>

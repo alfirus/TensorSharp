@@ -1,0 +1,4179 @@
+{
+  "version": 1,
+  "id": "ocr-2026-10-11.1",
+  "runtimes": [
+    {
+      "rid": "win-x64",
+      "platform": "win-64",
+      "bootstrap": {
+        "url": "https://github.com/mamba-org/micromamba-releases/releases/download/2.9.0-0/micromamba-win-64.exe",
+        "sha256": "a6d804394b2418991c4e29562853eaace2f2ce9d9da661a98e74e02e8dbb44b0",
+        "bytes": 11454464,
+        "fileName": "micromamba.exe",
+        "version": "2.9.0-0",
+        "license": "BSD-3-Clause",
+        "sourceUrl": "https://github.com/mamba-org/mamba/tree/2.9.0"
+      },
+      "packages": [
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/ucrt-10.0.26100.0-h57928b3_0.conda",
+          "sha256": "3005729dce6f3d3f5ec91dfc49fc75a0095f9cd23bab49efb899657297ac91a5",
+          "name": "ucrt",
+          "version": "10.0.26100.0",
+          "license": "LicenseRef-MicrosoftWindowsSDK10",
+          "build": "h57928b3_0",
+          "bytes": 694692,
+          "fileName": "ucrt-10.0.26100.0-h57928b3_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/ucrt",
+          "dependencies": [],
+          "sourceUrl": "https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/",
+          "feedstockUrl": "https://github.com/conda-forge/ucrt-feedstock",
+          "feedstockRevision": "46ee6062622aa89360649331a6ab800265e3ab08"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/vcomp14-14.51.36247-habf1de7_41.conda",
+          "sha256": "731e043390c9457299484d39e427221fc868a9249540a498a5a4f6456c7744d1",
+          "name": "vcomp14",
+          "version": "14.51.36247",
+          "license": "LicenseRef-MicrosoftVisualCpp2015-2022Runtime",
+          "build": "habf1de7_41",
+          "bytes": 155910,
+          "fileName": "vcomp14-14.51.36247-habf1de7_41.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/vcomp14",
+          "dependencies": [
+            "ucrt >=10.0.20348.0"
+          ],
+          "sourceUrl": "https://visualstudio.microsoft.com/downloads/",
+          "feedstockUrl": "https://github.com/conda-forge/vc-feedstock",
+          "feedstockRevision": "782496c55b64e6f47b592a5efde2dff17fb6af6c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/vc14_runtime-14.51.36247-habf1de7_41.conda",
+          "sha256": "4e4cb599cdc41bf2109d1464c127b5bcbddf548ce3e322e612afb691338b48f8",
+          "name": "vc14_runtime",
+          "version": "14.51.36247",
+          "license": "LicenseRef-MicrosoftVisualCpp2015-2022Runtime",
+          "build": "habf1de7_41",
+          "bytes": 767955,
+          "fileName": "vc14_runtime-14.51.36247-habf1de7_41.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/vc14_runtime",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vcomp14 14.51.36247 habf1de7_41"
+          ],
+          "sourceUrl": "https://visualstudio.microsoft.com/downloads/",
+          "feedstockUrl": "https://github.com/conda-forge/vc-feedstock",
+          "feedstockRevision": "782496c55b64e6f47b592a5efde2dff17fb6af6c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/vc-14.5-ha367084_41.conda",
+          "sha256": "35444c55a92e2f7f7ba26bc70f81e56e52344f7d064c0fd4b40a46a58517b79c",
+          "name": "vc",
+          "version": "14.5",
+          "license": "BSD-3-Clause",
+          "build": "ha367084_41",
+          "bytes": 21383,
+          "fileName": "vc-14.5-ha367084_41.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/vc",
+          "dependencies": [
+            "vc14_runtime >=14.51.36247"
+          ],
+          "sourceUrl": "https://github.com/conda/conda/wiki/VC-features",
+          "feedstockUrl": "https://github.com/conda-forge/vc-feedstock",
+          "feedstockRevision": "782496c55b64e6f47b592a5efde2dff17fb6af6c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/graphite2-1.3.15-h5112557_1.conda",
+          "sha256": "93a59bdf944fb6f947bd7ad2f293d5d80db3a90f8ff8dfabc591e3752141e46f",
+          "name": "graphite2",
+          "version": "1.3.15",
+          "license": "LGPL-2.0-or-later",
+          "build": "h5112557_1",
+          "bytes": 98064,
+          "fileName": "graphite2-1.3.15-h5112557_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/graphite2",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0"
+          ],
+          "sourceUrl": "https://github.com/silnrsi/graphite",
+          "feedstockUrl": "https://github.com/conda-forge/graphite2-feedstock",
+          "feedstockRevision": "ba0a8e0362b411f2fa172e105d805270ac086509"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libdeflate-1.25-h1a1d4e4_1.conda",
+          "sha256": "af1cda21d4653f594fbef20aa4e1ff158a546902b3307ef8af9a9b44b43862d2",
+          "name": "libdeflate",
+          "version": "1.25",
+          "license": "MIT",
+          "build": "h1a1d4e4_1",
+          "bytes": 157828,
+          "fileName": "libdeflate-1.25-h1a1d4e4_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libdeflate",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/ebiggers/libdeflate",
+          "feedstockUrl": "https://github.com/conda-forge/libdeflate-feedstock",
+          "feedstockRevision": "995dda5e8253e79324b87cb9b2fcf8cd40357ed2"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/bzip2-1.0.8-h0ad9c76_10.conda",
+          "sha256": "04767466ee9227c9c57ab2c6503e0149177d34111c7418d2f420297acb1eb229",
+          "name": "bzip2",
+          "version": "1.0.8",
+          "license": "bzip2-1.0.6",
+          "build": "h0ad9c76_10",
+          "bytes": 55919,
+          "fileName": "bzip2-1.0.8-h0ad9c76_10.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/bzip2",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://gitlab.com/bzip2/bzip2",
+          "feedstockUrl": "https://github.com/conda-forge/bzip2-feedstock",
+          "feedstockRevision": "f0f345e062aed39aa7f500c0746efed2dcea6971"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/lz4-c-1.10.0-h6a83c73_2.conda",
+          "sha256": "6824e36be0f95ae516dc36dddd18f69cbad0e4e07906fcb10a5f26a8dc471903",
+          "name": "lz4-c",
+          "version": "1.10.0",
+          "license": "BSD-2-Clause",
+          "build": "h6a83c73_2",
+          "bytes": 150673,
+          "fileName": "lz4-c-1.10.0-h6a83c73_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lz4-c",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0"
+          ],
+          "sourceUrl": "https://github.com/lz4/lz4",
+          "feedstockUrl": "https://github.com/conda-forge/lz4-c-feedstock",
+          "feedstockRevision": "7739afba01c0c2ec6ce7d9c9fab6c9818d7d6f22"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/lzo-2.10-h6a83c73_1003.conda",
+          "sha256": "e26c855c4b5d797ba5a9e96a6392d58676981660849b99fdb939aee3164e8323",
+          "name": "lzo",
+          "version": "2.10",
+          "license": "GPL-2.0-or-later",
+          "build": "h6a83c73_1003",
+          "bytes": 165289,
+          "fileName": "lzo-2.10-h6a83c73_1003.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lzo",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0"
+          ],
+          "sourceUrl": "http://www.oberhumer.com/opensource/lzo/",
+          "feedstockUrl": "https://github.com/conda-forge/lzo-feedstock",
+          "feedstockRevision": "d8595a3cb3261df0c3e777fd44b63ae9f9107e2d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libffi-3.7.0-h3d046cb_1.conda",
+          "sha256": "613e8077c5cca5df7fe84ade7d5050301bee3c6c4c450ffe61d34a349ab4f11c",
+          "name": "libffi",
+          "version": "3.7.0",
+          "license": "MIT",
+          "build": "h3d046cb_1",
+          "bytes": 49992,
+          "fileName": "libffi-3.7.0-h3d046cb_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libffi",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/libffi/libffi",
+          "feedstockUrl": "https://github.com/conda-forge/libffi-feedstock",
+          "feedstockRevision": "dc557589925d228815625e735ff1e63236d5fcd7"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/pixman-0.46.4-h5112557_3.conda",
+          "sha256": "cad8b94c2b00264a15d469eed6dc53aac1c59c6d46f27ad1d91bfaf227cf136a",
+          "name": "pixman",
+          "version": "0.46.4",
+          "license": "MIT",
+          "build": "h5112557_3",
+          "bytes": 257473,
+          "fileName": "pixman-0.46.4-h5112557_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pixman",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0"
+          ],
+          "sourceUrl": "https://cgit.freedesktop.org/pixman/",
+          "feedstockUrl": "https://github.com/conda-forge/pixman-feedstock",
+          "feedstockRevision": "aa115040c3fa1c298ba27ed7afb42d6feb4fac28"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/icu-78.3-h5112557_2.conda",
+          "sha256": "75c549b55b673e15de8785a8e5dd85bca7eb612eee0ff4dc8d7bdaa15eacbdbb",
+          "name": "icu",
+          "version": "78.3",
+          "license": "MIT",
+          "build": "h5112557_2",
+          "bytes": 16835644,
+          "fileName": "icu-78.3-h5112557_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/icu",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0"
+          ],
+          "sourceUrl": "https://github.com/unicode-org/icu",
+          "feedstockUrl": "https://github.com/conda-forge/icu-feedstock",
+          "feedstockRevision": "05cd48dd0219b71d577103cc880a443ab7ba3acf"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libiconv-1.18-hc1393d2_3.conda",
+          "sha256": "35e04e3ddac7720fc7c550a1c9f998604299d6a7bd1f3ec9b2825d825061daa2",
+          "name": "libiconv",
+          "version": "1.18",
+          "license": "LGPL-2.1-only",
+          "build": "hc1393d2_3",
+          "bytes": 694899,
+          "fileName": "libiconv-1.18-hc1393d2_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libiconv",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://www.gnu.org/software/libiconv/",
+          "feedstockUrl": "https://github.com/conda-forge/libiconv-feedstock",
+          "feedstockRevision": "c7fdcb1b68d6579a08d0c5dc5f34cbbf38780538"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libexpat-2.8.5-hac47afa_0.conda",
+          "sha256": "70c73d9fd24ad996f2821d1501adae2ca70984b4e2d8faed76227f348ce86078",
+          "name": "libexpat",
+          "version": "2.8.5",
+          "license": "MIT",
+          "build": "hac47afa_0",
+          "bytes": 72107,
+          "fileName": "libexpat-2.8.5-hac47afa_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libexpat",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/libexpat/libexpat",
+          "feedstockUrl": "https://github.com/conda-forge/expat-feedstock",
+          "feedstockRevision": "8c6a1ae4141ab05eac441c97e5e13d2f58b45eed"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libzlib-1.3.2-hfd05255_3.conda",
+          "sha256": "0629c2cc0404d3bb29d6baa7b4ba62da80797015e86de050db81ea5a07050527",
+          "name": "libzlib",
+          "version": "1.3.2",
+          "license": "Zlib",
+          "build": "hfd05255_3",
+          "bytes": 58529,
+          "fileName": "libzlib-1.3.2-hfd05255_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libzlib",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/madler/zlib",
+          "feedstockUrl": "https://github.com/conda-forge/zlib-feedstock",
+          "feedstockRevision": "044fc2361e1c5f1a35c8f417f1434a585e627297"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libwebp-base-1.6.0-h4d5522a_1.conda",
+          "sha256": "4470d98d3178b0d45492eed4808afe421d2e7808352b8d06c2dc29166b75d94d",
+          "name": "libwebp-base",
+          "version": "1.6.0",
+          "license": "BSD-3-Clause",
+          "build": "h4d5522a_1",
+          "bytes": 278886,
+          "fileName": "libwebp-base-1.6.0-h4d5522a_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libwebp-base",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://chromium.googlesource.com/webm/libwebp",
+          "feedstockUrl": "https://github.com/conda-forge/libwebp-base-feedstock",
+          "feedstockRevision": "b8a54ec0653ea0ac18e509fc889f1fc8f0b90233"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libjpeg-turbo-3.2.0-hfd05255_1.conda",
+          "sha256": "df78ab4c0eecb3dd9331898f96baeed8e5ca1c363346332517abeb0b614b9a53",
+          "name": "libjpeg-turbo",
+          "version": "3.2.0",
+          "license": "IJG AND BSD-3-Clause AND Zlib",
+          "build": "hfd05255_1",
+          "bytes": 990125,
+          "fileName": "libjpeg-turbo-3.2.0-hfd05255_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libjpeg-turbo",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/libjpeg-turbo/libjpeg-turbo",
+          "feedstockUrl": "https://github.com/conda-forge/libjpeg-turbo-feedstock",
+          "feedstockRevision": "cc922f6dba346613d6c2820d58011f1c6c175e7d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/lerc-4.2.0-hd936e49_0.conda",
+          "sha256": "93d666f63f284ef77b87b0b1f77b70f7d36d315a132f9afa64bc0012d937ba39",
+          "name": "lerc",
+          "version": "4.2.0",
+          "license": "Apache-2.0",
+          "build": "hd936e49_0",
+          "bytes": 175297,
+          "fileName": "lerc-4.2.0-hd936e49_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lerc",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/Esri/lerc",
+          "feedstockUrl": "https://github.com/conda-forge/lerc-feedstock",
+          "feedstockRevision": "11a9b9cedb32ef23cd0dc48743e0a354fc4f7342"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/giflib-5.2.2-hb0bd012_1.conda",
+          "sha256": "573af9bb6294d125a0be6dc4963e589188da92426c3887feb60dd22a07530e4f",
+          "name": "giflib",
+          "version": "5.2.2",
+          "license": "MIT",
+          "build": "hb0bd012_1",
+          "bytes": 84682,
+          "fileName": "giflib-5.2.2-hb0bd012_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/giflib",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "http://giflib.sourceforge.net",
+          "feedstockUrl": "https://github.com/conda-forge/giflib-feedstock",
+          "feedstockRevision": "ab669636b5ea8c982aedc48ca104f2f08c8c8a77"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/liblzma-5.8.3-hfd05255_1.conda",
+          "sha256": "d36c4a1e1f80fd08e18a407e03622ff2f34dfdd022da6488ad19603dea19e6d5",
+          "name": "liblzma",
+          "version": "5.8.3",
+          "license": "0BSD",
+          "build": "hfd05255_1",
+          "bytes": 105809,
+          "fileName": "liblzma-5.8.3-hfd05255_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/liblzma",
+          "dependencies": [
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "http://git.tukaani.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xz-feedstock",
+          "feedstockRevision": "bc37fbf54469221332fc589c1404294a159f403b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libpsl-0.23.1-h9b16d47_1.conda",
+          "sha256": "e53fe3b09f82b59b644264133d6d148ac31bb5451b7583cff55690bf038f2f62",
+          "name": "libpsl",
+          "version": "0.23.1",
+          "license": "MIT",
+          "build": "h9b16d47_1",
+          "bytes": 73511,
+          "fileName": "libpsl-0.23.1-h9b16d47_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libpsl",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "icu >=78.3,<79.0a0"
+          ],
+          "sourceUrl": "https://github.com/rockdaboot/libpsl",
+          "feedstockUrl": "https://github.com/conda-forge/libpsl-feedstock",
+          "feedstockRevision": "d93d163e4ace3c8de663d880c0381630b65d4590"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libintl-0.22.5-h5728263_4.conda",
+          "sha256": "85b50be2209f3b8a873830ec9894477d260f4c7ba9540e65959f5812bf7219f8",
+          "name": "libintl",
+          "version": "0.22.5",
+          "license": "LGPL-2.1-or-later",
+          "build": "h5728263_4",
+          "bytes": 96669,
+          "fileName": "libintl-0.22.5-h5728263_4.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libintl",
+          "dependencies": [
+            "libiconv >=1.18,<2.0a0"
+          ],
+          "sourceUrl": "https://www.gnu.org/software/gettext/",
+          "feedstockUrl": "https://github.com/conda-forge/gettext-feedstock",
+          "feedstockRevision": "8e011f31bdfb82ad0e67ae47a8147146db7bba2f"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/zstd-1.5.7-h534d264_7.conda",
+          "sha256": "ca7daae4f218a11fab82cc2857f0ea518ec3f46acec60490485347a4c22c6b3e",
+          "name": "zstd",
+          "version": "1.5.7",
+          "license": "BSD-3-Clause",
+          "build": "h534d264_7",
+          "bytes": 387535,
+          "fileName": "zstd-1.5.7-h534d264_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/zstd",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/facebook/zstd",
+          "feedstockUrl": "https://github.com/conda-forge/zstd-feedstock",
+          "feedstockRevision": "24c0f94340c0875e1a3bb815611276850f7cd7ca"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/pcre2-10.47-h8466c1e_1.conda",
+          "sha256": "d8e9ea26b52a09d880d1e5371830c8dd5b4c099a6db64dbdf8236440744b7499",
+          "name": "pcre2",
+          "version": "10.47",
+          "license": "BSD-3-Clause",
+          "build": "h8466c1e_1",
+          "bytes": 993241,
+          "fileName": "pcre2-10.47-h8466c1e_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pcre2",
+          "dependencies": [
+            "bzip2 >=1.0.8,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/PCRE2Project/pcre2",
+          "feedstockUrl": "https://github.com/conda-forge/pcre2-feedstock",
+          "feedstockRevision": "1036df63759c1365071c7531a6e01fcca90f28a1"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libpng-1.6.59-hdc8cecf_0.conda",
+          "sha256": "36050852deae6edc98d7b71489b8d07254e2753c69bd524bf5784927cd1f0b2c",
+          "name": "libpng",
+          "version": "1.6.59",
+          "license": "zlib-acknowledgement",
+          "build": "hdc8cecf_0",
+          "bytes": 385760,
+          "fileName": "libpng-1.6.59-hdc8cecf_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libpng",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://sourceforge.net/p/libpng/code/ci/libpng16/tree/",
+          "feedstockUrl": "https://github.com/conda-forge/libpng-feedstock",
+          "feedstockRevision": "fb861d8ff886d5bfe7fc4f01c6545d59779798ff"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libxml2-16-2.15.4-h3cfd58e_1.conda",
+          "sha256": "819c4edd7b7bcfa9461aeccb56c0a7e9fa7c251163333e64222c142499822958",
+          "name": "libxml2-16",
+          "version": "2.15.4",
+          "license": "MIT",
+          "build": "h3cfd58e_1",
+          "bytes": 515690,
+          "fileName": "libxml2-16-2.15.4-h3cfd58e_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxml2-16",
+          "dependencies": [
+            "icu >=78.3,<79.0a0",
+            "libiconv >=1.18,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://git.gnome.org/browse/libxml2/",
+          "feedstockUrl": "https://github.com/conda-forge/libxml2-feedstock",
+          "feedstockRevision": "2aea8424bab23ebc32ac1493984e90e73cda28dd"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libtiff-4.7.2-h8f73337_1.conda",
+          "sha256": "3575a092e3e52625a1767804a4ebd321becaadf61b63dcd6735ebb88c0b3c359",
+          "name": "libtiff",
+          "version": "4.7.2",
+          "license": "HPND",
+          "build": "h8f73337_1",
+          "bytes": 1014211,
+          "fileName": "libtiff-4.7.2-h8f73337_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libtiff",
+          "dependencies": [
+            "lerc >=4.2.0,<5.0a0",
+            "libdeflate >=1.25,<1.26.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "http://www.libtiff.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libtiff-feedstock",
+          "feedstockRevision": "69b00df993d8c9571dbd2aa423e50a10f1adfeda"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libglib-2.90.1-ha564072_0.conda",
+          "sha256": "7b44e3985afe6c5962a9e6489b5ad20b769c92513f071694bb74b07ecf3c9a97",
+          "name": "libglib",
+          "version": "2.90.1",
+          "license": "LGPL-2.1-or-later",
+          "build": "ha564072_0",
+          "bytes": 4611250,
+          "fileName": "libglib-2.90.1-ha564072_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglib",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "libffi >=3.7.0,<3.8.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "libintl >=0.22.5,<1.0a0",
+            "libiconv >=1.18,<2.0a0",
+            "pcre2 >=10.47,<10.48.0a0"
+          ],
+          "sourceUrl": "https://gitlab.gnome.org/GNOME/glib/",
+          "feedstockUrl": "https://github.com/conda-forge/glib-feedstock",
+          "feedstockRevision": "494a56fe1405fa8f1b555a31a4beb7df165c030c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libfreetype6-2.14.3-hdbac1cb_2.conda",
+          "sha256": "cbc650854003e434d4ff6c7b1a2667e38a4242ad8a391a1c5ff89721624065ce",
+          "name": "libfreetype6",
+          "version": "2.14.3",
+          "license": "GPL-2.0-only OR FTL",
+          "build": "hdbac1cb_2",
+          "bytes": 340385,
+          "fileName": "libfreetype6-2.14.3-hdbac1cb_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libfreetype6",
+          "dependencies": [
+            "libpng >=1.6.58,<1.7.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "feedstockUrl": "https://github.com/conda-forge/freetype-feedstock",
+          "feedstockRevision": "3520c4122afde3a5c30609f035de7cc4f501c069"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libxml2-2.15.4-he095d88_1.conda",
+          "sha256": "81e8cace5c3cb62c4125882b4a6df33ab48c16349231d8ea5008bbe0ee93c10f",
+          "name": "libxml2",
+          "version": "2.15.4",
+          "license": "MIT",
+          "build": "he095d88_1",
+          "bytes": 43629,
+          "fileName": "libxml2-2.15.4-he095d88_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxml2",
+          "dependencies": [
+            "icu >=78.3,<79.0a0",
+            "libiconv >=1.18,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libxml2-16 2.15.4 h3cfd58e_1",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://git.gnome.org/browse/libxml2/",
+          "feedstockUrl": "https://github.com/conda-forge/libxml2-feedstock",
+          "feedstockRevision": "2aea8424bab23ebc32ac1493984e90e73cda28dd"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/lcms2-2.19.1-hf2c6c5f_3.conda",
+          "sha256": "7c5f96b473b721a4279708b448591dc3d89ed274280ff480dea1b4f9b13e1fcd",
+          "name": "lcms2",
+          "version": "2.19.1",
+          "license": "MIT",
+          "build": "hf2c6c5f_3",
+          "bytes": 525499,
+          "fileName": "lcms2-2.19.1-hf2c6c5f_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lcms2",
+          "dependencies": [
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "http://www.littlecms.com/",
+          "feedstockUrl": "https://github.com/conda-forge/lcms2-feedstock",
+          "feedstockRevision": "3cefa7a569e5d8918e253214097b6c4fdef2eef0"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/openjpeg-2.5.4-h90fa87c_2.conda",
+          "sha256": "d1c630ccd9ae0898b48d84e986f4c330f66a25e535f99efe8cbf03f042b33da5",
+          "name": "openjpeg",
+          "version": "2.5.4",
+          "license": "BSD-2-Clause",
+          "build": "h90fa87c_2",
+          "bytes": 274994,
+          "fileName": "openjpeg-2.5.4-h90fa87c_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/openjpeg",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "http://www.openjpeg.org/",
+          "feedstockUrl": "https://github.com/conda-forge/openjpeg-feedstock",
+          "feedstockRevision": "00d4e8f7d73043cb46153df594d005aef33e05c7"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libfreetype-2.14.3-h57928b3_2.conda",
+          "sha256": "d794d7fddb6eea50e18a62fa27ab3819f40d51bad00b90cf4ca591fb0d4006c2",
+          "name": "libfreetype",
+          "version": "2.14.3",
+          "license": "GPL-2.0-only OR FTL",
+          "build": "h57928b3_2",
+          "bytes": 8742,
+          "fileName": "libfreetype-2.14.3-h57928b3_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libfreetype",
+          "dependencies": [
+            "libfreetype6 >=2.14.3"
+          ],
+          "feedstockUrl": "https://github.com/conda-forge/freetype-feedstock",
+          "feedstockRevision": "3520c4122afde3a5c30609f035de7cc4f501c069"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/leptonica-1.87.0-hb83fb89_1.conda",
+          "sha256": "6a0e2e099c4b530300fdcc092ddd0ffcc5383dbd04cdf03b232996857b3017d8",
+          "name": "leptonica",
+          "version": "1.87.0",
+          "license": "BSD-2-Clause",
+          "build": "hb83fb89_1",
+          "bytes": 1458170,
+          "fileName": "leptonica-1.87.0-hb83fb89_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/leptonica",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "libtiff >=4.7.1,<4.8.0a0",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "libpng >=1.6.56,<1.7.0a0",
+            "libjpeg-turbo >=3.1.2,<4.0a0",
+            "liblzma >=5.8.2,<6.0a0",
+            "giflib >=5.2.2,<5.3.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/DanBloomberg/leptonica",
+          "feedstockUrl": "https://github.com/conda-forge/leptonica-feedstock",
+          "feedstockRevision": "920fce346222be437f5b615392f2e53fe8fda919"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/fontconfig-2.18.3-hd47e2ca_1.conda",
+          "sha256": "f26139e3c774a6434c8a73381c08e3d2a4c2f9d9ef9587c66aab8836211ee2ec",
+          "name": "fontconfig",
+          "version": "2.18.3",
+          "license": "MIT",
+          "build": "hd47e2ca_1",
+          "bytes": 217988,
+          "fileName": "fontconfig-2.18.3-hd47e2ca_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fontconfig",
+          "dependencies": [
+            "libexpat >=2.8.1,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libiconv >=1.18,<2.0a0",
+            "libintl >=0.22.5,<1.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://cgit.freedesktop.org/fontconfig/",
+          "feedstockUrl": "https://github.com/conda-forge/fontconfig-feedstock",
+          "feedstockRevision": "7f94a24652814e2985044aeae8b2966fae633035"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/poppler-data-0.4.12-hd8ed1ab_0.conda",
+          "sha256": "2f227e17b3c0346112815faa605502b66c1c4511a856127f2899abf15a98a2cf",
+          "name": "poppler-data",
+          "version": "0.4.12",
+          "license": "BSD-3-Clause AND (GPL-2.0-only OR GPL-3.0-only)",
+          "build": "hd8ed1ab_0",
+          "bytes": 2348171,
+          "fileName": "poppler-data-0.4.12-hd8ed1ab_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/poppler-data",
+          "dependencies": [],
+          "sourceUrl": "https://poppler.freedesktop.org/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2",
+          "sha256": "58d7f40d2940dd0a8aa28651239adbf5613254df0f75789919c4e6762054403b",
+          "name": "font-ttf-dejavu-sans-mono",
+          "version": "2.37",
+          "license": "BSD-3-Clause",
+          "build": "hab24e00_0",
+          "bytes": 397370,
+          "fileName": "font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-dejavu-sans-mono",
+          "dependencies": [],
+          "sourceUrl": "https://dejavu-fonts.github.io/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-inconsolata-3.000-h77eed37_0.tar.bz2",
+          "sha256": "c52a29fdac682c20d252facc50f01e7c2e7ceac52aa9817aaf0bb83f7559ec5c",
+          "name": "font-ttf-inconsolata",
+          "version": "3.000",
+          "license": "OFL-1.1",
+          "build": "h77eed37_0",
+          "bytes": 96530,
+          "fileName": "font-ttf-inconsolata-3.000-h77eed37_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-inconsolata",
+          "dependencies": [],
+          "sourceUrl": "https://fonts.google.com/specimen/Inconsolata"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-source-code-pro-2.038-h77eed37_0.tar.bz2",
+          "sha256": "00925c8c055a2275614b4d983e1df637245e19058d79fc7dd1a93b8d9fb4b139",
+          "name": "font-ttf-source-code-pro",
+          "version": "2.038",
+          "license": "OFL-1.1",
+          "build": "h77eed37_0",
+          "bytes": 700814,
+          "fileName": "font-ttf-source-code-pro-2.038-h77eed37_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-source-code-pro",
+          "dependencies": [],
+          "sourceUrl": "https://adobe-fonts.github.io/source-code-pro/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-ubuntu-0.83-h77eed37_3.conda",
+          "sha256": "2821ec1dc454bd8b9a31d0ed22a7ce22422c0aef163c59f49dfdf915d0f0ca14",
+          "name": "font-ttf-ubuntu",
+          "version": "0.83",
+          "license": "LicenseRef-Ubuntu-Font-Licence-Version-1.0",
+          "build": "h77eed37_3",
+          "bytes": 1620504,
+          "fileName": "font-ttf-ubuntu-0.83-h77eed37_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-ubuntu",
+          "dependencies": [],
+          "sourceUrl": "https://design.ubuntu.com/font/",
+          "feedstockUrl": "https://github.com/conda-forge/font-ttf-ubuntu-feedstock",
+          "feedstockRevision": "e0124cc5a2cfff85f9584b558ec4f43bf091761b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-h4c7d964_0.conda",
+          "sha256": "95e8e74062a5fe5f870ac8c90302b6e89945165fdaed7810606e84ddee6aac12",
+          "name": "ca-certificates",
+          "version": "2026.7.22",
+          "license": "ISC",
+          "build": "h4c7d964_0",
+          "bytes": 132136,
+          "fileName": "ca-certificates-2026.7.22-h4c7d964_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/ca-certificates",
+          "dependencies": [
+            "__win"
+          ],
+          "sourceUrl": "https://github.com/conda-forge/ca-certificates-feedstock",
+          "feedstockUrl": "https://github.com/conda-forge/ca-certificates-feedstock",
+          "feedstockRevision": "e9adaddd7b8b4f8def01b4cfd8690cd7fec7fc7b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/fonts-conda-forge-1-hc364b38_1.conda",
+          "sha256": "54eea8469786bc2291cc40bca5f46438d3e062a399e8f53f013b6a9f50e98333",
+          "name": "fonts-conda-forge",
+          "version": "1",
+          "license": "BSD-3-Clause",
+          "build": "hc364b38_1",
+          "bytes": 4059,
+          "fileName": "fonts-conda-forge-1-hc364b38_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fonts-conda-forge",
+          "dependencies": [
+            "font-ttf-ubuntu",
+            "font-ttf-inconsolata",
+            "font-ttf-dejavu-sans-mono",
+            "font-ttf-source-code-pro"
+          ],
+          "sourceUrl": "https://conda-forge.org/",
+          "feedstockUrl": "https://github.com/conda-forge/fonts-conda-forge-feedstock",
+          "feedstockRevision": "1b7ad83c3dd122e856cbb86a4a52264cc1e28c5e"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/fonts-conda-ecosystem-1-0.tar.bz2",
+          "sha256": "a997f2f1921bb9c9d76e6fa2f6b408b7fa549edd349a77639c9fe7a23ea93e61",
+          "name": "fonts-conda-ecosystem",
+          "version": "1",
+          "license": "BSD-3-Clause",
+          "build": "0",
+          "bytes": 3667,
+          "fileName": "fonts-conda-ecosystem-1-0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fonts-conda-ecosystem",
+          "dependencies": [
+            "fonts-conda-forge"
+          ],
+          "sourceUrl": "https://conda.io"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/openssl-3.6.5-hf411b9b_0.conda",
+          "sha256": "bc44625e0c6d83f3e02b5f6adc01e0e3ca7001d3d94e24959591a57f5a011b9a",
+          "name": "openssl",
+          "version": "3.6.5",
+          "license": "Apache-2.0",
+          "build": "hf411b9b_0",
+          "bytes": 9402647,
+          "fileName": "openssl-3.6.5-hf411b9b_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/openssl",
+          "dependencies": [
+            "ca-certificates",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/openssl/openssl",
+          "feedstockUrl": "https://github.com/conda-forge/openssl-feedstock",
+          "feedstockRevision": "f0c4979996e075ca6fb7efbd6b65d4fe2cc1fe6f"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/cairo-1.18.6-h477c42c_0.conda",
+          "sha256": "af62a4e441719050878d050d242619f8256a891983515950f8fb877137868a45",
+          "name": "cairo",
+          "version": "1.18.6",
+          "license": "LGPL-2.1-only or MPL-1.1",
+          "build": "h477c42c_0",
+          "bytes": 1533334,
+          "fileName": "cairo-1.18.6-h477c42c_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/cairo",
+          "dependencies": [
+            "fontconfig >=2.18.3,<3.0a0",
+            "fonts-conda-ecosystem",
+            "icu >=78.3,<79.0a0",
+            "libexpat >=2.8.1,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libglib >=2.90.0,<3.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "pixman >=0.46.4,<1.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/cairo/cairo",
+          "feedstockUrl": "https://github.com/conda-forge/cairo-feedstock",
+          "feedstockRevision": "8b534c45e4a7945ac29aa8bd177109af1c318594"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libssh2-1.11.1-h734d217_1.conda",
+          "sha256": "1097b08429b4f53f5751a32c6d99a083d227ca7f7812c0b239eea124cec073a0",
+          "name": "libssh2",
+          "version": "1.11.1",
+          "license": "BSD-3-Clause",
+          "build": "h734d217_1",
+          "bytes": 295149,
+          "fileName": "libssh2-1.11.1-h734d217_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libssh2",
+          "dependencies": [
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.7,<4.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/libssh2/libssh2",
+          "feedstockUrl": "https://github.com/conda-forge/libssh2-feedstock",
+          "feedstockRevision": "e5701cd76588f38d76a9fd704185ffc88184c102"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/krb5-1.22.2-h719d79b_2.conda",
+          "sha256": "63ff03324e903eb01a715ccf357df56d66224e61952fd6615d86490ebefb3285",
+          "name": "krb5",
+          "version": "1.22.2",
+          "license": "MIT",
+          "build": "h719d79b_2",
+          "bytes": 753425,
+          "fileName": "krb5-1.22.2-h719d79b_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/krb5",
+          "dependencies": [
+            "openssl >=3.5.7,<4.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/krb5/krb5",
+          "feedstockUrl": "https://github.com/conda-forge/krb5-feedstock",
+          "feedstockRevision": "39e6b3c27e0762e320d9518e069c3df9f26b5bf9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libarchive-3.8.9-gpl_h8fdc8af_101.conda",
+          "sha256": "71cb6e49282d2aee1eb0249a290dc2333b0063ac2ecec69116ad569d822a0aaf",
+          "name": "libarchive",
+          "version": "3.8.9",
+          "license": "BSD-2-Clause",
+          "build": "gpl_h8fdc8af_101",
+          "bytes": 1151402,
+          "fileName": "libarchive-3.8.9-gpl_h8fdc8af_101.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libarchive",
+          "dependencies": [
+            "bzip2 >=1.0.8,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libxml2",
+            "libxml2-16 >=2.15.3",
+            "libzlib >=1.3.2,<2.0a0",
+            "lz4-c >=1.10.0,<1.11.0a0",
+            "lzo >=2.10,<3.0a0",
+            "openssl >=3.5.7,<4.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "http://www.libarchive.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libarchive-feedstock",
+          "feedstockRevision": "8702d4c08d57d3251ba945b6af3b230f6a714ce2"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libharfbuzz-14.6.0-h03b5201_1.conda",
+          "sha256": "689199e460f15021019266a54abdf18901b96e3b8bfd17edac18b19f40397f96",
+          "name": "libharfbuzz",
+          "version": "14.6.0",
+          "license": "MIT",
+          "build": "h03b5201_1",
+          "bytes": 1132989,
+          "fileName": "libharfbuzz-14.6.0-h03b5201_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libharfbuzz",
+          "dependencies": [
+            "cairo >=1.18.6,<2.0a0",
+            "graphite2 >=1.3.15,<2.0a0",
+            "icu >=78.3,<79.0a0",
+            "libexpat >=2.8.5,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libglib >=2.90.0,<3.0a0",
+            "libpng >=1.6.59,<1.7.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/harfbuzz/harfbuzz",
+          "feedstockUrl": "https://github.com/conda-forge/harfbuzz-feedstock",
+          "feedstockRevision": "fa98fde637a525ff8c41de4b795d9815b362a18d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/libcurl-8.22.0-hdb0ef4a_0.conda",
+          "sha256": "5fe063cffa90ad3ef04e25c76b1a79cdbc4f6c43747164a7dcdd89c4faebb84e",
+          "name": "libcurl",
+          "version": "8.22.0",
+          "license": "curl",
+          "build": "hdb0ef4a_0",
+          "bytes": 413226,
+          "fileName": "libcurl-8.22.0-hdb0ef4a_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libcurl",
+          "dependencies": [
+            "krb5 >=1.22.2,<1.23.0a0",
+            "libpsl >=0.23.1,<0.24.0a0",
+            "libssh2 >=1.11.1,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://github.com/curl/curl",
+          "feedstockUrl": "https://github.com/conda-forge/curl-feedstock",
+          "feedstockRevision": "4112bf00cdcc525cd7fa7ed1bba5a4b1c43eeb53"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/tesseract-5.5.3-he87eeb8_0.conda",
+          "sha256": "edbe2455a8ee83c47c04bc93d6b75957b9f76b194f0ac2fe69f31ab46de7e024",
+          "name": "tesseract",
+          "version": "5.5.3",
+          "license": "Apache-2.0",
+          "build": "he87eeb8_0",
+          "bytes": 178967988,
+          "fileName": "tesseract-5.5.3-he87eeb8_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/tesseract",
+          "dependencies": [
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208",
+            "ucrt >=10.0.20348.0",
+            "giflib >=5.2.2,<5.3.0a0",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libarchive >=3.8.8,<3.9.0a0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "leptonica >=1.87.0,<1.88.0a0",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "libcurl >=8.21.0,<9.0a0"
+          ],
+          "sourceUrl": "https://github.com/tesseract-ocr/tesseract",
+          "feedstockUrl": "https://github.com/conda-forge/tesseract-feedstock",
+          "feedstockRevision": "568e7986182393275d0cda725438219077d489b5"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/win-64/poppler-26.09.0-h924501e_0.conda",
+          "sha256": "bb319f6881d91e175f90a9d33a25313e4cfddc15dd234521519985baf92fefcd",
+          "name": "poppler",
+          "version": "26.09.0",
+          "license": "GPL-2.0-or-later",
+          "build": "h924501e_0",
+          "bytes": 2803695,
+          "fileName": "poppler-26.09.0-h924501e_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/poppler",
+          "dependencies": [
+            "cairo >=1.18.4,<2.0a0",
+            "lcms2 >=2.19.1,<3.0a0",
+            "libcurl >=8.22.0,<9.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libglib >=2.88.3,<3.0a0",
+            "libharfbuzz >=14.4.0",
+            "libiconv >=1.18,<2.0a0",
+            "libintl >=0.22.5,<1.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "poppler-data",
+            "ucrt >=10.0.20348.0",
+            "vc >=14.3,<15",
+            "vc14_runtime >=14.44.35208"
+          ],
+          "sourceUrl": "https://poppler.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/poppler-feedstock",
+          "feedstockRevision": "13d784d77510e73d6066a75a79cd8e6040a6a261"
+        }
+      ],
+      "rendererPath": "Library/bin/pdftoppm.exe",
+      "ocrPath": "Library/bin/tesseract.exe",
+      "environment": {
+        "PATH": "Library/bin"
+      }
+    },
+    {
+      "rid": "linux-x64",
+      "platform": "linux-64",
+      "bootstrap": {
+        "url": "https://github.com/mamba-org/micromamba-releases/releases/download/2.9.0-0/micromamba-linux-64",
+        "sha256": "366cd9cd8be14df1ab8ed50352a82111082a36686b2d389fdb79a92c3fafb3e3",
+        "bytes": 18292808,
+        "fileName": "micromamba",
+        "version": "2.9.0-0",
+        "license": "BSD-3-Clause",
+        "sourceUrl": "https://github.com/mamba-org/mamba/tree/2.9.0"
+      },
+      "packages": [
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libzlib-1.3.2-h25fd6f3_3.conda",
+          "sha256": "eb8a0db0aa570124f7d2a93d7c7f596e3390df5e047818d873baad32985fc736",
+          "name": "libzlib",
+          "version": "1.3.2",
+          "license": "Zlib",
+          "build": "h25fd6f3_3",
+          "bytes": 63713,
+          "fileName": "libzlib-1.3.2-h25fd6f3_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libzlib",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://github.com/madler/zlib",
+          "feedstockUrl": "https://github.com/conda-forge/zlib-feedstock",
+          "feedstockRevision": "044fc2361e1c5f1a35c8f417f1434a585e627297"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libgomp-16.2.0-he0feb66_7.conda",
+          "sha256": "92a0bb350c7be6a4eedcb4e111c60aefd176018e6b1c009a6e025dbe9bbcd758",
+          "name": "libgomp",
+          "version": "16.2.0",
+          "license": "GPL-3.0-only WITH GCC-exception-3.1",
+          "build": "he0feb66_7",
+          "bytes": 640566,
+          "fileName": "libgomp-16.2.0-he0feb66_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libgomp",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://gcc.gnu.org/onlinedocs/gccint/Libgcc.html",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "9130f5e7a99ff6de8041ce7b9542d5454e863689"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libglvnd-1.7.0-ha4b6fd6_5.conda",
+          "sha256": "6eb77601a44b78c4631d886d54ef54f321c2bdc69fdefc4065a1e0491f030c76",
+          "name": "libglvnd",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "ha4b6fd6_5",
+          "bytes": 133827,
+          "fileName": "libglvnd-1.7.0-ha4b6fd6_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglvnd",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/zstd-1.5.7-hb78ec9c_7.conda",
+          "sha256": "47d682b9f6d6ec9eb1a6e6c3e75ea6273e899e78fb7fc59f81d39745009fbc60",
+          "name": "zstd",
+          "version": "1.5.7",
+          "license": "BSD-3-Clause",
+          "build": "hb78ec9c_7",
+          "bytes": 601301,
+          "fileName": "zstd-1.5.7-hb78ec9c_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/zstd",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/facebook/zstd",
+          "feedstockUrl": "https://github.com/conda-forge/zstd-feedstock",
+          "feedstockRevision": "24c0f94340c0875e1a3bb815611276850f7cd7ca"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda",
+          "sha256": "1dd3fffd892081df9726d7eb7e0dea6198962ba775bd88842135a4ddb4deb3c9",
+          "name": "_openmp_mutex",
+          "version": "4.5",
+          "license": "BSD-3-Clause",
+          "build": "20_gnu",
+          "bytes": 28948,
+          "fileName": "_openmp_mutex-4.5-20_gnu.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/_openmp_mutex",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgomp >=7.5.0"
+          ],
+          "sourceUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "14a57afe05d9db64add1754ce28198e5e8d4d7b6"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libegl-1.7.0-ha4b6fd6_5.conda",
+          "sha256": "13d3fde9c1dcf254968cc70652222a43f25d04e69555ccf855553110e753288e",
+          "name": "libegl",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "ha4b6fd6_5",
+          "bytes": 46694,
+          "fileName": "libegl-1.7.0-ha4b6fd6_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libegl",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libglvnd 1.7.0 ha4b6fd6_5"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libgcc-16.2.0-ha9f2e26_7.conda",
+          "sha256": "e031634c3a928f9594eba868bc46ef5230d6571a364a0c63215b06c4563bfcea",
+          "name": "libgcc",
+          "version": "16.2.0",
+          "license": "GPL-3.0-only WITH GCC-exception-3.1",
+          "build": "ha9f2e26_7",
+          "bytes": 1058444,
+          "fileName": "libgcc-16.2.0-ha9f2e26_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libgcc",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "_openmp_mutex >=4.5"
+          ],
+          "sourceUrl": "https://gcc.gnu.org/onlinedocs/gccint/Libgcc.html",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "9130f5e7a99ff6de8041ce7b9542d5454e863689"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libice-1.1.2-h280c20c_0.conda",
+          "sha256": "49b532d1df875c6749d9078b56a76f3f5db49a5abe0ca620b593ed474ef0ebf1",
+          "name": "xorg-libice",
+          "version": "1.1.2",
+          "license": "MIT",
+          "build": "h280c20c_0",
+          "bytes": 62517,
+          "fileName": "xorg-libice-1.1.2-h280c20c_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libice",
+          "dependencies": [
+            "libgcc >=14",
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libice-feedstock",
+          "feedstockRevision": "e93ef724e26dc93f23fe0cecb3c1ca5b6e8cebbe"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxau-1.0.12-h7cc23a3_2.conda",
+          "sha256": "3ec065b94554dc48a4ca582a960a5484bc166b26e83ce0954653e08d17e8bd53",
+          "name": "xorg-libxau",
+          "version": "1.0.12",
+          "license": "MIT",
+          "build": "h7cc23a3_2",
+          "bytes": 18793,
+          "fileName": "xorg-libxau-1.0.12-h7cc23a3_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxau",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/xorg/lib/libxau",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxau-feedstock",
+          "feedstockRevision": "10bc4a8118d34cf2059c4462f4d77da1ae51fb27"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxdmcp-1.1.5-h7cc23a3_2.conda",
+          "sha256": "8a095df9bc1d2e50f2504ce8858a047ae29ea634aad6cc0b43298c63361da6d9",
+          "name": "xorg-libxdmcp",
+          "version": "1.1.5",
+          "license": "MIT",
+          "build": "h7cc23a3_2",
+          "bytes": 22606,
+          "fileName": "xorg-libxdmcp-1.1.5-h7cc23a3_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxdmcp",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/xorg/lib/libxdmcp",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxdmcp-feedstock",
+          "feedstockRevision": "c2383a456fe44a772631107ccf13e3fccb8dff63"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_10.conda",
+          "sha256": "1a0d382c515ebf55f8ee1f38c8b81bc95af5c2acc42ad53b66bc5df932032f96",
+          "name": "bzip2",
+          "version": "1.0.8",
+          "license": "bzip2-1.0.6",
+          "build": "hda65f42_10",
+          "bytes": 257808,
+          "fileName": "bzip2-1.0.8-hda65f42_10.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/bzip2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://gitlab.com/bzip2/bzip2",
+          "feedstockUrl": "https://github.com/conda-forge/bzip2-feedstock",
+          "feedstockRevision": "f0f345e062aed39aa7f500c0746efed2dcea6971"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/lzo-2.10-hebe6cf0_1003.conda",
+          "sha256": "a0a1400198e5302d8367f2ed53437ee3cc41dbc463cb481921ce765578780b7a",
+          "name": "lzo",
+          "version": "2.10",
+          "license": "GPL-2.0-or-later",
+          "build": "hebe6cf0_1003",
+          "bytes": 191573,
+          "fileName": "lzo-2.10-hebe6cf0_1003.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lzo",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "http://www.oberhumer.com/opensource/lzo/",
+          "feedstockUrl": "https://github.com/conda-forge/lzo-feedstock",
+          "feedstockRevision": "d8595a3cb3261df0c3e777fd44b63ae9f9107e2d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/ncurses-6.6-hdb14827_1.conda",
+          "sha256": "5d46557214ed184381dafe835b7c94a474a1c3b307a08a250b1ea4779b44ffb3",
+          "name": "ncurses",
+          "version": "6.6",
+          "license": "X11 AND BSD-3-Clause",
+          "build": "hdb14827_1",
+          "bytes": 911196,
+          "fileName": "ncurses-6.6-hdb14827_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/ncurses",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "http://invisible-island.net/ncurses/",
+          "feedstockUrl": "https://github.com/conda-forge/ncurses-feedstock",
+          "feedstockRevision": "105562343d06a3180e8d44a25762fdcb97f80aea"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libffi-3.7.0-h81df57d_1.conda",
+          "sha256": "c8c7583ef063bc3c430f1d48298e5ad24f796a35c22ed5b14183325825a61106",
+          "name": "libffi",
+          "version": "3.7.0",
+          "license": "MIT",
+          "build": "h81df57d_1",
+          "bytes": 68004,
+          "fileName": "libffi-3.7.0-h81df57d_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libffi",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://github.com/libffi/libffi",
+          "feedstockUrl": "https://github.com/conda-forge/libffi-feedstock",
+          "feedstockRevision": "dc557589925d228815625e735ff1e63236d5fcd7"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libuuid-2.42.4-hcfc3c73_0.conda",
+          "sha256": "f34b8d1de9a2bf62476d8608057d9b8a918d97444236dc53a47128f2fae79041",
+          "name": "libuuid",
+          "version": "2.42.4",
+          "license": "BSD-3-Clause",
+          "build": "hcfc3c73_0",
+          "bytes": 34442,
+          "fileName": "libuuid-2.42.4-hcfc3c73_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libuuid",
+          "dependencies": [
+            "libgcc >=15",
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "http://sourceforge.net/projects/libuuid/",
+          "feedstockUrl": "https://github.com/conda-forge/libuuid-feedstock",
+          "feedstockRevision": "01c4a2951ae5207d9b7548c4eafc5b9913ca01c9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/c-ares-1.34.8-hebe6cf0_2.conda",
+          "sha256": "9c37cc233238adf366ea75b0e845662a5be07ceadf62e458183516369340274b",
+          "name": "c-ares",
+          "version": "1.34.8",
+          "license": "MIT",
+          "build": "hebe6cf0_2",
+          "bytes": 228700,
+          "fileName": "c-ares-1.34.8-hebe6cf0_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/c-ares",
+          "dependencies": [
+            "libgcc >=15",
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://c-ares.haxx.se/",
+          "feedstockUrl": "https://github.com/conda-forge/c-ares-feedstock",
+          "feedstockRevision": "782d3c50cb0114eb43d89146fff922a85e5f596e"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libev-4.33-h280c20c_3.conda",
+          "sha256": "e4418f68d01a6307c4431b585c71b584f40189877364e542ee87deb777f5e85b",
+          "name": "libev",
+          "version": "4.33",
+          "license": "BSD-2-Clause OR GPL-2.0-or-later",
+          "build": "h280c20c_3",
+          "bytes": 43220,
+          "fileName": "libev-4.33-h280c20c_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libev",
+          "dependencies": [
+            "libgcc >=14",
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://software.schmorp.de/pkg/libev.html",
+          "feedstockUrl": "https://github.com/conda-forge/libev-feedstock",
+          "feedstockRevision": "865d6e94ceab52b90efb1658293f4d63f3cc6e69"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/keyutils-1.6.3-h7cc23a3_1.conda",
+          "sha256": "dd053c96dcb0dcfd59422aefea9d2fe937a190167f34fba7893ec1e10a7e8963",
+          "name": "keyutils",
+          "version": "1.6.3",
+          "license": "LGPL-2.1-or-later",
+          "build": "h7cc23a3_1",
+          "bytes": 135295,
+          "fileName": "keyutils-1.6.3-h7cc23a3_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/keyutils",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://git.kernel.org/pub/scm/linux/kernel/git/dhowells/keyutils.git/",
+          "feedstockUrl": "https://github.com/conda-forge/keyutils-feedstock",
+          "feedstockRevision": "42ba6a5b07dc968ff22743db1f52fb8500181e3a"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libexpat-2.8.5-hd2095e1_0.conda",
+          "sha256": "6de73033a7c5f712c9c5a54124e4581e025691029835e5bceaf10a333a7e7bc0",
+          "name": "libexpat",
+          "version": "2.8.5",
+          "license": "MIT",
+          "build": "hd2095e1_0",
+          "bytes": 77893,
+          "fileName": "libexpat-2.8.5-hd2095e1_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libexpat",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://github.com/libexpat/libexpat",
+          "feedstockUrl": "https://github.com/conda-forge/expat-feedstock",
+          "feedstockRevision": "8c6a1ae4141ab05eac441c97e5e13d2f58b45eed"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/pthread-stubs-0.4-h7cc23a3_1004.conda",
+          "sha256": "4a44fd00ea73b79ca2c89b0727b9ccf61c506ead71e67a9abfa4c590042b5a4a",
+          "name": "pthread-stubs",
+          "version": "0.4",
+          "license": "MIT",
+          "build": "h7cc23a3_1004",
+          "bytes": 9630,
+          "fileName": "pthread-stubs-0.4-h7cc23a3_1004.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pthread-stubs",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://xcb.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/pthread-stubs-feedstock",
+          "feedstockRevision": "2e3012e8be19d26d9deebd542f131e09475a9318"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libiconv-1.18-h0cb94f2_3.conda",
+          "sha256": "f943117edb9cd4d9c61cc972eee5a34291dc55ea7a6e9e38da104995841cbcb6",
+          "name": "libiconv",
+          "version": "1.18",
+          "license": "LGPL-2.1-only",
+          "build": "h0cb94f2_3",
+          "bytes": 789471,
+          "fileName": "libiconv-1.18-h0cb94f2_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libiconv",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://www.gnu.org/software/libiconv/",
+          "feedstockUrl": "https://github.com/conda-forge/libiconv-feedstock",
+          "feedstockRevision": "c7fdcb1b68d6579a08d0c5dc5f34cbbf38780538"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libdeflate-1.25-hd45a770_1.conda",
+          "sha256": "82e134c8a08b1eed9a2ed8ab578b89aa1730dcde3dea8dd87645ed0637878e54",
+          "name": "libdeflate",
+          "version": "1.25",
+          "license": "MIT",
+          "build": "hd45a770_1",
+          "bytes": 73710,
+          "fileName": "libdeflate-1.25-hd45a770_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libdeflate",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/ebiggers/libdeflate",
+          "feedstockUrl": "https://github.com/conda-forge/libdeflate-feedstock",
+          "feedstockRevision": "995dda5e8253e79324b87cb9b2fcf8cd40357ed2"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libwebp-base-1.6.0-hd42ef1d_1.conda",
+          "sha256": "8415001414f488c85b72b9d8cc2071dfb3981a47bc3c8eb56ef91a57d12eae7f",
+          "name": "libwebp-base",
+          "version": "1.6.0",
+          "license": "BSD-3-Clause",
+          "build": "hd42ef1d_1",
+          "bytes": 428430,
+          "fileName": "libwebp-base-1.6.0-hd42ef1d_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libwebp-base",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://chromium.googlesource.com/webm/libwebp",
+          "feedstockUrl": "https://github.com/conda-forge/libwebp-base-feedstock",
+          "feedstockRevision": "b8a54ec0653ea0ac18e509fc889f1fc8f0b90233"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libpng-1.6.59-h922cc85_0.conda",
+          "sha256": "c7381be8ef713501f6cd2f5ad473e401f2edeaec3c46788296b8dbf0de165e15",
+          "name": "libpng",
+          "version": "1.6.59",
+          "license": "zlib-acknowledgement",
+          "build": "h922cc85_0",
+          "bytes": 316872,
+          "fileName": "libpng-1.6.59-h922cc85_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libpng",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://sourceforge.net/p/libpng/code/ci/libpng16/tree/",
+          "feedstockUrl": "https://github.com/conda-forge/libpng-feedstock",
+          "feedstockRevision": "fb861d8ff886d5bfe7fc4f01c6545d59779798ff"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libjpeg-turbo-3.2.0-hb03c661_1.conda",
+          "sha256": "bba8538e6538ed58a8479b332337b96986561f975d06cfa2039a016c2d246ee4",
+          "name": "libjpeg-turbo",
+          "version": "3.2.0",
+          "license": "IJG AND BSD-3-Clause AND Zlib",
+          "build": "hb03c661_1",
+          "bytes": 650434,
+          "fileName": "libjpeg-turbo-3.2.0-hb03c661_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libjpeg-turbo",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/libjpeg-turbo/libjpeg-turbo",
+          "feedstockUrl": "https://github.com/conda-forge/libjpeg-turbo-feedstock",
+          "feedstockRevision": "cc922f6dba346613d6c2820d58011f1c6c175e7d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/giflib-5.2.2-ha257d8a_1.conda",
+          "sha256": "3611c5d605cd56017704e6c01c7bd849e74a656a546d4c49d655fde49ddfeecc",
+          "name": "giflib",
+          "version": "5.2.2",
+          "license": "MIT",
+          "build": "ha257d8a_1",
+          "bytes": 77403,
+          "fileName": "giflib-5.2.2-ha257d8a_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/giflib",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "http://giflib.sourceforge.net",
+          "feedstockUrl": "https://github.com/conda-forge/giflib-feedstock",
+          "feedstockRevision": "ab669636b5ea8c982aedc48ca104f2f08c8c8a77"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/liblzma-5.8.3-hb03c661_1.conda",
+          "sha256": "9787df8c22a59c9a70d3e5a10db9ad663485e75e9ccc3f09bd092cb7b95e0dab",
+          "name": "liblzma",
+          "version": "5.8.3",
+          "license": "0BSD",
+          "build": "hb03c661_1",
+          "bytes": 112995,
+          "fileName": "liblzma-5.8.3-hb03c661_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/liblzma",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "http://git.tukaani.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xz-feedstock",
+          "feedstockRevision": "bc37fbf54469221332fc589c1404294a159f403b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libstdcxx-16.2.0-h934c35e_7.conda",
+          "sha256": "fa7018298629fc429971fffd6ecba3d27a7b02e4e890d6a93ea01ffebe8cb745",
+          "name": "libstdcxx",
+          "version": "16.2.0",
+          "license": "GPL-3.0-only WITH GCC-exception-3.1",
+          "build": "h934c35e_7",
+          "bytes": 6615436,
+          "fileName": "libstdcxx-16.2.0-h934c35e_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libstdcxx",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc 16.2.0 ha9f2e26_7"
+          ],
+          "sourceUrl": "https://gcc.gnu.org/",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "9130f5e7a99ff6de8041ce7b9542d5454e863689"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/pcre2-10.47-h8b3dc9c_1.conda",
+          "sha256": "9ebb10a4eb3be51ae67d85c679f5a7a50cb040ed25c783e6331a225ea09991d4",
+          "name": "pcre2",
+          "version": "10.47",
+          "license": "BSD-3-Clause",
+          "build": "h8b3dc9c_1",
+          "bytes": 1218833,
+          "fileName": "pcre2-10.47-h8b3dc9c_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pcre2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "bzip2 >=1.0.8,<2.0a0",
+            "libgcc >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/PCRE2Project/pcre2",
+          "feedstockUrl": "https://github.com/conda-forge/pcre2-feedstock",
+          "feedstockRevision": "1036df63759c1365071c7531a6e01fcca90f28a1"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libedit-3.1.20260512-pl5321h373387f_0.conda",
+          "sha256": "45301f14f4eb66da57cfaf2d265f3eeee73f8b07e99614ee3afc5b26eea91126",
+          "name": "libedit",
+          "version": "3.1.20260512",
+          "license": "BSD-2-Clause",
+          "build": "pl5321h373387f_0",
+          "bytes": 135877,
+          "fileName": "libedit-3.1.20260512-pl5321h373387f_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libedit",
+          "dependencies": [
+            "ncurses",
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "ncurses >=6.6,<7.0a0"
+          ],
+          "sourceUrl": "http://thrysoee.dk/editline/",
+          "feedstockUrl": "https://github.com/conda-forge/libedit-feedstock",
+          "feedstockRevision": "68b86ed3628cf5ad0cc67e821c733d3729525c85"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libsm-1.2.6-h0d788c3_1.conda",
+          "sha256": "ef907caee0665cf3b0f775602cc50e388e3bade8ce22ecade0873ff26604b2fd",
+          "name": "xorg-libsm",
+          "version": "1.2.6",
+          "license": "MIT",
+          "build": "h0d788c3_1",
+          "bytes": 30739,
+          "fileName": "xorg-libsm-1.2.6-h0d788c3_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libsm",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "xorg-libice >=1.1.2,<2.0a0",
+            "libuuid >=2.42.2,<3.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libsm-feedstock",
+          "feedstockRevision": "78d8a84c62d816276ee5a6dc343730dc099c1226"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libxcb-1.17.0-hb83e432_2.conda",
+          "sha256": "7b49e6fd2a584b7f072943e6adf4149677af5121246975278804782d37752837",
+          "name": "libxcb",
+          "version": "1.17.0",
+          "license": "MIT",
+          "build": "hb83e432_2",
+          "bytes": 395120,
+          "fileName": "libxcb-1.17.0-hb83e432_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxcb",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "pthread-stubs",
+            "xorg-libxau >=1.0.12,<2.0a0",
+            "xorg-libxdmcp >=1.1.5,<2.0a0"
+          ],
+          "sourceUrl": "http://xcb.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libxcb-feedstock",
+          "feedstockRevision": "3c698030838a932106c913a828e935c4a8f0e897"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libfreetype6-2.14.3-h5e6c136_2.conda",
+          "sha256": "ec607dd5445dd17ff6bf8b7fe6832e5504c226dd91d3aaea7ba83569808b0ce4",
+          "name": "libfreetype6",
+          "version": "2.14.3",
+          "license": "GPL-2.0-only OR FTL",
+          "build": "h5e6c136_2",
+          "bytes": 387671,
+          "fileName": "libfreetype6-2.14.3-h5e6c136_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libfreetype6",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "feedstockUrl": "https://github.com/conda-forge/freetype-feedstock",
+          "feedstockRevision": "3520c4122afde3a5c30609f035de7cc4f501c069"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/graphite2-1.3.15-h54a6638_1.conda",
+          "sha256": "7fa3b6a9c081fa3e545573152a788d061a0a0ba57df7251cc0f4f75225fc93e7",
+          "name": "graphite2",
+          "version": "1.3.15",
+          "license": "LGPL-2.0-or-later",
+          "build": "h54a6638_1",
+          "bytes": 102835,
+          "fileName": "graphite2-1.3.15-h54a6638_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/graphite2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libstdcxx >=14",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/silnrsi/graphite",
+          "feedstockUrl": "https://github.com/conda-forge/graphite2-feedstock",
+          "feedstockRevision": "ba0a8e0362b411f2fa172e105d805270ac086509"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/icu-78.3-py310h44b86e0_2.conda",
+          "sha256": "9f07834f0c546ab14d885ce0366285f61f44e326c0edd1fc63b8294e113ae432",
+          "name": "icu",
+          "version": "78.3",
+          "license": "MIT",
+          "build": "py310h44b86e0_2",
+          "bytes": 14459115,
+          "fileName": "icu-78.3-py310h44b86e0_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/icu",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libstdcxx >=14",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/unicode-org/icu",
+          "feedstockUrl": "https://github.com/conda-forge/icu-feedstock",
+          "feedstockRevision": "72c98272513977fda6ffa2dd7a4e6f67a77976c9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/lz4-c-1.10.0-hee9eb32_2.conda",
+          "sha256": "b8c0e930183e6b7f83cd35ace102f2b8c2f0faae41dc05255dc72f247dfc556a",
+          "name": "lz4-c",
+          "version": "1.10.0",
+          "license": "BSD-2-Clause",
+          "build": "hee9eb32_2",
+          "bytes": 181812,
+          "fileName": "lz4-c-1.10.0-hee9eb32_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lz4-c",
+          "dependencies": [
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://github.com/lz4/lz4",
+          "feedstockUrl": "https://github.com/conda-forge/lz4-c-feedstock",
+          "feedstockRevision": "7739afba01c0c2ec6ce7d9c9fab6c9818d7d6f22"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/pixman-0.46.4-h54a6638_3.conda",
+          "sha256": "829d8288764282de5a9f7b9169acb75cc7dc0b6c3fe2535cfe87dea3436bbc5d",
+          "name": "pixman",
+          "version": "0.46.4",
+          "license": "MIT",
+          "build": "h54a6638_3",
+          "bytes": 376704,
+          "fileName": "pixman-0.46.4-h54a6638_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pixman",
+          "dependencies": [
+            "libstdcxx >=14",
+            "libgcc >=14",
+            "__glibc >=2.17,<3.0.a0"
+          ],
+          "sourceUrl": "https://cgit.freedesktop.org/pixman/",
+          "feedstockUrl": "https://github.com/conda-forge/pixman-feedstock",
+          "feedstockRevision": "aa115040c3fa1c298ba27ed7afb42d6feb4fac28"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/lerc-4.2.0-hdb68285_0.conda",
+          "sha256": "bf9fdebf55d8bc99d83531cdffda00703f4dc5f93a1a956768c147362c72feda",
+          "name": "lerc",
+          "version": "4.2.0",
+          "license": "Apache-2.0",
+          "build": "hdb68285_0",
+          "bytes": 271158,
+          "fileName": "lerc-4.2.0-hdb68285_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lerc",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "libstdcxx >=14"
+          ],
+          "sourceUrl": "https://github.com/Esri/lerc",
+          "feedstockUrl": "https://github.com/conda-forge/lerc-feedstock",
+          "feedstockRevision": "11a9b9cedb32ef23cd0dc48743e0a354fc4f7342"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/nspr-4.40-h29cc59b_0.conda",
+          "sha256": "7cf473259ef9945ce19ecc898a2dd146cd32dc86099d87b86f79c5e5b0ef55f0",
+          "name": "nspr",
+          "version": "4.40",
+          "license": "MPL-2.0",
+          "build": "h29cc59b_0",
+          "bytes": 231356,
+          "fileName": "nspr-4.40-h29cc59b_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/nspr",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "libstdcxx >=14"
+          ],
+          "sourceUrl": "https://developer.mozilla.org/en-US/docs/MDN",
+          "feedstockUrl": "https://github.com/conda-forge/nspr-feedstock",
+          "feedstockRevision": "cd185077f21ae9792918fa955fcb048b89bb3e70"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libglib-2.90.0-h569388d_0.conda",
+          "sha256": "9e688e046550415c030c3d08ed9a3fd13a51d7bc56295283b858b6c3070bb9f8",
+          "name": "libglib",
+          "version": "2.90.0",
+          "license": "LGPL-2.1-or-later",
+          "build": "h569388d_0",
+          "bytes": 4819130,
+          "fileName": "libglib-2.90.0-h569388d_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglib",
+          "dependencies": [
+            "libgcc >=15",
+            "__glibc >=2.17,<3.0.a0",
+            "libiconv >=1.18,<2.0a0",
+            "pcre2 >=10.47,<10.48.0a0",
+            "libffi >=3.7.0,<3.8.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://gitlab.gnome.org/GNOME/glib/",
+          "feedstockUrl": "https://github.com/conda-forge/glib-feedstock",
+          "feedstockRevision": "680d46a6d7a6dae4cb68234c72067a9d20313633"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libx11-1.8.13-he1eb515_1.conda",
+          "sha256": "68053eebfa9f0d91666786c8fb5839d989aa9b869add92cb8815228bb2d7302c",
+          "name": "xorg-libx11",
+          "version": "1.8.13",
+          "license": "MIT",
+          "build": "he1eb515_1",
+          "bytes": 839578,
+          "fileName": "xorg-libx11-1.8.13-he1eb515_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libx11",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "libxcb >=1.17.0,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libx11-feedstock",
+          "feedstockRevision": "ce1384271ac5711d8d98a75e069249c02ce22de4"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libfreetype-2.14.3-ha770c72_2.conda",
+          "sha256": "fb12ecb46c30d18d928c0e8fc346ab13b5f6fc8a9cacae4f2f4bb188782586f5",
+          "name": "libfreetype",
+          "version": "2.14.3",
+          "license": "GPL-2.0-only OR FTL",
+          "build": "ha770c72_2",
+          "bytes": 8407,
+          "fileName": "libfreetype-2.14.3-ha770c72_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libfreetype",
+          "dependencies": [
+            "libfreetype6 >=2.14.3"
+          ],
+          "feedstockUrl": "https://github.com/conda-forge/freetype-feedstock",
+          "feedstockRevision": "3520c4122afde3a5c30609f035de7cc4f501c069"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libxml2-16-2.15.4-hf3af7cc_1.conda",
+          "sha256": "d1906463070c21f3215cd5de93164f31c44d5bac6ae9b5d8f5adf42b1e304039",
+          "name": "libxml2-16",
+          "version": "2.15.4",
+          "license": "MIT",
+          "build": "hf3af7cc_1",
+          "bytes": 569062,
+          "fileName": "libxml2-16-2.15.4-hf3af7cc_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxml2-16",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "icu >=78.3,<79.0a0",
+            "libgcc >=15",
+            "libiconv >=1.18,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://git.gnome.org/browse/libxml2/",
+          "feedstockUrl": "https://github.com/conda-forge/libxml2-feedstock",
+          "feedstockRevision": "2aea8424bab23ebc32ac1493984e90e73cda28dd"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libsqlite-3.54.0-h13e7031_1.conda",
+          "sha256": "4823e42fe95fc318d7af6125dc6ef33bd60c1152054d41661413250dc0e84e6c",
+          "name": "libsqlite",
+          "version": "3.54.0",
+          "license": "blessing",
+          "build": "h13e7031_1",
+          "bytes": 984364,
+          "fileName": "libsqlite-3.54.0-h13e7031_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libsqlite",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "icu >=78.3,<79.0a0",
+            "libgcc >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://www.sqlite.org/src/dir?ci=trunk",
+          "feedstockUrl": "https://github.com/conda-forge/sqlite-feedstock",
+          "feedstockRevision": "50670969b1746603d7ee3ffcdca2ba67e2f0395f"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libpsl-0.23.1-hd9e3e90_1.conda",
+          "sha256": "09e8effdc89bc5d021349318d32b85594f5b8d8e3ab8f90a85b81f8fe695a566",
+          "name": "libpsl",
+          "version": "0.23.1",
+          "license": "MIT",
+          "build": "hd9e3e90_1",
+          "bytes": 72519,
+          "fileName": "libpsl-0.23.1-hd9e3e90_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libpsl",
+          "dependencies": [
+            "libstdcxx >=15",
+            "libgcc >=15",
+            "__glibc >=2.17,<3.0.a0",
+            "icu >=78.3,<79.0a0"
+          ],
+          "sourceUrl": "https://github.com/rockdaboot/libpsl",
+          "feedstockUrl": "https://github.com/conda-forge/libpsl-feedstock",
+          "feedstockRevision": "d93d163e4ace3c8de663d880c0381630b65d4590"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libtiff-4.7.2-hcc2c06a_1.conda",
+          "sha256": "10e125da82ca93e09191e66e5a94d566b2cf8d4024e2a0db3a9114297447e0d9",
+          "name": "libtiff",
+          "version": "4.7.2",
+          "license": "HPND",
+          "build": "hcc2c06a_1",
+          "bytes": 459753,
+          "fileName": "libtiff-4.7.2-hcc2c06a_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libtiff",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "lerc >=4.2.0,<5.0a0",
+            "libdeflate >=1.25,<1.26.0a0",
+            "libgcc >=15",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libstdcxx >=15",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "http://www.libtiff.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libtiff-feedstock",
+          "feedstockRevision": "69b00df993d8c9571dbd2aa423e50a10f1adfeda"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxrender-0.9.12-hb03c661_1.conda",
+          "sha256": "6901f91d398811e4ec89d7e20a69abac02a7bfebfaf073338b7ea3d1a99685b7",
+          "name": "xorg-libxrender",
+          "version": "0.9.12",
+          "license": "MIT",
+          "build": "hb03c661_1",
+          "bytes": 34645,
+          "fileName": "xorg-libxrender-0.9.12-hb03c661_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxrender",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxrender-feedstock",
+          "feedstockRevision": "a7b40035665d655e382d2db55c943defd82ca2ef"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxfixes-6.0.2-h7cc23a3_1.conda",
+          "sha256": "aec84f554fc897bf4085c7bc8b8f0740e4c224e13bca3cc51c93e7699d56f83a",
+          "name": "xorg-libxfixes",
+          "version": "6.0.2",
+          "license": "MIT",
+          "build": "h7cc23a3_1",
+          "bytes": 21440,
+          "fileName": "xorg-libxfixes-6.0.2-h7cc23a3_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxfixes",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxfixes-feedstock",
+          "feedstockRevision": "38660eac6a825e1404edc7fe8497d5939f927af8"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxext-1.3.7-h7cc23a3_1.conda",
+          "sha256": "aa9bbe8b278aacc194e280ff5037f9f9a1f2c5b33ed97de8e7f01cfbe90dda43",
+          "name": "xorg-libxext",
+          "version": "1.3.7",
+          "license": "MIT",
+          "build": "h7cc23a3_1",
+          "bytes": 53124,
+          "fileName": "xorg-libxext-1.3.7-h7cc23a3_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxext",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxext-feedstock",
+          "feedstockRevision": "2aad4e910b9b26c7e1d521125d355b0ad9d33c5c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libglx-1.7.0-ha4b6fd6_5.conda",
+          "sha256": "d1f0d51aea6bcc5d915969cbed32e72a8ed6a95931b87357ef8d0866573688c4",
+          "name": "libglx",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "ha4b6fd6_5",
+          "bytes": 79834,
+          "fileName": "libglx-1.7.0-ha4b6fd6_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglx",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libglvnd 1.7.0 ha4b6fd6_5",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/fontconfig-2.18.3-h4db4eae_1.conda",
+          "sha256": "5a3eb10b18a97223ab06b3a7f0d7f56658db2f2800e2f2af95836fe3bf55ba63",
+          "name": "fontconfig",
+          "version": "2.18.3",
+          "license": "MIT",
+          "build": "h4db4eae_1",
+          "bytes": 296288,
+          "fileName": "fontconfig-2.18.3-h4db4eae_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fontconfig",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libexpat >=2.8.1,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libuuid >=2.42.2,<3.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://cgit.freedesktop.org/fontconfig/",
+          "feedstockUrl": "https://github.com/conda-forge/fontconfig-feedstock",
+          "feedstockRevision": "7f94a24652814e2985044aeae8b2966fae633035"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libxml2-2.15.4-h7df9aa5_1.conda",
+          "sha256": "8c32be9e8720bc413d2b4267517459d7d71fad4a5f398a2aa8319b6d7b8a00e6",
+          "name": "libxml2",
+          "version": "2.15.4",
+          "license": "MIT",
+          "build": "h7df9aa5_1",
+          "bytes": 46570,
+          "fileName": "libxml2-2.15.4-h7df9aa5_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxml2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "icu >=78.3,<79.0a0",
+            "libgcc >=15",
+            "libiconv >=1.18,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libxml2-16 2.15.4 hf3af7cc_1",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://git.gnome.org/browse/libxml2/",
+          "feedstockUrl": "https://github.com/conda-forge/libxml2-feedstock",
+          "feedstockRevision": "2aea8424bab23ebc32ac1493984e90e73cda28dd"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/nss-3.118-h445c969_0.conda",
+          "sha256": "44dd98ffeac859d84a6dcba79a2096193a42fc10b29b28a5115687a680dd6aea",
+          "name": "nss",
+          "version": "3.118",
+          "license": "MPL-2.0",
+          "build": "h445c969_0",
+          "bytes": 2057773,
+          "fileName": "nss-3.118-h445c969_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/nss",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "libsqlite >=3.51.0,<4.0a0",
+            "libstdcxx >=14",
+            "libzlib >=1.3.1,<2.0a0",
+            "nspr >=4.38,<5.0a0"
+          ],
+          "sourceUrl": "https://hg.mozilla.org/projects/nss",
+          "feedstockUrl": "https://github.com/conda-forge/nss-feedstock",
+          "feedstockRevision": "0ce49a2f14623e6dcb02ccc38f619523cdd17c5a"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/lcms2-2.19.1-h9073bf1_3.conda",
+          "sha256": "03e675b9adaf235aab880e4133c72f4830e87bc7da2df59d6194771612239b22",
+          "name": "lcms2",
+          "version": "2.19.1",
+          "license": "MIT",
+          "build": "h9073bf1_3",
+          "bytes": 254292,
+          "fileName": "lcms2-2.19.1-h9073bf1_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lcms2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libtiff >=4.7.2,<4.8.0a0"
+          ],
+          "sourceUrl": "http://www.littlecms.com/",
+          "feedstockUrl": "https://github.com/conda-forge/lcms2-feedstock",
+          "feedstockRevision": "3cefa7a569e5d8918e253214097b6c4fdef2eef0"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/openjpeg-2.5.4-heb1ab33_2.conda",
+          "sha256": "131688a88bea8da92fe418c4558c5073435e2848911bc4c836c3a9dd5994b4aa",
+          "name": "openjpeg",
+          "version": "2.5.4",
+          "license": "BSD-2-Clause",
+          "build": "heb1ab33_2",
+          "bytes": 391242,
+          "fileName": "openjpeg-2.5.4-heb1ab33_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/openjpeg",
+          "dependencies": [
+            "libgcc >=15",
+            "__glibc >=2.17,<3.0.a0",
+            "libstdcxx >=15",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "libpng >=1.6.58,<1.7.0a0"
+          ],
+          "sourceUrl": "http://www.openjpeg.org/",
+          "feedstockUrl": "https://github.com/conda-forge/openjpeg-feedstock",
+          "feedstockRevision": "00d4e8f7d73043cb46153df594d005aef33e05c7"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxi-1.8.3-h7cc23a3_1.conda",
+          "sha256": "a523d71344a2f640efe6fc42b88fc261d9cd389d4f9838a5d42dcdb120c2b0c8",
+          "name": "xorg-libxi",
+          "version": "1.8.3",
+          "license": "MIT",
+          "build": "h7cc23a3_1",
+          "bytes": 49165,
+          "fileName": "xorg-libxi-1.8.3-h7cc23a3_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxi",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0",
+            "xorg-libxext >=1.3.7,<2.0a0",
+            "xorg-libxfixes >=6.0.2,<7.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxi-feedstock",
+          "feedstockRevision": "7e03ef922819ea16f45b1187de20d7c837b8d38d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxscrnsaver-1.2.4-hb9d3cd8_0.conda",
+          "sha256": "58e8fc1687534124832d22e102f098b5401173212ac69eb9fd96b16a3e2c8cb2",
+          "name": "xorg-libxscrnsaver",
+          "version": "1.2.4",
+          "license": "MIT",
+          "build": "hb9d3cd8_0",
+          "bytes": 14412,
+          "fileName": "xorg-libxscrnsaver-1.2.4-hb9d3cd8_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxscrnsaver",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=13",
+            "xorg-libx11 >=1.8.10,<2.0a0",
+            "xorg-libxext >=1.3.6,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxscrnsaver-feedstock",
+          "feedstockRevision": "a7d90675f22865f4e072ece18c805dba9d74c727"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libgl-1.7.0-ha4b6fd6_5.conda",
+          "sha256": "7b2e7e31e8a4f5a01c45ecadcd8aa68c8f733b035240bc7ba9881835ef4bf7b4",
+          "name": "libgl",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "ha4b6fd6_5",
+          "bytes": 131988,
+          "fileName": "libgl-1.7.0-ha4b6fd6_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libgl",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libglvnd 1.7.0 ha4b6fd6_5",
+            "libglx 1.7.0 ha4b6fd6_5"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/leptonica-1.87.0-h12c84f9_1.conda",
+          "sha256": "e822d7d1f8e610b2c9db244389ee0e87840a18c8b5f0f82b7393ee182a248dd4",
+          "name": "leptonica",
+          "version": "1.87.0",
+          "license": "BSD-2-Clause",
+          "build": "h12c84f9_1",
+          "bytes": 2615553,
+          "fileName": "leptonica-1.87.0-h12c84f9_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/leptonica",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "giflib >=5.2.2,<5.3.0a0",
+            "libtiff >=4.7.1,<4.8.0a0",
+            "libjpeg-turbo >=3.1.2,<4.0a0",
+            "liblzma >=5.8.2,<6.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "libpng >=1.6.56,<1.7.0a0"
+          ],
+          "sourceUrl": "https://github.com/DanBloomberg/leptonica",
+          "feedstockUrl": "https://github.com/conda-forge/leptonica-feedstock",
+          "feedstockRevision": "920fce346222be437f5b615392f2e53fe8fda919"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/xorg-libxtst-1.2.5-h7cc23a3_4.conda",
+          "sha256": "d66525e7b1c492aa179c6c55610fc8dfb0a9a62ea7d4fb9f904fa6af62127f61",
+          "name": "xorg-libxtst",
+          "version": "1.2.5",
+          "license": "MIT",
+          "build": "h7cc23a3_4",
+          "bytes": 35052,
+          "fileName": "xorg-libxtst-1.2.5-h7cc23a3_4.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxtst",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0",
+            "xorg-libxext >=1.3.7,<2.0a0",
+            "xorg-libxi >=1.8.3,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxtst-feedstock",
+          "feedstockRevision": "55167afec808fa5512d14ac0460026609bd2d1ee"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/poppler-data-0.4.12-hd8ed1ab_0.conda",
+          "sha256": "2f227e17b3c0346112815faa605502b66c1c4511a856127f2899abf15a98a2cf",
+          "name": "poppler-data",
+          "version": "0.4.12",
+          "license": "BSD-3-Clause AND (GPL-2.0-only OR GPL-3.0-only)",
+          "build": "hd8ed1ab_0",
+          "bytes": 2348171,
+          "fileName": "poppler-data-0.4.12-hd8ed1ab_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/poppler-data",
+          "dependencies": [],
+          "sourceUrl": "https://poppler.freedesktop.org/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2",
+          "sha256": "58d7f40d2940dd0a8aa28651239adbf5613254df0f75789919c4e6762054403b",
+          "name": "font-ttf-dejavu-sans-mono",
+          "version": "2.37",
+          "license": "BSD-3-Clause",
+          "build": "hab24e00_0",
+          "bytes": 397370,
+          "fileName": "font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-dejavu-sans-mono",
+          "dependencies": [],
+          "sourceUrl": "https://dejavu-fonts.github.io/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-inconsolata-3.000-h77eed37_0.tar.bz2",
+          "sha256": "c52a29fdac682c20d252facc50f01e7c2e7ceac52aa9817aaf0bb83f7559ec5c",
+          "name": "font-ttf-inconsolata",
+          "version": "3.000",
+          "license": "OFL-1.1",
+          "build": "h77eed37_0",
+          "bytes": 96530,
+          "fileName": "font-ttf-inconsolata-3.000-h77eed37_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-inconsolata",
+          "dependencies": [],
+          "sourceUrl": "https://fonts.google.com/specimen/Inconsolata"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-source-code-pro-2.038-h77eed37_0.tar.bz2",
+          "sha256": "00925c8c055a2275614b4d983e1df637245e19058d79fc7dd1a93b8d9fb4b139",
+          "name": "font-ttf-source-code-pro",
+          "version": "2.038",
+          "license": "OFL-1.1",
+          "build": "h77eed37_0",
+          "bytes": 700814,
+          "fileName": "font-ttf-source-code-pro-2.038-h77eed37_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-source-code-pro",
+          "dependencies": [],
+          "sourceUrl": "https://adobe-fonts.github.io/source-code-pro/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-ubuntu-0.83-h77eed37_3.conda",
+          "sha256": "2821ec1dc454bd8b9a31d0ed22a7ce22422c0aef163c59f49dfdf915d0f0ca14",
+          "name": "font-ttf-ubuntu",
+          "version": "0.83",
+          "license": "LicenseRef-Ubuntu-Font-Licence-Version-1.0",
+          "build": "h77eed37_3",
+          "bytes": 1620504,
+          "fileName": "font-ttf-ubuntu-0.83-h77eed37_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-ubuntu",
+          "dependencies": [],
+          "sourceUrl": "https://design.ubuntu.com/font/",
+          "feedstockUrl": "https://github.com/conda-forge/font-ttf-ubuntu-feedstock",
+          "feedstockRevision": "e0124cc5a2cfff85f9584b558ec4f43bf091761b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda",
+          "sha256": "0a0544cf95f64394fe4959286f5c71f5444ad58feb0602e53becb27448d24da6",
+          "name": "ca-certificates",
+          "version": "2026.7.22",
+          "license": "ISC",
+          "build": "hbd8a1cb_0",
+          "bytes": 131780,
+          "fileName": "ca-certificates-2026.7.22-hbd8a1cb_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/ca-certificates",
+          "dependencies": [
+            "__unix"
+          ],
+          "sourceUrl": "https://github.com/conda-forge/ca-certificates-feedstock",
+          "feedstockUrl": "https://github.com/conda-forge/ca-certificates-feedstock",
+          "feedstockRevision": "e9adaddd7b8b4f8def01b4cfd8690cd7fec7fc7b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/fonts-conda-forge-1-hc364b38_1.conda",
+          "sha256": "54eea8469786bc2291cc40bca5f46438d3e062a399e8f53f013b6a9f50e98333",
+          "name": "fonts-conda-forge",
+          "version": "1",
+          "license": "BSD-3-Clause",
+          "build": "hc364b38_1",
+          "bytes": 4059,
+          "fileName": "fonts-conda-forge-1-hc364b38_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fonts-conda-forge",
+          "dependencies": [
+            "font-ttf-ubuntu",
+            "font-ttf-inconsolata",
+            "font-ttf-dejavu-sans-mono",
+            "font-ttf-source-code-pro"
+          ],
+          "sourceUrl": "https://conda-forge.org/",
+          "feedstockUrl": "https://github.com/conda-forge/fonts-conda-forge-feedstock",
+          "feedstockRevision": "1b7ad83c3dd122e856cbb86a4a52264cc1e28c5e"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/fonts-conda-ecosystem-1-0.tar.bz2",
+          "sha256": "a997f2f1921bb9c9d76e6fa2f6b408b7fa549edd349a77639c9fe7a23ea93e61",
+          "name": "fonts-conda-ecosystem",
+          "version": "1",
+          "license": "BSD-3-Clause",
+          "build": "0",
+          "bytes": 3667,
+          "fileName": "fonts-conda-ecosystem-1-0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fonts-conda-ecosystem",
+          "dependencies": [
+            "fonts-conda-forge"
+          ],
+          "sourceUrl": "https://conda.io"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.5-h781a0a9_0.conda",
+          "sha256": "9c1533f1cf784f0e250919c0c9762d0b0e6bc727a79290ffb7cea1ceca1d038c",
+          "name": "openssl",
+          "version": "3.6.5",
+          "license": "Apache-2.0",
+          "build": "h781a0a9_0",
+          "bytes": 3195299,
+          "fileName": "openssl-3.6.5-h781a0a9_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/openssl",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "ca-certificates",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://github.com/openssl/openssl",
+          "feedstockUrl": "https://github.com/conda-forge/openssl-feedstock",
+          "feedstockRevision": "f0c4979996e075ca6fb7efbd6b65d4fe2cc1fe6f"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/cairo-1.18.6-h3c89d7e_0.conda",
+          "sha256": "5d0efc6f9981468aca72897460d9b2d17b74dff72787f20a9d2330e214064515",
+          "name": "cairo",
+          "version": "1.18.6",
+          "license": "LGPL-2.1-only or MPL-1.1",
+          "build": "h3c89d7e_0",
+          "bytes": 1007110,
+          "fileName": "cairo-1.18.6-h3c89d7e_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/cairo",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "fontconfig >=2.18.3,<3.0a0",
+            "fonts-conda-ecosystem",
+            "icu >=78.3,<79.0a0",
+            "libexpat >=2.8.1,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libglib >=2.90.0,<3.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libstdcxx >=15",
+            "libxcb >=1.17.0,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "pixman >=0.46.4,<1.0a0",
+            "xorg-libice >=1.1.2,<2.0a0",
+            "xorg-libsm >=1.2.6,<2.0a0",
+            "xorg-libx11 >=1.8.13,<2.0a0",
+            "xorg-libxext >=1.3.7,<2.0a0",
+            "xorg-libxrender >=0.9.12,<0.10.0a0"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/cairo/cairo",
+          "feedstockUrl": "https://github.com/conda-forge/cairo-feedstock",
+          "feedstockRevision": "8b534c45e4a7945ac29aa8bd177109af1c318594"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libssh2-1.11.1-h6154650_1.conda",
+          "sha256": "7e463000fa1cba3f3a6597b776f6ab301d425a96e3bc20d0d9d76a3b9f237aa3",
+          "name": "libssh2",
+          "version": "1.11.1",
+          "license": "BSD-3-Clause",
+          "build": "h6154650_1",
+          "bytes": 306045,
+          "fileName": "libssh2-1.11.1-h6154650_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libssh2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "libgcc >=14",
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.7,<4.0a0"
+          ],
+          "sourceUrl": "https://github.com/libssh2/libssh2",
+          "feedstockUrl": "https://github.com/conda-forge/libssh2-feedstock",
+          "feedstockRevision": "e5701cd76588f38d76a9fd704185ffc88184c102"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/krb5-1.22.2-hbc21106_2.conda",
+          "sha256": "2a5c38c85e63df84c4e69ee71439841ce570d259ae3060627bb9a49a938d66f4",
+          "name": "krb5",
+          "version": "1.22.2",
+          "license": "MIT",
+          "build": "hbc21106_2",
+          "bytes": 1394333,
+          "fileName": "krb5-1.22.2-hbc21106_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/krb5",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "keyutils >=1.6.3,<2.0a0",
+            "libedit >=3.1.20250104,<3.2.0a0",
+            "libedit >=3.1.20250104,<4.0a0",
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "openssl >=3.5.7,<4.0a0"
+          ],
+          "sourceUrl": "https://github.com/krb5/krb5",
+          "feedstockUrl": "https://github.com/conda-forge/krb5-feedstock",
+          "feedstockRevision": "39e6b3c27e0762e320d9518e069c3df9f26b5bf9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libnghttp2-1.68.1-h74cf4be_1.conda",
+          "sha256": "11a2f54a6f391e25738bce0023e6ef499600147bbcf21c1fa69d2e251b03cc6a",
+          "name": "libnghttp2",
+          "version": "1.68.1",
+          "license": "MIT",
+          "build": "h74cf4be_1",
+          "bytes": 649974,
+          "fileName": "libnghttp2-1.68.1-h74cf4be_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libnghttp2",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "c-ares >=1.34.8,<2.0a0",
+            "libev >=4.33,<4.34.0a0",
+            "libev >=4.33,<5.0a0",
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.7,<4.0a0"
+          ],
+          "sourceUrl": "https://github.com/nghttp2/nghttp2",
+          "feedstockUrl": "https://github.com/conda-forge/nghttp2-feedstock",
+          "feedstockRevision": "e15954f89745f04fde47402004f074c7e62fe28b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libarchive-3.8.9-gpl_h3152399_101.conda",
+          "sha256": "bfae027a67d02325cd6b75edd60beb67cf24483af9df0ae9ef74d4438e41c806",
+          "name": "libarchive",
+          "version": "3.8.9",
+          "license": "BSD-2-Clause",
+          "build": "gpl_h3152399_101",
+          "bytes": 875346,
+          "fileName": "libarchive-3.8.9-gpl_h3152399_101.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libarchive",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "bzip2 >=1.0.8,<2.0a0",
+            "libgcc >=15",
+            "liblzma >=5.8.3,<6.0a0",
+            "libxml2",
+            "libxml2-16 >=2.15.3",
+            "libzlib >=1.3.2,<2.0a0",
+            "lz4-c >=1.10.0,<1.11.0a0",
+            "lzo >=2.10,<3.0a0",
+            "openssl >=3.5.7,<4.0a0",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "http://www.libarchive.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libarchive-feedstock",
+          "feedstockRevision": "8702d4c08d57d3251ba945b6af3b230f6a714ce2"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libharfbuzz-14.6.0-h23af247_1.conda",
+          "sha256": "a5af64065d8fb70b77ce4551c9ae022b4f170f11b789249ee6efab3e83fedbe0",
+          "name": "libharfbuzz",
+          "version": "14.6.0",
+          "license": "MIT",
+          "build": "h23af247_1",
+          "bytes": 1465053,
+          "fileName": "libharfbuzz-14.6.0-h23af247_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libharfbuzz",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "cairo >=1.18.6,<2.0a0",
+            "graphite2 >=1.3.15,<2.0a0",
+            "icu >=78.3,<79.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libglib >=2.90.0,<3.0a0",
+            "libpng >=1.6.59,<1.7.0a0",
+            "libstdcxx >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/harfbuzz/harfbuzz",
+          "feedstockUrl": "https://github.com/conda-forge/harfbuzz-feedstock",
+          "feedstockRevision": "fa98fde637a525ff8c41de4b795d9815b362a18d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.22.0-ha042cf0_0.conda",
+          "sha256": "483b7eb97f56fbb3a9cb7190d33012dfa0a5aaed99ede61465563cd97dd82504",
+          "name": "libcurl",
+          "version": "8.22.0",
+          "license": "curl",
+          "build": "ha042cf0_0",
+          "bytes": 499651,
+          "fileName": "libcurl-8.22.0-ha042cf0_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libcurl",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "krb5 >=1.22.2,<1.23.0a0",
+            "libgcc >=15",
+            "libnghttp2 >=1.68.1,<2.0a0",
+            "libpsl >=0.23.1,<0.24.0a0",
+            "libssh2 >=1.11.1,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.8,<4.0a0",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "https://github.com/curl/curl",
+          "feedstockUrl": "https://github.com/conda-forge/curl-feedstock",
+          "feedstockRevision": "4112bf00cdcc525cd7fa7ed1bba5a4b1c43eeb53"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/tesseract-5.5.3-h7618cdf_0.conda",
+          "sha256": "62ccb114986026a75329b3060f1a77327a699644c8fb5aed322c14fd949b5273",
+          "name": "tesseract",
+          "version": "5.5.3",
+          "license": "Apache-2.0",
+          "build": "h7618cdf_0",
+          "bytes": 181031586,
+          "fileName": "tesseract-5.5.3-h7618cdf_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/tesseract",
+          "dependencies": [
+            "libgcc >=14",
+            "libstdcxx >=14",
+            "__glibc >=2.17,<3.0.a0",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "leptonica >=1.87.0,<1.88.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "giflib >=5.2.2,<5.3.0a0",
+            "libarchive >=3.8.8,<3.9.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libcurl >=8.21.0,<9.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "openjpeg >=2.5.4,<3.0a0"
+          ],
+          "sourceUrl": "https://github.com/tesseract-ocr/tesseract",
+          "feedstockUrl": "https://github.com/conda-forge/tesseract-feedstock",
+          "feedstockRevision": "568e7986182393275d0cda725438219077d489b5"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-64/poppler-26.09.0-h0b47b50_0.conda",
+          "sha256": "05397cc13c2efb9290861481ae248b8a5705a9601677204f369df29020aff712",
+          "name": "poppler",
+          "version": "26.09.0",
+          "license": "GPL-2.0-or-later",
+          "build": "h0b47b50_0",
+          "bytes": 2141142,
+          "fileName": "poppler-26.09.0-h0b47b50_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/poppler",
+          "dependencies": [
+            "__glibc >=2.17,<3.0.a0",
+            "cairo >=1.18.4,<2.0a0",
+            "fontconfig >=2.18.3,<3.0a0",
+            "fonts-conda-ecosystem",
+            "lcms2 >=2.19.1,<3.0a0",
+            "libcurl >=8.22.0,<9.0a0",
+            "libegl >=1.7.0,<2.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libgl >=1.7.0,<2.0a0",
+            "libglib >=2.88.3,<3.0a0",
+            "libharfbuzz >=14.4.0",
+            "libiconv >=1.18,<2.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libstdcxx >=15",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "nspr >=4.40,<5.0a0",
+            "nss >=3.118,<4.0a0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "poppler-data",
+            "xorg-libxscrnsaver >=1.2.4,<2.0a0",
+            "xorg-libxtst >=1.2.5,<2.0a0"
+          ],
+          "sourceUrl": "https://poppler.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/poppler-feedstock",
+          "feedstockRevision": "13d784d77510e73d6066a75a79cd8e6040a6a261"
+        }
+      ],
+      "rendererPath": "bin/pdftoppm",
+      "ocrPath": "bin/tesseract",
+      "environment": {
+        "FONTCONFIG_FILE": "etc/fonts/fonts.conf",
+        "FONTCONFIG_PATH": "etc/fonts"
+      }
+    },
+    {
+      "rid": "linux-arm64",
+      "platform": "linux-aarch64",
+      "bootstrap": {
+        "url": "https://github.com/mamba-org/micromamba-releases/releases/download/2.9.0-0/micromamba-linux-aarch64",
+        "sha256": "9f93b974adcb4d166996af969b6cd371287d1a3e52733704727884d9b74cb7a7",
+        "bytes": 22020296,
+        "fileName": "micromamba",
+        "version": "2.9.0-0",
+        "license": "BSD-3-Clause",
+        "sourceUrl": "https://github.com/mamba-org/mamba/tree/2.9.0"
+      },
+      "packages": [
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libzlib-1.3.2-hdc9db2a_3.conda",
+          "sha256": "76efa6cc9d7e6f5ee3bbca0939f64054af2bdfb3c3632531f8e633cf6c2ea41e",
+          "name": "libzlib",
+          "version": "1.3.2",
+          "license": "Zlib",
+          "build": "hdc9db2a_3",
+          "bytes": 70108,
+          "fileName": "libzlib-1.3.2-hdc9db2a_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libzlib",
+          "dependencies": [],
+          "sourceUrl": "https://github.com/madler/zlib",
+          "feedstockUrl": "https://github.com/conda-forge/zlib-feedstock",
+          "feedstockRevision": "044fc2361e1c5f1a35c8f417f1434a585e627297"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libgomp-16.2.0-h8acb6b2_7.conda",
+          "sha256": "4406fd67c5beeb99b9372f9bf07aa3e40ca141e337eceebac3ff64aa72799494",
+          "name": "libgomp",
+          "version": "16.2.0",
+          "license": "GPL-3.0-only WITH GCC-exception-3.1",
+          "build": "h8acb6b2_7",
+          "bytes": 617342,
+          "fileName": "libgomp-16.2.0-h8acb6b2_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libgomp",
+          "dependencies": [],
+          "sourceUrl": "https://gcc.gnu.org/onlinedocs/gccint/Libgcc.html",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "9130f5e7a99ff6de8041ce7b9542d5454e863689"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libglvnd-1.7.0-hd24410f_5.conda",
+          "sha256": "3d9447104ba1611cffbef1ce209a07f516db2eba0ed76d5af84fc344549b1fa1",
+          "name": "libglvnd",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "hd24410f_5",
+          "bytes": 147361,
+          "fileName": "libglvnd-1.7.0-hd24410f_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglvnd",
+          "dependencies": [],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/zstd-1.5.7-h9d15635_7.conda",
+          "sha256": "427fd14bcb3b8659796fecc682716617409350fb5a98e5b7b47558a10d1a2fc7",
+          "name": "zstd",
+          "version": "1.5.7",
+          "license": "BSD-3-Clause",
+          "build": "h9d15635_7",
+          "bytes": 615477,
+          "fileName": "zstd-1.5.7-h9d15635_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/zstd",
+          "dependencies": [
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/facebook/zstd",
+          "feedstockUrl": "https://github.com/conda-forge/zstd-feedstock",
+          "feedstockRevision": "24c0f94340c0875e1a3bb815611276850f7cd7ca"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda",
+          "sha256": "a2527b1d81792a0ccd2c05850960df119c2b6d8f5fdec97f2db7d25dc23b1068",
+          "name": "_openmp_mutex",
+          "version": "4.5",
+          "license": "BSD-3-Clause",
+          "build": "20_gnu",
+          "bytes": 28926,
+          "fileName": "_openmp_mutex-4.5-20_gnu.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/_openmp_mutex",
+          "dependencies": [
+            "libgomp >=7.5.0"
+          ],
+          "sourceUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "14a57afe05d9db64add1754ce28198e5e8d4d7b6"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libegl-1.7.0-hd24410f_5.conda",
+          "sha256": "8d80ccab2fd622ae38931691c27952e56a5d3007ff920efd9f3ff52e2c81a251",
+          "name": "libegl",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "hd24410f_5",
+          "bytes": 53909,
+          "fileName": "libegl-1.7.0-hd24410f_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libegl",
+          "dependencies": [
+            "libglvnd 1.7.0 hd24410f_5"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libgcc-16.2.0-h205dda4_7.conda",
+          "sha256": "eae7a3449d5a3b5351c5427137c076cc3fc826645c7bfc42dc10772b783826f1",
+          "name": "libgcc",
+          "version": "16.2.0",
+          "license": "GPL-3.0-only WITH GCC-exception-3.1",
+          "build": "h205dda4_7",
+          "bytes": 627793,
+          "fileName": "libgcc-16.2.0-h205dda4_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libgcc",
+          "dependencies": [
+            "_openmp_mutex >=4.5"
+          ],
+          "sourceUrl": "https://gcc.gnu.org/onlinedocs/gccint/Libgcc.html",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "9130f5e7a99ff6de8041ce7b9542d5454e863689"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libice-1.1.2-h80f16a2_0.conda",
+          "sha256": "e56bb636aefe3503a53520a0b7f3737f3a26fe0accf0befffc24d1c0ddd27008",
+          "name": "xorg-libice",
+          "version": "1.1.2",
+          "license": "MIT",
+          "build": "h80f16a2_0",
+          "bytes": 63847,
+          "fileName": "xorg-libice-1.1.2-h80f16a2_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libice",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libice-feedstock",
+          "feedstockRevision": "e93ef724e26dc93f23fe0cecb3c1ca5b6e8cebbe"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxau-1.0.12-h5bc82ec_2.conda",
+          "sha256": "6b22ffc0137003b41d44db995a3536737e2a2c854c8ed55c8a4eb6377d502abf",
+          "name": "xorg-libxau",
+          "version": "1.0.12",
+          "license": "MIT",
+          "build": "h5bc82ec_2",
+          "bytes": 19649,
+          "fileName": "xorg-libxau-1.0.12-h5bc82ec_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxau",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/xorg/lib/libxau",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxau-feedstock",
+          "feedstockRevision": "10bc4a8118d34cf2059c4462f4d77da1ae51fb27"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxdmcp-1.1.5-h5bc82ec_2.conda",
+          "sha256": "db2b37227a888d23269855409a9b2179e493c59f2ec9ee2071bf3fd198767ffd",
+          "name": "xorg-libxdmcp",
+          "version": "1.1.5",
+          "license": "MIT",
+          "build": "h5bc82ec_2",
+          "bytes": 23110,
+          "fileName": "xorg-libxdmcp-1.1.5-h5bc82ec_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxdmcp",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/xorg/lib/libxdmcp",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxdmcp-feedstock",
+          "feedstockRevision": "c2383a456fe44a772631107ccf13e3fccb8dff63"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/bzip2-1.0.8-h4777abc_10.conda",
+          "sha256": "24eacc8a20fd7c4616566178562bef7f9344eb4a8700cfc3180fa75a6ff9d39f",
+          "name": "bzip2",
+          "version": "1.0.8",
+          "license": "bzip2-1.0.6",
+          "build": "h4777abc_10",
+          "bytes": 194694,
+          "fileName": "bzip2-1.0.8-h4777abc_10.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/bzip2",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://gitlab.com/bzip2/bzip2",
+          "feedstockUrl": "https://github.com/conda-forge/bzip2-feedstock",
+          "feedstockRevision": "f0f345e062aed39aa7f500c0746efed2dcea6971"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/lzo-2.10-h29ee22c_1003.conda",
+          "sha256": "37ef465819e0a28d96a527a536106d21624ada3b15a798a98efd741be25ff4aa",
+          "name": "lzo",
+          "version": "2.10",
+          "license": "GPL-2.0-or-later",
+          "build": "h29ee22c_1003",
+          "bytes": 212884,
+          "fileName": "lzo-2.10-h29ee22c_1003.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lzo",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "http://www.oberhumer.com/opensource/lzo/",
+          "feedstockUrl": "https://github.com/conda-forge/lzo-feedstock",
+          "feedstockRevision": "d8595a3cb3261df0c3e777fd44b63ae9f9107e2d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/ncurses-6.6-h2b6f883_1.conda",
+          "sha256": "d69a04914139627f0a6bfd19412d6c7f1e37edc896af84a6011e07e8bc1e69fa",
+          "name": "ncurses",
+          "version": "6.6",
+          "license": "X11 AND BSD-3-Clause",
+          "build": "h2b6f883_1",
+          "bytes": 955422,
+          "fileName": "ncurses-6.6-h2b6f883_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/ncurses",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "http://invisible-island.net/ncurses/",
+          "feedstockUrl": "https://github.com/conda-forge/ncurses-feedstock",
+          "feedstockRevision": "105562343d06a3180e8d44a25762fdcb97f80aea"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libffi-3.7.0-hdaad0be_1.conda",
+          "sha256": "b1879d78b622c5f4817fd6d77fe7ae3ab7b501542e3c2f4ac77198c54c62c189",
+          "name": "libffi",
+          "version": "3.7.0",
+          "license": "MIT",
+          "build": "hdaad0be_1",
+          "bytes": 63137,
+          "fileName": "libffi-3.7.0-hdaad0be_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libffi",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://github.com/libffi/libffi",
+          "feedstockUrl": "https://github.com/conda-forge/libffi-feedstock",
+          "feedstockRevision": "dc557589925d228815625e735ff1e63236d5fcd7"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libuuid-2.42.4-hd6fdeab_0.conda",
+          "sha256": "4d94770cc7c47eb4a0d7b92f16d7a450506d1a82406d63c987d6208ab2fb8a16",
+          "name": "libuuid",
+          "version": "2.42.4",
+          "license": "BSD-3-Clause",
+          "build": "hd6fdeab_0",
+          "bytes": 36296,
+          "fileName": "libuuid-2.42.4-hd6fdeab_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libuuid",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "http://sourceforge.net/projects/libuuid/",
+          "feedstockUrl": "https://github.com/conda-forge/libuuid-feedstock",
+          "feedstockRevision": "01c4a2951ae5207d9b7548c4eafc5b9913ca01c9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/c-ares-1.34.8-h29ee22c_2.conda",
+          "sha256": "3838d10a78c206a1a4ec7ff041880b4f9b8ecde3520c911daae9e06baeb8858e",
+          "name": "c-ares",
+          "version": "1.34.8",
+          "license": "MIT",
+          "build": "h29ee22c_2",
+          "bytes": 241210,
+          "fileName": "c-ares-1.34.8-h29ee22c_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/c-ares",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://c-ares.haxx.se/",
+          "feedstockUrl": "https://github.com/conda-forge/c-ares-feedstock",
+          "feedstockRevision": "782d3c50cb0114eb43d89146fff922a85e5f596e"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libev-4.33-h80f16a2_3.conda",
+          "sha256": "4475f79a020e9ff2a5a0308c48cb2970a25d55c3dd724a97ab28bfac3be6cd49",
+          "name": "libev",
+          "version": "4.33",
+          "license": "BSD-2-Clause OR GPL-2.0-or-later",
+          "build": "h80f16a2_3",
+          "bytes": 45746,
+          "fileName": "libev-4.33-h80f16a2_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libev",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://software.schmorp.de/pkg/libev.html",
+          "feedstockUrl": "https://github.com/conda-forge/libev-feedstock",
+          "feedstockRevision": "865d6e94ceab52b90efb1658293f4d63f3cc6e69"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/keyutils-1.6.3-h5bc82ec_1.conda",
+          "sha256": "3999b1472f1e549a0b766428e2823abf20626aac5314b474c9b76bf6eb679def",
+          "name": "keyutils",
+          "version": "1.6.3",
+          "license": "LGPL-2.1-or-later",
+          "build": "h5bc82ec_1",
+          "bytes": 129546,
+          "fileName": "keyutils-1.6.3-h5bc82ec_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/keyutils",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://git.kernel.org/pub/scm/linux/kernel/git/dhowells/keyutils.git/",
+          "feedstockUrl": "https://github.com/conda-forge/keyutils-feedstock",
+          "feedstockRevision": "42ba6a5b07dc968ff22743db1f52fb8500181e3a"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libexpat-2.8.5-h4154aff_0.conda",
+          "sha256": "d155b9ee74abac0865095a66ebb008be967937a6deea6e7666ba01ead4a155fc",
+          "name": "libexpat",
+          "version": "2.8.5",
+          "license": "MIT",
+          "build": "h4154aff_0",
+          "bytes": 79463,
+          "fileName": "libexpat-2.8.5-h4154aff_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libexpat",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://github.com/libexpat/libexpat",
+          "feedstockUrl": "https://github.com/conda-forge/expat-feedstock",
+          "feedstockRevision": "8c6a1ae4141ab05eac441c97e5e13d2f58b45eed"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/pthread-stubs-0.4-h5bc82ec_1004.conda",
+          "sha256": "c66ea2c8f64b815b24344340a8a9d62152359dbf48a6151b1f282fdf35204d83",
+          "name": "pthread-stubs",
+          "version": "0.4",
+          "license": "MIT",
+          "build": "h5bc82ec_1004",
+          "bytes": 9592,
+          "fileName": "pthread-stubs-0.4-h5bc82ec_1004.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pthread-stubs",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://xcb.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/pthread-stubs-feedstock",
+          "feedstockRevision": "2e3012e8be19d26d9deebd542f131e09475a9318"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libiconv-1.18-h1ea5142_3.conda",
+          "sha256": "d22c666eb887afd2119aac2110e23a0e817e9391bda99293421f7c46dab1564c",
+          "name": "libiconv",
+          "version": "1.18",
+          "license": "LGPL-2.1-only",
+          "build": "h1ea5142_3",
+          "bytes": 785924,
+          "fileName": "libiconv-1.18-h1ea5142_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libiconv",
+          "dependencies": [
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://www.gnu.org/software/libiconv/",
+          "feedstockUrl": "https://github.com/conda-forge/libiconv-feedstock",
+          "feedstockRevision": "c7fdcb1b68d6579a08d0c5dc5f34cbbf38780538"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libdeflate-1.25-hfa851ae_1.conda",
+          "sha256": "4cb3da1d4ce7540604219d2a016253777da66c1a710c41557bc708aae7f54a75",
+          "name": "libdeflate",
+          "version": "1.25",
+          "license": "MIT",
+          "build": "hfa851ae_1",
+          "bytes": 71628,
+          "fileName": "libdeflate-1.25-hfa851ae_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libdeflate",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/ebiggers/libdeflate",
+          "feedstockUrl": "https://github.com/conda-forge/libdeflate-feedstock",
+          "feedstockRevision": "995dda5e8253e79324b87cb9b2fcf8cd40357ed2"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libwebp-base-1.6.0-ha2e29f5_1.conda",
+          "sha256": "4c64e6843d64876d054a28ecbab70abdf145da3c2cbdaa4a43db26cdf0fd760b",
+          "name": "libwebp-base",
+          "version": "1.6.0",
+          "license": "BSD-3-Clause",
+          "build": "ha2e29f5_1",
+          "bytes": 357551,
+          "fileName": "libwebp-base-1.6.0-ha2e29f5_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libwebp-base",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://chromium.googlesource.com/webm/libwebp",
+          "feedstockUrl": "https://github.com/conda-forge/libwebp-base-feedstock",
+          "feedstockRevision": "b8a54ec0653ea0ac18e509fc889f1fc8f0b90233"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libpng-1.6.59-hf9b7768_0.conda",
+          "sha256": "11a8f519c148e9ce968b78ee718965a1166af135321e1803941ee6f92bd5862c",
+          "name": "libpng",
+          "version": "1.6.59",
+          "license": "zlib-acknowledgement",
+          "build": "hf9b7768_0",
+          "bytes": 333207,
+          "fileName": "libpng-1.6.59-hf9b7768_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libpng",
+          "dependencies": [
+            "libgcc >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://sourceforge.net/p/libpng/code/ci/libpng16/tree/",
+          "feedstockUrl": "https://github.com/conda-forge/libpng-feedstock",
+          "feedstockRevision": "fb861d8ff886d5bfe7fc4f01c6545d59779798ff"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libjpeg-turbo-3.2.0-he30d5cf_1.conda",
+          "sha256": "c5626ea672be2e59784f9be20dc8ceb7961b8ab0053651ded2dffec64e4b8245",
+          "name": "libjpeg-turbo",
+          "version": "3.2.0",
+          "license": "IJG AND BSD-3-Clause AND Zlib",
+          "build": "he30d5cf_1",
+          "bytes": 716519,
+          "fileName": "libjpeg-turbo-3.2.0-he30d5cf_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libjpeg-turbo",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/libjpeg-turbo/libjpeg-turbo",
+          "feedstockUrl": "https://github.com/conda-forge/libjpeg-turbo-feedstock",
+          "feedstockRevision": "cc922f6dba346613d6c2820d58011f1c6c175e7d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/giflib-5.2.2-h5dd31e5_1.conda",
+          "sha256": "bcba20fab38b359fe982bd004e0b28e5ecfa07e43ca03733db2f6f26fad68f8f",
+          "name": "giflib",
+          "version": "5.2.2",
+          "license": "MIT",
+          "build": "h5dd31e5_1",
+          "bytes": 83028,
+          "fileName": "giflib-5.2.2-h5dd31e5_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/giflib",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "http://giflib.sourceforge.net",
+          "feedstockUrl": "https://github.com/conda-forge/giflib-feedstock",
+          "feedstockRevision": "ab669636b5ea8c982aedc48ca104f2f08c8c8a77"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/liblzma-5.8.3-he30d5cf_1.conda",
+          "sha256": "f760669fd1cea27f689f411c0d5488e26ce50e382c9b63e4ad348f959850124a",
+          "name": "liblzma",
+          "version": "5.8.3",
+          "license": "0BSD",
+          "build": "he30d5cf_1",
+          "bytes": 125578,
+          "fileName": "liblzma-5.8.3-he30d5cf_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/liblzma",
+          "dependencies": [
+            "libgcc >=14"
+          ],
+          "sourceUrl": "http://git.tukaani.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xz-feedstock",
+          "feedstockRevision": "bc37fbf54469221332fc589c1404294a159f403b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libstdcxx-16.2.0-hef695bb_7.conda",
+          "sha256": "b241a3acfa9cdb1359112864a1241225533c92642de3000d52ae65ef5d3a9786",
+          "name": "libstdcxx",
+          "version": "16.2.0",
+          "license": "GPL-3.0-only WITH GCC-exception-3.1",
+          "build": "hef695bb_7",
+          "bytes": 6236630,
+          "fileName": "libstdcxx-16.2.0-hef695bb_7.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libstdcxx",
+          "dependencies": [
+            "libgcc 16.2.0 h205dda4_7"
+          ],
+          "sourceUrl": "https://gcc.gnu.org/",
+          "feedstockUrl": "https://github.com/conda-forge/ctng-compilers-feedstock",
+          "feedstockRevision": "9130f5e7a99ff6de8041ce7b9542d5454e863689"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/pcre2-10.47-he574923_1.conda",
+          "sha256": "16e5bee11686028d60a495004f99a10c613ada44cc27e330bee18a1b67fb184c",
+          "name": "pcre2",
+          "version": "10.47",
+          "license": "BSD-3-Clause",
+          "build": "he574923_1",
+          "bytes": 1199286,
+          "fileName": "pcre2-10.47-he574923_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pcre2",
+          "dependencies": [
+            "bzip2 >=1.0.8,<2.0a0",
+            "libgcc >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/PCRE2Project/pcre2",
+          "feedstockUrl": "https://github.com/conda-forge/pcre2-feedstock",
+          "feedstockRevision": "1036df63759c1365071c7531a6e01fcca90f28a1"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libedit-3.1.20260512-pl5321hc48eb74_0.conda",
+          "sha256": "58fd637d0219016bb69edf2973b089975de283e8a38149d69ef586b8fc4ad90b",
+          "name": "libedit",
+          "version": "3.1.20260512",
+          "license": "BSD-2-Clause",
+          "build": "pl5321hc48eb74_0",
+          "bytes": 149680,
+          "fileName": "libedit-3.1.20260512-pl5321hc48eb74_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libedit",
+          "dependencies": [
+            "ncurses",
+            "libgcc >=14",
+            "ncurses >=6.6,<7.0a0"
+          ],
+          "sourceUrl": "http://thrysoee.dk/editline/",
+          "feedstockUrl": "https://github.com/conda-forge/libedit-feedstock",
+          "feedstockRevision": "68b86ed3628cf5ad0cc67e821c733d3729525c85"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libsm-1.2.6-hf23e593_1.conda",
+          "sha256": "4978f89a764b54dc8be7a115b2d57f570f793243f3227653232742ce0946101b",
+          "name": "xorg-libsm",
+          "version": "1.2.6",
+          "license": "MIT",
+          "build": "hf23e593_1",
+          "bytes": 31476,
+          "fileName": "xorg-libsm-1.2.6-hf23e593_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libsm",
+          "dependencies": [
+            "libgcc >=14",
+            "xorg-libice >=1.1.2,<2.0a0",
+            "libuuid >=2.42.2,<3.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libsm-feedstock",
+          "feedstockRevision": "78d8a84c62d816276ee5a6dc343730dc099c1226"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libxcb-1.17.0-h3f04742_2.conda",
+          "sha256": "bb1d9aaa885de73c504bd887e1841ad8e9d5b8432bd370b02eaf33067a001dc3",
+          "name": "libxcb",
+          "version": "1.17.0",
+          "license": "MIT",
+          "build": "h3f04742_2",
+          "bytes": 401562,
+          "fileName": "libxcb-1.17.0-h3f04742_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxcb",
+          "dependencies": [
+            "libgcc >=15",
+            "pthread-stubs",
+            "xorg-libxau >=1.0.12,<2.0a0",
+            "xorg-libxdmcp >=1.1.5,<2.0a0"
+          ],
+          "sourceUrl": "http://xcb.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libxcb-feedstock",
+          "feedstockRevision": "3c698030838a932106c913a828e935c4a8f0e897"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libfreetype6-2.14.3-h9cc7050_2.conda",
+          "sha256": "d29eac57042f2362d4e45c63a4a78d64a30e5284b1da29b99e0c1526671dd4c3",
+          "name": "libfreetype6",
+          "version": "2.14.3",
+          "license": "GPL-2.0-only OR FTL",
+          "build": "h9cc7050_2",
+          "bytes": 445035,
+          "fileName": "libfreetype6-2.14.3-h9cc7050_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libfreetype6",
+          "dependencies": [
+            "libgcc >=15",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "feedstockUrl": "https://github.com/conda-forge/freetype-feedstock",
+          "feedstockRevision": "3520c4122afde3a5c30609f035de7cc4f501c069"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/graphite2-1.3.15-h7ac5ae9_1.conda",
+          "sha256": "5be01914b445dfbde85a4751b1d12b331740e7af68a86e4ef6313ab38a870fdd",
+          "name": "graphite2",
+          "version": "1.3.15",
+          "license": "LGPL-2.0-or-later",
+          "build": "h7ac5ae9_1",
+          "bytes": 119414,
+          "fileName": "graphite2-1.3.15-h7ac5ae9_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/graphite2",
+          "dependencies": [
+            "libstdcxx >=14",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://github.com/silnrsi/graphite",
+          "feedstockUrl": "https://github.com/conda-forge/graphite2-feedstock",
+          "feedstockRevision": "ba0a8e0362b411f2fa172e105d805270ac086509"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/icu-78.3-py311h3512406_2.conda",
+          "sha256": "54d921defd947adb58a90e10203d3bfe6c1f209f5f1a1ad2c6a9f7617f2fb59e",
+          "name": "icu",
+          "version": "78.3",
+          "license": "MIT",
+          "build": "py311h3512406_2",
+          "bytes": 14688525,
+          "fileName": "icu-78.3-py311h3512406_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/icu",
+          "dependencies": [
+            "libgcc >=14",
+            "libstdcxx >=14"
+          ],
+          "sourceUrl": "https://github.com/unicode-org/icu",
+          "feedstockUrl": "https://github.com/conda-forge/icu-feedstock",
+          "feedstockRevision": "72c98272513977fda6ffa2dd7a4e6f67a77976c9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/lz4-c-1.10.0-hfb11796_2.conda",
+          "sha256": "e8392843a18954fef038f2721fde65c4dbe7693fcd07677e5e74fca85b1a690c",
+          "name": "lz4-c",
+          "version": "1.10.0",
+          "license": "BSD-2-Clause",
+          "build": "hfb11796_2",
+          "bytes": 218765,
+          "fileName": "lz4-c-1.10.0-hfb11796_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lz4-c",
+          "dependencies": [
+            "libgcc >=15",
+            "libstdcxx >=15"
+          ],
+          "sourceUrl": "https://github.com/lz4/lz4",
+          "feedstockUrl": "https://github.com/conda-forge/lz4-c-feedstock",
+          "feedstockRevision": "7739afba01c0c2ec6ce7d9c9fab6c9818d7d6f22"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/pixman-0.46.4-h7ac5ae9_3.conda",
+          "sha256": "ed718d35c744ceef33063b5686f27b4b8d30d4065485e24efafb248658ee83b5",
+          "name": "pixman",
+          "version": "0.46.4",
+          "license": "MIT",
+          "build": "h7ac5ae9_3",
+          "bytes": 304657,
+          "fileName": "pixman-0.46.4-h7ac5ae9_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/pixman",
+          "dependencies": [
+            "libstdcxx >=14",
+            "libgcc >=14"
+          ],
+          "sourceUrl": "https://cgit.freedesktop.org/pixman/",
+          "feedstockUrl": "https://github.com/conda-forge/pixman-feedstock",
+          "feedstockRevision": "aa115040c3fa1c298ba27ed7afb42d6feb4fac28"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/lerc-4.2.0-h52b7260_0.conda",
+          "sha256": "0176a71d64fcb5aec43c9e8ab4ae72faa6c6b0b1cda8f40b65e19429ce13c84d",
+          "name": "lerc",
+          "version": "4.2.0",
+          "license": "Apache-2.0",
+          "build": "h52b7260_0",
+          "bytes": 244850,
+          "fileName": "lerc-4.2.0-h52b7260_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lerc",
+          "dependencies": [
+            "libgcc >=14",
+            "libstdcxx >=14"
+          ],
+          "sourceUrl": "https://github.com/Esri/lerc",
+          "feedstockUrl": "https://github.com/conda-forge/lerc-feedstock",
+          "feedstockRevision": "11a9b9cedb32ef23cd0dc48743e0a354fc4f7342"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/nspr-4.40-h3ad9384_0.conda",
+          "sha256": "bff5602852f1662852e809d5d1cd0a79055bbcfa37906911e2574ca40681b10e",
+          "name": "nspr",
+          "version": "4.40",
+          "license": "MPL-2.0",
+          "build": "h3ad9384_0",
+          "bytes": 236892,
+          "fileName": "nspr-4.40-h3ad9384_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/nspr",
+          "dependencies": [
+            "libgcc >=14",
+            "libstdcxx >=14"
+          ],
+          "sourceUrl": "https://developer.mozilla.org/en-US/docs/MDN",
+          "feedstockUrl": "https://github.com/conda-forge/nspr-feedstock",
+          "feedstockRevision": "cd185077f21ae9792918fa955fcb048b89bb3e70"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libglib-2.90.1-h3584fe5_0.conda",
+          "sha256": "d47ad408d845e32fc6692961f2e1c8e4ce72c86a0769cba340a8b02af638b7e0",
+          "name": "libglib",
+          "version": "2.90.1",
+          "license": "LGPL-2.1-or-later",
+          "build": "h3584fe5_0",
+          "bytes": 4927714,
+          "fileName": "libglib-2.90.1-h3584fe5_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglib",
+          "dependencies": [
+            "libgcc >=15",
+            "libffi >=3.7.0,<3.8.0a0",
+            "libiconv >=1.18,<2.0a0",
+            "pcre2 >=10.47,<10.48.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://gitlab.gnome.org/GNOME/glib/",
+          "feedstockUrl": "https://github.com/conda-forge/glib-feedstock",
+          "feedstockRevision": "494a56fe1405fa8f1b555a31a4beb7df165c030c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libx11-1.8.13-h63a1b12_1.conda",
+          "sha256": "9ff59d55cbf85561833be3604a8c0a5497b0f13cdf122e8bb490e9cf3138d116",
+          "name": "xorg-libx11",
+          "version": "1.8.13",
+          "license": "MIT",
+          "build": "h63a1b12_1",
+          "bytes": 875768,
+          "fileName": "xorg-libx11-1.8.13-h63a1b12_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libx11",
+          "dependencies": [
+            "libgcc >=14",
+            "libxcb >=1.17.0,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libx11-feedstock",
+          "feedstockRevision": "ce1384271ac5711d8d98a75e069249c02ce22de4"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libfreetype-2.14.3-h8af1aa0_2.conda",
+          "sha256": "1e6ba895a397ee4fc1646f21000903ad13d93e9e6d9a7fb4dcef1baa837970bf",
+          "name": "libfreetype",
+          "version": "2.14.3",
+          "license": "GPL-2.0-only OR FTL",
+          "build": "h8af1aa0_2",
+          "bytes": 8409,
+          "fileName": "libfreetype-2.14.3-h8af1aa0_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libfreetype",
+          "dependencies": [
+            "libfreetype6 >=2.14.3"
+          ],
+          "feedstockUrl": "https://github.com/conda-forge/freetype-feedstock",
+          "feedstockRevision": "3520c4122afde3a5c30609f035de7cc4f501c069"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libxml2-16-2.15.4-h2e5089f_1.conda",
+          "sha256": "96bce6a0c8eae2e1d22e09473b9e54bb13a736b4997ddd7a111eeaef16734708",
+          "name": "libxml2-16",
+          "version": "2.15.4",
+          "license": "MIT",
+          "build": "h2e5089f_1",
+          "bytes": 628135,
+          "fileName": "libxml2-16-2.15.4-h2e5089f_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxml2-16",
+          "dependencies": [
+            "icu >=78.3,<79.0a0",
+            "libgcc >=15",
+            "libiconv >=1.18,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://git.gnome.org/browse/libxml2/",
+          "feedstockUrl": "https://github.com/conda-forge/libxml2-feedstock",
+          "feedstockRevision": "2aea8424bab23ebc32ac1493984e90e73cda28dd"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libsqlite-3.54.0-h399dd60_1.conda",
+          "sha256": "8698cc6bcb3406d8bf06f674ce623ebb33a1f4c7a3adb56ced22efd34c96a928",
+          "name": "libsqlite",
+          "version": "3.54.0",
+          "license": "blessing",
+          "build": "h399dd60_1",
+          "bytes": 981485,
+          "fileName": "libsqlite-3.54.0-h399dd60_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libsqlite",
+          "dependencies": [
+            "icu >=78.3,<79.0a0",
+            "libgcc >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://www.sqlite.org/src/dir?ci=trunk",
+          "feedstockUrl": "https://github.com/conda-forge/sqlite-feedstock",
+          "feedstockRevision": "50670969b1746603d7ee3ffcdca2ba67e2f0395f"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libpsl-0.23.1-hb8431ed_1.conda",
+          "sha256": "757f79c182ac3080cf416acd91c7643b8074b8b2e5c1eba0ffc5a16897feb84b",
+          "name": "libpsl",
+          "version": "0.23.1",
+          "license": "MIT",
+          "build": "hb8431ed_1",
+          "bytes": 73118,
+          "fileName": "libpsl-0.23.1-hb8431ed_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libpsl",
+          "dependencies": [
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "icu >=78.3,<79.0a0"
+          ],
+          "sourceUrl": "https://github.com/rockdaboot/libpsl",
+          "feedstockUrl": "https://github.com/conda-forge/libpsl-feedstock",
+          "feedstockRevision": "d93d163e4ace3c8de663d880c0381630b65d4590"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libtiff-4.7.2-h45f9f85_1.conda",
+          "sha256": "fa6daf2301dee912def3e74344fae792a8fc2bbbf7880dedee0e93ee8fb98fc5",
+          "name": "libtiff",
+          "version": "4.7.2",
+          "license": "HPND",
+          "build": "h45f9f85_1",
+          "bytes": 529726,
+          "fileName": "libtiff-4.7.2-h45f9f85_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libtiff",
+          "dependencies": [
+            "lerc >=4.2.0,<5.0a0",
+            "libdeflate >=1.25,<1.26.0a0",
+            "libgcc >=15",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libstdcxx >=15",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "http://www.libtiff.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libtiff-feedstock",
+          "feedstockRevision": "69b00df993d8c9571dbd2aa423e50a10f1adfeda"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxrender-0.9.12-he30d5cf_1.conda",
+          "sha256": "3cbac6f69e4a8634ba6b60cf283cba92606c8c74caa1369b799325f96b2f0cbf",
+          "name": "xorg-libxrender",
+          "version": "0.9.12",
+          "license": "MIT",
+          "build": "he30d5cf_1",
+          "bytes": 35814,
+          "fileName": "xorg-libxrender-0.9.12-he30d5cf_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxrender",
+          "dependencies": [
+            "libgcc >=14",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxrender-feedstock",
+          "feedstockRevision": "a7b40035665d655e382d2db55c943defd82ca2ef"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxfixes-6.0.2-h5bc82ec_1.conda",
+          "sha256": "fc432dbef14598e2fd283760c2a14536472c2441986264308b4cc1877a263e00",
+          "name": "xorg-libxfixes",
+          "version": "6.0.2",
+          "license": "MIT",
+          "build": "h5bc82ec_1",
+          "bytes": 22039,
+          "fileName": "xorg-libxfixes-6.0.2-h5bc82ec_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxfixes",
+          "dependencies": [
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxfixes-feedstock",
+          "feedstockRevision": "38660eac6a825e1404edc7fe8497d5939f927af8"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxext-1.3.7-h5bc82ec_1.conda",
+          "sha256": "e2cc4ba2b5291710f9ae3e88d917d778ce7911262450e673ba8a597a5d43490a",
+          "name": "xorg-libxext",
+          "version": "1.3.7",
+          "license": "MIT",
+          "build": "h5bc82ec_1",
+          "bytes": 53801,
+          "fileName": "xorg-libxext-1.3.7-h5bc82ec_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxext",
+          "dependencies": [
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxext-feedstock",
+          "feedstockRevision": "2aad4e910b9b26c7e1d521125d355b0ad9d33c5c"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libglx-1.7.0-hd24410f_5.conda",
+          "sha256": "4440c7ae251efa83bb7bc0d3fd25ba901640cc712b1284c75d7b8333e1c4b62e",
+          "name": "libglx",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "hd24410f_5",
+          "bytes": 75476,
+          "fileName": "libglx-1.7.0-hd24410f_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libglx",
+          "dependencies": [
+            "libglvnd 1.7.0 hd24410f_5",
+            "xorg-libx11 >=1.8.13,<2.0a0"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/fontconfig-2.18.3-ha4b22b4_1.conda",
+          "sha256": "5f7801b6044ff233943e68f5156d4987fe8447d1be9378fb5c67f7aa009a33e7",
+          "name": "fontconfig",
+          "version": "2.18.3",
+          "license": "MIT",
+          "build": "ha4b22b4_1",
+          "bytes": 304159,
+          "fileName": "fontconfig-2.18.3-ha4b22b4_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fontconfig",
+          "dependencies": [
+            "libexpat >=2.8.1,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libuuid >=2.42.2,<3.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://cgit.freedesktop.org/fontconfig/",
+          "feedstockUrl": "https://github.com/conda-forge/fontconfig-feedstock",
+          "feedstockRevision": "7f94a24652814e2985044aeae8b2966fae633035"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libxml2-2.15.4-h92b9305_1.conda",
+          "sha256": "f714cfffb6009f1bd028a06d237e6f4550ff4ffb3f4209a9bfaeb2b36f7c6a56",
+          "name": "libxml2",
+          "version": "2.15.4",
+          "license": "MIT",
+          "build": "h92b9305_1",
+          "bytes": 48661,
+          "fileName": "libxml2-2.15.4-h92b9305_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libxml2",
+          "dependencies": [
+            "icu >=78.3,<79.0a0",
+            "libgcc >=15",
+            "libiconv >=1.18,<2.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libxml2-16 2.15.4 h2e5089f_1",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://git.gnome.org/browse/libxml2/",
+          "feedstockUrl": "https://github.com/conda-forge/libxml2-feedstock",
+          "feedstockRevision": "2aea8424bab23ebc32ac1493984e90e73cda28dd"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/nss-3.118-h544fa81_0.conda",
+          "sha256": "48942696889367ffd448f8dccfc080fb7e130b9938a4a3b6b20ef8e6af856463",
+          "name": "nss",
+          "version": "3.118",
+          "license": "MPL-2.0",
+          "build": "h544fa81_0",
+          "bytes": 2061869,
+          "fileName": "nss-3.118-h544fa81_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/nss",
+          "dependencies": [
+            "libgcc >=14",
+            "libsqlite >=3.51.0,<4.0a0",
+            "libstdcxx >=14",
+            "libzlib >=1.3.1,<2.0a0",
+            "nspr >=4.38,<5.0a0"
+          ],
+          "sourceUrl": "https://hg.mozilla.org/projects/nss",
+          "feedstockUrl": "https://github.com/conda-forge/nss-feedstock",
+          "feedstockRevision": "0ce49a2f14623e6dcb02ccc38f619523cdd17c5a"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/lcms2-2.19.1-h137c43b_3.conda",
+          "sha256": "1f9f5f1e9a2c0e83dae98b02c32b9b0363c9786cda2ef9aefd37139fa8aef5f0",
+          "name": "lcms2",
+          "version": "2.19.1",
+          "license": "MIT",
+          "build": "h137c43b_3",
+          "bytes": 302445,
+          "fileName": "lcms2-2.19.1-h137c43b_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/lcms2",
+          "dependencies": [
+            "libgcc >=15",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libtiff >=4.7.2,<4.8.0a0"
+          ],
+          "sourceUrl": "http://www.littlecms.com/",
+          "feedstockUrl": "https://github.com/conda-forge/lcms2-feedstock",
+          "feedstockRevision": "3cefa7a569e5d8918e253214097b6c4fdef2eef0"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/openjpeg-2.5.4-h504851f_2.conda",
+          "sha256": "d07b190935acda11419bef754a96c2fcdc0171df8c5a34ce81c7883dc195b115",
+          "name": "openjpeg",
+          "version": "2.5.4",
+          "license": "BSD-2-Clause",
+          "build": "h504851f_2",
+          "bytes": 450421,
+          "fileName": "openjpeg-2.5.4-h504851f_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/openjpeg",
+          "dependencies": [
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "http://www.openjpeg.org/",
+          "feedstockUrl": "https://github.com/conda-forge/openjpeg-feedstock",
+          "feedstockRevision": "00d4e8f7d73043cb46153df594d005aef33e05c7"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxi-1.8.3-h5bc82ec_1.conda",
+          "sha256": "3759f62da8f9e093dc94e8fb87a30b99b4a2414e0c197810126e5c2c25a6d63a",
+          "name": "xorg-libxi",
+          "version": "1.8.3",
+          "license": "MIT",
+          "build": "h5bc82ec_1",
+          "bytes": 50969,
+          "fileName": "xorg-libxi-1.8.3-h5bc82ec_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxi",
+          "dependencies": [
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0",
+            "xorg-libxext >=1.3.7,<2.0a0",
+            "xorg-libxfixes >=6.0.2,<7.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxi-feedstock",
+          "feedstockRevision": "7e03ef922819ea16f45b1187de20d7c837b8d38d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxscrnsaver-1.2.4-h86ecc28_0.conda",
+          "sha256": "ab88b1533e7498baeb00cbda50c899a6fe73eaee14df32c57b8ad3f2a0b3cc26",
+          "name": "xorg-libxscrnsaver",
+          "version": "1.2.4",
+          "license": "MIT",
+          "build": "h86ecc28_0",
+          "bytes": 15720,
+          "fileName": "xorg-libxscrnsaver-1.2.4-h86ecc28_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxscrnsaver",
+          "dependencies": [
+            "libgcc >=13",
+            "xorg-libx11 >=1.8.12,<2.0a0",
+            "xorg-libxext >=1.3.6,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxscrnsaver-feedstock",
+          "feedstockRevision": "6daeb8ab99b826676a9f3bfc11893477416a8566"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libgl-1.7.0-hd24410f_5.conda",
+          "sha256": "f1814f83ebb510cd51147fa1578b7c77eaefcca3b1ce5e32c48b62c114e39de6",
+          "name": "libgl",
+          "version": "1.7.0",
+          "license": "LicenseRef-libglvnd",
+          "build": "hd24410f_5",
+          "bytes": 146493,
+          "fileName": "libgl-1.7.0-hd24410f_5.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libgl",
+          "dependencies": [
+            "libglvnd 1.7.0 hd24410f_5",
+            "libglx 1.7.0 hd24410f_5"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/glvnd/libglvnd",
+          "feedstockUrl": "https://github.com/conda-forge/libglvnd-feedstock",
+          "feedstockRevision": "14d996fb6a45090567d905e3739476ecb868fbc9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/leptonica-1.87.0-hf7dde1d_1.conda",
+          "sha256": "d9bb57225d633ded7fe7d19265be914d8d9a6799a9fcf5f6be544ecc83343edf",
+          "name": "leptonica",
+          "version": "1.87.0",
+          "license": "BSD-2-Clause",
+          "build": "hf7dde1d_1",
+          "bytes": 3272035,
+          "fileName": "leptonica-1.87.0-hf7dde1d_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/leptonica",
+          "dependencies": [
+            "libgcc >=14",
+            "libzlib >=1.3.2,<2.0a0",
+            "libpng >=1.6.56,<1.7.0a0",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "liblzma >=5.8.2,<6.0a0",
+            "libtiff >=4.7.1,<4.8.0a0",
+            "giflib >=5.2.2,<5.3.0a0",
+            "libjpeg-turbo >=3.1.2,<4.0a0",
+            "openjpeg >=2.5.4,<3.0a0"
+          ],
+          "sourceUrl": "https://github.com/DanBloomberg/leptonica",
+          "feedstockUrl": "https://github.com/conda-forge/leptonica-feedstock",
+          "feedstockRevision": "920fce346222be437f5b615392f2e53fe8fda919"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/xorg-libxtst-1.2.5-h5bc82ec_4.conda",
+          "sha256": "075b22e79db93db685281cda76b6250c71ac6b454ca64eafd20710cde25ef949",
+          "name": "xorg-libxtst",
+          "version": "1.2.5",
+          "license": "MIT",
+          "build": "h5bc82ec_4",
+          "bytes": 35699,
+          "fileName": "xorg-libxtst-1.2.5-h5bc82ec_4.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/xorg-libxtst",
+          "dependencies": [
+            "libgcc >=15",
+            "xorg-libx11 >=1.8.13,<2.0a0",
+            "xorg-libxext >=1.3.7,<2.0a0",
+            "xorg-libxi >=1.8.3,<2.0a0"
+          ],
+          "sourceUrl": "https://www.x.org/",
+          "feedstockUrl": "https://github.com/conda-forge/xorg-libxtst-feedstock",
+          "feedstockRevision": "55167afec808fa5512d14ac0460026609bd2d1ee"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/poppler-data-0.4.12-hd8ed1ab_0.conda",
+          "sha256": "2f227e17b3c0346112815faa605502b66c1c4511a856127f2899abf15a98a2cf",
+          "name": "poppler-data",
+          "version": "0.4.12",
+          "license": "BSD-3-Clause AND (GPL-2.0-only OR GPL-3.0-only)",
+          "build": "hd8ed1ab_0",
+          "bytes": 2348171,
+          "fileName": "poppler-data-0.4.12-hd8ed1ab_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/poppler-data",
+          "dependencies": [],
+          "sourceUrl": "https://poppler.freedesktop.org/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2",
+          "sha256": "58d7f40d2940dd0a8aa28651239adbf5613254df0f75789919c4e6762054403b",
+          "name": "font-ttf-dejavu-sans-mono",
+          "version": "2.37",
+          "license": "BSD-3-Clause",
+          "build": "hab24e00_0",
+          "bytes": 397370,
+          "fileName": "font-ttf-dejavu-sans-mono-2.37-hab24e00_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-dejavu-sans-mono",
+          "dependencies": [],
+          "sourceUrl": "https://dejavu-fonts.github.io/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-inconsolata-3.000-h77eed37_0.tar.bz2",
+          "sha256": "c52a29fdac682c20d252facc50f01e7c2e7ceac52aa9817aaf0bb83f7559ec5c",
+          "name": "font-ttf-inconsolata",
+          "version": "3.000",
+          "license": "OFL-1.1",
+          "build": "h77eed37_0",
+          "bytes": 96530,
+          "fileName": "font-ttf-inconsolata-3.000-h77eed37_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-inconsolata",
+          "dependencies": [],
+          "sourceUrl": "https://fonts.google.com/specimen/Inconsolata"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-source-code-pro-2.038-h77eed37_0.tar.bz2",
+          "sha256": "00925c8c055a2275614b4d983e1df637245e19058d79fc7dd1a93b8d9fb4b139",
+          "name": "font-ttf-source-code-pro",
+          "version": "2.038",
+          "license": "OFL-1.1",
+          "build": "h77eed37_0",
+          "bytes": 700814,
+          "fileName": "font-ttf-source-code-pro-2.038-h77eed37_0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-source-code-pro",
+          "dependencies": [],
+          "sourceUrl": "https://adobe-fonts.github.io/source-code-pro/"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/font-ttf-ubuntu-0.83-h77eed37_3.conda",
+          "sha256": "2821ec1dc454bd8b9a31d0ed22a7ce22422c0aef163c59f49dfdf915d0f0ca14",
+          "name": "font-ttf-ubuntu",
+          "version": "0.83",
+          "license": "LicenseRef-Ubuntu-Font-Licence-Version-1.0",
+          "build": "h77eed37_3",
+          "bytes": 1620504,
+          "fileName": "font-ttf-ubuntu-0.83-h77eed37_3.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/font-ttf-ubuntu",
+          "dependencies": [],
+          "sourceUrl": "https://design.ubuntu.com/font/",
+          "feedstockUrl": "https://github.com/conda-forge/font-ttf-ubuntu-feedstock",
+          "feedstockRevision": "e0124cc5a2cfff85f9584b558ec4f43bf091761b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2026.7.22-hbd8a1cb_0.conda",
+          "sha256": "0a0544cf95f64394fe4959286f5c71f5444ad58feb0602e53becb27448d24da6",
+          "name": "ca-certificates",
+          "version": "2026.7.22",
+          "license": "ISC",
+          "build": "hbd8a1cb_0",
+          "bytes": 131780,
+          "fileName": "ca-certificates-2026.7.22-hbd8a1cb_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/ca-certificates",
+          "dependencies": [
+            "__unix"
+          ],
+          "sourceUrl": "https://github.com/conda-forge/ca-certificates-feedstock",
+          "feedstockUrl": "https://github.com/conda-forge/ca-certificates-feedstock",
+          "feedstockRevision": "e9adaddd7b8b4f8def01b4cfd8690cd7fec7fc7b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/fonts-conda-forge-1-hc364b38_1.conda",
+          "sha256": "54eea8469786bc2291cc40bca5f46438d3e062a399e8f53f013b6a9f50e98333",
+          "name": "fonts-conda-forge",
+          "version": "1",
+          "license": "BSD-3-Clause",
+          "build": "hc364b38_1",
+          "bytes": 4059,
+          "fileName": "fonts-conda-forge-1-hc364b38_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fonts-conda-forge",
+          "dependencies": [
+            "font-ttf-ubuntu",
+            "font-ttf-inconsolata",
+            "font-ttf-dejavu-sans-mono",
+            "font-ttf-source-code-pro"
+          ],
+          "sourceUrl": "https://conda-forge.org/",
+          "feedstockUrl": "https://github.com/conda-forge/fonts-conda-forge-feedstock",
+          "feedstockRevision": "1b7ad83c3dd122e856cbb86a4a52264cc1e28c5e"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/noarch/fonts-conda-ecosystem-1-0.tar.bz2",
+          "sha256": "a997f2f1921bb9c9d76e6fa2f6b408b7fa549edd349a77639c9fe7a23ea93e61",
+          "name": "fonts-conda-ecosystem",
+          "version": "1",
+          "license": "BSD-3-Clause",
+          "build": "0",
+          "bytes": 3667,
+          "fileName": "fonts-conda-ecosystem-1-0.tar.bz2",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/fonts-conda-ecosystem",
+          "dependencies": [
+            "fonts-conda-forge"
+          ],
+          "sourceUrl": "https://conda.io"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/openssl-3.6.5-he6ad1d5_0.conda",
+          "sha256": "238136f1df197ecd89bafd728a34d0642176f3170423d13d8276746d675a9485",
+          "name": "openssl",
+          "version": "3.6.5",
+          "license": "Apache-2.0",
+          "build": "he6ad1d5_0",
+          "bytes": 3716078,
+          "fileName": "openssl-3.6.5-he6ad1d5_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/openssl",
+          "dependencies": [
+            "ca-certificates",
+            "libgcc >=15"
+          ],
+          "sourceUrl": "https://github.com/openssl/openssl",
+          "feedstockUrl": "https://github.com/conda-forge/openssl-feedstock",
+          "feedstockRevision": "f0c4979996e075ca6fb7efbd6b65d4fe2cc1fe6f"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/cairo-1.18.6-hca320e2_0.conda",
+          "sha256": "8cb719a45d778510fe5636025fbeea72c3f0776d33ea914223d2cfff32bd6b40",
+          "name": "cairo",
+          "version": "1.18.6",
+          "license": "LGPL-2.1-only or MPL-1.1",
+          "build": "hca320e2_0",
+          "bytes": 977435,
+          "fileName": "cairo-1.18.6-hca320e2_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/cairo",
+          "dependencies": [
+            "fontconfig >=2.18.3,<3.0a0",
+            "fonts-conda-ecosystem",
+            "icu >=78.3,<79.0a0",
+            "libexpat >=2.8.1,<3.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libglib >=2.90.0,<3.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libstdcxx >=15",
+            "libxcb >=1.17.0,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "pixman >=0.46.4,<1.0a0",
+            "xorg-libice >=1.1.2,<2.0a0",
+            "xorg-libsm >=1.2.6,<2.0a0",
+            "xorg-libx11 >=1.8.13,<2.0a0",
+            "xorg-libxext >=1.3.7,<2.0a0",
+            "xorg-libxrender >=0.9.12,<0.10.0a0"
+          ],
+          "sourceUrl": "https://gitlab.freedesktop.org/cairo/cairo",
+          "feedstockUrl": "https://github.com/conda-forge/cairo-feedstock",
+          "feedstockRevision": "8b534c45e4a7945ac29aa8bd177109af1c318594"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libssh2-1.11.1-h7572e3e_1.conda",
+          "sha256": "f6fef76c1c8899d7976030871b8cd8016b0a306d2b8519834cd6491d6a42fb82",
+          "name": "libssh2",
+          "version": "1.11.1",
+          "license": "BSD-3-Clause",
+          "build": "h7572e3e_1",
+          "bytes": 315682,
+          "fileName": "libssh2-1.11.1-h7572e3e_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libssh2",
+          "dependencies": [
+            "libgcc >=14",
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.7,<4.0a0"
+          ],
+          "sourceUrl": "https://github.com/libssh2/libssh2",
+          "feedstockUrl": "https://github.com/conda-forge/libssh2-feedstock",
+          "feedstockRevision": "e5701cd76588f38d76a9fd704185ffc88184c102"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/krb5-1.22.2-h095d8e5_2.conda",
+          "sha256": "601d79af94d9562ba70e2d4947034ba159aae293a3c860855335a7c76c14400e",
+          "name": "krb5",
+          "version": "1.22.2",
+          "license": "MIT",
+          "build": "h095d8e5_2",
+          "bytes": 1538590,
+          "fileName": "krb5-1.22.2-h095d8e5_2.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/krb5",
+          "dependencies": [
+            "keyutils >=1.6.3,<2.0a0",
+            "libedit >=3.1.20250104,<3.2.0a0",
+            "libedit >=3.1.20250104,<4.0a0",
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "openssl >=3.5.7,<4.0a0"
+          ],
+          "sourceUrl": "https://github.com/krb5/krb5",
+          "feedstockUrl": "https://github.com/conda-forge/krb5-feedstock",
+          "feedstockRevision": "39e6b3c27e0762e320d9518e069c3df9f26b5bf9"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libnghttp2-1.68.1-ha4b982d_1.conda",
+          "sha256": "0c28d734512fa2c66a232b2f3968eae7124dbd6ad42c594c752f1d08dfb86195",
+          "name": "libnghttp2",
+          "version": "1.68.1",
+          "license": "MIT",
+          "build": "ha4b982d_1",
+          "bytes": 734829,
+          "fileName": "libnghttp2-1.68.1-ha4b982d_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libnghttp2",
+          "dependencies": [
+            "c-ares >=1.34.8,<2.0a0",
+            "libev >=4.33,<4.34.0a0",
+            "libev >=4.33,<5.0a0",
+            "libgcc >=15",
+            "libstdcxx >=15",
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.7,<4.0a0"
+          ],
+          "sourceUrl": "https://github.com/nghttp2/nghttp2",
+          "feedstockUrl": "https://github.com/conda-forge/nghttp2-feedstock",
+          "feedstockRevision": "e15954f89745f04fde47402004f074c7e62fe28b"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libarchive-3.8.9-gpl_h1204ebd_101.conda",
+          "sha256": "5f6a00f0fdefd023b45d9688d3b74e73f9e996a2ae73d976bf8215194d8c183f",
+          "name": "libarchive",
+          "version": "3.8.9",
+          "license": "BSD-2-Clause",
+          "build": "gpl_h1204ebd_101",
+          "bytes": 1006265,
+          "fileName": "libarchive-3.8.9-gpl_h1204ebd_101.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libarchive",
+          "dependencies": [
+            "bzip2 >=1.0.8,<2.0a0",
+            "libgcc >=15",
+            "liblzma >=5.8.3,<6.0a0",
+            "libxml2",
+            "libxml2-16 >=2.15.3",
+            "libzlib >=1.3.2,<2.0a0",
+            "lz4-c >=1.10.0,<1.11.0a0",
+            "lzo >=2.10,<3.0a0",
+            "openssl >=3.5.7,<4.0a0",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "http://www.libarchive.org/",
+          "feedstockUrl": "https://github.com/conda-forge/libarchive-feedstock",
+          "feedstockRevision": "8702d4c08d57d3251ba945b6af3b230f6a714ce2"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libharfbuzz-14.6.0-h8f7ccb3_1.conda",
+          "sha256": "52e018610445a3df417eaec133ade7f14bfa642fb13ab49961efd4cabbfd87b1",
+          "name": "libharfbuzz",
+          "version": "14.6.0",
+          "license": "MIT",
+          "build": "h8f7ccb3_1",
+          "bytes": 1520084,
+          "fileName": "libharfbuzz-14.6.0-h8f7ccb3_1.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libharfbuzz",
+          "dependencies": [
+            "cairo >=1.18.6,<2.0a0",
+            "graphite2 >=1.3.15,<2.0a0",
+            "icu >=78.3,<79.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libglib >=2.90.0,<3.0a0",
+            "libpng >=1.6.59,<1.7.0a0",
+            "libstdcxx >=15",
+            "libzlib >=1.3.2,<2.0a0"
+          ],
+          "sourceUrl": "https://github.com/harfbuzz/harfbuzz",
+          "feedstockUrl": "https://github.com/conda-forge/harfbuzz-feedstock",
+          "feedstockRevision": "fa98fde637a525ff8c41de4b795d9815b362a18d"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.22.0-h86273da_0.conda",
+          "sha256": "8634a43ca7161d49b94098d8d27f32040ccf19b5227b37d05826ec8b5729b3c4",
+          "name": "libcurl",
+          "version": "8.22.0",
+          "license": "curl",
+          "build": "h86273da_0",
+          "bytes": 524318,
+          "fileName": "libcurl-8.22.0-h86273da_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/libcurl",
+          "dependencies": [
+            "krb5 >=1.22.2,<1.23.0a0",
+            "libgcc >=15",
+            "libnghttp2 >=1.68.1,<2.0a0",
+            "libpsl >=0.23.1,<0.24.0a0",
+            "libssh2 >=1.11.1,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "openssl >=3.5.8,<4.0a0",
+            "zstd >=1.5.7,<1.6.0a0"
+          ],
+          "sourceUrl": "https://github.com/curl/curl",
+          "feedstockUrl": "https://github.com/conda-forge/curl-feedstock",
+          "feedstockRevision": "4112bf00cdcc525cd7fa7ed1bba5a4b1c43eeb53"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/tesseract-5.5.3-hc3d8a9e_0.conda",
+          "sha256": "f81c536b6afb2c706cdf5ef43c32ea690f195f862fef7704da5a4b469cb427c2",
+          "name": "tesseract",
+          "version": "5.5.3",
+          "license": "Apache-2.0",
+          "build": "hc3d8a9e_0",
+          "bytes": 181412790,
+          "fileName": "tesseract-5.5.3-hc3d8a9e_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/tesseract",
+          "dependencies": [
+            "libstdcxx >=14",
+            "libgcc >=14",
+            "libcurl >=8.21.0,<9.0a0",
+            "leptonica >=1.87.0,<1.88.0a0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "liblzma >=5.8.3,<6.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libwebp-base >=1.6.0,<2.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libarchive >=3.8.8,<3.9.0a0",
+            "giflib >=5.2.2,<5.3.0a0",
+            "libpng >=1.6.58,<1.7.0a0"
+          ],
+          "sourceUrl": "https://github.com/tesseract-ocr/tesseract",
+          "feedstockUrl": "https://github.com/conda-forge/tesseract-feedstock",
+          "feedstockRevision": "568e7986182393275d0cda725438219077d489b5"
+        },
+        {
+          "url": "https://conda.anaconda.org/conda-forge/linux-aarch64/poppler-26.09.0-h18c21d9_0.conda",
+          "sha256": "30418c2104c8b750aaaf156bd517bae2873a45529669adf13723eaeb7e6ae1f1",
+          "name": "poppler",
+          "version": "26.09.0",
+          "license": "GPL-2.0-or-later",
+          "build": "h18c21d9_0",
+          "bytes": 2325891,
+          "fileName": "poppler-26.09.0-h18c21d9_0.conda",
+          "packageMetadataUrl": "https://api.anaconda.org/package/conda-forge/poppler",
+          "dependencies": [
+            "cairo >=1.18.4,<2.0a0",
+            "fontconfig >=2.18.3,<3.0a0",
+            "fonts-conda-ecosystem",
+            "lcms2 >=2.19.1,<3.0a0",
+            "libcurl >=8.22.0,<9.0a0",
+            "libegl >=1.7.0,<2.0a0",
+            "libfreetype >=2.14.3",
+            "libfreetype6 >=2.14.3",
+            "libgcc >=15",
+            "libgl >=1.7.0,<2.0a0",
+            "libglib >=2.88.3,<3.0a0",
+            "libharfbuzz >=14.4.0",
+            "libiconv >=1.18,<2.0a0",
+            "libjpeg-turbo >=3.2.0,<4.0a0",
+            "libpng >=1.6.58,<1.7.0a0",
+            "libstdcxx >=15",
+            "libtiff >=4.7.2,<4.8.0a0",
+            "libzlib >=1.3.2,<2.0a0",
+            "nspr >=4.40,<5.0a0",
+            "nss >=3.118,<4.0a0",
+            "openjpeg >=2.5.4,<3.0a0",
+            "poppler-data",
+            "xorg-libxscrnsaver >=1.2.4,<2.0a0",
+            "xorg-libxtst >=1.2.5,<2.0a0"
+          ],
+          "sourceUrl": "https://poppler.freedesktop.org/",
+          "feedstockUrl": "https://github.com/conda-forge/poppler-feedstock",
+          "feedstockRevision": "13d784d77510e73d6066a75a79cd8e6040a6a261"
+        }
+      ],
+      "rendererPath": "bin/pdftoppm",
+      "ocrPath": "bin/tesseract",
+      "environment": {
+        "FONTCONFIG_FILE": "etc/fonts/fonts.conf",
+        "FONTCONFIG_PATH": "etc/fonts"
+      }
+    }
+  ],
+  "languages": [
+    {
+      "language": "eng",
+      "sha256": "8280aed0782fe27257a68ea10fe7ef324ca0f8d85bd2fd145d1c2b560bcb66ba",
+      "bytes": 15400601,
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/eng.traineddata",
+      "fileName": "eng.traineddata",
+      "license": "Apache-2.0",
+      "sourceUrl": "https://github.com/tesseract-ocr/tessdata_best/tree/e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
+    },
+    {
+      "language": "chi_sim",
+      "sha256": "4fef2d1306c8e87616d4d3e4c6c67faf5d44be3342290cf8f2f0f6e3aa7e735b",
+      "bytes": 13077423,
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/chi_sim.traineddata",
+      "fileName": "chi_sim.traineddata",
+      "license": "Apache-2.0",
+      "sourceUrl": "https://github.com/tesseract-ocr/tessdata_best/tree/e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
+    },
+    {
+      "language": "chi_sim_vert",
+      "sha256": "ea672a78157199c333aa12ec4e74550077689b545df5fc770903716850c8b2e5",
+      "bytes": 13077507,
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/chi_sim_vert.traineddata",
+      "fileName": "chi_sim_vert.traineddata",
+      "license": "Apache-2.0",
+      "sourceUrl": "https://github.com/tesseract-ocr/tessdata_best/tree/e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
+    },
+    {
+      "language": "chi_tra",
+      "sha256": "1aa60488574cafa69486d919284f079ca9b68fcc7f6ad8dc1ff1b318dfd97028",
+      "bytes": 12985735,
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/chi_tra.traineddata",
+      "fileName": "chi_tra.traineddata",
+      "license": "Apache-2.0",
+      "sourceUrl": "https://github.com/tesseract-ocr/tessdata_best/tree/e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
+    },
+    {
+      "language": "chi_tra_vert",
+      "sha256": "bbe518f94b9e3852109113507357bfe7e257834d88d2d1ead44178046bcd2181",
+      "bytes": 12985521,
+      "url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_best/e12c65a915945e4c28e237a9b52bc4a8f39a0cec/chi_tra_vert.traineddata",
+      "fileName": "chi_tra_vert.traineddata",
+      "license": "Apache-2.0",
+      "sourceUrl": "https://github.com/tesseract-ocr/tessdata_best/tree/e12c65a915945e4c28e237a9b52bc4a8f39a0cec"
+    }
+  ]
+}

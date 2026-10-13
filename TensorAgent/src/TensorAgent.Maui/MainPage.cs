@@ -45,6 +45,8 @@ public sealed class MainPage : ContentPage
     private bool _chatVisible;
     private bool _languageReloadPending;
     private bool _languageReloadRetryScheduled;
+    private bool _knowledgeDirectoryImporting;
+    private readonly Queue<string> _knowledgePresentedPreviewFolders = new();
 #if IOS
     private int _shareNotificationPrompting;
 #endif
@@ -218,6 +220,185 @@ public sealed class MainPage : ContentPage
 
         if (failure is not null)
             await DisplayAlert(Loc.T("app.openFile.alert.title"), failure, Loc.T("common.ok"));
+    }
+
+    /// <summary>Present a validated version of an indexed original using the native file viewer.</summary>
+    private async Task OpenKnowledgeSourceAsync(string url, string? displayName)
+    {
+        if (!Core.Hosting.KnowledgeSourceDownload.TryParse(url, _host.EntryUrl, out var selected))
+            return;
+        string? failure = null;
+        string? preview = null;
+        try
+        {
+            var document = _host.App.Knowledge.ListDocuments(selected!.CollectionId)
+                .FirstOrDefault(document => document.Id == selected.DocumentId)
+                ?? throw new FileNotFoundException(Loc.T("app.openFile.missing"));
+            // OpenOriginal owns collection/document/version validation. The event
+            // never names a filesystem path, including through encoded separators.
+            await using Stream source = _host.App.Knowledge.OpenOriginal(selected.CollectionId,
+                selected.DocumentId, selected.Version);
+            string previewRoot = Path.Combine(_host.App.Paths.CacheRoot, "knowledge-previews");
+            string folder = Path.Combine(previewRoot, Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(folder);
+            preview = Path.Combine(folder, Path.GetFileName(document.FileName));
+            await using (FileStream output = File.Create(preview))
+                await source.CopyToAsync(output);
+            failure = await Services.FilePresenter.PresentAsync(preview,
+                string.IsNullOrWhiteSpace(displayName) ? document.FileName : displayName);
+            if (failure is null)
+            {
+                // QuickLook may retain its URL after the present call returns. Keep
+                // this source and its predecessor while pruning older private copies.
+                _knowledgePresentedPreviewFolders.Enqueue(folder);
+                while (_knowledgePresentedPreviewFolders.Count > 2) _knowledgePresentedPreviewFolders.Dequeue();
+                PruneKnowledgeSourcePreviews(previewRoot);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or KeyNotFoundException
+            or UnauthorizedAccessException or TensorSharp.Knowledge.KnowledgeStaleReferenceException)
+        {
+            failure = ex.Message;
+        }
+        if (failure is not null)
+        {
+            if (preview is not null) try { File.Delete(preview); } catch (IOException) { }
+            await DisplayAlert(Loc.T("app.openFile.alert.title"), failure, Loc.T("common.ok"));
+        }
+    }
+
+    private void PruneKnowledgeSourcePreviews(string previewRoot)
+    {
+        const long maximumBytes = 128L * 1024 * 1024;
+        const int maximumFolders = 10;
+        try
+        {
+            if ((File.GetAttributes(previewRoot) & FileAttributes.ReparsePoint) != 0) return;
+            var protectedFolders = _knowledgePresentedPreviewFolders.ToHashSet(StringComparer.Ordinal);
+            // Only the GUID folders this method creates are ours to prune. Do not
+            // follow links or recurse into unexpected children in a cache folder.
+            var folders = new DirectoryInfo(previewRoot).EnumerateDirectories()
+                .Where(folder => folder.Name.Length == 32 && folder.Name.All(char.IsAsciiHexDigitLower)
+                    && (folder.Attributes & FileAttributes.ReparsePoint) == 0)
+                .Where(folder => !folder.EnumerateDirectories().Any())
+                .Select(folder => new
+                {
+                    Folder = folder,
+                    Files = folder.EnumerateFiles().ToArray(),
+                })
+                .Where(entry => entry.Files.All(file => (file.Attributes & FileAttributes.ReparsePoint) == 0))
+                .OrderBy(entry => entry.Folder.CreationTimeUtc).ToArray();
+            long totalBytes = folders.Sum(entry => entry.Files.Sum(file => file.Length));
+            int count = folders.Length;
+            foreach (var entry in folders)
+            {
+                if (totalBytes <= maximumBytes && count <= maximumFolders) break;
+                if (protectedFolders.Contains(entry.Folder.FullName)) continue;
+                long bytes = entry.Files.Sum(file => file.Length);
+                foreach (var file in entry.Files) file.Delete();
+                entry.Folder.Delete(recursive: false);
+                totalBytes -= bytes;
+                count--;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A retained platform viewer can keep a file open on Windows. Keep the
+            // preview usable and let a later presentation retry its cache cleanup.
+            Console.WriteLine("TensorAgent: source preview cache cleanup deferred: " + ex.Message);
+        }
+    }
+
+    /// <summary>Import a user-selected folder through the same store as browser uploads.</summary>
+    private async Task PickKnowledgeDirectoryAsync(string collectionId, string requestId)
+    {
+        if (_knowledgeDirectoryImporting)
+        {
+            await CallBridgeAsync("knowledgeDirectoryProgress", new
+            {
+                collectionId, requestId, done = true, error = "A folder import is already running.",
+                completed = 0, total = 0, imported = 0, failed = 0,
+            });
+            return;
+        }
+        _knowledgeDirectoryImporting = true;
+        int total = 0, completed = 0, imported = 0, failed = 0;
+        bool cancelled = false;
+        string? lastFile = null, failure = null;
+        var errors = new List<object>();
+        try
+        {
+            // Validate the captured collection before showing a picker or copying files.
+            _ = _host.App.Knowledge.ListDocuments(collectionId);
+            using Services.KnowledgeDirectorySelection? selected = await Services.KnowledgeDirectoryPicker.PickAsync();
+            if (selected is null) { cancelled = true; return; }
+            await CallBridgeAsync("knowledgeDirectoryProgress", new
+            {
+                collectionId, requestId, phase = "scanning", completed, total, imported, failed, done = false,
+            });
+            var files = await selected.ReadFilesAsync();
+            total = files.Count;
+            var lastProgress = System.Diagnostics.Stopwatch.StartNew();
+            foreach (var file in files)
+            {
+                lastFile = file.RelativePath;
+                failure = file.Error;
+                string? failureCode = null;
+                if (failure is null)
+                {
+                    try
+                    {
+                        await using Stream source = await selected.OpenReadAsync(file.FullPath, _host.App.Knowledge.Options.MaxFileBytes);
+                        string? contentType = TensorSharp.Server.Hosting.UploadContentPolicy.ServeContentTypes
+                            .GetValueOrDefault(Path.GetExtension(file.FullPath));
+                        await Task.Run(() => _host.App.Knowledge.ImportAsync(collectionId,
+                            Path.GetFileName(file.FullPath), source, contentType, file.RelativePath, CancellationToken.None));
+                        imported++;
+                    }
+                    catch (Exception ex) when (ex is IOException or ArgumentException or InvalidDataException or JsonException
+                        or UnauthorizedAccessException or KeyNotFoundException or NotSupportedException
+                        or TensorSharp.Knowledge.KnowledgeLimitException or TensorSharp.Server.Knowledge.PdfOcrSetupException)
+                    {
+                        failure = ex.Message;
+                        if (ex is TensorSharp.Server.Knowledge.PdfOcrSetupException) failureCode = "pdf_ocr_setup_failed";
+                    }
+                }
+                if (failure is not null)
+                {
+                    failed++;
+                    if (errors.Count < 100) errors.Add(new { fileName = file.RelativePath, fileIndex = completed, error = failure, code = failureCode });
+                }
+                completed++;
+                if (lastProgress.ElapsedMilliseconds >= 150 || completed == total)
+                {
+                    await CallBridgeAsync("knowledgeDirectoryProgress", new
+                    {
+                        collectionId, requestId, completed, total, imported, failed, lastFile, error = failure, done = false,
+                    });
+                    lastProgress.Restart();
+                }
+            }
+            failure = null;
+        }
+        catch (Exception ex)
+        {
+            // Picker/provider errors are visible in the Knowledge panel and must
+            // never escape this asynchronous native UI callback.
+            failure = ex.Message;
+        }
+        finally
+        {
+            _knowledgeDirectoryImporting = false;
+            try
+            {
+                await CallBridgeAsync("knowledgeDirectoryProgress", new
+                {
+                    collectionId, requestId, completed, total, imported, failed, lastFile,
+                    error = failure, errors, done = true, cancelled,
+                });
+            }
+            catch (Exception ex) { Console.WriteLine("TensorAgent: folder import result could not reach the page: " + ex.Message); }
+        }
     }
 
 #if DEBUG
@@ -1473,6 +1654,7 @@ public sealed class MainPage : ContentPage
     private Task<string?> AnnounceNativeReadyAsync() => CallBridgeAsync("nativeReady", new
     {
         dictation = Services.Dictation.IsSupported,
+        knowledgeDirectory = true,
 #if WINDOWS
         composerHint = Loc.T("app.composer.placeholderWindows"),
 #else
@@ -2182,6 +2364,30 @@ public sealed class MainPage : ContentPage
 
             case "dictate-start":
                 MainThread.BeginInvokeOnMainThread(async () => await StartDictationAsync());
+                return;
+
+            case "pick-knowledge-directory":
+                string collectionId = message.TryGetProperty("collectionId", out JsonElement collection)
+                    && collection.ValueKind == JsonValueKind.String ? collection.GetString() ?? string.Empty : string.Empty;
+                string requestId = message.TryGetProperty("requestId", out JsonElement request)
+                    && request.ValueKind == JsonValueKind.String ? request.GetString() ?? string.Empty : string.Empty;
+                MainThread.BeginInvokeOnMainThread(async () => await PickKnowledgeDirectoryAsync(collectionId, requestId));
+                return;
+
+            case "open-knowledge-source":
+                string sourceUrl = message.TryGetProperty("url", out JsonElement original)
+                    && original.ValueKind == JsonValueKind.String ? original.GetString() ?? string.Empty : string.Empty;
+                string sourceName = message.TryGetProperty("name", out JsonElement originalName)
+                    && originalName.ValueKind == JsonValueKind.String ? originalName.GetString() ?? string.Empty : string.Empty;
+                MainThread.BeginInvokeOnMainThread(async () =>
+                {
+                    try { await OpenKnowledgeSourceAsync(sourceUrl, sourceName); }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("TensorAgent: open-knowledge-source failed: " + ex.Message);
+                        await DisplayAlert(Loc.T("app.openFile.alert.title"), ex.Message, Loc.T("common.ok"));
+                    }
+                });
                 return;
 
             case "dictate-stop":

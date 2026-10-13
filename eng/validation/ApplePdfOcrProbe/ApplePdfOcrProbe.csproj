@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-ios</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SupportedOSPlatformVersion>17.0</SupportedOSPlatformVersion>
+    <ApplicationId>ai.tensorsharp.validation.pdfocr</ApplicationId>
+    <ApplicationTitle>TensorSharp PDF OCR Probe</ApplicationTitle>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>1.0</ApplicationDisplayVersion>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">iossimulator-arm64</RuntimeIdentifier>
+    <DefineConstants Condition="$(RuntimeIdentifier.StartsWith('iossimulator-'))">$(DefineConstants);PROBE_SIMULATOR</DefineConstants>
+    <TrimMode>partial</TrimMode>
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
+    <!-- Simulator binaries still need ad-hoc signatures; this uses no identity or provisioning profile. -->
+    <CodesignKey Condition="$(RuntimeIdentifier.StartsWith('iossimulator-'))">-</CodesignKey>
+    <TensorSharpSkipGgmlNative>true</TensorSharpSkipGgmlNative>
+    <TensorSharpSkipMlxNative>true</TensorSharpSkipMlxNative>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Execute the actual product assembly, not a Swift substitute or copied OCR implementation. -->
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj"
+      AdditionalProperties="TensorSharpAppleTargets=true;TensorSharpSkipGgmlNative=true;TensorSharpSkipMlxNative=true" />
+    <ProjectReference Include="../../../TensorSharp.Knowledge/TensorSharp.Knowledge.csproj" />
+    <!-- The platform bridge is production source; linking it avoids pulling the unrelated chat host into this small app. -->
+    <Compile Include="../../../TensorSharp.Chat/Knowledge/PdfKnowledgePageExtractor.cs" Link="PdfKnowledgePageExtractor.cs" />
+    <Compile Include="../../../TensorSharp.Chat/Knowledge/PdfOcrOptions.cs" Link="PdfOcrOptions.cs" />
+    <Compile Include="../../../TensorSharp.Chat/Knowledge/PortablePdfPageExtractor.cs" Link="PortablePdfPageExtractor.cs" />
+    <Compile Include="../../../TensorSharp.Chat/Knowledge/PortablePdfProcessRunner.cs" Link="PortablePdfProcessRunner.cs" />
+    <BundleResource Include="../../../InferenceWeb.Tests/Fixtures/Knowledge/*.pdf" LogicalName="Fixtures/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

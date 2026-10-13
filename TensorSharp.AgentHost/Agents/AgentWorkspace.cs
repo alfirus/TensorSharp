@@ -88,6 +88,8 @@ internal sealed class AgentWorkspace : IDisposable
             owner.Context = new SkillToolContext(parent.Reachable, parent.MaxReadBytes)
             {
                 Workspace = owner.Workspace,
+                Knowledge = parent.Knowledge,
+                KnowledgeRetrieval = parent.Knowledge == null ? null : new Knowledge.KnowledgeRetrievalProgress(parent.Knowledge.MaxCharacters),
                 CodeRunner = runner,
                 ScriptRunner = mutable
                     ? parent.ScriptRunner?.ForkForWorkspace(owner.Workspace, runner) : null,
@@ -106,6 +108,7 @@ internal sealed class AgentWorkspace : IDisposable
 
     internal static bool AllowsTool(SkillToolContext parent, bool mutable, string toolName)
     {
+        if (Knowledge.KnowledgeTools.IsTool(toolName)) return parent.Knowledge != null;
         if (toolName is SkillTools.ReadToolName or SkillTools.ListToolName) return true;
         if (toolName == SkillTools.RunToolName) return mutable && parent.ScriptRunner?.CanForkForWorkspace == true;
         string? canonical = SkillToolNames.CanonicalName(toolName);
@@ -114,6 +117,7 @@ internal sealed class AgentWorkspace : IDisposable
 
     internal bool AllowsTool(string toolName)
     {
+        if (Knowledge.KnowledgeTools.IsTool(toolName)) return Context.Knowledge != null;
         if (toolName is SkillTools.ReadToolName or SkillTools.ListToolName) return true;
         if (toolName == SkillTools.RunToolName) return Context.ScriptRunner != null;
         string? canonical = SkillToolNames.CanonicalName(toolName);

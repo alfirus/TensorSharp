@@ -49,6 +49,8 @@ public sealed class StoredMessage
     [JsonPropertyName("attachments")] public List<StoredAttachment>? Attachments { get; set; }
     /// <summary>Files a tool produced during this assistant turn (download chips).</summary>
     [JsonPropertyName("artifacts")] public List<StoredArtifact>? Artifacts { get; set; }
+    /// <summary>Host-authored source citations, retained independently of model-generated answer links.</summary>
+    [JsonPropertyName("knowledgeSources")] public List<JsonElement>? KnowledgeSources { get; set; }
     /// <summary>Generated image URL for an image-edit turn.</summary>
     [JsonPropertyName("imageUrl")] public string? ImageUrl { get; set; }
     /// <summary>
@@ -229,6 +231,8 @@ public sealed class Conversation
     [JsonPropertyName("modelId")] public string? ModelId { get; set; }
     [JsonPropertyName("think")] public bool Think { get; set; }
     [JsonPropertyName("skills")] public List<string> Skills { get; set; } = new();
+    /// <summary>Only these explicitly selected personal knowledge collections may be retrieved for this chat.</summary>
+    [JsonPropertyName("knowledgeCollections")] public List<string> KnowledgeCollections { get; set; } = new();
     /// <summary>
     /// Whether <see cref="Skills"/> is a deliberate per-chat selection. An empty
     /// list without this bit means "let skill discovery decide"; an empty list with

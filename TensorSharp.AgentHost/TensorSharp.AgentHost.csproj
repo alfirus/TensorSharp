@@ -16,6 +16,7 @@
          that wants plain OpenAI/Ollama serving can then take TensorSharp.Runtime
          alone and carry none of this. -->
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+    <ProjectReference Include="..\TensorSharp.Knowledge\TensorSharp.Knowledge.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.6" />

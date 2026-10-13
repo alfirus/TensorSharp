@@ -419,6 +419,31 @@ These variables are real runtime knobs, but they are not registered in
 | `TENSORSHARP_CUDA_POOL_LARGE_MB` | direct `cuda` backend | Budget for the global large-block (≥ 2 MB) device-memory cache; keeps prefill-sized activations pooled instead of re-issuing cuMemAlloc/cuMemFree per layer | `1024` | not registered | no |
 | `TS_CUDA_PROFILE` | direct `cuda` backend | Print CPU-fallback op and host↔device sync counters at exit (`1`), with call-site attribution (`2`) | OFF | not registered | no |
 
+## Out-of-Matrix Knowledge Configuration
+
+These host settings are not registered or swept by TestMatrix. They configure
+the [personal knowledge library](knowledge-system.md), rather than changing the
+chat model's numerical backend. Set them before starting the host; reindex when
+the extractor or embedding identity changes. The standalone server opts in with
+`TS_KNOWLEDGE_DIRECTORY`; TensorAgent has its own persistent library directory.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_KNOWLEDGE_DIRECTORY` | standalone server | Enables the local library and `/api/knowledge`; chat requests still select `knowledgeCollections` explicitly | unset (disabled) | not registered | no |
+| `TS_KNOWLEDGE_EMBEDDING_MODEL` | knowledge runtime | Local sentence-embedding GGUF, owned separately from the chat model | unset (BM25 only) | not registered | no |
+| `TS_KNOWLEDGE_EMBEDDING_BACKEND` | knowledge encoder | Encoder backend | `CPU` | not registered | no |
+| `TS_KNOWLEDGE_QUERY_PREFIX` / `TS_KNOWLEDGE_DOCUMENT_PREFIX` | knowledge encoder | Model-required prefixes; changing them changes vector-space identity | empty / empty | not registered | no |
+| `TS_KNOWLEDGE_RERANK` | knowledge-enabled chat | `0` disables the one bounded model relevance pass; invalid output or timeout retains retrieval order | enabled when a chat model is available and there are at least three candidates | not registered | no |
+| `TS_KNOWLEDGE_PDF_OCR` | PDF knowledge extraction | `auto`, `apple`, `tesseract`, or `none`; `none` preserves selectable text | `auto` | not registered | no |
+| `TS_KNOWLEDGE_PDFTOPPM_PATH` / `TS_KNOWLEDGE_TESSERACT_PATH` | portable PDF OCR | Explicit absolute tool paths; opts out of TensorAgent's managed installation | resolve installed tools or use the supplied managed provisioner | not registered | no |
+| `TS_KNOWLEDGE_TESSDATA_DIRECTORY` | portable PDF OCR | Explicit language-data directory; opts out of managed installation | provider configuration | not registered | no |
+| `TS_KNOWLEDGE_OCR_LANGUAGES` | portable PDF OCR | Installed Tesseract language names | managed `eng+chi_sim`; `eng+chi_tra` available | not registered | no |
+
+Standalone Windows/Linux hosts need installed tools or an explicitly supplied
+`PdfOcrProvisioner`; configuring `auto` alone does not provision TensorAgent's
+private OCR runtime. Platform, media-model and validation limits are in the
+[knowledge guide](knowledge-system.md#validation-and-current-boundaries).
+
 ## Feature Coverage
 
 The matrix feature catalog lives in

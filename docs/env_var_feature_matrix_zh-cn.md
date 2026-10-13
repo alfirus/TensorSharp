@@ -373,6 +373,28 @@ TestMatrix 配置中 sweep。
 | `TENSORSHARP_CUDA_POOL_LARGE_MB` | 直连 `cuda` 后端 | 全局大块（≥ 2 MB）显存缓存预算；让 prefill 级激活保持池化，避免每层重复 cuMemAlloc/cuMemFree | `1024` | 未注册 | 否 |
 | `TS_CUDA_PROFILE` | 直连 `cuda` 后端 | 退出时打印 CPU 回退算子与主机↔设备同步计数（`1`），含调用点归因（`2`） | 关闭 | 未注册 | 否 |
 
+## 矩阵外的知识库配置
+
+这些宿主设置不在 TestMatrix 中注册或扫描；它们配置[个人知识库](knowledge-system_zh-cn.md)，
+不改变聊天模型的数值后端。启动宿主前设置；提取器或嵌入身份变化时需重新索引。
+独立服务端通过 `TS_KNOWLEDGE_DIRECTORY` 启用；TensorAgent 使用自己的持久化资料库目录。
+
+| 环境变量 | 适用范围 | 功能影响 | 默认值 | 扫描值 | 默认扫描 |
+|---|---|---|---|---|---|
+| `TS_KNOWLEDGE_DIRECTORY` | 独立服务端 | 启用本地资料库与 `/api/knowledge`；聊天仍显式选择 `knowledgeCollections` | 未设置（关闭） | 未注册 | 否 |
+| `TS_KNOWLEDGE_EMBEDDING_MODEL` | 知识运行时 | 独立于聊天模型的本地句向量 GGUF | 未设置（仅 BM25） | 未注册 | 否 |
+| `TS_KNOWLEDGE_EMBEDDING_BACKEND` | 知识编码器 | 编码器后端 | `CPU` | 未注册 | 否 |
+| `TS_KNOWLEDGE_QUERY_PREFIX` / `TS_KNOWLEDGE_DOCUMENT_PREFIX` | 知识编码器 | 模型要求的前缀；更改会改变向量空间身份 | 均为空 | 未注册 | 否 |
+| `TS_KNOWLEDGE_RERANK` | 已选知识的聊天 | `0` 关闭一次有界模型相关性排序；无效输出或超时保留检索顺序 | 有聊天模型且至少三个候选时启用 | 未注册 | 否 |
+| `TS_KNOWLEDGE_PDF_OCR` | PDF 知识提取 | `auto`、`apple`、`tesseract` 或 `none`；`none` 保留可选择文本 | `auto` | 未注册 | 否 |
+| `TS_KNOWLEDGE_PDFTOPPM_PATH` / `TS_KNOWLEDGE_TESSERACT_PATH` | 可移植 PDF OCR | 显式工具绝对路径；退出 TensorAgent 托管安装 | 查找本地工具或使用提供的托管安装器 | 未注册 | 否 |
+| `TS_KNOWLEDGE_TESSDATA_DIRECTORY` | 可移植 PDF OCR | 显式语言数据目录；退出托管安装 | 提取器配置 | 未注册 | 否 |
+| `TS_KNOWLEDGE_OCR_LANGUAGES` | 可移植 PDF OCR | 已安装的 Tesseract 语言名 | 托管 `eng+chi_sim`，可选 `eng+chi_tra` | 未注册 | 否 |
+
+独立 Windows/Linux 宿主需要已安装工具或显式提供 `PdfOcrProvisioner`；
+仅设置 `auto` 不会准备 TensorAgent 的私有 OCR 运行时。
+平台、媒体模型与验证限制见[知识库指南](knowledge-system_zh-cn.md)。
+
 ## 功能覆盖
 
 功能目录位于

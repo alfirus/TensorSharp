@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Personal Knowledge Bases — TensorSharp Wiki</title>
+  <meta name="description" content="Build local knowledge collections in TensorAgent from files, folders and saved chats; search documents, OCR and derived media text, select chat scope, and follow versioned citations.">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="knowledge">
+<a class="skip" href="#content">Skip to content</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index.html">Home</a> › Personal Knowledge Bases</div>
+  <h1>Personal Knowledge Bases</h1>
+  <p class="lede">Keep a reusable local library of documents, datasets and media. TensorSharp.Knowledge retains original files and indexes searchable excerpts with source locations. TensorAgent adds collection management, folder uploads, saved-chat imports, previews and per-chat selection; supported server chat APIs and agent tools use the same store.</p>
+  <p>This guide describes current source. Personal knowledge and response steering were added after <code>v2026.10.10</code>; use a newer build containing them. A release tag or successful package build alone does not establish model, OCR or device validation.</p>
+
+  <h2 id="start">Create a library and use it in a chat</h2>
+  <ol class="steps">
+    <li><h3>Create a collection</h3><p>Open <strong>Menu → Knowledge</strong>, enter a name and select <strong>Create</strong>. Collections keep their identity when renamed.</p></li>
+    <li><h3>Add sources</h3><p>Choose <strong>Upload files</strong> or <strong>Upload folder</strong>. Folder imports include nested folders and retain relative paths. The app uses a native folder picker; the browser uses its directory picker. Progress and per-file failures are visible. Originals remain in the library after chat or upload-cache cleanup.</p></li>
+    <li><h3>Bring in saved conversations</h3><p><strong>Add chats</strong> opens a searchable history picker. Select up to 32 saved chats across pages and choose <strong>Add and index selected chats</strong>. User and assistant messages, available attachments and produced files are indexed; private reasoning is excluded. Missing files are reported. Reimporting refreshes stable source paths without duplicating unchanged files. This is a snapshot: later conversation changes require another import.</p></li>
+    <li><h3>Check extraction</h3><p>Browse counts, filename/path and type filters, sort order and file pages. Inspect each source's status and warnings. Search within a collection, use <strong>Read surrounding context</strong>, or open indexed text and supported original previews. <strong>Download original</strong> returns the retained source.</p></li>
+    <li><h3>Select a chat scope</h3><p>Check <strong>Use {collection} in this chat</strong> or its checkbox in the collection catalog. Selected chips appear above the composer. Up to 32 collections can be selected; a new chat starts with none, while saved chats restore their selection. Browsing, importing and reindexing do not select a collection for inference.</p></li>
+    <li><h3>Ask with evidence</h3><p>Relevant excerpts are retrieved before the reply. Tool-capable models can refine searches, expand context and open originals for analysis, subject to the host's evidence and tool budgets. For a dataset calculation, ask the agent to open the complete original and run code rather than treating a few retrieved rows as the whole dataset.</p></li>
+  </ol>
+
+  <h2 id="formats">What becomes searchable</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Sources</th><th>Indexed content</th><th>Limits</th></tr></thead>
+    <tbody>
+      <tr><td>Text, Markdown, code, logs, HTML</td><td>Text excerpts; line/section locations where available</td><td>Strict text decoding; HTML scripts and styles are removed, with no rendering or remote loading.</td></tr>
+      <tr><td>CSV/TSV, JSON arrays, JSONL/NDJSON</td><td>Records with row/item locations</td><td>Bounded parsing and retrieval; this is not a database query engine.</td></tr>
+      <tr><td>PDF</td><td>Selectable text and OCR of scanned/image-bearing pages, with original page numbers</td><td>OCR may misread text and does not reconstruct exact layout; warnings identify missing coverage.</td></tr>
+      <tr><td>DOCX, PPTX, XLSX</td><td>Paragraphs/tables/notes, slide text, or worksheet rows/cached values</td><td>Partial extraction: no rendered layout or embedded image/chart interpretation; no formula recalculation. PPTX speaker notes are not indexed.</td></tr>
+      <tr><td>Images</td><td>Visible-text transcription and description from a loaded vision model/projector</td><td>Partial model-derived evidence, up to 16,777,216 pixels; no native image embeddings.</td></tr>
+      <tr><td>Audio</td><td>Transcript from a compatible loaded audio tower or configured transcription companion</td><td>Local input is PCM WAV up to 120 seconds; other formats need conversion or a companion. No diarization or word timestamps.</td></tr>
+      <tr><td>Video; SRT/VTT</td><td>Up to eight described frames with sample times; supplied subtitle cues retain their time ranges</td><td>Video needs a compatible codec and vision model. No soundtrack indexing or coverage between samples; maximum ten minutes / 36,000 frames.</td></tr>
+      <tr><td>Unsupported files or unavailable media capabilities</td><td>Original plus searchable filename metadata</td><td><code>MetadataOnly</code>: the contents have not been understood. Load a compatible model and reindex when possible.</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>Ready</code> means the extractor produced content without a declared coverage warning; <code>Partial</code> records limitations; <code>MetadataOnly</code> indexes the filename only. Generated descriptions and transcripts always remain partial. Reindexing uses the retained original with the currently available extractors and embedding provider.</p>
+
+  <h2 id="ocr">PDF OCR runs on the host</h2>
+  <p>Supported Apple hosts use CoreGraphics and Apple Vision, with no separate installation. TensorAgent on Windows and its Linux core host automatically prepares private Poppler/Tesseract tools and pinned English and simplified/traditional Chinese language data when a page first needs OCR. Text-only PDFs do not trigger that download. Setup progress and retry are visible; a setup failure preserves an existing committed document. OCR then runs locally, including on mixed pages with both selectable text and scanned content.</p>
+  <p>The default budget is 128 OCR pages per document, 16,777,216 rendered pixels per page and a 60-second page deadline. Recognition and platform coverage remain separate from successful setup. There is no shipped Linux MAUI desktop application; standalone Windows/Linux hosts must configure tools or opt into the provisioner. Browser previews use the connected host's OCR.</p>
+
+  <h2 id="search">Retrieval, citations and retained originals</h2>
+  <p>Default retrieval uses local BM25 text search with Unicode-aware terms and CJK n-grams. Optional <a href="embeddings.html">GGUF sentence embeddings</a> add exact cosine search; reciprocal rank fusion combines lexical and semantic rankings. Chat hosts can apply one bounded relevance pass with the loaded model; <code>TS_KNOWLEDGE_RERANK=0</code> disables it. Invalid output or timeout keeps the original order. These methods search extracted text, including media captions, rather than raw media embeddings.</p>
+  <p><strong>Retrieved sources</strong> shows only retrieved identities actually cited in the final answer. Source links open the cited excerpt or original preview; image/video sources can show thumbnails and video sample times. Citation markers such as <code>[K1]</code> bind to host-issued identities. Unknown or stale markers do not create source chips. Correct identity does not prove every claim in the answer.</p>
+  <p>Originals are SHA-256-addressed; importing the same relative filename and bytes is idempotent. Changed files or reindexing advance the version. Only the current version is retained, so old citations fail as stale rather than opening changed content. Failed extraction or embedding preserves the previous committed source. The store is an embedded, single-writer personal library.</p>
+  <p>Defaults include 64 MiB per file, 2 GiB logical source storage, 100 collections and 10,000 documents. Indexes and temporary files need additional disk/memory. Automatic retrieval has bounded excerpts and tool calls. Strongly identified single-document evidence can expand to a complete indexed-text snapshot only after the actual prompt and answer allowance pass the model-context fit check; otherwise ordinary retrieval remains. A complete indexed-text snapshot does not establish complete extraction.</p>
+
+  <h2 id="server">Standalone server and agent integration</h2>
+  <p>Set <code>TS_KNOWLEDGE_DIRECTORY</code> before starting <code>TensorSharp.Server.Host</code> to opt into the store and <code>/api/knowledge</code> routes. Optional <code>TS_KNOWLEDGE_EMBEDDING_MODEL</code>, <code>TS_KNOWLEDGE_EMBEDDING_BACKEND</code>, <code>TS_KNOWLEDGE_QUERY_PREFIX</code> and <code>TS_KNOWLEDGE_DOCUMENT_PREFIX</code> configure a separate local encoder. Changing its identity requires reindexing for semantic search; old documents retain lexical retrieval.</p>
+  <pre data-lang="bash"><code>TS_KNOWLEDGE_DIRECTORY="$PWD/library" \
+dotnet run --project TensorSharp.Server.Host -- \
+  --model /path/to/chat-model.gguf --backend ggml_metal --port 5000</code></pre>
+  <p>Management includes collection creation/deletion, document listing/upload/deletion/reindexing, <code>POST /api/knowledge/search</code>, <code>POST /api/knowledge/read</code> and versioned original downloads. The standalone upload accepts one multipart file per request. Search/read use explicit <code>collectionIds</code>. TensorAgent additionally supplies rename, folder/chat import and preview UI routes; these are not all standalone-server endpoints.</p>
+  <p>Supported inference routes use the exact camel-case field <code>knowledgeCollections</code>: TensorAgent/WebUI <code>POST /api/chat</code>, standalone <code>POST /v1/chat/completions</code>, <code>POST /v1/responses</code>, <code>POST /api/chat/ollama</code>, and <code>POST /api/generate</code>. Ollama generate supports retrieval and citations without an agent tool loop. Empty or missing selection retrieves nothing; invalid/deleted selections are rejected. The ordinary TensorAgent host does not expose every standalone compatibility API.</p>
+  <pre data-lang="json"><code>{
+  "model": "chat-model.gguf",
+  "messages": [{ "role": "user", "content": "Compare the findings in these documents." }],
+  "knowledgeCollections": ["collection-id"],
+  "stream": false
+}</code></pre>
+  <p>OpenAI/Ollama replies expose <code>knowledge_sources</code>, <code>knowledge_citation_repairs</code> and bounded <code>knowledge_tool_steps</code> metadata when knowledge is selected. Streaming compatibility adapters buffer final answer text for citation binding before emitting append-only answer deltas; reasoning and tool activity can arrive earlier. <code>tool_choice: "none"</code> keeps retrieval while disabling agent tools. Tool-capable hosts provide <code>knowledge_list</code>, <code>knowledge_search</code>, <code>knowledge_read</code> and <code>knowledge_open</code>; the last can copy the complete original into an enabled private code workspace.</p>
+  <p>Keep remote management behind the application's authentication boundary. Collection IDs define retrieval scope and are not authorization credentials. The bundled standalone server Chat page has no TensorAgent collection-management panel; use the API or SDK there.</p>
+
+  <h2 id="validation">Coverage and validation</h2>
+  <p>The repository includes store/extractor, host integration, scope/citation, chat import, browser UI, OCR and live-model tests and probes. Test presence, fixture tests and package builds do not certify every extractor, codec, model or device. Skipped/unavailable scenarios are unvalidated. Small clean media and synthetic scans are correctness diagnostics, not general answer-quality, OCR-accuracy or throughput benchmarks.</p>
+  <p>See the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/knowledge-system.md" target="_blank" rel="noopener">full knowledge design and configuration guide</a> and <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/eng/validation/knowledge/README.md" target="_blank" rel="noopener">validation procedures and platform limitations</a>. Review generated answers against originals separately from citation checks.</p>
+  <div class="content-footer"><a href="tensoragent.html">← TensorAgent Desktop</a><a href="http-api.html#knowledge">Knowledge HTTP API →</a></div>
+</main>
+</body>
+</html>

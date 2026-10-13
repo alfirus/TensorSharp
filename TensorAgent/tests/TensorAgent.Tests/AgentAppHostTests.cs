@@ -195,14 +195,16 @@ public sealed class AgentAppHostTests : IDisposable
     /// same argument for the case that vanished instead of growing too big.
     /// </para>
     /// </summary>
-    [Fact]
-    public void AModelTheCatalogNoLongerHasIsClearedFromTheSavedChoice()
+    [Theory]
+    [InlineData("gemma-4-12b-iq3xxs")]
+    [InlineData("gemma-4-12b-iq2m")]
+    public void AModelTheCatalogNoLongerHasIsClearedFromTheSavedChoice(string retired)
     {
         AgentPaths paths = Paths with { DeviceMemoryGB = 12 };
         paths.EnsureCreated();
         var settings = new SettingsStore(paths.SettingsFile);
         AppSettings chosen = settings.Load();
-        chosen.SelectedModelId = "gemma-4-12b-iq3xxs";
+        chosen.SelectedModelId = retired;
         settings.Save(chosen);
 
         _host = new AgentAppHost(paths);
@@ -240,13 +242,14 @@ public sealed class AgentAppHostTests : IDisposable
     /// those of an id it does not know, which a newer build sharing the directories may
     /// have installed (see CatalogTests.ASweepByAnOlderBuildKeepsTheModelsANewerBuildInstalled).
     /// </summary>
-    [Fact]
-    public void StartupReclaimsRetiredModelsAndKeepsAnUnknownIdsFiles()
+    [Theory]
+    [InlineData("gemma-4-12b-iq3xxs")]
+    [InlineData("gemma-4-12b-iq2m")]
+    public void StartupReclaimsRetiredModelsAndKeepsAnUnknownIdsFiles(string retired)
     {
         AgentPaths paths = Paths;
         paths.EnsureCreated();
         string prefixCache = Path.Combine(paths.CacheRoot, "prefix-cache");
-        const string retired = "gemma-4-12b-iq3xxs";
         const string newer = "a-newer-builds-entry-q4";
         Assert.True(ModelCatalog.IsRetired(retired));
         foreach (string id in new[] { retired, newer })
@@ -308,6 +311,9 @@ public sealed class AgentAppHostTests : IDisposable
 
         JsonElement listed = await Get("/api/agent/loras");
         Assert.Equal(LoraCatalog.BuiltIn.Count, listed.GetProperty("loras").GetArrayLength());
+        Assert.False(listed.GetProperty("supportsLoras").GetBoolean());
+        Assert.False(listed.GetProperty("loadedModelIsImage").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, listed.GetProperty("loadedModelName").ValueKind);
         Assert.All(listed.GetProperty("loras").EnumerateArray(), l => Assert.Equal("NotInstalled", l.GetProperty("state").GetString()));
         Assert.Equal(0, listed.GetProperty("chosen").GetArrayLength());
 

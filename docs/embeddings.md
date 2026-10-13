@@ -3,10 +3,22 @@
 [English](embeddings.md) | [中文](embeddings_zh-cn.md)
 
 TensorSharp serves GGUF BERT and XLM-RoBERTa sentence encoders through
-`TensorSharp.Server` and `TensorSharp.Server.Host`. This is source-build support;
-older release archives may not include it. It addresses
+`TensorSharp.Server` and `TensorSharp.Server.Host`. Packages and archives reflect
+their own release tags; older releases may not include this support. It addresses
 [discussion #183](https://github.com/zhongkaifu/TensorSharp/discussions/183),
 including semantic search over source code stored in SQLite.
+
+## Embeddings for personal knowledge
+
+The [personal knowledge store](knowledge-system.md) has BM25 retrieval by default
+and can use a separate local sentence encoder for semantic retrieval. Set
+`TS_KNOWLEDGE_EMBEDDING_MODEL` to a supported GGUF, with
+`TS_KNOWLEDGE_EMBEDDING_BACKEND` and the query/document prefixes required by that
+model, before starting TensorAgent or the configured server. This does not require
+starting an HTTP `--embeddings` service; the knowledge runtime owns its encoder
+separately from the chat model. Reindex existing documents to add or refresh their
+vectors. Model and prefix changes retain lexical search but never mix incompatible
+vector spaces. Knowledge retrieval added after `v2026.10.10` requires a newer build.
 
 ## Models and downloads
 

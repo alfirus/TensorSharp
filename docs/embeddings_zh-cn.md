@@ -2,7 +2,17 @@
 
 [English](embeddings.md) | [中文](embeddings_zh-cn.md)
 
-TensorSharp 通过 `TensorSharp.Server` 与 `TensorSharp.Server.Host` 托管 GGUF BERT / XLM-RoBERTa 句向量编码器。这是当前源码新增的功能；较早的发布归档不一定包含。它回应了[讨论 #183](https://github.com/zhongkaifu/TensorSharp/discussions/183)中把代码向量存入 SQLite、按语义检索代码的需求。
+TensorSharp 通过 `TensorSharp.Server` 与 `TensorSharp.Server.Host` 托管 GGUF BERT / XLM-RoBERTa 句向量编码器。包与归档反映各自发布标签，较早的版本不一定包含这项功能。它回应了[讨论 #183](https://github.com/zhongkaifu/TensorSharp/discussions/183)中把代码向量存入 SQLite、按语义检索代码的需求。
+
+## 个人知识库的嵌入检索
+
+[个人知识存储](knowledge-system_zh-cn.md)默认使用 BM25，也可加载独立的本地句向量编码器
+提供语义检索。在启动 TensorAgent 或已配置的服务端前，将
+`TS_KNOWLEDGE_EMBEDDING_MODEL` 设置为支持的 GGUF，并按模型要求设置
+`TS_KNOWLEDGE_EMBEDDING_BACKEND` 及查询/文档前缀。
+无需启动 HTTP `--embeddings` 服务；知识运行时独立持有编码器，不与聊天模型共用。
+重新索引已有文档以添加或更新向量。改变模型或前缀时，文本检索仍可使用，
+但不混用不兼容的向量空间。知识检索晚于 `v2026.10.10`，需要包含这些改动的构建。
 
 ## 模型与下载
 

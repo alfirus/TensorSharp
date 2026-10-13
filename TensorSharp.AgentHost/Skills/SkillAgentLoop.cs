@@ -273,11 +273,26 @@ namespace TensorSharp.AgentHost.Skills
             var invocations = new List<SkillToolInvocation>();
             int maxRounds = Math.Max(1, options.MaxRounds);
             SkillTurnOutput output = default;
+            int roundsRun = 0;
+            bool knowledgeSynthesis = false;
+            bool knowledgeFinished = false;
+            var activeTools = tools;
+            var retrieval = context.KnowledgeRetrieval ?? context.Knowledge?.Retrieval;
+            bool CanAccessOriginal() => retrieval?.CanAccessOriginal == true
+                && context.Workspace != null && context.CodeRunner?.CanRun == true;
+            if (retrieval?.ShouldSynthesize == true)
+            {
+                knowledgeFinished = true;
+                activeTools = Knowledge.KnowledgeTools.WithoutRetrieval(tools, options.ClientTools, CanAccessOriginal());
+                working = Knowledge.KnowledgeTools.BuildSynthesisMessages(working, context.Knowledge!, retrieval,
+                    activeTools.Any(t => SkillTools.IsBuiltInTool(t.Name) && !Knowledge.KnowledgeTools.IsTool(t.Name)));
+            }
 
             for (int round = 1; round <= maxRounds; round++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                output = await generate(working, tools, cancellationToken).ConfigureAwait(false);
+                roundsRun = round;
+                output = await generate(working, activeTools, cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 if (output.HistoryCompacted)
                     context.Workspace?.Reads.InvalidateReadVisibility();
@@ -293,6 +308,7 @@ namespace TensorSharp.AgentHost.Skills
                     out List<ToolCall> skillCalls,
                     out List<ToolCall> clientCalls,
                     out List<ToolCall> unknownCalls);
+                bool originalAccessAllowedThisRound = CanAccessOriginal();
 
                 if (skillCalls.Count == 0 && unknownCalls.Count == 0)
                 {
@@ -309,7 +325,7 @@ namespace TensorSharp.AgentHost.Skills
                             RawPromptTrailingWhitespace = output.RawPromptTrailingWhitespace,
                             RawGenerationSuffix = output.RawGenerationSuffix,
                         });
-                        working.Add(new ChatMessage { Role = "user", Content = await options.AgentSession
+                        working.Add(new HostContinuationMessage { Role = "user", Content = await options.AgentSession
                             .CollectResultsAsync(options.AgentId, cancellationToken).ConfigureAwait(false) });
                         continue;
                     }
@@ -373,7 +389,7 @@ namespace TensorSharp.AgentHost.Skills
                     {
                         result = await options.AgentSession.ExecuteHostToolAsync(call, options.AgentId, cancellationToken).ConfigureAwait(false);
                     }
-                    else result = SkillTools.Execute(call, context);
+                    else result = SkillTools.Execute(call, context, cancellationToken: cancellationToken);
                     executed++;
 
                     var invocation = new SkillToolInvocation(
@@ -394,21 +410,47 @@ namespace TensorSharp.AgentHost.Skills
                     return new SkillLoopResult(
                         output, working, round, invocations, HitRoundLimit: false, clientCalls);
                 }
+                if (knowledgeFinished && skillCalls.Any(call => Knowledge.KnowledgeTools.IsTool(call.Name)
+                    && !(call.Name == Knowledge.KnowledgeTools.Open && originalAccessAllowedThisRound)))
+                {
+                    knowledgeSynthesis = true;
+                    break;
+                }
+                if (knowledgeFinished)
+                    activeTools = Knowledge.KnowledgeTools.WithoutRetrieval(tools, options.ClientTools, CanAccessOriginal());
+                if (!knowledgeFinished && retrieval?.ShouldSynthesize == true)
+                {
+                    knowledgeFinished = true;
+                    activeTools = Knowledge.KnowledgeTools.WithoutRetrieval(tools, options.ClientTools, CanAccessOriginal());
+                    if (activeTools?.Any(t => SkillTools.IsBuiltInTool(t.Name) && !Knowledge.KnowledgeTools.IsTool(t.Name)) == true)
+                        working = Knowledge.KnowledgeTools.BuildSynthesisMessages(working, context.Knowledge!, retrieval, allowOtherTools: true);
+                    else
+                    {
+                        knowledgeSynthesis = true;
+                        break;
+                    }
+                }
             }
 
             // Out of rounds with the model still asking for files. Tell it so, in the
             // conversation, and let it answer from what it already has — returning the
             // last tool-call-only turn to the user would show them nothing at all.
-            working.Add(BuildResultMessage(options,
-                "Error: the limit on tool calls for this turn has been reached. "
-                + "Answer now using what you have already read, and say which part you could not check."));
+            if (context.Knowledge != null)
+                working = Knowledge.KnowledgeTools.BuildSynthesisMessages(working, context.Knowledge, retrieval);
+            else
+                working.Add(BuildResultMessage(options,
+                    "Error: the limit on tool calls for this turn has been reached. "
+                    + "Answer now using what you have already read, and say which part you could not check."));
 
             if (options.AgentSession?.HasPendingResults(options.AgentId) == true)
-                working.Add(new ChatMessage { Role = "user", Content = await options.AgentSession
+                working.Add(new HostContinuationMessage { Role = "user", Content = await options.AgentSession
                     .CollectResultsAsync(options.AgentId, cancellationToken).ConfigureAwait(false) });
 
             cancellationToken.ThrowIfCancellationRequested();
-            output = await generate(working, tools, cancellationToken).ConfigureAwait(false);
+            // The final generation must actually be able to finish. Leaving host
+            // retrieval tools advertised invites the same loop after 'answer now'.
+            var finalTools = context.Knowledge == null ? tools : options.ClientTools?.ToList() ?? new List<ToolFunction>();
+            output = await generate(working, finalTools, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
             if (output.HistoryCompacted)
                 context.Workspace?.Reads.InvalidateReadVisibility();
@@ -439,7 +481,7 @@ namespace TensorSharp.AgentHost.Skills
             }
 
             return new SkillLoopResult(
-                output, working, maxRounds + 1, invocations, HitRoundLimit: true, finalClientCalls);
+                output, working, roundsRun + 1, invocations, HitRoundLimit: !knowledgeSynthesis, finalClientCalls);
         }
 
         /// <summary>
@@ -488,14 +530,20 @@ namespace TensorSharp.AgentHost.Skills
             // Round-limit guidance is not a result for any outstanding call. A
             // standalone tool message would be invalid on an OpenAI transport.
             if (tool == null && toolCallId == null)
-                return new ChatMessage { Role = "user", Content = content };
+                return new HostContinuationMessage { Role = "user", Content = content };
+            if (tool is Knowledge.KnowledgeTools.Search or Knowledge.KnowledgeTools.Read)
+                return new Knowledge.KnowledgeToolResultMessage
+                {
+                    Role = options.ToolResultsAreRendered ? "tool" : "user", ToolCallId = toolCallId,
+                    Content = options.ToolResultsAreRendered ? content : $"Result of your {tool} call:\n\n" + content,
+                };
             if (options.ToolResultsAreRendered)
                 return new ChatMessage { Role = "tool", Content = content, ToolCallId = toolCallId };
 
             string prefix = tool == null
                 ? "Result of the skill lookup you requested:"
                 : $"Result of your {tool} call:";
-            return new ChatMessage { Role = "user", Content = prefix + "\n\n" + content };
+            return new HostContinuationMessage { Role = "user", Content = prefix + "\n\n" + content };
         }
     }
 }

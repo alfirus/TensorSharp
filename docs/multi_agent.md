@@ -17,8 +17,8 @@ Delegation does not depend on skills or code execution. With `--no-skills` and
 without `--code-exec`, every eligible request still carries the five
 coordination tools and the coordination prompt, merged into the leading
 system/developer message (or added as a new leading system message when the
-request has none). Children in such a request then have no host tools
-besides those five.
+request has none). Without selected knowledge collections, children in such a
+request have no host tools besides those five.
 
 ## Choosing work and models
 
@@ -69,6 +69,17 @@ from the parent's workspace; dependency outputs are staged separately. Follow-up
 turns reuse the child's own conversation and workspace. The parent receives
 bounded result reports and exported output paths rather than the child's full
 tool transcript.
+
+When the caller selects [knowledge collections](knowledge-system.md), children
+inherit the same allowed collection IDs and request thinking-token limit. They
+can retrieve evidence through their permitted knowledge tools without receiving
+the parent's whole transcript. They cannot enlarge the selection or modify the
+library; `knowledge_open` stages originals in the invoking child's private
+workspace when file tools are available. An accepted complete-document snapshot
+can let the parent synthesize directly; delegation solely to partition evidence
+already fitting in context is discouraged, while independent verification,
+source or workspace work and explicit delegation requests remain supported.
+These knowledge contracts describe source after the `v2026.10.10` tag.
 
 Children with the same role, governing instructions, and offered tools share a
 stable system/tool prefix. Their unique agent IDs and assignments follow it in

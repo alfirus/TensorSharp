@@ -3,6 +3,7 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using TensorAgent.Core.Catalog;
 using TensorAgent.Core.Hosting;
 using TensorAgent.Core.Settings;
@@ -81,7 +82,9 @@ if (webRoot is null)
     if (Directory.Exists(candidate))
         webRoot = candidate;
 }
+using var rankingLogging = LoggerFactory.Create(builder => builder.AddProvider(new RankingLogProvider()));
 using var host = new AgentAppHost(paths,
+    loggerFactory: rankingLogging,
     webRoot: webRoot,
     port: Number("--port", 0),
     backends: new[] { new BackendOption(backend, backend) });
@@ -122,6 +125,8 @@ loadClock.Stop();
 string connection = JsonSerializer.Serialize(new
 {
     baseUrl = host.Server.BaseUrl,
+    dataRoot = paths.DataRoot,
+    cacheRoot = paths.CacheRoot,
     entryUrl = host.Server.EntryUrl,
     cookie,
     executionBackend = host.Backend.Name,
@@ -161,3 +166,22 @@ try
 }
 catch (OperationCanceledException) { }
 return 0;
+
+// Only bounded, non-sensitive ranking diagnostics. Source text and authentication
+// material are never included by this logger.
+sealed class RankingLogProvider : ILoggerProvider
+{
+    public ILogger CreateLogger(string categoryName) => new RankingLogger();
+    public void Dispose() { }
+    sealed class RankingLogger : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            string message = formatter(state, exception);
+            if (message.StartsWith("Knowledge rerank ", StringComparison.Ordinal)) Console.WriteLine(message);
+        }
+    }
+}

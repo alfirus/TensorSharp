@@ -187,7 +187,7 @@ If you already have a file at that `path`, it is used as-is (no download).
 | [`auto-download.json`](auto-download.json) | Qwen3.5-9B (~8.9 GB) | Auto-download demo using a public GGUF |
 | [`qwen-image-2.1.json`](qwen-image-2.1.json) | Qwen-Image-2.1 Q4_K_M + dedicated VAE + Qwen3-VL-8B + projector | Text-to-image and editing; pinned, checksum-verified downloads |
 | [`qwen-image-2.1-turbo.json`](qwen-image-2.1-turbo.json) | Qwen-Image-2.1-Turbo AD-Q4_K + the same VAE, Qwen3-VL-8B and projector | Text-to-image and editing in 8 steps; declares `"qwen-image-variant": "turbo"`; the companions keep their publishers' file names, so a base-model config pointed at the same folder and names downloads them once for both |
-| [`lora/qwen-image-2.1-*.json`](lora/) | Twelve Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins on top of `qwen-image-2.1.json`: step-distilled 4–8-step recipes, styles and editing skills; see [below](#qwen-image-21-lora-plug-ins-lora) |
+| [`lora/qwen-image-2.1-*.json`](lora/) | Fourteen Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins for Qwen-Image-2.1; Film Stills, Grainscape, Casual Phone Photo and Voxel Style also work with the official 8-step Turbo checkpoint; see [below](#qwen-image-21-lora-plug-ins-lora) |
 | [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
 | [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~12.9 GB) | Video only, 4-step distilled, text- **and** image-to-video |
@@ -344,6 +344,8 @@ TensorSharp.Server.Host --config config/qwen-image-2.1.json --lora config/lora/q
 | [`qwen-image-2.1-fun-acc-4step.json`](lora/qwen-image-2.1-fun-acc-4step.json) | Alibaba PAI Fun-Acc PDD bundle: 4 steps with per-step output heads; forwards its `pdd_config.json` |
 | [`qwen-image-2.1-film-stills.json`](lora/qwen-image-2.1-film-stills.json) | Danrisi Film Stills: cinematic 35 mm film-still style, strength 0.7 |
 | [`qwen-image-2.1-grainscape.json`](lora/qwen-image-2.1-grainscape.json) | Danrisi Grainscape: grainy 35 mm colour-negative look, strength 0.7 |
+| [`qwen-image-2.1-casual-phone.json`](lora/qwen-image-2.1-casual-phone.json) | Casual Phone Photo: candid phone-photo style, strength 0.8; include `lbxstyle` and a clear subject and setting |
+| [`qwen-image-2.1-voxel-style.json`](lora/qwen-image-2.1-voxel-style.json) | Voxel Style (editing): attach a photo and request `Transform the image into a voxel style`, strength 1.0; experimental, backgrounds can change |
 | [`qwen-image-2.1-fix.json`](lora/qwen-image-2.1-fix.json) | e-n-v-y Qwen-Image-2.1-Fix: a DoRA quality fix |
 | [`qwen-image-2.1-detail-enhancer.json`](lora/qwen-image-2.1-detail-enhancer.json) | elusarca Detail Enhancer (editing): detail, upscaling and restoration |
 | [`qwen-image-2.1-natural-exposure.json`](lora/qwen-image-2.1-natural-exposure.json) | prithivMLmods Natural Exposure (editing): balanced, neutral exposure |
@@ -353,6 +355,19 @@ TensorSharp.Server.Host --config config/qwen-image-2.1.json --lora config/lora/q
 
 Notes:
 
+- **Official Turbo keeps its own 8 steps and CFG 1.** The four compatible style/edit
+  adapters above add no sampling recipe. Use the Turbo host config, for example:
+
+  ```bash
+  TensorSharp.Cli --config config/qwen-image-2.1-turbo.json \
+    --lora config/lora/qwen-image-2.1-casual-phone.json \
+    --prompt "lbxstyle, an orange cat beside a blue mug on a kitchen counter" \
+    --width 1024 --height 1024 --output casual-phone.png
+  ```
+
+  Do not add Viggle, Pruna or Fun-Acc speed adapters to the official Turbo model.
+  See the [source review and validation scope](../docs/models/qwenimage21.md#lora-plug-ins-on-turbo)
+  before treating a style change as a quality improvement.
 - **Explicit settings win.** `--diffusion-steps` / `--cfg` (or a server request's
   `steps` / `cfg`) override a plug-in's recipe; a step count the recipe has no
   schedule for is refused, naming the supported ones.

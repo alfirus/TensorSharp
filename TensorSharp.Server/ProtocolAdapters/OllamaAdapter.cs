@@ -18,6 +18,8 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.Knowledge;
+using TensorSharp.Server.Knowledge;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.RequestParsers;
 using TensorSharp.Server.ResponseSerializers;
@@ -38,6 +40,7 @@ namespace TensorSharp.Server.ProtocolAdapters;
 public sealed class OllamaAdapter
 {
     private readonly ModelService _svc;
+    private readonly KnowledgeStore? _knowledge;
     private readonly ServerHostingOptions _options;
     private readonly UploadStoragePolicy _uploads;
     private readonly SkillRegistry _skills;
@@ -57,7 +60,19 @@ public sealed class OllamaAdapter
         ICodeRunner? codeRunner,
         SessionWorkspaceManager workspaces,
         ILoggerFactory loggerFactory)
+        : this(svc, options, uploads, skills, codeRunner, workspaces, loggerFactory, null) { }
+
+    public OllamaAdapter(
+        ModelService svc,
+        ServerHostingOptions options,
+        UploadStoragePolicy uploads,
+        SkillRegistry skills,
+        ICodeRunner? codeRunner,
+        SessionWorkspaceManager workspaces,
+        ILoggerFactory loggerFactory,
+        KnowledgeStore? knowledge = null)
     {
+        _knowledge = knowledge;
         _svc = svc ?? throw new ArgumentNullException(nameof(svc));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
@@ -154,6 +169,19 @@ public sealed class OllamaAdapter
                 ? SamplingConfigParser.ReadRequestedMaxTokens(opts, "num_predict")
                 : null);
 
+        var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens, ollama: true,
+            reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
+        if (knowledge == null) return;
+        if (knowledge.Enabled)
+        {
+            var prepared = await knowledge.PrepareAsync(ctx, new() { new() { Role = "user", Content = prompt } },
+                toolsAvailable: false, ollama: true).ConfigureAwait(false);
+            if (prepared == null) return;
+            // Raw generate has no role or tool channel. Keep the fixed trust guidance
+            // before its bounded reference block and the caller's original prompt.
+            prompt = string.Join("\n\n", prepared.Select(message => message.Content));
+        }
+
         List<string>? imagePaths;
         try
         {
@@ -176,11 +204,11 @@ public sealed class OllamaAdapter
 
         if (stream)
         {
-            await StreamGenerateAsync(ctx, modelName, prompt!, imagePaths, maxTokens, samplingConfig).ConfigureAwait(false);
+            await StreamGenerateAsync(ctx, modelName, prompt!, imagePaths, maxTokens, samplingConfig, knowledge).ConfigureAwait(false);
         }
         else
         {
-            await CompleteGenerateAsync(ctx, modelName, prompt!, imagePaths, maxTokens, samplingConfig).ConfigureAwait(false);
+            await CompleteGenerateAsync(ctx, modelName, prompt!, imagePaths, maxTokens, samplingConfig, knowledge).ConfigureAwait(false);
         }
     }
 
@@ -190,7 +218,8 @@ public sealed class OllamaAdapter
         string prompt,
         List<string>? imagePaths,
         int maxTokens,
-        SamplingConfig samplingConfig)
+        SamplingConfig samplingConfig,
+        KnowledgeProtocolRequest knowledge)
     {
         NdJsonWriter.ApplyHeaders(ctx.Response);
 
@@ -203,9 +232,23 @@ public sealed class OllamaAdapter
             return;
         }
 
+        var knowledgeAnswer = knowledge.Enabled ? new StringBuilder() : null;
         await foreach (var update
             in _svc.GenerateStreamAsync(prompt, imagePaths, maxTokens, ctx.RequestAborted, samplingConfig).ConfigureAwait(false))
         {
+            if (knowledgeAnswer != null)
+            {
+                if (!update.Done)
+                {
+                    knowledgeAnswer.Append(update.Piece);
+                    await NdJsonWriter.KeepAliveIfIdleAsync(ctx.Response, KeepAliveInterval,
+                        () => OllamaResponseFactory.GenerateTokenChunk(_svc.LoadedModelName, ""), ctx.RequestAborted).ConfigureAwait(false);
+                    continue;
+                }
+                await NdJsonWriter.WriteLineAsync(ctx.Response,
+                    OllamaResponseFactory.GenerateTokenChunk(_svc.LoadedModelName, knowledge.Normalize(knowledgeAnswer.ToString())),
+                    ctx.RequestAborted).ConfigureAwait(false);
+            }
             // /api/generate has no tool-call surface, so the only distinction
             // that matters here is truncated vs. finished.
             object resp = update.Done
@@ -215,7 +258,7 @@ public sealed class OllamaAdapter
                     update.TotalNs, update.PromptNs, update.EvalNs)
                 : OllamaResponseFactory.GenerateTokenChunk(_svc.LoadedModelName, update.Piece);
 
-            await NdJsonWriter.WriteLineAsync(ctx.Response, resp, ctx.RequestAborted).ConfigureAwait(false);
+            await NdJsonWriter.WriteLineAsync(ctx.Response, update.Done ? knowledge.WithSources(resp) : resp, ctx.RequestAborted).ConfigureAwait(false);
         }
     }
 
@@ -225,7 +268,8 @@ public sealed class OllamaAdapter
         string prompt,
         List<string>? imagePaths,
         int maxTokens,
-        SamplingConfig samplingConfig)
+        SamplingConfig samplingConfig,
+        KnowledgeProtocolRequest knowledge)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -256,10 +300,10 @@ public sealed class OllamaAdapter
         }
 
         await ctx.Response.WriteAsJsonAsync(
-            OllamaResponseFactory.GenerateNonStreamingResponse(
-                _svc.LoadedModelName, sb.ToString(),
+            knowledge.WithSources(OllamaResponseFactory.GenerateNonStreamingResponse(
+                _svc.LoadedModelName, knowledge.Normalize(sb.ToString()),
                 FinishReasonMapper.ToOllamaDoneReason(pipelineFinishReason, hasToolCalls: false),
-                promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)).ConfigureAwait(false);
+                promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs))).ConfigureAwait(false);
     }
 
     // ---- Chat ------------------------------------------------------------
@@ -292,6 +336,9 @@ public sealed class OllamaAdapter
         bool stream = true;
         if (body.TryGetProperty("stream", out var streamProp)) stream = streamProp.GetBoolean();
         var samplingConfig = SamplingConfigParser.ParseOllama(body, _options.SamplingDefaults);
+        var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens, ollama: true,
+            reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
+        if (knowledge == null) return;
         int maxTokens = _options.ResolveMaxTokens(
             body.TryGetProperty("options", out var opts) && opts.ValueKind == JsonValueKind.Object
                 ? SamplingConfigParser.ReadRequestedMaxTokens(opts, "num_predict")
@@ -311,6 +358,9 @@ public sealed class OllamaAdapter
             return;
         }
         var ollamaTools = ToolFunctionParser.ParseOllama(body);
+        bool toolsDisabled = body.TryGetProperty("tool_choice", out var toolChoice)
+            && toolChoice.ValueKind == JsonValueKind.String && toolChoice.GetString() == "none";
+        if (toolsDisabled) ollamaTools = null;
         bool ollamaThink = body.TryGetProperty("think", out var thinkProp) && thinkProp.GetBoolean();
         // Same contract as /v1/chat/completions: a block-diffusion model has no
         // tool-call loop, so tools are refused up front rather than answered with prose.
@@ -352,13 +402,15 @@ public sealed class OllamaAdapter
         }
 
         using RequestWorkspaceLease? workspaceLease = RequestWorkspaceLease.Acquire(
-            _workspaces, _codeRunner, _svc.Architecture);
+            _workspaces, _codeRunner, _svc.Architecture, allowTools: !toolsDisabled);
 
         var skillPlan = SkillRequestPlan.Create(
             _skills, requestedSkills, SkillSelectionParser.ParseDiscovery(body), ollamaTools,
-            _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills, codeRunner: _codeRunner,
+            _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills, allowTools: !toolsDisabled, codeRunner: _codeRunner,
             workspace: workspaceLease?.Workspace, logger: ollamaLogger,
-            multiAgent: SkillSelectionParser.ParseMultiAgent(body));
+            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope);
+
+        knowledge.Plan = skillPlan;
 
         if (unknownSkills.Count > 0)
         {
@@ -388,13 +440,17 @@ public sealed class OllamaAdapter
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered);
         }
 
+        messages = await knowledge.PrepareAsync(ctx, messages, skillPlan?.ToolsOffered == true, ollama: true,
+            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxTokens, ollamaTools2, ollamaThink)).ConfigureAwait(false);
+        if (messages == null) return;
+
         if (stream)
         {
-            await StreamChatAsync(ctx, modelName!, messages, maxTokens, samplingConfig, ollamaTools2, ollamaThink, skillPlan, ollamaLogger).ConfigureAwait(false);
+            await StreamChatAsync(ctx, modelName!, messages, maxTokens, samplingConfig, ollamaTools2, ollamaThink, skillPlan, ollamaLogger, knowledge).ConfigureAwait(false);
         }
         else
         {
-            await CompleteChatAsync(ctx, modelName!, messages, maxTokens, samplingConfig, ollamaTools2, ollamaThink, skillPlan, ollamaLogger).ConfigureAwait(false);
+            await CompleteChatAsync(ctx, modelName!, messages, maxTokens, samplingConfig, ollamaTools2, ollamaThink, skillPlan, ollamaLogger, knowledge).ConfigureAwait(false);
         }
     }
 
@@ -407,7 +463,8 @@ public sealed class OllamaAdapter
         List<ToolFunction>? tools,
         bool enableThinking,
         SkillRequestPlan? skillPlan,
-        ILogger skillLogger)
+        ILogger skillLogger,
+        KnowledgeProtocolRequest knowledge)
     {
         NdJsonWriter.ApplyHeaders(ctx.Response);
 
@@ -429,11 +486,13 @@ public sealed class OllamaAdapter
         // SkillChatLoop). `parser` is bypassed for those and must not be flushed at
         // the end either — the loop's own parser already flushed.
         bool sawParsedUpdate = false;
+        var knowledgeAnswer = knowledge.Enabled ? new StringBuilder() : null;
 
         await foreach (var update
             in _svc.ChatStreamWithSkillsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
                 tools, enableThinking, skillPlan, skillLogger).ConfigureAwait(false))
         {
+            knowledge.Observe(update);
             if (!update.Done)
             {
                 // Text a parser holds sends nothing for as long as it is held.
@@ -453,6 +512,7 @@ public sealed class OllamaAdapter
 
                     string? parsedThink = string.IsNullOrEmpty(update.ThinkingPiece) ? null : update.ThinkingPiece;
                     string parsedContent = update.Piece ?? "";
+                    if (knowledgeAnswer != null) { knowledgeAnswer.Append(parsedContent); parsedContent = ""; }
                     if (parsedThink == null && parsedContent.Length == 0)
                         continue;
 
@@ -462,8 +522,9 @@ public sealed class OllamaAdapter
                     continue;
                 }
 
+                if (!useParser && knowledgeAnswer != null) { knowledgeAnswer.Append(update.Piece); continue; }
                 object? resp = useParser
-                    ? BuildParsedChatChunk(_svc.LoadedModelName, parser, update.Piece!, ref collectedToolCalls, out bool emit)
+                    ? BuildParsedChatChunk(_svc.LoadedModelName, parser, update.Piece!, ref collectedToolCalls, out bool emit, knowledgeAnswer)
                     : OllamaResponseFactory.ChatRawTokenChunk(_svc.LoadedModelName, update.Piece);
 
                 if (useParser && resp == null)
@@ -483,29 +544,31 @@ public sealed class OllamaAdapter
                     {
                         string? thinkChunk = !string.IsNullOrEmpty(finalParsed.Thinking) ? finalParsed.Thinking : null;
                         string contentChunk = finalParsed.Content ?? "";
+                        if (knowledgeAnswer != null) { knowledgeAnswer.Append(contentChunk); contentChunk = ""; }
                         await NdJsonWriter.WriteLineAsync(ctx.Response,
                             OllamaResponseFactory.ChatParsedChunk(_svc.LoadedModelName, contentChunk, thinkChunk),
                             ctx.RequestAborted, JsonOptions.IgnoreNulls).ConfigureAwait(false);
                     }
 
+                }
+                if (knowledgeAnswer != null && knowledgeAnswer.Length > 0)
                     await NdJsonWriter.WriteLineAsync(ctx.Response,
-                        OllamaResponseFactory.ChatParsedFinalChunk(_svc.LoadedModelName,
+                        OllamaResponseFactory.ChatParsedChunk(_svc.LoadedModelName, knowledge.Normalize(knowledgeAnswer.ToString()), null),
+                        ctx.RequestAborted, JsonOptions.IgnoreNulls).ConfigureAwait(false);
+
+                object final = useParser || sawParsedUpdate
+                    ? OllamaResponseFactory.ChatParsedFinalChunk(_svc.LoadedModelName,
                             FinishReasonMapper.ToOllamaDoneReason(update.FinishReason,
                                 collectedToolCalls != null && collectedToolCalls.Count > 0),
                             collectedToolCalls,
                             update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens,
-                            update.TotalNs, update.PromptNs, update.EvalNs),
-                        ctx.RequestAborted, JsonOptions.IgnoreNulls).ConfigureAwait(false);
-                }
-                else
-                {
-                    await NdJsonWriter.WriteLineAsync(ctx.Response,
-                        OllamaResponseFactory.ChatRawFinalChunk(_svc.LoadedModelName,
+                            update.TotalNs, update.PromptNs, update.EvalNs)
+                    : OllamaResponseFactory.ChatRawFinalChunk(_svc.LoadedModelName,
                             FinishReasonMapper.ToOllamaDoneReason(update.FinishReason, hasToolCalls: false),
                             update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens,
-                            update.TotalNs, update.PromptNs, update.EvalNs),
-                        ctx.RequestAborted, JsonOptions.IgnoreNulls).ConfigureAwait(false);
-                }
+                            update.TotalNs, update.PromptNs, update.EvalNs);
+                await NdJsonWriter.WriteLineAsync(ctx.Response, knowledge.WithSources(final),
+                    ctx.RequestAborted, JsonOptions.IgnoreNulls).ConfigureAwait(false);
             }
         }
     }
@@ -521,7 +584,8 @@ public sealed class OllamaAdapter
         IOutputParser parser,
         string piece,
         ref List<ToolCall>? collectedToolCalls,
-        out bool emit)
+        out bool emit,
+        StringBuilder? knowledgeAnswer = null)
     {
         var parsed = parser.Add(piece, false);
         if (parsed.ToolCalls != null)
@@ -529,6 +593,7 @@ public sealed class OllamaAdapter
 
         string? thinkChunk = !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
         string contentChunk = parsed.Content ?? "";
+        if (knowledgeAnswer != null) { knowledgeAnswer.Append(contentChunk); contentChunk = ""; }
 
         if (thinkChunk == null && contentChunk.Length == 0)
         {
@@ -549,7 +614,8 @@ public sealed class OllamaAdapter
         List<ToolFunction>? tools,
         bool enableThinking,
         SkillRequestPlan? skillPlan,
-        ILogger skillLogger)
+        ILogger skillLogger,
+        KnowledgeProtocolRequest knowledge)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -568,6 +634,7 @@ public sealed class OllamaAdapter
             in _svc.ChatStreamWithSkillsAsync(messages, maxTokens, ctx.RequestAborted, samplingConfig,
                 tools, enableThinking, skillPlan, skillLogger).ConfigureAwait(false))
         {
+            knowledge.Observe(update);
             if (!update.Done)
             {
                 collector.Add(update);
@@ -591,18 +658,18 @@ public sealed class OllamaAdapter
         {
             var parsed = collector.Resolve(_svc.Architecture, enableThinking, tools);
             string? thinkingOut = enableThinking && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
-            finalMessage = OllamaResponseFactory.ChatNonStreamingMessage(parsed.Content, thinkingOut, parsed.ToolCalls);
+            finalMessage = OllamaResponseFactory.ChatNonStreamingMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
         }
         else
         {
-            finalMessage = OllamaResponseFactory.ChatPlainMessage(rawOutput);
+            finalMessage = OllamaResponseFactory.ChatPlainMessage(knowledge.Normalize(rawOutput));
         }
 
         await ctx.Response.WriteAsync(JsonSerializer.Serialize(
-            OllamaResponseFactory.ChatNonStreamingResponse(_svc.LoadedModelName, finalMessage,
+            knowledge.WithSources(OllamaResponseFactory.ChatNonStreamingResponse(_svc.LoadedModelName, finalMessage,
                 FinishReasonMapper.ToOllamaDoneReason(pipelineFinishReason, sawToolCalls),
-                promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs),
+                promptTokens, evalTokens, kvReusedTokens, totalNs, promptNs, evalNs)),
             JsonOptions.IgnoreNulls)).ConfigureAwait(false);
     }
 }

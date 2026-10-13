@@ -91,7 +91,7 @@ public class WebUiTurnStatsTests
             Assert.Contains("turnEvalNs += update.EvalNs;", handler.Groups["body"].Value, StringComparison.Ordinal);
         }
 
-        Assert.Contains("turnRepetitionExplained, turnEvalTokens, turnEvalNs))", source, StringComparison.Ordinal);
+        Assert.Matches(@"turnRepetitionExplained,\s*turnEvalTokens,\s*turnEvalNs(?:,\s*knowledge)?\)\)", source);
         Assert.Contains("WebUiTurnStats.Summarize(evalTokens, evalNs, tokenCount, sw.Elapsed.TotalSeconds)", source, StringComparison.Ordinal);
     }
 

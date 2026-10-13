@@ -110,12 +110,17 @@ public static partial class WebUiRoutes
         CatalogModel? loadedModel = host.Catalog.FirstOrDefault(m =>
             string.Equals(Path.GetFileName(Path.GetDirectoryName(loaded)), m.Id, StringComparison.Ordinal)
             && string.Equals(Path.GetFileName(loaded), m.Weights.FileName, StringComparison.Ordinal));
+        IReadOnlyList<CatalogLora> offered = LoraCatalog.Offered(loadedModel, host.Catalog);
         return new
         {
             loadedModel = loadedModel?.Id,
+            loadedModelFile = Path.GetFileName(loaded),
+            loadedModelName = loadedModel?.DisplayName,
+            loadedModelIsImage = loadedModel?.IsImageGenerator == true,
+            supportsLoras = loadedModel?.IsImageGenerator == true && offered.Count > 0,
             minStrength = LoraCatalog.MinStrength,
             maxStrength = LoraCatalog.MaxStrength,
-            loras = LoraCatalog.Offered(loadedModel, host.Catalog)
+            loras = offered
                 .Select(l =>
                 {
                     ImageLoraChoice? choice = chosen.FirstOrDefault(c => string.Equals(c.Id, l.Id, StringComparison.OrdinalIgnoreCase));

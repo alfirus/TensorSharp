@@ -176,6 +176,9 @@
   <table class="ref-table">
     <thead><tr><th>Variable</th><th>Description</th></tr></thead>
     <tbody>
+      <tr><td><code>TS_KNOWLEDGE_DIRECTORY</code></td><td>Standalone server store root; setting it enables <code>/api/knowledge</code>. TensorAgent uses its own data directory. <a href="knowledge.html#server">Configuration →</a></td></tr>
+      <tr><td><code>TS_KNOWLEDGE_EMBEDDING_MODEL / TS_KNOWLEDGE_EMBEDDING_BACKEND / TS_KNOWLEDGE_QUERY_PREFIX / TS_KNOWLEDGE_DOCUMENT_PREFIX</code></td><td>Optional local GGUF encoder, backend and query/document prefixes; changing its identity needs reindexing for semantic search.</td></tr>
+      <tr><td><code>TS_KNOWLEDGE_RERANK</code></td><td><code>0</code> disables chat hosts' bounded model relevance pass; fallback retains the original retrieval order.</td></tr>
       <tr><td><code>BACKEND</code></td><td>Default backend (<code>ggml_metal</code> on macOS, <code>ggml_cpu</code> elsewhere).</td></tr>
       <tr><td><code>MAX_TOKENS</code></td><td>Default max generation length (20000).</td></tr>
       <tr><td><code>TS_PDF_MAX_PAGES</code></td><td>Cap on PDF pages read (upload and CLI <code>--pdf</code>); 0 = all pages (default).</td></tr>
@@ -251,6 +254,7 @@
   <table class="ref-table">
     <thead><tr><th>Method &amp; path</th><th>Style</th><th>Purpose</th></tr></thead>
     <tbody>
+      <tr><td><code>/api/knowledge/collections</code> · document routes · <code>POST /api/knowledge/search</code> · <code>POST /api/knowledge/read</code></td><td>Opt-in</td><td>Collection/document lifecycle, scoped search/read and versioned original downloads. Search/read use <code>collectionIds</code>; supported inference requests use <code>knowledgeCollections</code>. <a href="http-api.html#knowledge">Endpoint scope →</a></td></tr>
       <tr><td><code>GET /</code> · <code>GET /index.html</code></td><td>Web UI</td><td>Browser chat application when <code>wwwroot</code> is present; bare <code>/</code> falls back to liveness only in a headless deployment.</td></tr>
       <tr><td><code>GET /health</code></td><td>Utility</td><td>Stable plain-text liveness response.</td></tr>
       <tr><td><code>POST /api/generate</code></td><td>Ollama</td><td>Single-prompt completion (stream or not).</td></tr>
@@ -309,6 +313,7 @@
   <table class="ref-table">
     <thead><tr><th>Member</th><th>Signature / values</th><th>Notes</th></tr></thead>
     <tbody>
+      <tr><td><code>KnowledgeStore</code> · <code>KnowledgeOptions</code> · <code>IKnowledgeExtractor</code> · <code>IKnowledgeEmbeddingProvider</code></td><td><code>TensorSharp.Knowledge</code></td><td>Independent personal store, configuration and extraction/embedding extension points. <a href="knowledge.html">Coverage and limits</a>.</td></tr>
       <tr><td><code>ModelBase.Create</code></td><td><code>static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null, string draftModelPath = null)</code></td><td>Auto-detects architecture from GGUF metadata.</td></tr>
       <tr><td><code>ModelBase.Forward</code></td><td><code>float[] Forward(int[] tokens)</code></td><td>Returns next-token logits (length = vocab size).</td></tr>
       <tr><td><code>ModelBase.Sample</code></td><td><code>int Sample(float[] logits, SamplingConfig config, IList&lt;int&gt; generated = null)</code></td><td>Applies penalties + sampling.</td></tr>

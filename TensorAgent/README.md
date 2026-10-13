@@ -8,8 +8,33 @@ in the app process for text and reasoning, multimodal questions, agentic code an
 document work, **Qwen-Image 2.1 image generation and editing**, and MiniMax-H3 short
 video with audio. Choose a model for the task and use the same composer, saved chats
 and artifact links. Image edits support painted selections, protected pixels,
-original/result comparison and twelve optional LoRA plug-ins. The interface is
+original/result comparison and fourteen optional LoRA plug-ins. The interface is
 available in [eight languages](#languages).
+
+**Personal knowledge:** open **Menu → Knowledge** to upload documents, datasets,
+media or nested folders, and import saved chats with available attachments and produced
+files. Browse by filename, path and type, inspect indexed totals and extraction coverage,
+rename collections, and explicitly select collections for a chat. Cited source links
+open an in-app original/text preview and persist with the conversation; image/video
+sources show thumbnails, and code agents can open complete datasets in their private
+workspace. See [Reusable knowledge](#reusable-knowledge) and the
+[knowledge guide](../docs/knowledge-system.md) for setup and current limits.
+
+**Steer a response:** type and submit a new instruction while the app is reasoning
+or answering. The next response uses the conversation, partial output and your
+guidance. Stop remains available when the composer is empty.
+
+PDF reading uses the system OCR frameworks on Apple devices. On supported Windows
+hosts, TensorAgent automatically prepares the PDF tools and English, Simplified
+Chinese and Traditional Chinese language data in its private cache when a PDF
+page first needs OCR. Selectable-text PDFs work offline without setup. The Knowledge
+panel shows progress and offers **Retry PDF setup** if a download fails; later uses
+work offline. English and Simplified Chinese are selected by default; Traditional
+Chinese is available through the OCR language option. This setup needs no administrator
+rights or package-manager commands, and does not upload your documents. Explicit
+OCR executable/data paths or the disabled provider override automatic setup.
+The reusable TensorAgent host also supports this setup on Linux; there is no Linux
+MAUI application package.
 
 The .NET MAUI project shares its chat page and loopback API across iOS/iPadOS,
 Mac Catalyst and Windows WinUI heads. Physical iPhones and iPads use GGML Metal
@@ -24,7 +49,10 @@ setup and your first chat. The updated Release Binaries workflow publishes Deskt
 DMG/PKG/ZIP and MSI/ZIP assets; historical releases may lack them. iPhone/iPad still
 use the [source-build instructions](#build-and-run).
 
-**Model and validation scope.** The 37 catalog entries start at the 12 GB system
+Knowledge and response steering were added after the `v2026.10.10` tag; use a
+source build or a package that contains those changes.
+
+**Model and validation scope.** The 38 catalog entries start at the 12 GB system
 RAM tier, with larger models requiring higher tiers. Qwen3.8 Flash Next has an
 experimental UD-IQ1_M entry from 32 GB and a UD-Q2_K_XL entry from 48 GB,
 both with SSD-backed weights and optional vision and draft companions. These eligibility tiers describe physical system RAM,
@@ -200,7 +228,13 @@ the keyboard, a layout that follows `visualViewport`, a single `+` sheet for
 Photo / Camera / Video / File, and reasoning collapsed behind a disclosure.
 
 Press **Enter** to send and **Shift+Enter** for a new line. Enter used to confirm an
-IME composition does not send, and pressing it during generation does not stop the turn.
+IME composition does not send. While a response is running, typing a new instruction
+changes the composer action to **Steer response**; send it to interrupt the current
+producer and start a response from the conversation, saved partial output and new
+guidance. Cleanup of the old generation/tool work finishes before the next producer
+starts, and rapid guidance messages are preserved in order. With an empty composer,
+the button remains **Stop**; a bare Enter does not stop the turn. The server Web UI
+and interactive CLI support the same workflow; redirected CLI input remains sequential.
 After a text turn, the answer shows its token count, elapsed time and tokens per second,
 plus prompt/KV reuse when reported and a stopped/truncated marker when applicable.
 Those statistics are saved with the conversation and return when it is reopened;
@@ -258,7 +292,6 @@ See [The desktop's larger models](#the-desktops-larger-models) for the historica
 | --- | --- | --- | --- | --- |
 | Gemma 4 E2B (Q8_0) | text, image, audio, video | download: 4,967,497,152-byte main GGUF + 557,368,064-byte projector | 12 GB | `ggml-org/gemma-4-E2B-it-GGUF` |
 | Gemma 4 E4B (IQ4_XS) | text, image, audio, video | download: 4,715,416,704-byte main GGUF + 559,874,816-byte projector; 98,653,280-byte draft optional | 12 GB | `unsloth/gemma-4-E4B-it-GGUF` + `ggml-org/gemma-4-E4B-it-GGUF` (projector and draft) |
-| Gemma 4 12B (UD-IQ2_M) | text; image and video with optional projector | download: 4,213,353,280-byte main GGUF; 175,115,840-byte projector and 465,109,248-byte draft optional | 12 GB | `unsloth/gemma-4-12b-it-GGUF` |
 | Bonsai 2 27B (PTQ1_0) | text; image with optional projector | download: 5,946,648,928-byte main GGUF; 629,246,976-byte projector optional | 16 GB | `prism-ml/Ternary-Bonsai-2-27B-gguf` |
 | Qwen3.5 9B (IQ4_XS) | text; image and video with optional projector | download: 5,168,653,536-byte main GGUF; 918,166,080-byte projector optional | 12 GB | `unsloth/Qwen3.5-9B-GGUF` |
 | Qwen3.8 27B (UD-Q4_K_XL) | text; image and video with optional projector | download: 17,559,178,144-byte main GGUF; 927,607,488-byte projector optional | 32 GB | `unsloth/Qwen3.8-27B-GGUF` |
@@ -393,15 +426,18 @@ HEIC/HEIF photos use a full-resolution PNG for editing and comparison while thei
 small preview remains in the attachment list. Reattach older HEIC/HEIF uploads if
 the editor asks for a full-resolution source.
 
-**LoRA plug-ins.** With Qwen-Image 2.1 loaded, Model > LoRA plug-ins lists twelve LoRAs
-made for it. Each is pinned to a commit and a SHA-256 in `LoraCatalog` and downloaded on its
+**LoRA plug-ins.** With a compatible Qwen-Image 2.1 model loaded, the **LoRA plug-ins**
+button above the message box opens its compatible adapters in one tap. The model details
+sheet keeps the same shortcut; both hide when the loaded model has no supported LoRAs.
+The existing side menu is unchanged. Search filters the list locally, and the composer
+shows the selected adapters. The catalog contains fourteen LoRAs in total. Each is pinned to a commit and a SHA-256 in `LoraCatalog` and downloaded on its
 own, 80-680 MB, into `Library/Caches/TensorAgent/loras/<id>/`. A switch turns one on, a
 slider sets the strength of a style or an edit (10-150%), and Remove deletes the files and
 turns it off. Speed plug-ins (Viggle Turbo, 6 steps; Pruna 8-Step; Pruna 5-Step; Fun-Acc
 4-Step) replace the model's 40 steps with their own schedule, so only one can be on and
-turning on another turns it off. Styles (Film Stills, Grainscape, Quality Fix) apply to every
+turning on another turns it off. Styles (Film Stills, Grainscape, Casual Phone Photo, Quality Fix) apply to every
 picture. Edits (Detail Enhancer, Natural Exposure, Object Remover, Object Mover, Anime
-Consistency) apply only when a photo is attached, and the sheet shows the phrase a request
+Consistency, Voxel Style) apply only when a photo is attached, and the sheet shows the phrase a request
 needs for the ones trained on one. The choice is saved (`imageLoras` in the settings) and
 applies from the next picture, never to one being drawn, and the progress line names what
 the picture is drawn with ("Drawing with Viggle Turbo + Film Stills… step 3 of 6"). Object
@@ -410,16 +446,22 @@ applies to; on its own example photos it removed both marked cats but none of th
 cars, which is why its row says to check the result. A plug-in that is on but whose files
 have gone refuses the picture with the reason rather than drawing without it, and its row
 keeps the switch that turns it off. Most are under the Qwen Research License
-(non-commercial), Anime Consistency is Apache-2.0, and the authors of Quality Fix and Detail
-Enhancer state none; each row says which.
+(non-commercial), Anime Consistency is Apache-2.0, and the authors of Quality Fix, Detail
+Enhancer and Casual Phone Photo state none; each row says which.
 
 **Qwen-Image 2.1 Turbo.** The Turbo entries' GGUFs carry no metadata and have the base
 model's tensors, so each entry declares that it is Turbo (`CatalogModel.ImageVariant`,
 published to the engine as `TS_QWEN_IMAGE_VARIANT` with its companions) and every picture
 samples Turbo's own 8-step schedule at CFG 1, whatever the file is called. Turbo is
 step-distilled already, so the LoRA sheet does not offer it a speed plug-in: while a Turbo
-entry is loaded the sheet lists only the plug-ins validated on it, Film Stills and
-Grainscape. A plug-in turned on for Qwen-Image 2.1 that does not apply to Turbo stays saved
+entry is loaded the sheet lists only compatible plug-ins: Film Stills,
+Grainscape, Casual Phone Photo, and Voxel Style. Casual Phone Photo uses strength 0.8 and
+the `lbxstyle` trigger; Voxel Style uses strength 1 with an attached photo and the
+instruction `Transform the image into a voxel style`. Both keep Turbo’s eight steps.
+The new adapters' image validation covers AD-Q4_K; Q8 shares their architecture
+and adapter mapping, but has not been separately image-tested. See the
+[validation scope](../docs/models/qwenimage21.md#lora-plug-ins-on-turbo).
+A plug-in turned on for Qwen-Image 2.1 that does not apply to Turbo stays saved
 and sits out Turbo's pictures, which the log says for each one ("Viggle Turbo sits out:
 Qwen-Image 2.1 Turbo is step-distilled already", "Detail Enhancer sits out: not validated on
 Qwen-Image 2.1 Turbo"). The picture planner, the Qwen3-VL scoring and edits that keep the source size work
@@ -680,7 +722,11 @@ running keeps the terms it started with.
 a link — one archive, or a plain-text list of links, one per line — and can remove any
 skill, bundled ones included: removing a bundled skill is recorded in
 `removed-skills.txt` in the backed-up data directory, so an app update does not bring it
-back.
+back. Each row in the Skills list has a **Use in this chat** switch and a **Remove
+this skill** button, so multiple skills can be managed without opening their details.
+The skill name opens its full description. When the Skills master switch is off,
+chat switches are disabled, while removal remains available. Failed removals show
+an error in the list and keep the skill and its selection intact.
 
 **Code, generated and run.** The agent host's shell tool works here, backed by an
 in-process POSIX shell, an embedded CPython 3.13 and JavaScriptCore, because iOS
@@ -791,6 +837,50 @@ is active. The folder must be writable. `GET /api/agent/settings` reports the
 effective `modelCacheDirectory`; change it through
 `POST /api/agent/settings/model-cache-directory` with
 `{"modelCacheDirectory":"<absolute-path>"}` (an empty string restores the default).
+
+## Reusable knowledge
+
+Open **Menu → Knowledge**, create or browse a collection, then choose **Upload files**,
+**Upload folder**, or **Add chats**. Folder imports include nested files and preserve
+relative paths. The searchable, paginated chat picker can import up to 32 saved chats
+with their available attachments and produced files. Both user and assistant messages
+are indexed; private reasoning is excluded. Imports are snapshots, and adding a chat
+again refreshes its stable source paths without duplicating unchanged files. Missing
+files and per-file failures are reported for retry.
+
+Browsing, importing or reindexing a collection does not select it for inference.
+Check **Use {collection} in this chat**, or its checkbox in the collection catalog.
+Selected chips appear above the composer; a new chat starts with no collections,
+and reopening a saved chat restores its selection. Collection totals, filename/path
+and type filters, sorting, and pagination help inspect large libraries. Rename keeps
+the collection's identity and selections intact.
+
+The default retrieval is local BM25. Optional GGUF embeddings add semantic search,
+and bounded reranking can use the loaded chat model. Documents and Office files are
+read locally with explicit extraction coverage; PDF OCR uses the providers described
+above. A compatible vision model/projector can transcribe visible text and describe
+images or up to eight video frames; audio needs an audio-capable model or configured
+transcription companion. Media model output is parsed before indexing, excluding
+private reasoning and tool framing. Filename/path matches remain searchable without
+becoming source text, and explicit media searches prefer relevant original assets.
+Unsupported formats or missing capabilities remain metadata-only until reindexed.
+Video soundtracks and events between sampled frames are not indexed.
+
+Search results offer **Read surrounding context** and an original/text preview.
+An answer's **Retrieved sources** includes only sources cited in the final answer,
+using host-verified identities. The same links survive saved-chat restoration and
+stream replay; stale or deleted versions fail instead of opening a different source.
+Image/video links show thumbnails; supported video previews seek to the retrieved
+timestamp. Native downloads present the original through the platform file viewer.
+These identities establish the source being opened, not the correctness of every
+generated statement.
+
+Knowledge tools can refine a search, expand cited context and open complete originals
+in a code agent's private workspace. This allows aggregation over a complete CSV,
+while ordinary answer retrieval stays bounded by evidence and tool budgets. The same
+core store, supported inference adapters and `/api/knowledge` API serve TensorSharp's
+standalone server. See the [knowledge guide](../docs/knowledge-system.md) for format
+limits, OCR and embedding setup, API scope, reproducible probes and validation coverage.
 
 ## Build and run
 
@@ -1798,6 +1888,17 @@ dotnet test TensorAgent/tests/TensorAgent.Tests/TensorAgent.Tests.csproj
 The project is part of `TensorSharp.slnx`, so `dotnet test TensorSharp.slnx` runs it
 together with `InferenceWeb.Tests`.
 
+Knowledge regression suites cover folder and saved-chat import, per-chat collection
+selection, source previews, cited-only thumbnails, and extraction/store contracts in
+`TensorAgent.Tests`, `TensorSharp.Knowledge.Tests` and `InferenceWeb.Tests`.
+`ChatSteeringTests` and the CLI/WebUI steering tests cover cancellation, ordered
+successors, saved partial output and replay using controlled producers. The
+[knowledge layout probe](../eng/validation/tensoragent-knowledge-layout.py) and
+[steering probe](../eng/validation/validate-webui-steering.mjs) exercise the browser UI.
+These probes use controlled API/SSE fixtures and do not establish real-model
+inference or native keyboard/folder-picker coverage; live-model and OCR runs have
+their own prerequisites and recorded scope in the knowledge guide.
+
 Hermetic by default. These groups need something the machine may not have and say
 so rather than passing silently:
 
@@ -1821,7 +1922,7 @@ the real files load is `InferenceWeb.Tests`' `RealArticleLoras_LoadCompletelyAga
 with `TENSORSHARP_QWEN21_LORA_DIR` pointing at the app's `Library/Caches/TensorAgent/loras`
 and `TENSORSHARP_QWEN21_DIT` at its Qwen-Image transformer GGUF. Its rank-256 Viggle Turbo
 row needs a file the app does not ship, so against that folder it fails with
-FileNotFoundException and the twelve the app offers pass.
+FileNotFoundException; the original twelve catalog adapters passed that validation.
 
 None of this runs in CI. `.github/workflows/pr-unit-tests.yml` runs `InferenceWeb.Tests`,
 whose `TensorAgentMauiProjectTests` read the MAUI head's project file, `Info.plist`,
@@ -2102,10 +2203,11 @@ checked and these were not:
   never came that close: 14 follow-ups written to be ambiguous, in four languages, led by
   0.24 at the least (`ImageTurnsRealModelTests`). So the question and its buttons have not
   been shown for a real answer, and whether 0.15 is the right line is not measured.
-- **LoRA plug-ins beyond the prompts tried.** Each of the twelve made pictures in the app
+- **LoRA plug-ins beyond the prompts tried.** Each of the original twelve made pictures in the app
   from the prompts and photos `chat-e2e.py` sends, and the two box-driven edits were also run
   on their authors' example photos. Object Remover failed on one of its two. How each fares
-  on other subjects is up to the plug-in, and nothing here measures it.
+  on other subjects is up to the plug-in, and nothing here measures it. The two newly added
+  adapters have separate AD-Q4_K image validation; their Q8 image quality and latency remain untested.
 - **Qwen3.8 Flash Next beyond the recorded configurations.** UD-Q2_K_XL was measured
   in the Debug app on one 48 GB M5 Pro. A Mac with more memory gets a different expert
   placement plan, which nothing here has measured; the Q2 entry retains its 48 GB tier.

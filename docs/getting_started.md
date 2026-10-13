@@ -163,6 +163,41 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 
 Use `cpu` for 100% pure C# execution without native inference libraries, or `ggml_cpu`, `ggml_metal`, and `ggml_cuda` for native GGML execution; run chat and embedding services separately. See the [embedding guide](embeddings.md) for Snowflake downloads, batching, dimensions, the C# API, tokenization, and performance validation.
 
+## Reuse your files as a knowledge library
+
+Current source after the `v2026.10.10` tag adds personal knowledge collections
+and response steering; use a source build until a release includes these changes.
+In TensorAgent, open **☰ → Knowledge**, create a collection and upload files or
+folders, or use **Add chats** to index snapshots of saved chats with available
+attachments and generated files. Inspect each source's extraction status, then
+choose **Use in this chat** before asking questions. Uploading alone does not
+select a collection. Cited answer links open the retained original and excerpts.
+
+The library supports text, code, datasets, partial Office extraction and local
+PDF OCR. Images and sampled video need a compatible loaded vision model; audio can use
+a loaded audio tower or a configured `TS_JEV_TRANSCRIPTION_URL` companion.
+**Reindex** processes the original again after capabilities change.
+Retrieval defaults to BM25, with optional GGUF embeddings for semantic search.
+The [knowledge guide](knowledge-system.md) explains coverage, limits and citations.
+
+The standalone server enables the same store through `TS_KNOWLEDGE_DIRECTORY`:
+
+```bash
+export TS_KNOWLEDGE_DIRECTORY="$HOME/TensorSharpKnowledge"
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model models/gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal \
+  --host 127.0.0.1 --port 5001
+```
+
+Use a backend available on your host. Manage sources with `/api/knowledge` and
+send their collection IDs as `knowledgeCollections` on a supported chat request;
+see the [API examples](../TensorSharp.Server.Host/API_EXAMPLES.md#personal-knowledge-library).
+The standalone browser UI provides response steering; TensorAgent provides the
+collection-management interface. While the CLI, TensorAgent or server browser UI
+is reasoning or answering, submit a new instruction to interrupt and continue
+with that guidance. **Stop**, or Ctrl+C in the CLI, interrupts without a new
+message. Redirected CLI input remains sequential.
+
 ## Pick a Backend
 
 Backend support depends on the model architecture. Embedding models support pure C# `cpu` and native `ggml_cpu`, `ggml_metal`, and `ggml_cuda`; see the [status matrix](PROJECT_STATUS.md#status-matrix) for other model-specific limits.

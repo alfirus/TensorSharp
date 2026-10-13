@@ -8,15 +8,17 @@
 
 **TensorSharp is a .NET 10 inference engine for local GGUF models.** Run it on Windows, macOS or Linux through the CLI, browser chat, or Ollama/OpenAI-compatible APIs, or embed it in your own .NET application. Use managed C# CPU kernels or native CUDA, Metal and Vulkan backends, with support that varies by model.
 
-Current source covers text and reasoning, multimodal input, embeddings, image generation/editing, video with audio, and Agent Skills with code tools. TensorSharp also powers [TensorAgent](TensorAgent/README.md), the local app for iPhone, iPad, Mac and Windows. Start below, or check the [project status](docs/PROJECT_STATUS.md) for capabilities and validation limits; source changes may be ahead of published packages.
+Current source covers text and reasoning, multimodal input, embeddings, image generation/editing, video with audio, personal knowledge collections, and Agent Skills with code tools. TensorSharp also powers [TensorAgent](TensorAgent/README.md), the local app for iPhone, iPad, Mac and Windows. Start below, or check the [project status](docs/PROJECT_STATUS.md) for capabilities and validation limits; knowledge and response steering were added after the `v2026.10.10` tag and require a build containing those changes.
 
 ## Highlights
 
 - **Local models, several interfaces.** One engine for CLI use, browser chat and Ollama/OpenAI-compatible APIs, across managed CPU and native accelerator backends.
 - **Text and multimodal models.** Dense and MoE GGUF models, reasoning, image/audio input and document questions. See [Supported models](docs/supported_models.md) for each family's capabilities.
-- **Embeddings and media generation.** [Text/code embeddings](docs/embeddings.md), [Qwen-Image-2.1](docs/models/qwenimage21.md) generation and masked editing, and video models including [MiniMax-H3 with audio](docs/models/minimax-h3.md).
+- **Embeddings and media generation.** [Text/code embeddings](docs/embeddings.md), [Qwen-Image-2.1 and its 8-step Turbo variant](docs/models/qwenimage21.md) generation and masked editing, and video models including [MiniMax-H3 with audio](docs/models/minimax-h3.md).
 - **Efficient serving.** Continuous batching and a paged, Radix prefix-shared KV cache are on by default. Speculative decoding and multi-GPU placement are available for supported models. See [Features](FEATURES.md).
 - **Agent Skills and code tools.** `TensorSharp.AgentHost` adds file, shell and document workflows. Server and TensorAgent chats also support [bounded sub-agent delegation](docs/multi_agent.md) with private workspaces and read-only defaults.
+- **Personal knowledge collections.** [Upload files or nested folders, and import saved chats with their attachments and artifacts](docs/knowledge-system.md). Select collections per chat, retrieve cited excerpts with page/row/time locations, preview originals, or let code agents open full datasets. Local BM25 works by default; optional GGUF embeddings add semantic search, and compatible media models index images, audio and sampled video. Extraction status and warnings show coverage limits.
+- **Steer an active response.** Submit a new instruction while the CLI, server Web UI or TensorAgent is reasoning or answering. The next response uses the conversation, partial output and your guidance; Stop remains available.
 - **Recorded comparisons.** Benchmarks against `llama.cpp` use identical GGUF files and hardware; results apply to the measured model, backend and workload. See [Benchmarks](docs/benchmarks.md).
 - **TensorAgent apps.** Local chat, attachments, skills and saved work on phones and desktops. See the [Mac/Windows installation guide](docs/tensoragent_desktop.md) and [app coverage notes](TensorAgent/README.md).
 
@@ -84,7 +86,7 @@ The app includes its .NET runtime and native engine. Windows needs [WebView2 Eve
 
 Backend, modality, feature support, and validation coverage vary by model. See the [supported models](docs/supported_models.md) tables, the [model cards](docs/models/README.md), and the [embedding guide](docs/embeddings.md) for details.
 
-Recent source additions include Qwen-Image-2.1 masked edits with exact protected pixels and optional processing of the selected region, twelve TensorAgent LoRA plug-ins for speed, style and editing, and Qwen3.8 Flash Next on a 48 GB Mac using SSD-backed weights. Multi-GPU `--layer-split` and `--tp` are separate controls; support and performance depend on the architecture and quantization. These source features may be ahead of published packages; Desktop installers appear in releases built with the updated Release Binaries workflow, while older releases may lack them.
+TensorAgent's current catalog has 38 entries, grouped into searchable model families with memory and download filters, including Qwen-Image-2.1 Turbo at 4-bit and 8-bit quantizations and fourteen image LoRA plug-ins. The expanded catalog includes experimental entries whose memory tiers and app/device behavior have not all been measured. Qwen3.8 Flash Next uses SSD-backed weights; its Q2 package was measured on a 48 GB Mac, and IQ1_M has separate Windows catalog-host validation. Multi-GPU `--layer-split` and `--tp` are separate controls; support and performance depend on the architecture and quantization. See [TensorAgent's coverage notes](TensorAgent/README.md#what-has-not-been-verified) and the model cards. Desktop installers appear in releases built with the updated Release Binaries workflow, while older releases may lack them.
 
 ## See it in action
 
@@ -141,6 +143,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | The vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
 | [Agent Skills & agentic work](docs/agent_skills.md) | The `SKILL.md` format, progressive disclosure and its budget, the in-process tool loop, sandboxed code execution, workspaces and artifacts, the path/ZIP/exec security model, and the HTTP + C# surfaces |
 | [Multiple agents](docs/multi_agent.md) | Automatic task delegation, private child workspaces, dependency scheduling, permission limits, server controls, and reproducible evaluation |
+| [Personal knowledge](docs/knowledge-system.md) | Collections, folder and saved-chat imports, document/PDF/media extraction, local retrieval, cited previews, dataset tools, APIs and validation limits |
 | [Browser automation skill (Playwright)](docs/playwright_agent.md) | Running the bundled `playwright` skill, which drives a browser through `@playwright/cli` via `skills_run`: the flags it needs, the macOS Chromium-sandbox config, account handoff, and TensorAgent desktop hosting (not iOS) |
 | [Speculative decoding](docs/speculative_decoding.md) | The three-layer design (model adapter / algorithm / speculator weights), the shipped `auto` / `draft-head` / `block` / `ngram` algorithms, and what to write to add a new one |
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
@@ -160,7 +163,8 @@ Actively developed, and the source tree runs ahead of the published packages.
 | Backends | Pure C# CPU, direct CUDA/cuBLAS, MLX Metal, and GGML CPU/Metal/CUDA/Vulkan, with per-architecture exceptions. |
 | Serving features | Continuous batching with a shared prefix cache, speculative decoding, tensor parallelism, structured output, and tool calling. |
 | Agentic work | Agent Skills, sandboxed file and shell tools, and bounded sub-agents. See [Agent Skills](docs/agent_skills.md) and [Multiple agents](docs/multi_agent.md). |
-| TensorAgent | Twelve catalog entries, saved chats and artifacts, masked image edits and LoRA choices, eight interface languages, and persisted text-turn statistics. Media generation has been measured on a Mac; iOS media generation and Windows image/audio/video generation remain unverified. |
+| Knowledge | Local document, dataset and media collections; folder/saved-chat import in TensorAgent, per-chat scope, lexical/optional semantic retrieval, source previews and complete-dataset agent tools. Media extraction and OCR have explicit coverage limits. See [Personal knowledge](docs/knowledge-system.md). |
+| TensorAgent | 38 catalog entries with family search and filters, saved chats and artifacts, personal knowledge, response steering, masked image edits, 8-step Turbo, fourteen LoRAs, eight interface languages, and persisted text-turn statistics. Expanded catalog entries remain experimental; iOS media generation and Windows image/audio/video generation remain unverified. |
 
 Per-area detail (which architecture runs on which backend, which features each family supports, and the known limits) is in the [status matrix](docs/PROJECT_STATUS.md#status-matrix).
 

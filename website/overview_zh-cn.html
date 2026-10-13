@@ -27,10 +27,11 @@
     <li><strong>库</strong> —— 引用源码项目，从你自己的 .NET 代码调用引擎。→ <a href="code-api_zh-cn.html">C# 库</a></li>
   </ul>
 
+  <p>TensorAgent 提供本地应用界面，支持可搜索的模型家族目录、个人知识库与生成中的回答引导。<a href="tensoragent_zh-cn.html">桌面指南</a> · <a href="knowledge_zh-cn.html">知识库</a>。个人知识库与回答引导在 <code>v2026.10.10</code> 后合入；请使用包含这些功能的新构建。</p>
   <h2 id="business">商业价值</h2>
   <p>对评估本地推理的决策者而言，核心权衡是用<em>运行自己的硬件</em>换取<em>掌控力与成本</em>。</p>
   <div class="card-grid">
-    <div class="card"><div class="ic">🔒</div><h3>数据隐私与合规</h3><p>提示词与文档永不离开你的基础设施 —— 适合受监管、私有部署或离网环境。</p></div>
+    <div class="card"><div class="ic">🔒</div><h3>数据隐私与合规</h3><p>本地推理与知识库存储在自己的硬件上运行。下载、启用网络的工具与显式配置的外部伴随服务遵循宿主配置。</p></div>
     <div class="card"><div class="ic">💸</div><h3>成本可预测</h3><p>没有按 token 计费的 API。容量受限于你本就已预算的硬件。</p></div>
     <div class="card"><div class="ic">🧩</div><h3>无供应商锁定</h3><p>来自 Hugging Face 的开放 GGUF 模型，以及现有工具已支持的 OpenAI / Ollama 兼容接口。</p></div>
     <div class="card"><div class="ic">🏗️</div><h3>.NET 原生集成</h3><p>将推理嵌入现有 C# 服务，而非桥接到外部运行时。</p></div>
@@ -39,7 +40,7 @@
   </div>
 
   <h2 id="architecture">架构</h2>
-  <p>TensorSharp 是一个分层系统。每一层都是可独立打包的项目，因此源码使用者只需引用需要的部分。发布集合共 13 个包，由 <code>eng/verify-packages.ps1</code> 校验。包与 Release 版本对应各自的发布标签；发行后合并的功能需要包含它们的新版发行包，或使用当前源码构建。<a href="code-api_zh-cn.html#packages">包的职责与引用方式 →</a></p>
+  <p>TensorSharp 是一个分层系统。每一层都是可独立打包的项目，因此源码使用者只需引用需要的部分。当前源码发布集合共 14 个包，由 <code>eng/verify-packages.ps1</code> 校验。包与 Release 版本对应各自的发布标签；发行后合并的功能需要包含它们的新版发行包，或使用当前源码构建。<a href="code-api_zh-cn.html#packages">包的职责与引用方式 →</a></p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>层</th><th>职责</th></tr></thead>
@@ -52,6 +53,7 @@
       <tr><td><strong>TensorSharp.Backends.Cuda</strong></td><td>直接 CUDA 路径：CUDA Driver API、cuBLAS GEMM，以及热点运算的 PTX 内核，并带 CPU 回退。</td></tr>
       <tr><td><strong>TensorSharp.Backends.MLX</strong></td><td>Apple Silicon 的 MLX 路径，封装 <a href="https://github.com/ml-explore/mlx-c" target="_blank" rel="noopener">mlx-c</a>，提供量化、融合与编译内核。</td></tr>
       <tr><td><strong>TensorSharp.Distributed</strong></td><td>多节点张量并行所用的点对点 TCP 协调层，与模型 / 运行时层分离。</td></tr>
+      <tr><td><strong>TensorSharp.Knowledge</strong></td><td>独立的个人资料库：原文件与版本化文档、提取器、BM25/可选向量检索、范围隔离与引用位置；Chat、AgentHost 与宿主层接入同一个存储。<a href="knowledge_zh-cn.html">知识库指南 →</a></td></tr>
       <tr><td><strong>TensorSharp.Chat</strong></td><td>服务端与 TensorAgent 共用的、与宿主无关的聊天流水线：模型服务、会话、生成、每模型的连续批处理引擎宿主、技能与子智能体循环，以及 Web UI 的请求 / 流式协议，不依赖 ASP.NET Core。CLI 项目虽然引用了该库，但并不基于它的流水线运行，而是用自己的循环驱动 <code>TensorSharp.Runtime</code> 的推理引擎。</td></tr>
       <tr><td><strong>TensorSharp.Server</strong></td><td>构建在 <code>TensorSharp.Chat</code> 之上的 ASP.NET Core HTTP / 应用层：兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI 的路由、上传处理与参数解析。<code>TensorSharp.Server.Host</code> 是提供该页面的可执行程序。</td></tr>
       <tr><td><strong>TensorSharp.Cli</strong></td><td>控制台宿主，用于本地提示词、多模态实验、提示词检查、JSONL 批处理工作流、交互式 REPL 与基准测试。</td></tr>

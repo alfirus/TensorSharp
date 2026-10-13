@@ -1305,7 +1305,8 @@ button.primary:hover { background: var(--accent-hover); }
         <textarea id="message-input" placeholder="Type a message..." rows="1"></textarea>
         <div class="input-actions">
           <button onclick="document.getElementById('file-input').click()" title="Attach file">&#x1F4CE;</button>
-          <button class="send-btn" id="btn-send" onclick="sendMessage()">&#x27A4;</button>
+          <button class="stop-btn" id="btn-stop" onclick="abortGeneration()" title="Stop generating" aria-label="Stop generating" hidden>&#x25A0;</button>
+          <button class="send-btn" id="btn-send" onclick="sendMessage()" title="Send message" aria-label="Send message">&#x27A4;</button>
         </div>
       </div>
     </div>
@@ -1344,7 +1345,6 @@ let chatHistory = [];
 let pendingAttachments = [];
 let activeImageEditTarget = null;
 let isGenerating = false;
-let currentAbortController = null;
 let currentLoadedModel = null;
 let currentArchitecture = null;
 // What the loaded model does with attached pictures, straight from /api/models.
@@ -1483,16 +1483,32 @@ window.addEventListener('beforeunload', () => {
   }
 });
 
-async function createSession() {
-  try {
-    const res = await fetch('/api/sessions', { method: 'POST' });
-    const data = await res.json();
-    if (data && data.sessionId) {
-      currentSessionId = data.sessionId;
+async function createSession(contextVersion = chatContextVersion) {
+  if (sessionCreationTask && sessionCreationTask.contextVersion === contextVersion) {
+    return sessionCreationTask.promise;
+  }
+  const creation = { contextVersion, promise: null };
+  creation.promise = (async () => {
+    try {
+      const res = await fetch('/api/sessions', { method: 'POST' });
+      const data = await res.json();
+      if (contextVersion !== chatContextVersion) {
+        if (data && data.sessionId && data.sessionId !== DEFAULT_SESSION_ID) {
+          await fetch('/api/sessions/' + encodeURIComponent(data.sessionId), { method: 'DELETE' });
+        }
+        return;
+      }
+      if (data && data.sessionId) currentSessionId = data.sessionId;
+    } catch (e) {
+      console.error('Failed to create chat session:', e);
+      if (contextVersion === chatContextVersion) currentSessionId = null;
     }
-  } catch (e) {
-    console.error('Failed to create chat session:', e);
-    currentSessionId = null;
+  })();
+  sessionCreationTask = creation;
+  try {
+    await creation.promise;
+  } finally {
+    if (sessionCreationTask === creation) sessionCreationTask = null;
   }
 }
 
@@ -1509,6 +1525,11 @@ async function disposeCurrentSession() {
 }
 
 async function clearChat() {
+  const contextVersion = ++chatContextVersion;
+  queuedChatMessages.length = 0;
+  queuedResponseRequested = false;
+  cancelCurrentGeneration('discarded');
+  const generationFinished = currentGeneration ? currentGeneration.finished : Promise.resolve();
   chatHistory = [];
   pendingAttachments = [];
   activeImageEditTarget = null;
@@ -1516,9 +1537,21 @@ async function clearChat() {
   chatContainer.innerHTML = '';
   needsCacheReset = false;
   shouldAutoScroll = true;
-  await disposeCurrentSession();
-  await createSession();
-  renderEmptyState();
+  const reset = (async () => {
+    await generationFinished;
+    if (contextVersion !== chatContextVersion) return;
+    await disposeCurrentSession();
+    if (contextVersion !== chatContextVersion) return;
+    await createSession(contextVersion);
+    if (contextVersion === chatContextVersion) renderEmptyState();
+  })();
+  chatResetTask = reset;
+  try {
+    await reset;
+  } finally {
+    if (chatResetTask === reset) chatResetTask = null;
+    setSendButtonState(isGenerating || queuedResponseRequested);
+  }
 }
 
 let uploadQueue = Promise.resolve();
@@ -2663,7 +2696,6 @@ function mdInline(text, host) {
 }
 
 async function sendMessage() {
-  if (isGenerating) return;
   if (pendingUploadCount) {
     alert('Please wait for file uploads to finish, then send again.');
     return;
@@ -2765,21 +2797,73 @@ async function sendMessage() {
     });
   }
 
-  chatHistory.push(msg);
-  addUserBubble(userContent, attachmentsCopy, chatHistory.length - 1);
   messageInput.value = '';
   messageInput.style.height = 'auto';
   pendingAttachments = [];
   activeImageEditTarget = null;
   attachmentsDiv.innerHTML = '';
 
-  const empt = chatContainer.querySelector('.empty-state');
-  if (empt) empt.remove();
-
-  await requestAssistantResponse();
+  queuedChatMessages.push({ message: msg, displayText: userContent, attachments: attachmentsCopy });
+  queuedResponseRequested = true;
+  cancelCurrentGeneration('steered');
+  setSendButtonState(true);
+  await drainChatSubmissions();
 }
 
-async function runImageEdit(userMsg, bubbleText, statsDiv) {
+// Finish the interrupted assistant entry before appending guidance. Several
+// submissions during cancellation become one successor request in their original
+// order, and only one stream may own the current chat's history at a time.
+let queuedChatMessages = [];
+let queuedResponseRequested = false;
+let chatSubmissionTask = null;
+let chatContextVersion = 0;
+let chatResetTask = null;
+let sessionCreationTask = null;
+let currentGeneration = null;
+
+function drainChatSubmissions() {
+  if (chatSubmissionTask) return chatSubmissionTask;
+  chatSubmissionTask = (async () => {
+    try {
+      while (queuedChatMessages.length || queuedResponseRequested) {
+        while (currentGeneration || chatResetTask) {
+          if (currentGeneration) await currentGeneration.finished;
+          if (chatResetTask) await chatResetTask;
+        }
+        if (!queuedChatMessages.length && !queuedResponseRequested) break;
+        for (const queued of queuedChatMessages.splice(0)) {
+          chatHistory.push(queued.message);
+          addUserBubble(queued.displayText, queued.attachments, chatHistory.length - 1);
+        }
+        const empt = chatContainer.querySelector('.empty-state');
+        if (empt) empt.remove();
+        if (queuedResponseRequested) {
+          queuedResponseRequested = false;
+          await requestAssistantResponse();
+        }
+      }
+    } finally {
+      chatSubmissionTask = null;
+      setSendButtonState(isGenerating || queuedResponseRequested);
+    }
+  })();
+  return chatSubmissionTask;
+}
+
+function cancelCurrentGeneration(reason) {
+  if (!currentGeneration) return;
+  currentGeneration.cancelReason = reason;
+  currentGeneration.controller.abort();
+}
+
+function ensureCurrentGeneration(generation) {
+  generation.controller.signal.throwIfAborted();
+  if (generation !== currentGeneration || generation.contextVersion !== chatContextVersion) {
+    throw new DOMException('The chat has changed.', 'AbortError');
+  }
+}
+
+async function runImageEdit(userMsg, bubbleText, statsDiv, generation) {
   const editImages = userMsg.stillImagePaths || userMsg.imagePaths || [];
   const editing = editImages.length > 0;
   const action = editing ? 'Image edit' : 'Image generation';
@@ -2814,8 +2898,9 @@ async function runImageEdit(userMsg, bubbleText, statsDiv) {
         prompt: userMsg.content || '', keepSourceSize: editing || undefined,
         maskPath: userMsg.maskPath, maskMode: userMsg.maskMode,
         maskFeather: userMsg.maskFeather, maskCrop: userMsg.maskCrop }),
-      signal: currentAbortController.signal
+      signal: generation.controller.signal
     });
+    ensureCurrentGeneration(generation);
     if (!res.ok) {
       let err = 'HTTP ' + res.status;
       try { const j = await res.json(); if (j && j.error) err = j.error; } catch {}
@@ -2829,6 +2914,7 @@ async function runImageEdit(userMsg, bubbleText, statsDiv) {
     let buffer = '';
     while (true) {
       const { done, value } = await reader.read();
+      ensureCurrentGeneration(generation);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -2913,7 +2999,7 @@ function fmtDuration(s) {
   return `${Math.round(s)}s`;
 }
 
-async function runVideoGenerate(userMsg, bubbleText, statsDiv) {
+async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
   bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
   // What attached media MEANS depends on the checkpoint, and only the server knows
   // which one is loaded. A reference model (MiniMax-H3 Ref2VA) takes stills, clips
@@ -2964,8 +3050,9 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      signal: currentAbortController.signal
+      signal: generation.controller.signal
     });
+    ensureCurrentGeneration(generation);
     if (!res.ok) {
       let err = 'HTTP ' + res.status;
       try { const j = await res.json(); if (j && j.error) err = j.error; } catch {}
@@ -2979,6 +3066,7 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv) {
     let buffer = '';
     while (true) {
       const { done, value } = await reader.read();
+      ensureCurrentGeneration(generation);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -3045,11 +3133,18 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv) {
 }
 
 async function requestAssistantResponse() {
-  if (isGenerating) return;
+  if (currentGeneration) return currentGeneration.finished;
   if (!currentLoadedModel) return;
 
+  let finishGeneration;
+  const generation = {
+    controller: new AbortController(),
+    contextVersion: chatContextVersion,
+    cancelReason: null,
+    finished: new Promise(resolve => { finishGeneration = resolve; })
+  };
+  currentGeneration = generation;
   isGenerating = true;
-  currentAbortController = new AbortController();
   setSendButtonState(true);
 
   const assistDiv = addAssistantBubble();
@@ -3058,7 +3153,6 @@ async function requestAssistantResponse() {
 
   let fullText = '';
   let fullThinking = '';
-  let wasAborted = false;
   // Tokens arrive faster than frames, so the answer is re-rendered at most once a
   // frame. Anything that writes the bubble another way cancels a pending render first.
   let answerFrame = 0;
@@ -3066,6 +3160,7 @@ async function requestAssistantResponse() {
     if (answerFrame) return;
     answerFrame = requestAnimationFrame(() => {
       answerFrame = 0;
+      if (generation.controller.signal.aborted || generation.contextVersion !== chatContextVersion) return;
       renderMarkdown(bubbleText, fullText);
       scrollChatToBottom();
     });
@@ -3080,25 +3175,29 @@ async function requestAssistantResponse() {
 
   try {
     if (!currentSessionId) {
-      await createSession();
+      await createSession(generation.contextVersion);
     }
+    ensureCurrentGeneration(generation);
 
     // Qwen image models use the diffusion endpoints; an attachment selects editing.
     const _lastUser = chatHistory[chatHistory.length - 1];
     if ((currentArchitecture === 'qwen_image' || currentArchitecture === 'qwen-image') && _lastUser) {
-      await runImageEdit(_lastUser, bubbleText, statsDiv);
+      await runImageEdit(_lastUser, bubbleText, statsDiv, generation);
       return;
     }
 
     // Video generation: the prompt (plus an optional attached image as the first
     // frame) produces a video, not chat text. Every video architecture routes here.
     if (VIDEO_ARCHITECTURES.has(currentArchitecture) && _lastUser) {
-      await runVideoGenerate(_lastUser, bubbleText, statsDiv);
+      await runVideoGenerate(_lastUser, bubbleText, statsDiv, generation);
       return;
+    }
+    if (!currentSessionId || currentSessionId === DEFAULT_SESSION_ID) {
+      throw new Error('Could not create a chat session. Please try sending the message again.');
     }
 
     const reasoningOn = document.getElementById('reasoning-toggle').checked;
-    const chatPayload = { messages: chatHistory, maxTokens: serverDefaultMaxTokens, think: reasoningOn };
+    const chatPayload = { messages: chatHistory, maxTokens: serverDefaultMaxTokens, think: reasoningOn, replaceActive: true };
     if (currentSessionId) {
       chatPayload.sessionId = currentSessionId;
     }
@@ -3114,13 +3213,15 @@ async function requestAssistantResponse() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(chatPayload),
-      signal: currentAbortController.signal
+      signal: generation.controller.signal
     });
+    ensureCurrentGeneration(generation);
 
     if (res.status === 404 && chatPayload.sessionId) {
       // Session vanished on the server (e.g. restart); recreate and retry once.
       currentSessionId = null;
-      await createSession();
+      await createSession(generation.contextVersion);
+      ensureCurrentGeneration(generation);
       if (currentSessionId) {
         chatPayload.sessionId = currentSessionId;
         chatPayload.newChat = true;
@@ -3128,8 +3229,9 @@ async function requestAssistantResponse() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(chatPayload),
-          signal: currentAbortController.signal
+          signal: generation.controller.signal
         });
+        ensureCurrentGeneration(generation);
       }
     }
 
@@ -3155,6 +3257,7 @@ async function requestAssistantResponse() {
 
     while (true) {
       const { done, value } = await reader.read();
+      ensureCurrentGeneration(generation);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -3263,18 +3366,23 @@ async function requestAssistantResponse() {
       }
     }
   } catch (e) {
-    if (e.name === 'AbortError') {
-      wasAborted = true;
-      statsDiv.textContent = 'Stopped by user';
+    if (e.name === 'AbortError' || generation.controller.signal.aborted) {
+      statsDiv.textContent = generation.cancelReason === 'steered' ? 'Steered by new prompt' : 'Stopped by user';
+      if (!fullText && !fullThinking) {
+        bubbleText.textContent = generation.cancelReason === 'steered' ? 'Interrupted by new prompt.' : 'Response stopped.';
+      }
     } else {
       cancelLiveAnswer();
       bubbleText.textContent = 'Error: ' + e.message;
     }
   } finally {
+    cancelLiveAnswer();
     // Covers cancellation, network failure, malformed/early-ended SSE, and any
     // server path that could not emit the normal `finished`/`done` lifecycle.
     clearCurrentActivity(assistDiv);
-    if (fullText) {
+    const sameChat = generation.contextVersion === chatContextVersion;
+    if (fullText && sameChat) renderMarkdown(bubbleText, fullText);
+    if ((fullText || fullThinking) && sameChat) {
       const assistantMessage = { role: 'assistant', content: fullText };
       if (fullThinking) assistantMessage.thinking = fullThinking;
       chatHistory.push(assistantMessage);
@@ -3287,16 +3395,19 @@ async function requestAssistantResponse() {
       actionsDiv.innerHTML = `<button class="danger" onclick="revertFrom(${assistIdx})" title="Remove this response">&#x21A9; Revert</button>`;
       bubble.appendChild(actionsDiv);
     }
-    isGenerating = false;
-    currentAbortController = null;
-    setSendButtonState(false);
+    if (currentGeneration === generation) {
+      currentGeneration = null;
+      isGenerating = false;
+      setSendButtonState(queuedResponseRequested);
+    }
     const indicator = assistDiv.querySelector('.typing-indicator');
     if (indicator) indicator.remove();
+    finishGeneration();
   }
 }
 
 function revertFrom(historyIdx) {
-  if (isGenerating) return;
+  if (isGenerating || chatSubmissionTask || chatResetTask) return;
 
   chatHistory.splice(historyIdx);
 
@@ -3311,7 +3422,7 @@ function revertFrom(historyIdx) {
 }
 
 function startEdit(historyIdx) {
-  if (isGenerating) return;
+  if (isGenerating || chatSubmissionTask || chatResetTask) return;
 
   const msgEl = chatContainer.querySelector(`.message[data-idx="${historyIdx}"]`);
   if (!msgEl) return;
@@ -3349,6 +3460,7 @@ function cancelEdit(historyIdx) {
 }
 
 async function submitEdit(historyIdx) {
+  if (isGenerating || chatSubmissionTask || chatResetTask) return;
   const msgEl = chatContainer.querySelector(`.message[data-idx="${historyIdx}"]`);
   if (!msgEl) return;
 
@@ -3381,23 +3493,27 @@ async function submitEdit(historyIdx) {
 }
 
 function abortGeneration() {
-  if (currentAbortController) {
-    currentAbortController.abort();
-  }
+  // Accepted guidance still belongs in history, but Stop prevents its automatic
+  // restart if it was submitted just before this click.
+  queuedResponseRequested = false;
+  cancelCurrentGeneration('stopped');
+  setSendButtonState(isGenerating);
 }
 
 function setSendButtonState(generating) {
   const btn = document.getElementById('btn-send');
+  const stop = document.getElementById('btn-stop');
+  stop.hidden = !generating;
+  // Reserve all three controls at narrow widths while steering is available.
+  messageInput.style.paddingRight = generating ? '148px' : '';
   if (generating) {
-    btn.className = 'stop-btn';
-    btn.innerHTML = '&#x25A0;';
-    btn.setAttribute('onclick', 'abortGeneration()');
-    btn.title = 'Stop generating';
+    btn.title = 'Send a message to steer the response';
+    btn.setAttribute('aria-label', 'Send a message to steer the response');
+    messageInput.placeholder = 'Type a message to steer the response...';
   } else {
-    btn.className = 'send-btn';
-    btn.innerHTML = '&#x27A4;';
-    btn.setAttribute('onclick', 'sendMessage()');
     btn.title = 'Send message';
+    btn.setAttribute('aria-label', 'Send message');
+    messageInput.placeholder = 'Type a message...';
   }
 }
 

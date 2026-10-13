@@ -137,6 +137,23 @@ namespace TensorSharp.Runtime
         public bool OutputParserAlwaysRequired { get; init; }
 
         /// <summary>
+        /// Use the protocol parser to identify reasoning for the thinking budget.
+        /// Routed formats such as Muse-Glimmer have several self, tool, and user
+        /// messages in one reply; counting until a generic reasoning-end tag counts
+        /// the answer too, because that tag is absent from their format.
+        /// </summary>
+        public bool ThinkingBudgetUsesOutputParser { get; init; }
+
+        /// <summary>
+        /// Routing header to complete after <see cref="TemplateAssistantHeaderAnchor"/>
+        /// when generating a direct answer with neither reasoning nor tools enabled.
+        /// Applied only when the rendered generation prompt ends at that bare anchor.
+        /// It is recorded from the actual prompt for parsing and raw-token replay;
+        /// it must not be assumed for older turns whose model emitted its own header.
+        /// </summary>
+        public string? DirectAnswerGenerationSuffix { get; init; }
+
+        /// <summary>
         /// Text after which a structured-output grammar may start enforcing, or null
         /// when the model's very first token is already part of the answer.
         ///
@@ -176,6 +193,13 @@ namespace TensorSharp.Runtime
         /// and Qwen3.5-9B cut at 450 tokens went on reasoning in its answer.
         /// </summary>
         public string? ThinkingBudgetClosingText { get; init; }
+        /// <summary>For message-routed reasoning, trained framing that closes the
+        /// reasoning message and opens the answer message within one generation.
+        /// The host installs it only after tokenization and EOS validation.</summary>
+        public string? ThinkingBudgetTransitionText { get; init; }
+        /// <summary>Alternative framing when tools are offered. Leaves recipient
+        /// selection to the model so closing reasoning cannot suppress a tool call.</summary>
+        public string? ThinkingBudgetToolTransitionText { get; init; }
 
         /// <summary>
         /// The generation prompt opens the reasoning block whatever the request's thinking

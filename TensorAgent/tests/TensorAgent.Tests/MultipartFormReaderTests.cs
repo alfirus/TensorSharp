@@ -33,6 +33,40 @@ public sealed class MultipartFormReaderTests
 {
     private const string Boundary = "----WebKitFormBoundaryQrJ0k9y2mLc8Xv3P";
 
+    [Theory]
+    [InlineData("report;part.txt", "report;part.txt")]
+    [InlineData("report \\\"draft\\\".txt", "report \"draft\".txt")]
+    [InlineData("literal%22%2F.txt", "literal%22%2F.txt")]
+    [InlineData("研究资料 空间.txt", "研究资料 空间.txt")]
+    [InlineData("C:\\\\fakepath\\\\report.txt", "report.txt")]
+    public async Task QuotedMultipartFileNamesPreservePunctuationUnicodeAndLiteralPercentSequences(string wireName, string expected)
+    {
+        using var form = await MultipartFormReader.ReadAsync(new ChoppyStream(Body(wireName, "text/plain", "plans"u8.ToArray()), 7),
+            "multipart/form-data; boundary=" + Boundary, CancellationToken.None);
+        var file = Assert.Single(form.Files);
+        Assert.Equal(expected, file.FileName);
+        Assert.Equal("plans", await File.ReadAllTextAsync(file.TempPath));
+    }
+
+    [Fact]
+    public async Task ExtendedMultipartFileNameDecodesUtf8AndEscapesWithoutChangingLiteralPercents()
+    {
+        string name = "研究; \"draft\" %22.txt";
+        string wire = $"--{Boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"fallback.txt\"; "
+            + $"filename*=UTF-8''{Uri.EscapeDataString(name)}\r\nContent-Type: text/plain\r\n\r\nplans\r\n--{Boundary}--\r\n";
+        using var form = await MultipartFormReader.ReadAsync(new ChoppyStream(Encoding.UTF8.GetBytes(wire), 7),
+            "multipart/form-data; boundary=" + Boundary, CancellationToken.None);
+        Assert.Equal(name, Assert.Single(form.Files).FileName);
+    }
+
+    [Fact]
+    public async Task MalformedQuotedMultipartDispositionIsRejectedBeforeSpooling()
+    {
+        using var stream = new ChoppyStream(Body("bad\"unfinished.txt", "text/plain", "plans"u8.ToArray()), 7);
+        await Assert.ThrowsAsync<InvalidDataException>(() => MultipartFormReader.ReadAsync(stream,
+            "multipart/form-data; boundary=" + Boundary, CancellationToken.None));
+    }
+
     /// <summary>
     /// The size that used to break it, and every size around it.
     ///
@@ -156,7 +190,7 @@ public sealed class MultipartFormReaderTests
     private static byte[] Body(string fileName, string contentType, byte[] content, (string Name, string Value)? field = null)
     {
         var body = new MemoryStream();
-        void Write(string text) => body.Write(Encoding.ASCII.GetBytes(text));
+        void Write(string text) => body.Write(Encoding.UTF8.GetBytes(text));
 
         if (field is { } f)
         {

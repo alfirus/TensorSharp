@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseAppHost>false</UseAppHost>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <!-- Export the executable and its runtime files through the standard project-reference
+       copy protocol. The consuming test project must not guess bin/configuration/TFM
+       paths: solution mappings and custom output directories can change those paths. -->
+  <Target Name="ExposePdfProcessFixtureOutputs" BeforeTargets="GetCopyToOutputDirectoryItems"
+          DependsOnTargets="AddDepsJsonAndRuntimeConfigToCopyItemsForReferencingProjects">
+    <ItemGroup>
+      <AllItemsFullPathWithTargetPath Include="$(TargetPath)"
+                                    TargetPath="PdfProcessFixture/$(TargetFileName)"
+                                    CopyToOutputDirectory="PreserveNewest" />
+      <AllItemsFullPathWithTargetPath Update="$(ProjectDepsFilePath);$(ProjectRuntimeConfigFilePath)"
+                                    TargetPath="PdfProcessFixture/%(Filename)%(Extension)" />
+    </ItemGroup>
+  </Target>
+</Project>

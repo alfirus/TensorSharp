@@ -47,18 +47,20 @@ public sealed record CatalogLora
     /// <summary>The <see cref="ModelCatalog"/> entry it adapts.</summary>
     public required string BaseModelId { get; init; }
     /// <summary>
-    /// Other entries it applies to beside <see cref="BaseModelId"/>, each one only after a real
-    /// picture showed the plug-in working there: the Qwen-Image 2.1 Turbo entries take the style
-    /// plug-ins validated on Turbo. Never a speed plug-in: Turbo is step-distilled already and
-    /// the engine refuses a second schedule (<c>LoraCatalogTests</c> holds both rules).
+    /// Other entries it applies to beside <see cref="BaseModelId"/>. Turbo style/edit adapters
+    /// are checked with real pictures on at least one quantization. The same-architecture Q8
+    /// entry shares compatibility; that does not imply separate image validation on Q8 (see
+    /// docs/models/qwenimage21.md for measured scope). Never a speed plug-in: Turbo already
+    /// supplies its own schedule, and the engine refuses a second one.
     /// </summary>
     public IReadOnlyList<string> AlsoFor { get; init; } = Array.Empty<string>();
     public required LoraKind Kind { get; init; }
     /// <summary>The adapter weights (always first) and any file the engine reads beside them.</summary>
     public required IReadOnlyList<LoraFile> Files { get; init; }
-    /// <summary>The strength the publisher recommends. A speed plug-in is always used at it.</summary>
+    /// <summary>The publisher's recommended strength, or a documented starting value when none
+    /// is specified. A speed plug-in is always used at it.</summary>
     public float DefaultStrength { get; init; } = 1f;
-    /// <summary>A speed plug-in's step count; null for the others, which run the model's own 40.</summary>
+    /// <summary>A speed plug-in's step count; null for the others, which keep the model's own schedule.</summary>
     public int? Steps { get; init; }
     /// <summary>
     /// The engine's plug-in config (<c>config/lora/&lt;id&gt;.json</c>, embedded in this assembly)
@@ -100,10 +102,10 @@ public sealed record CatalogLora
 }
 
 /// <summary>
-/// The LoRA plug-ins the app offers, all for Qwen-Image 2.1: the twelve the engine ships
+/// The LoRA plug-ins the app offers, all for Qwen-Image 2.1: the fourteen the engine ships
 /// configs for in <c>config/lora/</c>, at the same pinned files (<c>LoraCatalogTests</c> keeps
 /// the two equal). Sizes and hashes were read from the Hugging Face tree API at the pinned
-/// commits on 2026-10-01 and checked against downloaded copies.
+/// commits on 2026-10-01 (the two added adapters on 2026-10-10) and checked against downloaded copies.
 ///
 /// <para>
 /// They are add-ons, not catalog entries: a plug-in is nothing without its base model, is a
@@ -116,8 +118,8 @@ public static class LoraCatalog
 {
     public const string QwenImage = "qwen-image-2.1-q4km";
 
-    /// <summary>The Qwen-Image 2.1 Turbo entries: the style plug-ins validated on Turbo apply to
-    /// them (<see cref="CatalogLora.AlsoFor"/>), the speed plug-ins never do.</summary>
+    /// <summary>The same-architecture Qwen-Image 2.1 Turbo entries. Style/edit adapters apply
+    /// to both, with image-validation scope recorded separately; speed adapters never do.</summary>
     public static readonly IReadOnlyList<string> QwenImageTurbo = new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" };
 
     /// <summary>The Qwen Research License of the base model and most plug-ins.</summary>
@@ -245,6 +247,44 @@ public static class LoraCatalog
                     79_743_888, "b04b226561c5c3cc65a8e5f79a63a831ffb068d8bd3f156271650cb46e1dc2bf"),
             },
             Purpose = "catalog.lora.grainscape.purpose",
+            License = QwenResearch,
+        },
+        new CatalogLora
+        {
+            Id = "qwen-image-2.1-casual-phone",
+            DisplayName = "Casual Phone Photo",
+            BaseModelId = QwenImage,
+            AlsoFor = QwenImageTurbo,
+            Kind = LoraKind.Style,
+            DefaultStrength = 0.8f,
+            Trigger = "lbxstyle",
+            Files = new[]
+            {
+                new LoraFile("lbxstyle-qwen-image-2.1-step-1890.safetensors",
+                    Hf("19nbrown/qwen-image-2.1-casual-phone-photo-style-lora", "3ace7de571892ac5fa6245aed4f0500ae1da795a",
+                        "lbxstyle-qwen-image-2.1-step-1890.safetensors"),
+                    167_830_056, "c23c23e3346ab93e0af121888b34f2176347f18dac26ade87eacf21fc11bd9dc"),
+            },
+            Purpose = "catalog.lora.casualPhone.purpose",
+            License = NoneStated,
+        },
+        new CatalogLora
+        {
+            Id = "qwen-image-2.1-voxel-style",
+            DisplayName = "Voxel Style",
+            BaseModelId = QwenImage,
+            AlsoFor = QwenImageTurbo,
+            Kind = LoraKind.Edit,
+            NeedsPhoto = true,
+            Trigger = "Transform the image into a voxel style",
+            Files = new[]
+            {
+                new LoraFile("Qwen-Image-2.1-Voxel-Style-3000.safetensors",
+                    Hf("prithivMLmods/Qwen-Image-2.1-Voxel-Style", "b4ccfe9333f04c2f978f2d1bfdfdafe287cbfad1",
+                        "Qwen-Image-2.1-Voxel-Style-3000.safetensors"),
+                    83_943_936, "165e50dfe0de46276208edf76bceb075dc65ceb1867d78c5844ad23af9a14b25"),
+            },
+            Purpose = "catalog.lora.voxelStyle.purpose",
             License = QwenResearch,
         },
         new CatalogLora

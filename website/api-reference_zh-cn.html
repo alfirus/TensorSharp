@@ -176,6 +176,9 @@
   <table class="ref-table">
     <thead><tr><th>变量</th><th>说明</th></tr></thead>
     <tbody>
+      <tr><td><code>TS_KNOWLEDGE_DIRECTORY</code></td><td>独立服务器知识库存储根目录；设置后启用 <code>/api/knowledge</code>。TensorAgent 使用自己的数据目录。<a href="knowledge_zh-cn.html#server">配置 →</a></td></tr>
+      <tr><td><code>TS_KNOWLEDGE_EMBEDDING_MODEL / TS_KNOWLEDGE_EMBEDDING_BACKEND / TS_KNOWLEDGE_QUERY_PREFIX / TS_KNOWLEDGE_DOCUMENT_PREFIX</code></td><td>可选本地 GGUF 编码器、后端及查询/文档前缀；编码器身份变化后需重新索引才能语义检索。</td></tr>
+      <tr><td><code>TS_KNOWLEDGE_RERANK</code></td><td>设为 <code>0</code> 关闭聊天宿主的有界模型相关性重排；回退保留原始检索排序。</td></tr>
       <tr><td><code>BACKEND</code></td><td>默认后端（macOS 上为 <code>ggml_metal</code>，其他平台为 <code>ggml_cpu</code>）。</td></tr>
       <tr><td><code>MAX_TOKENS</code></td><td>默认最大生成长度（20000）。</td></tr>
       <tr><td><code>TS_PDF_MAX_PAGES</code></td><td>PDF 上传与 CLI <code>--pdf</code> 读取的最大页数；0 = 全部（默认）。</td></tr>
@@ -251,6 +254,7 @@
   <table class="ref-table">
     <thead><tr><th>方法与路径</th><th>风格</th><th>用途</th></tr></thead>
     <tbody>
+      <tr><td><code>/api/knowledge/collections</code> · document routes · <code>POST /api/knowledge/search</code> · <code>POST /api/knowledge/read</code></td><td>显式启用</td><td>集合/文档生命周期、范围检索/读取与版本化原文件下载。搜索/读取使用 <code>collectionIds</code>；支持的推理请求使用 <code>knowledgeCollections</code>。<a href="http-api_zh-cn.html#knowledge">端点范围 →</a></td></tr>
       <tr><td><code>GET /</code> · <code>GET /index.html</code></td><td>Web UI</td><td>存在 <code>wwwroot</code> 时提供浏览器聊天应用；仅在无 UI 部署中，裸 <code>/</code> 才回退为存活响应。</td></tr>
       <tr><td><code>GET /health</code></td><td>工具</td><td>稳定的纯文本存活响应。</td></tr>
       <tr><td><code>POST /api/generate</code></td><td>Ollama</td><td>单提示补全（流式或非流式）。</td></tr>
@@ -309,6 +313,7 @@
   <table class="ref-table">
     <thead><tr><th>成员</th><th>签名 / 取值</th><th>说明</th></tr></thead>
     <tbody>
+      <tr><td><code>KnowledgeStore</code> · <code>KnowledgeOptions</code> · <code>IKnowledgeExtractor</code> · <code>IKnowledgeEmbeddingProvider</code></td><td><code>TensorSharp.Knowledge</code></td><td>独立个人存储、配置与提取/嵌入扩展；<a href="knowledge_zh-cn.html">支持范围与限制</a>。</td></tr>
       <tr><td><code>ModelBase.Create</code></td><td><code>static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null, string draftModelPath = null)</code></td><td>从 GGUF 元数据自动识别架构。</td></tr>
       <tr><td><code>ModelBase.Forward</code></td><td><code>float[] Forward(int[] tokens)</code></td><td>返回下一 token 的 logits（长度 = 词表大小）。</td></tr>
       <tr><td><code>ModelBase.Sample</code></td><td><code>int Sample(float[] logits, SamplingConfig config, IList&lt;int&gt; generated = null)</code></td><td>应用惩罚 + 采样。</td></tr>

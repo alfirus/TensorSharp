@@ -166,18 +166,31 @@ public sealed class ChatTurnManager : IDisposable
     /// </summary>
     /// <param name="key">The conversation this belongs to, or the session when there is no conversation.</param>
     /// <param name="frames">The generation, started with the TURN's token — never a request's.</param>
-    public string Start(string key, Func<CancellationToken, IAsyncEnumerable<object>> frames)
+    /// <param name="sessionId">The request's session, so cancellation before a terminal frame can still save partial output.</param>
+    public string Start(string key, Func<CancellationToken, IAsyncEnumerable<object>> frames, string? sessionId = null)
+        => StartCore(key, frames, sessionId, preservePrevious: false);
+
+    /// <summary>Interrupt a response, save its partial output, and continue after its producer has unwound.</summary>
+    public string StartSteered(string key, Func<CancellationToken, IAsyncEnumerable<object>> frames, string? sessionId = null)
+        => StartCore(key, frames, sessionId, preservePrevious: true);
+
+    private string StartCore(string key, Func<CancellationToken, IAsyncEnumerable<object>> frames, string? sessionId, bool preservePrevious)
     {
         ArgumentException.ThrowIfNullOrEmpty(key);
         ArgumentNullException.ThrowIfNull(frames);
 
-        var turn = new Turn(Guid.NewGuid().ToString("N"), key);
+        var turn = new Turn(Guid.NewGuid().ToString("N"), key) { SerializesPredecessor = preservePrevious };
         Turn? previous;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             EvictExpired();
             _byKey.TryGetValue(key, out previous);
+            // Once a replacement must wait for a preserving predecessor, later
+            // replacements inherit that boundary until the chain has unwound.
+            turn.SerializesPredecessor = preservePrevious || previous?.SerializesPredecessor == true;
+            if (preservePrevious && previous is not null)
+                previous.PersistBeforeSuccessor = true;
             _byKey[key] = turn;
             _byId[turn.Id] = turn;
         }
@@ -190,7 +203,7 @@ public sealed class ChatTurnManager : IDisposable
         // On its own thread, and deliberately not awaited. The first pull of a
         // generation blocks for as long as a prefill takes, and the request that asked
         // for this turn must be free to start streaming it long before then.
-        _ = Task.Run(() => PumpAsync(turn, frames));
+        _ = Task.Run(() => PumpAsync(turn, frames, sessionId, turn.SerializesPredecessor ? previous?.Completion : null));
         return turn.Id;
     }
 
@@ -353,13 +366,14 @@ public sealed class ChatTurnManager : IDisposable
     /// long gone by the last token.
     /// </para>
     /// </summary>
-    private async Task PumpAsync(Turn turn, Func<CancellationToken, IAsyncEnumerable<object>> frames)
+    private async Task PumpAsync(Turn turn, Func<CancellationToken, IAsyncEnumerable<object>> frames, string? initialSessionId, Task? predecessor)
     {
         var content = new StringBuilder();
         var thinking = new StringBuilder();
         var artifacts = new List<StoredArtifact>();
+        var knowledgeSources = new List<JsonElement>();
         var artifactUrls = new HashSet<string>(StringComparer.Ordinal);
-        string? sessionId = null;
+        string? sessionId = initialSessionId;
         string? imageUrl = null, videoUrl = null, audioUrl = null;
         ImageTurnRecord? image = null;
         StoredTurnStats? stats = null;
@@ -367,14 +381,26 @@ public sealed class ChatTurnManager : IDisposable
 
         try
         {
+            // Wait even when this turn was itself superseded. Its preparation can
+            // record the guidance before the next successor reads the transcript.
+            if (predecessor is not null)
+                await predecessor.ConfigureAwait(false);
             await foreach (object frame in frames(turn.Token).WithCancellation(turn.Token).ConfigureAwait(false))
             {
-                turn.Append(frame, content, MaxBufferedFrames);
-                ReadInto(frame, content, thinking, artifacts, artifactUrls, ref sessionId, ref imageUrl, ref videoUrl, ref audioUrl, ref image, ref stats);
+                // Some native/tool producers finish their current step before
+                // observing cancellation. Those late frames belong to no response.
+                if (turn.Token.IsCancellationRequested)
+                    continue;
+                turn.Append(frame, content, MaxBufferedFrames, knowledgeSources);
+                ReadInto(frame, content, thinking, artifacts, artifactUrls, ref sessionId, ref imageUrl, ref videoUrl, ref audioUrl, ref image, ref stats, knowledgeSources);
             }
-            state = ChatTurnState.Completed;
+            state = turn.Token.IsCancellationRequested ? ChatTurnState.Cancelled : ChatTurnState.Completed;
         }
         catch (OperationCanceledException)
+        {
+            state = ChatTurnState.Cancelled;
+        }
+        catch (Exception) when (turn.Token.IsCancellationRequested)
         {
             state = ChatTurnState.Cancelled;
         }
@@ -389,12 +415,13 @@ public sealed class ChatTurnManager : IDisposable
             }
             else
             {
-                turn.Append(new { error = ex.Message }, content, MaxBufferedFrames);
+                turn.Append(new { error = ex.Message }, content, MaxBufferedFrames, knowledgeSources);
             }
             state = ChatTurnState.Failed;
         }
 
-        // Only the turn that still OWNS the conversation writes the transcript.
+        // The owner writes the transcript, as does a turn whose steering successor
+        // explicitly waits for this recording to complete before using that history.
         //
         // A turn that was cancelled because a NEW one replaced it can take a long time
         // to unwind -- a shell command is a synchronous wait of up to the tool timeout --
@@ -403,7 +430,7 @@ public sealed class ChatTurnManager : IDisposable
         // delete the answer the user is looking at and put its own fragment under the
         // wrong question. A turn the USER stopped is still saved: it is still the turn
         // this conversation has, and its partial answer is what is on the screen.
-        if (sessionId is not null && StillOwns(turn))
+        if (sessionId is not null && MayPersist(turn))
         {
             try
             {
@@ -416,7 +443,8 @@ public sealed class ChatTurnManager : IDisposable
                     videoUrl,
                     audioUrl,
                     stats,
-                    image);
+                    image,
+                    knowledgeSources);
             }
             catch (Exception) { /* a lost transcript must not be a crash on a background thread */ }
         }
@@ -425,11 +453,12 @@ public sealed class ChatTurnManager : IDisposable
         RaiseBusy();
     }
 
-    /// <summary>Whether this turn is still the one its conversation is generating.</summary>
-    private bool StillOwns(Turn turn)
+    /// <summary>Whether this turn owns the transcript or a serialized successor needs its partial output.</summary>
+    private bool MayPersist(Turn turn)
     {
         lock (_gate)
-            return _byKey.TryGetValue(turn.Key, out Turn? current) && ReferenceEquals(current, turn);
+            return turn.PersistBeforeSuccessor
+                || (_byKey.TryGetValue(turn.Key, out Turn? current) && ReferenceEquals(current, turn));
     }
 
     /// <summary>
@@ -448,7 +477,8 @@ public sealed class ChatTurnManager : IDisposable
         ref string? videoUrl,
         ref string? audioUrl,
         ref ImageTurnRecord? image,
-        ref StoredTurnStats? stats)
+        ref StoredTurnStats? stats,
+        List<JsonElement> knowledgeSources)
     {
         try
         {
@@ -457,6 +487,7 @@ public sealed class ChatTurnManager : IDisposable
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
                 return;
+            Hosting.WebUiRoutes.CollectKnowledgeSources(root, knowledgeSources);
             if (root.TryGetProperty("done", out JsonElement done) && done.ValueKind == JsonValueKind.True)
                 stats = StoredTurnStats.FromDoneFrame(root);
             if (root.TryGetProperty("token", out JsonElement token) && token.GetString() is { } piece)
@@ -609,6 +640,12 @@ public sealed class ChatTurnManager : IDisposable
         private ChatTurnState _state = ChatTurnState.Running;
         private DateTimeOffset? _finishedAt;
         private Exception? _rejection;
+        private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // Set under the manager gate; successor generation waits for Completion.
+        public bool PersistBeforeSuccessor { get; set; }
+        public bool SerializesPredecessor { get; set; }
+        public Task Completion => _completion.Task;
 
         /// <summary>Guards everything below; also what a reader waits under.</summary>
         public object Sync { get; } = new();
@@ -637,7 +674,7 @@ public sealed class ChatTurnManager : IDisposable
             catch (ObjectDisposedException) { return false; }
         }
 
-        public void Append(object frame, StringBuilder answerSoFar, int maxFrames)
+        public void Append(object frame, StringBuilder answerSoFar, int maxFrames, IReadOnlyList<JsonElement>? knowledgeSources = null)
         {
             lock (Sync)
             {
@@ -649,7 +686,7 @@ public sealed class ChatTurnManager : IDisposable
                     // so every position a reader can be holding is still meaningful.
                     _dropped += _frames.Count - 1;
                     _frames.Clear();
-                    _frames.Add(new { replace = answerSoFar.ToString() });
+                    _frames.Add(new { replace = answerSoFar.ToString(), knowledgeSources = knowledgeSources?.ToArray() });
                 }
                 _frames.Add(frame);
                 Signal();
@@ -669,6 +706,7 @@ public sealed class ChatTurnManager : IDisposable
                 _state = state;
                 _finishedAt = DateTimeOffset.UtcNow;
                 Signal();
+                _completion.TrySetResult();
             }
         }
 

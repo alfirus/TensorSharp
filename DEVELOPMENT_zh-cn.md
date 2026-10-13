@@ -329,7 +329,9 @@ TensorSharp/
 │   ├── Speculative/             # 投机解码：起草/验证/回滚核心（SpeculativeExecution）、ISpeculator 各算法（DraftHeadSpeculator、BlockDraftSpeculator、NGramSpeculator）与 SpeculatorRegistry、模型侧契约（ISpecTrunk、SpeculativeModelContracts）、共用的参数解析（SpeculativeCliFlags、SpeculationOptions）以及运行期成本裁判
 │   ├── PrefillChunking.cs       # SWA / 超长 prompt 使用的分块 prefill 辅助
 │   └── Logging/                 # JSON-line 文件日志器 + 每轮遥测
+├── TensorSharp.Knowledge/       # 与宿主无关：持久原文件、有界文本/Office/PDF 抽取、分块、BM25/混合检索和版本化来源引用；不依赖推理或应用项目
 ├── TensorSharp.AgentHost/       # 构建在运行时之上的智能体层：Agent Skills、代码执行与子智能体委派
+│   ├── Knowledge/              # 范围受限的知识工具、证据预算、重排契约和引用绑定
 │   ├── Agents/                  # 子智能体：请求级限额（MultiAgentOptions）、spawn_agent / wait_agent / send_input / close_agent / list_agents 五个工具声明（MultiAgentTools）、请求自有的智能体树及其角色、只读工具门控与串行化的宿主工具（MultiAgentSession）、协调提示词（MultiAgentPrompt）、宿主在 prefill 之前据以设置检查点的子智能体提示词画像（MultiAgentPromptProfile），以及 Web UI 展示的进度快照（MultiAgentProgress）；详见 docs/multi_agent.md
 │   ├── Skills/                  # Agent Skills：SKILL.md frontmatter 解析（YamlFrontmatter、SkillManifest）、未配置技能根目录时使用的仓库技能根——从工作目录向上直到 Git 根目录的每个已存在的 .agents/skills（由近及远），排在 <程序目录>/skills 之前（SkillDiscovery）、发现 / 安装 / 查找（SkillRegistry、SkillArchive）、目录边界约束（SkillPathGuard）、提示词规划（SkillPrompt）、内置的 skills_list / skills_read / skills_run 工具与进程内披露循环（SkillTools、SkillAgentLoop、SkillScriptRunner）、共用的参数解析（SkillHostOptions）以及对外客户端（SkillsChatClient），以及各平台沙箱（SkillSandbox、SkillSandboxWindows）及其违规监视器、会话级工作区（SessionWorkspace）
 │   └── CodeExec/                # 文件工具（read_file、write_file）、shell 与 apply_patch：执行引擎（ShellRunner）、提供给模型的四个工具声明——read_file、apply_patch、write_file（仅用于新建文件）与 shell——以及小模型所需的宽松参数读取（ShellTools）、command 参数的解读——把一行命令拆成各个简单命令、判定其中哪些是软件包安装（这决定了这一行到底能不能拿到套接字）、并在 shell 看到之前拦截 apply_patch heredoc（ShellCommand）、会话级的工作目录与导出环境变量——因为没有常驻的 shell 进程，它们通过文件持久化（ShellSession）、shell 的发现与方言（ShellProgram）、补丁信封解析（CodePatch）及其匹配引擎——对参考实现 V4A applier 的逐行移植（V4ADiff）、把一次失败改写成下一条该敲的命令（CodeDiagnostics）、当一次运行是因为模型猜错了库的 API 而失败时，直接从已安装的包里读出真实 API（ApiProbe）、检查命令写入或补丁改动后的文件是否仍能解析（SyntaxCheck）、把宿主的绝对路径从命令的全部输出中改写掉（OutputPaths）、字符串替换编辑器及其容错阶梯——已不再向模型提供，仅为让旧客户端的编辑调用仍能分派而保留（FileEdit）、所有工具与拒绝信息展示文件时共用的带行号清单渲染器（NumberedListing）、注入系统提示词的八条编辑规则（CodePrompt）、发现「为改两行而重打整个文件」的行为（RewriteWatch）、为 import 失败的技能脚本由宿主发起的安装（PackageInstaller）、宿主侧的执行条款（CodeExecOptions）、受限启动——它也可以只启动进程而不等它结束，后台任务即由此实现（ConfinedProcess）、解释器发现（CodeEnvironment）、产物捕获（CodeArtifactStore）、安装期的软件源代理（EgressProxy）、结果记录（CodeExecResult），以及技能层所见的 ICodeRunner 接缝（CodeRunnerAdapter）
@@ -402,6 +404,7 @@ TensorSharp/
 │   ├── ggml_ops_training.cpp              # 仅训练用内核（运行时不使用）
 │   └── tests/                              # 原生单元 + 烟雾测试
 ├── TensorSharp.Chat/            # 与宿主无关的聊天流水线，由 Server、CLI 与 TensorAgent 共用（不依赖 ASP.NET Core 与 Distributed）
+│   ├── Knowledge/              # KnowledgeRuntime、请求检索/上下文适配、GGUF 嵌入/重排、已加载模型的媒体抽取及平台/托管 PDF OCR 适配
 │   ├── ModelService.cs          # 模型加载/释放、InferenceEngineHost 与生成流水线之上的门面（TensorParallelGroupFactory、SchedulerConfigOverride、UnloadModel）
 │   ├── ModelLifecycleService.cs # 模型加载/释放与后端选择；张量并行组由宿主传入
 │   ├── InferenceEngineHost.cs   # 单模型 InferenceEngine 单例（连续批处理入口）
@@ -424,6 +427,7 @@ TensorSharp/
 │   ├── ResponseSerializers/     # WebUiSseEvents（Web UI 帧形状）+ 共用 JSON 选项
 │   └── ProtocolAdapters/        # ChatStreamCollector + FinishReasonMapper（流水线词汇 -> 协议词汇）
 ├── TensorSharp.Server/          # Web 聊天 + API 服务库（ASP.NET Core）；可运行的应用是 TensorSharp.Server.Host
+│   ├── Knowledge/              # 各兼容协议的逐请求范围和引用来源/工具步骤元数据
 │   ├── BackendCatalogProbes.cs  # TensorSharp.Chat 的 BackendCatalog 背后的 CUDA / MLX / GGML 可用性探测
 │   ├── OpenAIResponseFormatParser.cs  # OpenAI response_format（json_object / json_schema）解析
 │   ├── Hosting/                 # 启动期相关：选项装配（ServerOptionsBuilder，也负责解析子智能体限额）、wwwroot 解析、/uploads 静态文件与清理、embedding 托管、多节点张量并行工厂、连续批处理 CLI 翻译
@@ -431,7 +435,7 @@ TensorSharp/
 │   ├── Responses/               # 存储的 /v1/responses 记录（内存，或经 --redis-url 存到 Redis）
 │   ├── StreamingWriters/        # SSE 与 NDJSON 线协议辅助
 │   ├── ProtocolAdapters/        # 各协议的请求处理器（OllamaAdapter、OpenAIChatAdapter、OpenAIResponsesAdapter、JevAdapter、EmbeddingAdapter；WebUiAdapter 与 SkillsAdapter 是 TensorSharp.Chat 之上的薄 HTTP 外壳）
-│   ├── Endpoints/               # ASP.NET Core 路由映射（每协议一个扩展方法）
+│   ├── Endpoints/               # ASP.NET Core 路由映射（每协议一个扩展方法），包括 /api/knowledge 管理/搜索/读取/原文件下载
 │   └── Logging/                 # 请求日志中间件 + 低噪声路径支持
 ├── TensorSharp.Server.Host/     # 可运行的 Web 应用
 │   ├── Program.cs               # 精简启动：配置文件展开、DI 注册、中间件、端点映射、连续批处理 CLI 翻译
@@ -460,6 +464,7 @@ TensorSharp/
 │   ├── skills/                  # 12 个技能（也是桌面宿主的技能根目录）；verdicts.json 记录 verify-skills.py 对每个技能的静态检查结论（对照打包的解释器解析 Python import，检查 shell 脚本是否调用 npm/npx/pnpm/yarn/parcel/vite）。10 个通过并打包进 iOS 应用；playwright 与 web-artifacts-builder 未通过，由 TensorAgent.Maui.csproj 排除
 │   └── scripts/                 # 桌面构建/启动、模拟器/真机构建/部署/验证、后台/分享探针、Python 暂存、技能检查与聊天/媒体验证
 ├── InferenceWeb.Tests/          # xUnit 单元测试，覆盖算子、KV 缓存、分页调度器、批处理模型正确性以及 Web/服务辅助逻辑
+├── TensorSharp.Knowledge.Tests/ # 可移植的存储/抽取/检索测试与固定样本；集成测试也位于 InferenceWeb.Tests 和 TensorAgent.Tests
 ├── AdvUtils/                    # 工具库（日志）
 ├── docs/                        # 开发者参考文档
 │   ├── models/                  # 按模型架构卡片（每个模型一份 .md，中英双语）
@@ -467,6 +472,7 @@ TensorSharp/
 │   ├── speculative_decoding.md  # 起草-验证设计：ISpeculativeTarget / ISpeculator / IDraftHead 三层，以及 draft-head、block 与 ngram 三种算法（英文）
 │   ├── agent_skills.md          # Agent Skills：SKILL.md 格式、渐进式披露与其预算、进程内工具循环、路径 / ZIP / 脚本执行的安全模型，以及 HTTP 与 C# 两套接口（英文）
 │   ├── multi_agent.md           # 子智能体委派：工具、角色与只读子智能体、限额、与父智能体共享前缀、宿主集成（英文）
+│   ├── knowledge-system.md      # 知识集合、抽取覆盖、OCR、检索/智能体范围、引用、SDK/HTTP 契约与验证限制（中英双语）
 │   ├── playwright_agent.md      # Playwright 浏览器技能：所需参数、macOS 沙箱配置、账号交接、已验证的宿主（英文）
 │   └── env_var_feature_matrix.md  # TestMatrix 使用的运行时开关 × 模型/后端/功能覆盖矩阵
 ├── benchmarks/                  # 可重现的基准脚本
@@ -486,6 +492,7 @@ TensorSharp/
 | `TensorSharp.Core` | `TensorSharp.Tensors` | `TensorSharp` | Tensor 原语、Ops、分配器、存储与设备抽象 |
 | `TensorSharp.Runtime.Logging` | `TensorSharp.Runtime.Logging` | `TensorSharp.Runtime.Logging` | 各宿主共用的日志抽象与输出目标；单独拆出后，引擎各层不必再背上宿主的日志栈 |
 | `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF 解析、分词器、Prompt 渲染、采样、输出协议解析、分页 KV 缓存、连续批处理调度器 |
+| `TensorSharp.Knowledge` | `TensorSharp.Knowledge`（当前源码可打包） | `TensorSharp.Knowledge` | 持久本地集合、保留原文件、有界抽取/分块、BM25/混合检索、嵌入/抽取器契约与版本化引用；不依赖运行时、模型、ASP.NET Core 或 TensorAgent 项目 |
 | `TensorSharp.AgentHost` | `TensorSharp.AgentHost` | `TensorSharp.AgentHost` | Agent Skills、代码执行（`read_file` + `write_file` + `shell` + `apply_patch`，含操作系统级沙箱、Web/CLI 会话级与 HTTP 请求级工作区，以及由宿主判定的软件包安装），以及子智能体委派的基础组件（`MultiAgentSession`、`MultiAgentTools`、`MultiAgentOptions`）——构建在 `TensorSharp.Runtime` 之上 |
 | `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`、各模型架构、多模态编码器、批处理 / 分页前向、模型侧执行辅助 |
 | `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML 执行后端与原生互操作 |
@@ -557,7 +564,7 @@ TensorSharp 采用分层系统结构：
 
 2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`），以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IBackendExecutionPlan` 等抽象。它刻意不包含智能体层：技能、代码执行与子智能体委派位于 **TensorSharp.AgentHost**，该项目引用运行时、且运行时绝不反向引用，因此只需提供 OpenAI / Ollama 聊天补全的宿主可以只依赖运行时，不携带技能注册表、沙箱与代码执行器。（若该方向被反转，`AgentHostLayeringTests` 会失败。）
 
-3. **TensorSharp.Models** 实现 `ModelBase` 以及已登记的全部 15 个架构描述符（`Architecture/BuiltInArchitectures.cs`）和多模态辅助组件——12 个文本家族（DeepSeek V4 Flash、DeepSeek V4.1 Flash、GLM 5.x、Gemma 4、DiffusionGemma、Qwen 3.5/3.6 系列、Qwen 3.8 Flash Next、GPT OSS、Nemotron-H、Mistral 3、Hunyuan Dense、Muse-Glimmer）与 3 个媒体输出家族（Qwen-Image-2.1、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-2.1（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像生成与编辑通过 `GenerateImage()` / `EditImage()` 进行，由它们编排扩散 Transformer、专用 2.1 VAE 与 Qwen3-VL-8B 文本编码器。LoRA 插件（`--lora` / `--lora-scale` / `--lora-config`，由 `TensorSharp.Runtime/LoraSpec.cs` 为两个宿主统一解析）以不合并的方式作用于扩散 Transformer（`QwenImage21LoraSet`）；`config/lora/` 提供十二个预设。视频家族更进一步：`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动两者（以及日后新增的模型），而不必逐个判断具体模型类型。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——不带架构元数据的文件例外，它们依据张量识别：MiniMax-H3 公开发布的 GGUF 完全不带元数据（`LooksLikeMiniMaxH3`，经由 `MiniMaxH3Architecture.DetectFromTensors` 接入），不带元数据的 Qwen-Image-2.1 GGUF（例如 Unsloth 的 Q8_0）也是如此（`QwenImageArchitecture.DetectFromTensors`）。以通用 `llama` 标签发布的文件则由描述符的 `RecognizeRelabelledFile` 逐个文件认领，目前只有 Mistral 3 实现了它（例如标为 `llama` 的 Mistral Small 3.1）。
+3. **TensorSharp.Models** 实现 `ModelBase` 以及已登记的全部 15 个架构描述符（`Architecture/BuiltInArchitectures.cs`）和多模态辅助组件——12 个文本家族（DeepSeek V4 Flash、DeepSeek V4.1 Flash、GLM 5.x、Gemma 4、DiffusionGemma、Qwen 3.5/3.6 系列、Qwen 3.8 Flash Next、GPT OSS、Nemotron-H、Mistral 3、Hunyuan Dense、Muse-Glimmer）与 3 个媒体输出家族（Qwen-Image-2.1、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-2.1（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像生成与编辑通过 `GenerateImage()` / `EditImage()` 进行，由它们编排扩散 Transformer、专用 2.1 VAE 与 Qwen3-VL-8B 文本编码器。LoRA 插件（`--lora` / `--lora-scale` / `--lora-config`，由 `TensorSharp.Runtime/LoraSpec.cs` 为两个宿主统一解析）以不合并的方式作用于扩散 Transformer（`QwenImage21LoraSet`）；`config/lora/` 提供十四个预设。视频家族更进一步：`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动两者（以及日后新增的模型），而不必逐个判断具体模型类型。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——不带架构元数据的文件例外，它们依据张量识别：MiniMax-H3 公开发布的 GGUF 完全不带元数据（`LooksLikeMiniMaxH3`，经由 `MiniMaxH3Architecture.DetectFromTensors` 接入），不带元数据的 Qwen-Image-2.1 GGUF（例如 Unsloth 的 Q8_0）也是如此（`QwenImageArchitecture.DetectFromTensors`）。以通用 `llama` 标签发布的文件则由描述符的 `RecognizeRelabelledFile` 逐个文件认领，目前只有 Mistral 3 实现了它（例如标为 `llama` 的 Mistral Small 3.1）。
 
 4. **TensorSharp.Backends.GGML** 通过原生 C++ 桥接库（`libGgmlOps` / `GgmlOps.dll`）注册同名操作的加速实现，并链接 [ggml](https://github.com/ggml-org/ggml)。在 macOS 上可提供 Metal GPU 计算，在 Windows/Linux 上可启用面向 NVIDIA GPU 的 GGML CUDA。除原生量化 matmul（Q4_K_M、Q8_0 等，无需反量化到 FP32）外，还提供分页注意力（`TSGgml_PagedAttentionForward`，含 / 不含注意力 sinks 两种版本）以及架构特定的批处理内核（Mamba2、GatedDeltaNet）。
 
@@ -568,6 +575,8 @@ TensorSharp 采用分层系统结构：
 7. **TensorSharp.Server** 是 HTTP / 应用层，提供兼容 Ollama 与 OpenAI 的 REST API、浏览器聊天 UI、上传处理、中间件与 SSE 写出。它所服务的流水线位于 **TensorSharp.Chat**——`ModelService`、持有自回归模型连续批处理引擎的 `InferenceEngineHost`、为所有协议（Web UI、OpenAI、Ollama）的 DiffusionGemma 聊天轮次去噪的 `DiffusionBatchScheduler`、会话、技能循环以及 Web UI 请求/流式契约（`WebUiChatService`、`SkillsService`）——因此 CLI 与 iOS 应用无需 ASP.NET Core 即可驱动同一套代码；旧的队列状态接口保留作为向后兼容。
 
 8. **TensorSharp.Cli** 是控制台 / 应用层，用于本地 prompt 运行、多模态实验、prompt 检查、JSONL 批处理、交互式 REPL 与内置的 prefill / decode 基准。
+
+9. **TensorSharp.Knowledge** 是独立的来源与索引层。**AgentHost** 添加范围受限的工具、引用与证据处理；**Chat** 装配模型抽取、嵌入、重排和平台 OCR。**Server** 暴露 HTTP 管理与推理扩展，**TensorAgent** 提供文件夹和已保存聊天导入、预览及逐聊天集合选择。这些知识功能对应 `v2026.10.10` 标签之后的源码；项目可打包本身不证明已发布相应包。精确宿主契约见[知识库指南](docs/knowledge-system_zh-cn.md)。
 
 ### 新增模型、模态或对话格式
 
@@ -675,6 +684,20 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 ```
 
 TensorAgent 共用的应用宿主有自己的测试项目 `TensorAgent/tests/TensorAgent.Tests`（见 [TensorAgent/README.md](TensorAgent/README.md)），它属于 `TensorSharp.slnx`；PR CI 不运行它，不过 `InferenceWeb.Tests` 会检查该应用的项目文件、plist、entitlement 与原生导出清单（`TensorAgentMauiProjectTests`），以及解决方案构建如何构建该应用（`TensorAgentSolutionBuildTests`）。
+
+#### 知识库验证
+
+可移植核心、协议/智能体集成与应用宿主流程分别有测试项目。以下命令从仓库根目录运行：
+
+```bash
+dotnet test TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj -c Release
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --filter 'FullyQualifiedName~Knowledge'
+dotnet test TensorAgent/tests/TensorAgent.Tests/TensorAgent.Tests.csproj -c Release --filter 'FullyQualifiedName~Knowledge'
+```
+
+真实宿主的协议、媒体、回答质量与 PDF OCR 检查见[知识库验证指南](eng/validation/knowledge/README.md)。使用隔离测试部署，将专用数据根目录放在忽略的 `artifacts/` 或 `docs/validation/` 中；需要已有知识库时，在启动宿主前复制进去，不能让有修改操作的探针指向正在使用的应用知识库。报告、原始对话、截图与生成的来源快照应保持忽略。可复用工具放在 `eng/`，必需固定样本放在相关测试项目，例如 `InferenceWeb.Tests/Fixtures/Knowledge` 与 `TensorSharp.Knowledge.Tests/Fixtures`。
+
+记录模型/后端、OCR 提供者、所选协议与实际执行的检查；不可用模型、设备或 OCR 提供者属于跳过/未覆盖。原生桥接改动需在未修改的上游 ggml 上验证并记录其版本。引用身份检查本身不证明回答质量。[知识库基准](eng/validation/KnowledgeBench/README.md)分别记录词法与真实嵌入运行，并说明固定样本与性能测量的限制。
 
 #### 测试分组（Test lanes）
 

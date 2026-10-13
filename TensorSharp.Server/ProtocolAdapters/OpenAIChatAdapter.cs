@@ -18,6 +18,8 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.Knowledge;
+using TensorSharp.Server.Knowledge;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.RequestParsers;
 using TensorSharp.Server.ResponseSerializers;
@@ -39,6 +41,7 @@ namespace TensorSharp.Server.ProtocolAdapters;
 public sealed partial class OpenAIChatAdapter
 {
     private readonly ModelService _svc;
+    private readonly KnowledgeStore? _knowledge;
     private readonly ServerHostingOptions _options;
     private readonly UploadStoragePolicy _uploads;
     private readonly SkillRegistry _skills;
@@ -58,7 +61,19 @@ public sealed partial class OpenAIChatAdapter
         ICodeRunner? codeRunner,
         SessionWorkspaceManager workspaces,
         ILoggerFactory loggerFactory)
+        : this(svc, options, uploads, skills, codeRunner, workspaces, loggerFactory, null) { }
+
+    public OpenAIChatAdapter(
+        ModelService svc,
+        ServerHostingOptions options,
+        UploadStoragePolicy uploads,
+        SkillRegistry skills,
+        ICodeRunner? codeRunner,
+        SessionWorkspaceManager workspaces,
+        ILoggerFactory loggerFactory,
+        KnowledgeStore? knowledge = null)
     {
+        _knowledge = knowledge;
         _svc = svc ?? throw new ArgumentNullException(nameof(svc));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _uploads = uploads ?? throw new ArgumentNullException(nameof(uploads));
@@ -113,6 +128,9 @@ public sealed partial class OpenAIChatAdapter
         int maxTokens = _options.ResolveMaxTokens(
             SamplingConfigParser.ReadRequestedMaxTokens(body, "max_tokens", "max_completion_tokens"));
         var samplingConfig = SamplingConfigParser.ParseOpenAI(body, _options.SamplingDefaults);
+        var knowledge = await KnowledgeProtocolRequest.ParseAsync(ctx, body, _knowledge, _svc.ContextTokens,
+            reranker: _svc.CreateKnowledgeReranker()).ConfigureAwait(false);
+        if (knowledge == null) return;
         List<ChatMessage> messages;
         try
         {
@@ -228,7 +246,9 @@ public sealed partial class OpenAIChatAdapter
             _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills,
             allowTools: responseFormat == null && !toolsDisabled, codeRunner: _codeRunner,
             workspace: workspaceLease?.Workspace, logger: openaiLogger,
-            multiAgent: SkillSelectionParser.ParseMultiAgent(body));
+            multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge.Scope);
+
+        knowledge.Plan = skillPlan;
 
         if (unknownSkills.Count > 0)
         {
@@ -274,15 +294,19 @@ public sealed partial class OpenAIChatAdapter
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered, skillPlan.Prompt.ApproximateTokens);
         }
 
+        inferenceMessages = await knowledge.PrepareAsync(ctx, inferenceMessages, skillPlan?.ToolsOffered == true,
+            completeDocumentFits: candidate => _svc.KnowledgePromptFits(candidate, maxTokens, effectiveTools, openaiThink)).ConfigureAwait(false);
+        if (inferenceMessages == null) return;
+
         if (stream)
         {
             await StreamCompletionAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar).ConfigureAwait(false);
+                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
         }
         else
         {
             await CompleteSyncAsync(ctx, requestId, modelName!, inferenceMessages, maxTokens,
-                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar).ConfigureAwait(false);
+                samplingConfig, effectiveTools, openaiThink, responseFormat, skillPlan, openaiLogger, toolGrammar, knowledge).ConfigureAwait(false);
         }
     }
 
@@ -465,7 +489,8 @@ public sealed partial class OpenAIChatAdapter
         StructuredOutputFormat? responseFormat,
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
-        TensorSharp.Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar)
+        TensorSharp.Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar,
+        KnowledgeProtocolRequest knowledge)
     {
         // Only the strict json_schema path must buffer the whole response so it
         // can be schema-normalized before anything is sent to the client. Plain
@@ -504,6 +529,13 @@ public sealed partial class OpenAIChatAdapter
         bool useStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
             || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate, samplingConfig);
         var buffer = bufferForStructured ? new StringBuilder() : null;
+        var knowledgeAnswer = knowledge.Enabled ? new StringBuilder() : null;
+        Task EmitContentAsync(string content)
+        {
+            if (knowledgeAnswer != null) { knowledgeAnswer.Append(content); return Task.CompletedTask; }
+            return SseWriter.WriteEventAsync(ctx.Response,
+                OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, content), ctx.RequestAborted);
+        }
 
         IOutputParser? parser = null;
         bool sawToolCall = false;
@@ -528,6 +560,7 @@ public sealed partial class OpenAIChatAdapter
         await foreach (var update in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxTokens,
             ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger).ConfigureAwait(false))
         {
+            knowledge.Observe(update);
             string piece = update.Piece;
             if (!update.Done)
             {
@@ -564,9 +597,7 @@ public sealed partial class OpenAIChatAdapter
                     {
                         string parsedContent = jsonObjectFilter != null ? jsonObjectFilter.Feed(piece) : piece;
                         if (!string.IsNullOrEmpty(parsedContent))
-                            await SseWriter.WriteEventAsync(ctx.Response,
-                                OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, parsedContent),
-                                ctx.RequestAborted).ConfigureAwait(false);
+                            await EmitContentAsync(parsedContent).ConfigureAwait(false);
                     }
                     continue;
                 }
@@ -609,9 +640,7 @@ public sealed partial class OpenAIChatAdapter
                         if (chunkContent.Length == 0)
                             continue;
                     }
-                    await SseWriter.WriteEventAsync(ctx.Response,
-                        OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, chunkContent),
-                        ctx.RequestAborted).ConfigureAwait(false);
+                    await EmitContentAsync(chunkContent).ConfigureAwait(false);
                     continue;
                 }
 
@@ -622,21 +651,19 @@ public sealed partial class OpenAIChatAdapter
                     if (passthrough.Length == 0)
                         continue;
                 }
-                await SseWriter.WriteEventAsync(ctx.Response,
-                    OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, passthrough),
-                    ctx.RequestAborted).ConfigureAwait(false);
+                await EmitContentAsync(passthrough).ConfigureAwait(false);
                 continue;
             }
 
             if (bufferForStructured)
             {
                 if (!await FlushStructuredCompletionAsync(ctx, requestId, responseFormat,
-                        buffer!.ToString(), useStreamParser && !preParsed, openaiThink, openaiTools, update).ConfigureAwait(false))
+                        buffer!.ToString(), useStreamParser && !preParsed, openaiThink, openaiTools, update, knowledge).ConfigureAwait(false))
                     return;
                 continue;
             }
 
-            if (parser != null)
+            if (parser != null && !preParsed)
             {
                 var finalParsed = parser.Add("", true);
                 if (finalParsed.ToolCalls != null && finalParsed.ToolCalls.Count > 0)
@@ -658,27 +685,21 @@ public sealed partial class OpenAIChatAdapter
                         ? jsonObjectFilter.Feed(finalParsed.Content)
                         : finalParsed.Content;
                     if (!string.IsNullOrEmpty(finalContent))
-                        await SseWriter.WriteEventAsync(ctx.Response,
-                            OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName, finalContent),
-                            ctx.RequestAborted).ConfigureAwait(false);
+                        await EmitContentAsync(finalContent).ConfigureAwait(false);
                 }
-
-                // The final chunk must carry the same reason the non-streaming
-                // path would report; clients switch on it identically either way.
-                string finReason = FinishReasonMapper.ToOpenAIChat(update.FinishReason, sawToolCall);
-                await SseWriter.WriteEventAsync(ctx.Response,
-                    OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName, finReason,
-                        update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens),
-                    ctx.RequestAborted).ConfigureAwait(false);
             }
-            else
+            if (knowledgeAnswer != null && knowledgeAnswer.Length > 0)
             {
                 await SseWriter.WriteEventAsync(ctx.Response,
-                    OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName,
-                        FinishReasonMapper.ToOpenAIChat(update.FinishReason, hasToolCalls: false),
-                        update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens),
+                    OpenAIResponseFactory.ContentChunk(requestId, _svc.LoadedModelName,
+                        knowledge.Normalize(knowledgeAnswer.ToString(), structured: responseFormat != null)),
                     ctx.RequestAborted).ConfigureAwait(false);
             }
+            await SseWriter.WriteEventAsync(ctx.Response,
+                knowledge.WithSources(OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName,
+                    FinishReasonMapper.ToOpenAIChat(update.FinishReason, sawToolCall),
+                    update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens)),
+                ctx.RequestAborted).ConfigureAwait(false);
 
             await SseWriter.WriteDoneSentinelAsync(ctx.Response, ctx.RequestAborted).ConfigureAwait(false);
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted).ConfigureAwait(false);
@@ -693,7 +714,8 @@ public sealed partial class OpenAIChatAdapter
         bool useStreamParser,
         bool openaiThink,
         List<ToolFunction>? openaiTools,
-        ChatStreamUpdate update)
+        ChatStreamUpdate update,
+        KnowledgeProtocolRequest knowledge)
     {
         if (useStreamParser)
         {
@@ -723,7 +745,7 @@ public sealed partial class OpenAIChatAdapter
         SseWriter.ApplyHeaders(ctx.Response);
 
         await SseWriter.WriteEventAsync(ctx.Response,
-            OpenAIResponseFactory.StructuredContentChunk(requestId, _svc.LoadedModelName, normalized.NormalizedContent),
+            OpenAIResponseFactory.StructuredContentChunk(requestId, _svc.LoadedModelName, knowledge.Normalize(normalized.NormalizedContent, structured: true)),
             ctx.RequestAborted).ConfigureAwait(false);
 
         // Structured output never reports tool_calls — response_format and tools
@@ -732,9 +754,9 @@ public sealed partial class OpenAIChatAdapter
         // normalization, so "length" is what tells the client to retry with more
         // room rather than trust a document that stops early.
         await SseWriter.WriteEventAsync(ctx.Response,
-            OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName,
+            knowledge.WithSources(OpenAIResponseFactory.EndChunk(requestId, _svc.LoadedModelName,
                 FinishReasonMapper.ToOpenAIChat(update.FinishReason, hasToolCalls: false),
-                update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens),
+                update.PromptTokens, update.EvalTokens, update.KvCacheReusedTokens)),
             ctx.RequestAborted).ConfigureAwait(false);
 
         await SseWriter.WriteDoneSentinelAsync(ctx.Response, ctx.RequestAborted).ConfigureAwait(false);
@@ -756,7 +778,8 @@ public sealed partial class OpenAIChatAdapter
         StructuredOutputFormat? responseFormat,
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
-        Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar)
+        Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar,
+        KnowledgeProtocolRequest knowledge)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
                 _options.StartupModelPath, _options.StartupMmProjPath, _options.DefaultBackend, out string loadError))
@@ -778,6 +801,7 @@ public sealed partial class OpenAIChatAdapter
         await foreach (var update in _svc.ChatStreamWithSkillsAsync(inferenceMessages, maxTokens,
             ctx.RequestAborted, samplingConfig, openaiTools, openaiThink, skillPlan, skillLogger).ConfigureAwait(false))
         {
+            knowledge.Observe(update);
             if (!update.Done)
             {
                 collector.Add(update);
@@ -820,26 +844,26 @@ public sealed partial class OpenAIChatAdapter
                 return;
             }
 
-            responseMessage = OpenAIResponseFactory.StructuredAssistantMessage(normalized.NormalizedContent);
+            responseMessage = OpenAIResponseFactory.StructuredAssistantMessage(knowledge.Normalize(normalized.NormalizedContent, structured: true));
         }
         else if (useParser || collector.IsParsed)
         {
             var parsed = collector.Resolve(_svc.Architecture, openaiThink, openaiTools);
 
             string? thinkingOut = openaiThink && !string.IsNullOrEmpty(parsed.Thinking) ? parsed.Thinking : null;
-            responseMessage = OpenAIResponseFactory.ParsedAssistantMessage(parsed.Content, thinkingOut, parsed.ToolCalls);
+            responseMessage = OpenAIResponseFactory.ParsedAssistantMessage(knowledge.Normalize(parsed.Content), thinkingOut, parsed.ToolCalls);
 
             sawToolCalls = parsed.ToolCalls != null && parsed.ToolCalls.Count > 0;
         }
         else
         {
-            responseMessage = OpenAIResponseFactory.PlainAssistantMessage(rawOutput);
+            responseMessage = OpenAIResponseFactory.PlainAssistantMessage(knowledge.Normalize(rawOutput));
         }
 
         await ctx.Response.WriteAsync(JsonSerializer.Serialize(
-            OpenAIResponseFactory.Completion(requestId, _svc.LoadedModelName, responseMessage,
+            knowledge.WithSources(OpenAIResponseFactory.Completion(requestId, _svc.LoadedModelName, responseMessage,
                 FinishReasonMapper.ToOpenAIChat(pipelineFinishReason, sawToolCalls),
-                promptTokens, evalTokens, kvReusedTokens),
+                promptTokens, evalTokens, kvReusedTokens)),
             JsonOptions.IgnoreNulls)).ConfigureAwait(false);
     }
 }

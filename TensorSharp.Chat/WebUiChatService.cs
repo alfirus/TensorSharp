@@ -23,6 +23,9 @@ using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.AgentHost.Knowledge;
+using TensorSharp.Knowledge;
+using TensorSharp.Server.Knowledge;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.ProtocolAdapters;
 using TensorSharp.Server.RequestParsers;
@@ -185,6 +188,9 @@ namespace TensorSharp.Chat
         /// fails the request; the host owns that decision.
         /// </summary>
         public Action<string, JsonElement> OnChatRequest { get; set; }
+
+        /// <summary>Optional personal library. Each request must explicitly select collections before retrieval or tools can access it.</summary>
+        public KnowledgeStore Knowledge { get; set; }
 
         /// <summary>
         /// Optional host-owned lease acquired near the start of a chat request, before
@@ -2365,6 +2371,23 @@ namespace TensorSharp.Chat
                 chatSession = _sessions.DefaultSession;
             }
 
+            bool replaceActive = body.TryGetProperty("replaceActive", out var replaceProp)
+                && replaceProp.ValueKind == JsonValueKind.True;
+            if (replaceActive && chatSession.SharedAcrossConversations)
+                throw new WebUiRequestRejectedException(400,
+                    new { error = "replaceActive requires a dedicated sessionId." });
+
+            // A steering prompt may arrive before the closed HTTP connection's abort
+            // reaches the server. Cancel locally and wait for the preceding producer's
+            // transcript and tool cleanup before preparing the replacement prompt.
+            using WebUiTurnCoordinator.Lease turnLease = chatSession.SharedAcrossConversations
+                ? null : await chatSession.WebUiTurns.EnterAsync(replaceActive, cancellationToken);
+            cancellationToken = turnLease?.Token ?? cancellationToken;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (chatSession.IsDisposed)
+                throw new WebUiRequestRejectedException(404,
+                    new { error = $"Session '{chatSession.Id}' not found or has been disposed." });
+
             // Acquired before any attachment path is resolved or file is staged. A host
             // can therefore arbitrate a shared draft's Send-versus-Discard race without
             // either winner observing bytes the other has just deleted. `using` spans
@@ -2403,6 +2426,8 @@ namespace TensorSharp.Chat
                 uiTools = ToolFunctionParser.ParseOllama(body);
 
             var messages = ChatMessageParser.ParseWebUi(messagesEl);
+            KnowledgeToolScope knowledge = KnowledgeRequestContext.Parse(body, Knowledge, _svc.ContextTokens,
+                _svc.CreateKnowledgeReranker());
             string audioInputError = ChatGenerationPipeline.UnsupportedAudioInputError(_svc.Architecture, messages,
                 _svc.IsAudioEncoderLoaded);
             if (audioInputError != null)
@@ -2485,8 +2510,9 @@ namespace TensorSharp.Chat
                         error = "The attached CSV could not be read from upload storage. Upload it again and retry.",
                     });
                 }
+                messages = await KnowledgeRequestContext.PrepareAsync(messages, knowledge, toolsAvailable: false, cancellationToken);
                 OnChatRequest?.Invoke(chatSession.Id, body);
-                await foreach (object frame in ChatStreamDiffusionAsync(chatSession, messages, maxTokens, uiThink, webUiLogger, cancellationToken, samplingConfig))
+                await foreach (object frame in ChatStreamDiffusionAsync(chatSession, messages, maxTokens, uiThink, webUiLogger, cancellationToken, samplingConfig, knowledge))
                     yield return frame;
                 yield break;
             }
@@ -2510,7 +2536,7 @@ namespace TensorSharp.Chat
                 workspace: workspace,
                 captureProducedFiles: ScriptFileCapture(),
                 logger: webUiLogger,
-                multiAgent: SkillSelectionParser.ParseMultiAgent(body));
+                multiAgent: SkillSelectionParser.ParseMultiAgent(body), knowledge: knowledge);
 
             if (unknownSkills.Count > 0)
             {
@@ -2691,6 +2717,13 @@ namespace TensorSharp.Chat
                     skillPlan.Prompt.Catalog.Count, skillPlan.ToolsOffered);
             }
 
+            // Keep the actual task without eager evidence for a possible thinking
+            // recovery; the loop will replay the evidence it really collected once.
+            var messagesBeforeKnowledge = messages;
+            messages = await KnowledgeRequestContext.PrepareAsync(messages, knowledge,
+                toolsAvailable: skillPlan?.ToolsOffered == true, cancellationToken,
+                candidate => _svc.KnowledgePromptFits(candidate, maxTokens, uiTools, uiThink));
+
             // Every refusal is behind us: this request is going to stream.
             OnChatRequest?.Invoke(chatSession.Id, body);
 
@@ -2751,7 +2784,7 @@ namespace TensorSharp.Chat
             // guarded, and the frames for each update are yielded outside it.
             IAsyncEnumerator<ChatStreamUpdate> stream = _svc
                 .ChatStreamWithSkillsAsync(chatSession, messages, maxTokens, cancellationToken, samplingConfig,
-                    uiTools, uiThink, skillPlan, webUiLogger)
+                    uiTools, uiThink, skillPlan, webUiLogger, thinkingTokenLimit: knowledge == null ? null : 512)
                 .GetAsyncEnumerator(cancellationToken);
             try
             {
@@ -2891,8 +2924,12 @@ namespace TensorSharp.Chat
             // engine's guard already ends and explains those turns.
             bool reasonedPastItsBudget = string.Equals(
                 turnFinishReason, FinishReasonMapper.PipelineThinkingBudget, StringComparison.Ordinal);
-            if (reasonedPastItsBudget && tokenCount == 0 && !aborted && inferenceError == null && uiThink)
+            if (reasonedPastItsBudget && IsNullOrWhiteSpace(visibleAnswer) && !aborted && inferenceError == null
+                && (uiThink || knowledge != null))
             {
+                // Raw reasoning pieces, whitespace, and retracted text are not an
+                // answer. Only the final visible content can suppress recovery.
+                tokenCount = 0;
                 webUiLogger.LogWarning(LogEventIds.ChatCompleted,
                     "chat.retry-without-thinking sessionId={SessionId}: the turn spent its whole "
                     + "token budget reasoning and produced no answer; retrying with thinking off.",
@@ -2906,9 +2943,11 @@ namespace TensorSharp.Chat
                 retryParser?.AcceptRetractions();
                 bool retryCompleted = false;
                 bool retrySawParsedUpdate = false;
+                var retryMessages = PrepareKnowledgeThinkingRetry(messagesBeforeKnowledge, messages, knowledge, skillPlan);
                 IAsyncEnumerator<ChatStreamUpdate> retry = _svc
-                    .ChatStreamWithSkillsAsync(chatSession, messages, maxTokens, cancellationToken,
-                        samplingConfig, uiTools, false, skillPlan, webUiLogger)
+                    .ChatStreamWithSkillsAsync(chatSession, retryMessages, maxTokens, cancellationToken,
+                        samplingConfig, uiTools, false, skillPlan, webUiLogger,
+                        thinkingTokenLimit: knowledge == null ? null : 512)
                     .GetAsyncEnumerator(cancellationToken);
                 try
                 {
@@ -2983,7 +3022,7 @@ namespace TensorSharp.Chat
 
             foreach (object frame in FinalFrames(sawParsedUpdate ? null : uiParser, aborted, inferenceError, chatSession, sw, tokenCount,
                 turnPromptTokens, turnKvReusedTokens, turnTruncated, visibleAnswer, turnFinishReason,
-                turnRepetitionExplained, turnEvalTokens, turnEvalNs))
+                turnRepetitionExplained, turnEvalTokens, turnEvalNs, knowledge))
             {
                 yield return frame;
             }
@@ -2993,13 +3032,14 @@ namespace TensorSharp.Chat
 
         private async IAsyncEnumerable<object> ChatStreamDiffusionAsync(
             ChatSession chatSession, List<ChatMessage> messages, int maxTokens, bool think, ILogger webUiLogger,
-            [EnumeratorCancellation] CancellationToken cancellationToken, SamplingConfig samplingConfig)
+            [EnumeratorCancellation] CancellationToken cancellationToken, SamplingConfig samplingConfig, KnowledgeToolScope knowledge = null)
         {
             var sw = Stopwatch.StartNew();
             bool aborted = false;
             string inferenceError = null;
             int finalTokenCount = 0;
             int turnPromptTokens = 0;
+            var visibleAnswer = new StringBuilder();
 
             // The canvas text arrives with its channels already separated (the thought
             // block is dropped unless the request asked for it), so the replace frames
@@ -3040,6 +3080,7 @@ namespace TensorSharp.Chat
                         continue;
                     }
                     // Both intermediate previews and the final answer use whole-message replace.
+                    visibleAnswer.Clear().Append(u.Text);
                     yield return WebUiSseEvents.Replace(u.Text, u.Step, u.TotalSteps, u.IsPreview);
                 }
             }
@@ -3048,6 +3089,9 @@ namespace TensorSharp.Chat
                 await stream.DisposeAsync();
             }
 
+            if (!aborted && inferenceError == null)
+                foreach (object frame in KnowledgeCitationFrames(visibleAnswer, knowledge))
+                    yield return frame;
             sw.Stop();
             double tokPerSec = finalTokenCount > 0 ? finalTokenCount / sw.Elapsed.TotalSeconds : 0;
             yield return WebUiSseEvents.Done(finalTokenCount, sw.Elapsed.TotalSeconds, tokPerSec, aborted, inferenceError,
@@ -3529,7 +3573,7 @@ namespace TensorSharp.Chat
             IOutputParser uiParser, bool aborted, string inferenceError,
             ChatSession chatSession, Stopwatch sw, int tokenCount, int turnPromptTokens, int turnKvReusedTokens,
             bool truncated, StringBuilder visibleAnswer, string finishReason = null,
-            bool repetitionExplained = false, long evalTokens = 0, long evalNs = 0)
+            bool repetitionExplained = false, long evalTokens = 0, long evalNs = 0, KnowledgeToolScope knowledge = null)
         {
             if (uiParser != null && !aborted)
             {
@@ -3543,6 +3587,10 @@ namespace TensorSharp.Chat
                 if (finalParsed.ToolCalls != null)
                     yield return WebUiSseEvents.ToolCalls(finalParsed.ToolCalls);
             }
+
+            if (!aborted && inferenceError == null)
+                foreach (object frame in KnowledgeCitationFrames(visibleAnswer, knowledge))
+                    yield return frame;
 
             // The silence a user actually hits: the turn ran a skill
             // or a tool, streamed plenty of tokens doing it, and then ended without writing
@@ -3592,6 +3640,34 @@ namespace TensorSharp.Chat
             yield return WebUiSseEvents.Done(generated, sw.Elapsed.TotalSeconds, tokPerSec, aborted, inferenceError, chatSession.Id,
                 turnPromptTokens, turnKvReusedTokens,
                 truncated && !FinishReasonMapper.IsRepetition(finishReason));
+        }
+
+        internal static List<ChatMessage> PrepareKnowledgeThinkingRetry(List<ChatMessage> originalMessages,
+            List<ChatMessage> preparedMessages, KnowledgeToolScope knowledge, SkillRequestPlan plan)
+        {
+            if (knowledge == null || plan?.ToolsOffered != true) return preparedMessages;
+            // A fresh loop cannot assume that previous tool-result messages remain
+            // in its history. Replay its bounded evidence and disable new retrieval
+            // before generation instead of starting the same search cycle again.
+            (plan.ToolContext.KnowledgeRetrieval ?? knowledge.Retrieval).RequestSynthesis();
+            plan.KnowledgeAnswerRecovery = plan.CompletionRequirement == null;
+            return SkillPrompt.Apply(originalMessages, KnowledgeTools.Guidance);
+        }
+
+        internal static IEnumerable<object> KnowledgeCitationFrames(StringBuilder visibleAnswer, KnowledgeToolScope knowledge)
+        {
+            if (knowledge == null) yield break;
+            var normalized = KnowledgeTools.NormalizeCitationUrls(visibleAnswer.ToString(), knowledge);
+            if (normalized.RepairCount > 0)
+            {
+                visibleAnswer.Clear().Append(normalized.Text);
+                yield return WebUiSseEvents.Replace(normalized.Text);
+                yield return new { knowledgeCitationRepairs = normalized.RepairCount };
+            }
+            // Emit a replacement snapshot, including an empty one, only once the
+            // final parser flush and any URL repairs have settled the visible answer.
+            yield return new { knowledgeSources = KnowledgeCitations.UsedSources(normalized.Text, knowledge)
+                .Select(KnowledgeTools.DescribeSource).ToArray() };
         }
     }
 }

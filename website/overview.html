@@ -27,10 +27,11 @@
     <li><strong>Library</strong> — reference the source projects and call the engine from your own .NET code. → <a href="code-api.html">C# Library</a></li>
   </ul>
 
+  <p>TensorAgent adds a local app with searchable model families, personal knowledge collections and response steering during generation. <a href="tensoragent.html">Desktop guide</a> · <a href="knowledge.html">Knowledge bases</a>. Personal knowledge and steering were merged after <code>v2026.10.10</code>; use a newer build containing them.</p>
   <h2 id="business">Business value</h2>
   <p>For decision-makers evaluating local inference, the core trade is <em>control and cost</em> in exchange for <em>running your own hardware</em>.</p>
   <div class="card-grid">
-    <div class="card"><div class="ic">🔒</div><h3>Data privacy &amp; compliance</h3><p>Prompts and documents never leave your infrastructure — a fit for regulated, on-prem, or air-gapped environments.</p></div>
+    <div class="card"><div class="ic">🔒</div><h3>Data privacy &amp; compliance</h3><p>Local inference and knowledge storage run on your hardware. Downloads, network-enabled tools and explicitly configured external companions follow the host configuration.</p></div>
     <div class="card"><div class="ic">💸</div><h3>Predictable cost</h3><p>No per-token API billing. Capacity is bounded by hardware you already budget for.</p></div>
     <div class="card"><div class="ic">🧩</div><h3>No vendor lock-in</h3><p>Open GGUF models from Hugging Face, and an OpenAI/Ollama-compatible surface that existing tools already speak.</p></div>
     <div class="card"><div class="ic">🏗️</div><h3>.NET-native integration</h3><p>Embed inference inside existing C# services instead of bridging to an external runtime.</p></div>
@@ -39,7 +40,7 @@
   </div>
 
   <h2 id="architecture">Architecture</h2>
-  <p>TensorSharp is a layered system. Each layer is an independently packable project, so source consumers can reference only what they need. The publish set is thirteen packages, verified by <code>eng/verify-packages.ps1</code>. Package and release versions follow their release tag; features merged after a release require a newer release containing them or current source builds. <a href="code-api.html#packages">Package roles and references →</a></p>
+  <p>TensorSharp is a layered system. Each layer is an independently packable project, so source consumers can reference only what they need. The current source publish set is fourteen packages, verified by <code>eng/verify-packages.ps1</code>. Package and release versions follow their release tag; features merged after a release require a newer release containing them or current source builds. <a href="code-api.html#packages">Package roles and references →</a></p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Layer</th><th>Responsibility</th></tr></thead>
@@ -52,6 +53,7 @@
       <tr><td><strong>TensorSharp.Backends.Cuda</strong></td><td>The direct CUDA path: CUDA Driver API, cuBLAS GEMM, and PTX kernels for hot ops, with CPU fallbacks.</td></tr>
       <tr><td><strong>TensorSharp.Backends.MLX</strong></td><td>The Apple-Silicon MLX path, wrapping <a href="https://github.com/ml-explore/mlx-c" target="_blank" rel="noopener">mlx-c</a> with quantized, fused, and compiled kernels.</td></tr>
       <tr><td><strong>TensorSharp.Distributed</strong></td><td>Peer-to-peer TCP coordination for multi-node tensor parallelism, kept separate from the model/runtime layers.</td></tr>
+      <tr><td><strong>TensorSharp.Knowledge</strong></td><td>Independent personal store: originals and versioned documents, extractors, BM25/optional vectors, collection scope and source locations. Chat, AgentHost and host layers integrate the same store. <a href="knowledge.html">Knowledge guide →</a></td></tr>
       <tr><td><strong>TensorSharp.Chat</strong></td><td>The host-neutral chat pipeline behind the server and TensorAgent: model service, sessions, generation, the per-model continuous-batching engine host, the skills and sub-agent loop, and the Web UI request/stream contract, with no ASP.NET Core dependency. The CLI project references the library but does not run on its pipeline: it drives <code>TensorSharp.Runtime</code>'s inference engine with its own loop.</td></tr>
       <tr><td><strong>TensorSharp.Server</strong></td><td>The ASP.NET Core HTTP / application layer over <code>TensorSharp.Chat</code>: Ollama- and OpenAI-compatible REST APIs, the browser chat UI's routes, upload handling, and option parsing. <code>TensorSharp.Server.Host</code> is the executable that serves the page.</td></tr>
       <tr><td><strong>TensorSharp.Cli</strong></td><td>The console host for local prompts, multimodal experiments, prompt inspection, JSONL batch workflows, the interactive REPL, and benchmarks.</td></tr>

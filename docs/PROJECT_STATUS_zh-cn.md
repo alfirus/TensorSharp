@@ -1,18 +1,26 @@
 # TensorSharp 项目状态
 
-本页集中放置仓库级状态，以及不适合塞进 README 的较长说明。
+本页集中放置仓库级状态，以及不适合塞进 README 的较长说明。这里描述当前源码；本地最新发布标签为 `v2026.10.10`。知识集合与生成中引导功能是在该标签之后加入的，需要包含这些改动的构建。
 
 ## 当前方向
 
-TensorSharp 是面向 GGUF 模型的原生 .NET 10 推理引擎。当前源码包含 CLI、服务端/Web UI、兼容 HTTP API、AgentHost，以及 TensorAgent 应用（iOS/iPadOS，同一个项目还能构建 Mac 与 Windows 桌面版）。AgentHost 随 CLI 与服务端归档一同发布，也作为 `TensorSharp.AgentHost` NuGet 包发布。更新后的 Release Binaries 工作流还会打包 Apple Silicon Mac（DMG / PKG / ZIP）与 Windows x64 CPU / CUDA（MSI / ZIP）的 TensorAgent 桌面版；历史发布可能没有桌面资源，iPhone / iPad 仍需源码构建。请看[桌面版下载、安装与首次聊天指南](tensoragent_desktop_zh-cn.md)。`v2026.09.01` 标签之后合入的改动（其中包括 Qwen-Image-2.1、Bonsai2、DiffusionGemma 图像输入与 Jev API、子智能体、Playwright 浏览器技能以及 GB10 发布归档）在下一个标签之前只存在于源码构建中；其中会改变现有配置行为的改动列在[发布说明](#发布说明自上个标签以来的行为变化)中。
+TensorSharp 是面向 GGUF 模型的原生 .NET 10 推理引擎。当前源码包含 CLI、服务端/Web UI、兼容 HTTP API、AgentHost，以及 TensorAgent 应用（iOS/iPadOS，同一个项目还能构建 Mac 与 Windows 桌面版）。AgentHost 随 CLI 与服务端归档一同发布，也作为 `TensorSharp.AgentHost` NuGet 包发布。Release Binaries 工作流还会打包 Apple Silicon Mac（DMG / PKG / ZIP）与 Windows x64 CPU / CUDA（MSI / ZIP）的 TensorAgent 桌面版；历史发布可能没有桌面资源，iPhone / iPad 仍需源码构建。请看[桌面版下载、安装与首次聊天指南](tensoragent_desktop_zh-cn.md)。包与归档反映各自标签中的实现，不代表当前分支的全部功能。[发布说明](#发布说明兼容性与近期变化)区分当前新增功能与历史兼容性变化；配置了打包任务不等于某个版本的资源已经发布或验证。
 
 ### TensorAgent：在同一应用中聊天、执行任务与生成媒体
 
-TensorAgent 在同一会话界面中提供文本与多模态聊天、代码和技能工作流，以及对应模型的图像/视频生成。Mac 模型目录包含用于文生图和参考图编辑的 Qwen-Image-2.1，可选择 LoRA 插件，并通过 **Select area** 区域编辑器保留选区外的像素；还包含生成带配乐视频的 MiniMax-H3。模型目录由应用头共享，条目是否可用取决于设备内存预算。图像/视频生成已在 Mac 应用中实测；iOS 与 Windows 上的媒体生成尚未验证。
+TensorAgent 在同一会话界面中提供文本与多模态聊天、代码和技能工作流、个人知识检索，以及对应模型的图像/视频生成。可搜索的模型目录按系列分组，并依据设备内存预算筛选。目录包含用于文生图和参考图编辑的 Qwen-Image-2.1 及显式声明的八步 Turbo 变体，可选择 LoRA 插件，并通过 **Select area** 区域编辑器保留选区外的像素；还包含生成带配乐视频的 MiniMax-H3。目录可用性与验证范围是两回事：已有的 Mac 应用媒体实测不覆盖所有新增条目；iOS 与 Windows 上的媒体生成尚未验证。
 
-界面现支持英语、简体与繁体中文、日语、韩语、西班牙语、法语和德语。设置可跟随系统语言或手动选择，模型仍根据用户的提示词决定回答语言。文本轮次会保存并显示 token 数、耗时、token 速率，以及可用的 KV 复用统计。**Enter** 发送提示词，**Shift+Enter** 换行，输入法确认候选字时的 Enter 不会发送。
+界面现支持英语、简体与繁体中文、日语、韩语、西班牙语、法语和德语。设置可跟随系统语言或手动选择，模型仍根据用户的提示词决定回答语言。文本轮次会保存并显示 token 数、耗时、token 速率，以及可用的 KV 复用统计。**Enter** 发送提示词，**Shift+Enter** 换行，输入法确认候选字时的 Enter 不会发送。文本回答生成期间可以发送新消息引导当前轮次：宿主取消当前生成，保留部分回答与已接受的引导，再从该会话继续生成。独立服务端浏览器聊天与交互式 CLI 也支持引导；它不会撤销已执行的工具操作。各界面的操作说明见[使用指南](../USAGE_zh-cn.md)。
 
 `dotnet build TensorSharp.slnx -c Release` 还会构建 TensorAgent.Core、TensorAgent.Sharing 和 TensorAgent.Tests。在 macOS 与 Windows 上会尝试构建对应的 MAUI 应用头；缺失工作负载或已准备的原生依赖时会明确警告并跳过。被跳过的应用头不算构建验证成功。详见 [TensorAgent 指南](../TensorAgent/README.md)与[开发说明](../DEVELOPMENT_zh-cn.md)。
+
+### 个人知识集合
+
+`TensorSharp.Knowledge` 是内嵌、单写入者的本地存储，保留原文件、提取状态、来源位置与带版本的引用。TensorAgent 的**菜单 → 知识库**支持创建和重命名集合、上传文件及多级文件夹、导入已保存聊天的快照及可用附件和生成文件、浏览、搜索、预览和下载原文件，以及重新索引。导入资料不会自动选中它用于推理：需要显式勾选**在此聊天中使用该集合**。已保存聊天会恢复选择，新聊天默认不选择集合。引用的图片和视频可显示缩略图与视频采样时间；**检索到的来源**仅列出回答实际引用的证据。
+
+BM25 检索不需要嵌入模型。可选 GGUF 嵌入增加语义检索；聊天宿主还可执行一次有界的模型相关性排序，失败时回退到原检索顺序。文本、数据记录、PDF 和 Office 文件各有提取限制；已加载的兼容媒体模型可为图片、音频和视频采样帧生成描述或转录。这些生成表示仍标为部分提取，不支持的来源会明确标为仅元数据。受支持的 Apple 宿主使用 Apple Vision 做 PDF OCR；Windows/Linux 上的 TensorAgent 核心宿主可首次按需准备 Poppler/Tesseract。这不意味着已提供 Linux MAUI 应用，也不构成 Windows 或设备运行验证。
+
+独立服务端通过 `TS_KNOWLEDGE_DIRECTORY` 启用存储，并提供 `/api/knowledge`。受支持的聊天、Responses 和 Ollama 请求以 `knowledgeCollections` 选择检索范围；管理 API 的搜索和读取使用 `collectionIds`。知识工具与子智能体共享该范围，并可将完整原文件复制到私有工作区做计算。CLI 不会自动选择知识集合，也没有多用户权限层。提取范围、端点、引用与验证工具见[知识库指南](knowledge-system_zh-cn.md)；已配置的工作流以及未运行的模型或设备场景均不算验证通过。
 
 ### 嵌入模型与服务
 
@@ -66,9 +74,15 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
 也有 CUDA 对比脚本，但尚未提交任何 CUDA 结果。见
 [Bonsai2 卡片](models/bonsai2_zh-cn.md)。
 
-### 发布说明：自上个标签以来的行为变化
+<a id="发布说明自上个标签以来的行为变化"></a>
 
-`v2026.09.01` 标签之后合入、会改变现有配置行为的改动：
+### 发布说明：兼容性与近期变化
+
+以下变化跨越多个发布标签。个人知识集合与生成中引导功能晚于 `v2026.10.10`；其余条目保留早期工作的兼容性说明和性能实测记录。
+
+- **TensorAgent 与显式启用的服务端请求支持知识集合。** 每个聊天或请求都需显式选择集合；加载兼容模型后可重新索引仅元数据的媒体。导入保留原文件；替换或重新索引会使旧版本引用失效。见[个人知识库](knowledge-system_zh-cn.md)。
+- **文本会话可在生成中接受引导。** TensorAgent、独立服务端浏览器聊天与交互式 CLI 保留已接受的引导及部分回答，然后重新开始生成。已经执行的工具操作不会撤销。见[使用指南](../USAGE_zh-cn.md)。
+- **Qwen-Image-2.1 Turbo 与扩展后的 TensorAgent 模型目录。** Turbo 配置与目录条目显式声明变体，并采用八步默认设置；模型系列搜索和内存筛选便于浏览扩展后的目录。见[图像模型卡片](models/qwenimage21_zh-cn.md)与 [TensorAgent 目录](../TensorAgent/README.md)。
 
 - **Qwen 3.8 Flash Next 能在 Apple Silicon 上超出内存运行。** 在 `ggml_metal` 上，它 28.8 GB 的 n-gram 表从不上传也不拷贝
   （每个 token 的 16 行按需从 GGUF 内存映射中读取）；引擎自行规划最前面多少层的路由专家留在主机上、直接从该映射运行
@@ -306,7 +320,7 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 - **桌面宿主。** 当 `TensorAgent.Core` 运行在 macOS、Linux 或 Windows 上时，`AgentExecutionMode.Auto` 以 OS 沙箱下的原生进程运行代码，而不是嵌入式解释器；设置了 `networkHosts` 允许列表时，它会拒绝需要联网的启动，因为进程沙箱无法强制执行该列表。
 - **桌面应用。** 同一个项目还能构建 Mac 版（Mac Catalyst）与 Windows 版（WinUI，已于 2026-10-01 在 Windows x64 上完成有限的 Debug/Release 验证）的 TensorAgent。Mac 版随附桌面引擎库，以 Seatbelt 约束的原生进程运行模型编写的代码，使用引擎的桌面内存默认值，并在模型工作期间阻止 App Nap。在 M5 Pro 上以 Gemma 4 E2B 实测：其解码速度与运行在 CoreCLR 上的同一份宿主代码相差不到 3%，每一轮的首个 token 约晚 60 毫秒，因为 .NET 以 Mono 运行 Mac Catalyst 应用。
 - **Windows 覆盖。** 2026-10-01 的 Debug/Release 检查使用 i7-11800H、32 GiB RAM、RTX 3080 Laptop GPU（16 GiB）与 .NET SDK 10.0.204，对应未修改的上游 ggml `353b63b439f27ab2cc19dac97ab1681ba6d2d084`。覆盖 WebView 上传、会话保存/恢复、取消、PowerShell、Python 产物，以及 CUDA 上 Gemma 4 12B QAT UD-Q4_K_XL 的合成图像问答。托管测试通过 895 项，明确跳过 177 项；跳过的场景不算通过。模型目录下载、原生对话框/摄像头、音频/视频生成、其他模型/后端与长时间运行尚未验证。详细检查与测量见[应用指南](../TensorAgent/README.md#on-windows)。
-- **CI。** PR CI 通过 `InferenceWeb.Tests` 检查应用的项目文件、Info.plist、entitlements、共享扩展与原生导出清单，但不运行 `TensorAgent.Tests`，也没有任何工作流构建 iOS 或桌面应用。
+- **CI。** PR CI 通过 `InferenceWeb.Tests` 检查应用项目、Info.plist、entitlements、分享扩展和原生导出清单；它不运行 `TensorAgent.Tests`，也不构建 MAUI 应用。发布工作流负责桌面打包；独立的 `knowledge-pdf-portable.yml` 按需验证 Windows/Linux 托管 OCR。工作流存在不代表运行成功，缺失模型或设备的场景必须单独报告。
 
 构建、模拟器、真机、打包与测试详见 [TensorAgent README](../TensorAgent/README.md)，上述三点的实测数据也在其中。
 
@@ -316,12 +330,14 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 
 | 范围 | 状态 |
 |---|---|
+| 个人知识库 | 本地原文件与带版本的来源；TensorAgent 文件/多级文件夹/聊天快照导入、预览与逐聊天选择；独立服务端显式启用 `/api/knowledge` 和请求范围。BM25、可选嵌入及有界模型排序；媒体/PDF/Office 提取有明确限制。见[指南](knowledge-system_zh-cn.md)。 |
+| 生成中引导 | TensorAgent、独立浏览器聊天与交互式 CLI 的文本生成可接受新用户指令，保留部分回答后继续；不撤销已完成工具操作。见[使用指南](../USAGE_zh-cn.md)。 |
 | 嵌入模型 | GGUF BERT/XLM-R：Snowflake Arctic Embed L v2.0、all-MiniLM-L6-v2；纯 C# CPU 与原生 GGML CPU/Metal/CUDA，独立 `--embeddings` 服务，OpenAI/Ollama 单条与批量 API。上下文、分词、质量及实测范围见[指南](embeddings_zh-cn.md)。 |
 | 模型家族 | DeepSeek V4 Flash（`deepseek4`）、DeepSeek V4.1 Flash（`deepseek41`）、GLM 5.x（`glm-dsa`、`glm_dsa`、`glm5next`）、Gemma 4、DiffusionGemma、Qwen 3.5/3.6-family（`qwen35`、`qwen35moe`、`qwen3next`）、Qwen 3.8 Flash Next（`qwen4exp`）、Bonsai2 27B（带 PRISM `prism.hadamard.*` 元数据和 PQ2_0 / PTQ1_0 张量的 `qwen35` 文件）、GPT OSS、Nemotron-H（含 Nemotron 3 Nano Omni 与 Nemotron 3.5 Lightning；`nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni`）、Mistral 3（`mistral3`，以及标为 `llama` 的 Mistral Small 3.x 文件）、Hunyuan Dense（`hunyuan-dense`）、Muse-Glimmer（`muse-glimmer`、`muse_glimmer`）。文生图与图像编辑通过 Qwen-Image-2.1（`qwen_image`、`qwen-image`）；音视频联合生成通过 MiniMax-H3（`minimax-h3`、`minimax_h3`），纯视频生成通过 Wan 2.1 / 2.2（`wan`、`wan2.1`、`wan2.2`）。 |
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 风格 API、OpenAI Responses 风格 API，以及 Jev 类型化决策 API（`POST /v1/systemone`，由已加载的 DiffusionGemma 模型提供，状态支持文本、图像、上传文档、抽样视频帧和已配置 ASR 服务的语音转录；见 [Jev](models/jev_zh-cn.md)）。 |
 | TensorAgent 应用 | TensorAgent 支持 iOS/iPadOS，同一个项目还能构建 Mac 版（Mac Catalyst：桌面引擎库、Seatbelt 约束的进程，已实测）与 Windows 版（Windows x64 上有限的 Debug/Release 聊天、合成图像与工具检查；图像/音频/视频生成尚未验证）。在手机上它将 GGML 作为 iOS `.xcframework` 链接，并在真机上使用 `ggml_metal`。它共享与宿主无关的聊天流水线（`TensorSharp.Chat`），但通过进程内 loopback 宿主提供自己的手机版页面——iOS 既没有 ASP.NET Core 运行时包，也不能启动子进程。它支持 iPhone 与 iPad（arm64，iOS 17.0 或更高版本）。应用离开屏幕后这一轮不会丢失（应用不在前台时生成暂停，回到前台后继续）；投机解码与子智能体委派默认开启；共享提示词前缀的 checkpoint 会按模型持久化，使每次启动的第一条消息只需一次恢复而不必完整预填充（在 iPhone 17 Pro Max 上以 Qwen3.5 9B 实测：原本 54 秒的冷启动首条消息，变成 1.2 秒预热加约 0.6 秒的首条消息）；引擎的内存策略也按 iOS jetsam 实际计费的口径来设定。详见 [TensorAgent](../TensorAgent/README.md)。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS（`cuda`）、MLX Metal（`mlx`）、GGML CPU、GGML Metal、GGML CUDA、GGML Vulkan。DeepSeek V4 另有三套专属的整模型执行器——Direct CUDA、原生 ggml 与纯 C# CPU——在 GPU 执行器上通过 `--layer-split N` 按整层放置权重（`--layer-split N` 指定卡数）。DeepSeek V4.1 的服务路径是 `ggml_cuda`；`ggml_cpu` 用同一套原生计算图跑标量回退实现，`cpu` 则是纯 C# 的 V4.1 执行器，两者都是正确性与可移植性通道，而非服务通道。`cuda` 用 Direct CUDA 引擎自己的内核运行 V4.1（不经过 ggml），已有针对合成内核/槽位的测试，但没有完整检查点的数值门禁。`ggml_vulkan` / `ggml_metal` 需要 `TS_DSV41_ALLOW_NON_CUDA_GPU=1`；`mlx` 会直接拒绝该检查点，而不会把 V4.1 的权重塞进并未实现它的计算图。视频家族中，Wan 是对后端有限制的那一个：它可运行于各 GGML 后端以及 Direct `cuda` / 纯 C# `cpu` 后端，但不支持 MLX。Qwen-Image-2.1 支持 GGML 后端及完整的纯 C# `cpu` 流水线（单进程，不支持张量并行），Bonsai2 需要单设备 GGML 后端。Qwen 3.8 Flash Next 会直接拒绝 `mlx`，并指明改用 `ggml_metal`。 |
-| 发布构建与 CI | 打标签的发布会构建自包含的 CLI 与服务端归档：Windows x64（CPU/CUDA）、Linux x64（CPU/CUDA）与 macOS arm64。自 `v2026.09.01` 之后，发布工作流还会构建面向 NVIDIA GB10 / DGX Spark 的实验性 `linux-arm64-cuda13-GB10` 归档（CUDA 13、SM121a），它在没有 GPU 的托管 ARM64 runner 上用 Docker 构建；第一个带有该归档的标签发布将是下一个标签。已记录的 GB10 真机冒烟数据是历史数据，早于上游重新集成，不能为当前代码背书（[GB10 构建](../DEVELOPMENT_zh-cn.md#gb10--dgx-spark-构建容器实验性)）。PR CI 在 x64 与 ARM64 Linux 上运行 `InferenceWeb.Tests` 的 CPU 正确性测试与 GB10 容器门禁检查；发往 `main` 的 PR 还会在自托管 CUDA runner 上运行一次引擎对比冒烟测试（Gemma 4 12B，TensorSharp 对比 llama.cpp，`test-matrix.yml`）。PR CI 不运行 `TensorAgent.Tests`，也不构建 iOS 应用。打标签的发布还会推送 `eng/verify-packages.ps1` 所列的 NuGet 包（含 `TensorSharp.AgentHost`）。 |
+| 发布构建与 CI | 打标签的发布构建 Windows x64（CPU/CUDA）、Linux x64（CPU/CUDA）与 macOS arm64 的自包含 CLI/服务端归档，并打包 TensorAgent Mac（DMG/PKG/ZIP）和 Windows x64 CPU/CUDA（MSI/ZIP）。实验性 `linux-arm64-cuda13-GB10` 归档在无 GPU 的托管 ARM64 runner 中构建；历史 GB10 真机数据不验证当前代码（[构建说明](../DEVELOPMENT_zh-cn.md#gb10--dgx-spark-构建容器实验性)）。PR CI 运行 `InferenceWeb.Tests` CPU 测试、GB10 容器门禁及自托管 CUDA 的引擎对比冒烟；不运行 `TensorAgent.Tests` 或构建 MAUI 应用。独立的按需工作流检查 Windows/Linux 托管 PDF OCR。NuGet 包列表见 `eng/verify-packages.ps1`，当前打包源码包含 `TensorSharp.Knowledge`。配置了工作流不等于其已成功运行；资源和包取决于具体标签。 |
 | 多模态 | Gemma 4 图像/视频/音频；Qwen 3.5-family（含带配套投影器的 Bonsai2）、Qwen 3.8 Flash Next、GLM-5.3-Flash、Mistral 3、Nemotron-H Omni、Muse-Glimmer、DiffusionGemma 图像输入；Qwen 3.8 Flash Next 的 `video_url` 视频；DeepSeek V4.1 通过视觉伴随文件支持图像与视频；Nemotron-H 只有加载了携带 Parakeet 音频塔的伴随 GGUF 时才支持音频（公开 GGUF 都不附带）；DiffusionGemma 拒绝音频与 `video_url` 视频（Web UI 上传的视频只会以逐帧普通图像的形式送入模型）；PDF（CLI `--pdf` + Web UI）。媒体*输出*：Qwen-Image-2.1（文生图、参考图编辑与遮罩局部编辑，可通过 `--lora` 加载 LoRA 插件，并对文本与参考图 token 默认启用前缀 KV 缓存）、MiniMax-H3（H.264 MP4 **外加一份 32 kHz 立体声 `.wav` 旁挂文件**，两者在同一份打包潜变量里一起生成；在 Apple 平台的 TensorAgent 中，MP4 本身也带有 AAC 音轨），以及 Wan 2.1 / 2.2（仅 H.264 MP4 视频，文本→视频与图像→视频）。 |
 | 连续批处理 | vLLM 风格分页 KV 缓存、默认启用的 Radix（基数树）前缀缓存（`--no-prefix-cache` / `TS_SCHED_PREFIX_CACHE=0` 关闭全部复用；`--spec` 不会关闭它），覆盖 Qwen 3.5-family、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、GPT OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer 与 Nemotron-H，但不包括 DiffusionGemma 与媒体生成模型；共享前缀 checkpoint（所有会话共享的那段提示词末尾的状态会被克隆进每个新会话，因此新会话只需重新 prefill 自己的那条消息；适用于 GGML 上的 Gemma 4、Qwen 3.5/3.6 与 Qwen 3.8 Flash Next，宿主还可通过 `IPrefixCheckpointStore` 让 Gemma 4 或 Qwen 3.5-family 的 checkpoint 跨进程重启存活）、迭代级调度器（默认启用，`--no-continuous-batching` 关闭）。分页池常驻主机内存，因此它买到的是内存效率与前缀复用，而不是随并发增长的吞吐。DeepSeek V4 / V4.1 与 GLM 5.x 在同一引擎上通过各自原生的 per-sequence slot 提供服务——压缩后的 MLA 每 token 只有一行缓存，没有可分页的布局——GLM 的批处理融合解码默认启用（设置 `TS_BATCHED_FUSED_DECODE=0` 可切回串行融合 decode；4 路并发下总吞吐 1.81 倍）。Qwen 3.8 Flash Next 出于同样的原因使用逐序列状态持有者——它的 GatedDeltaNet、PLE 与索引器状态同样没有可分页的布局。 |
 | 投机解码 | Qwen 3.6、Qwen 3.8-27B、GLM 5.2 与 GLM-5.3（均内嵌于 checkpoint——GLM-5.3 的 `blk.78` NextN 块本身是完整的，但它没有自己的 LM head，因此投机在单设备或显式 `--layer-split N` 放置模式下生效，不启用张量并行）、Gemma 4（独立草稿 GGUF，通过 `--draft-model` 加载）以及 Qwen 3.8 Flash Next（独立的共享 MTP head GGUF，通过 `--draft-model` 加载，仅限 GGML 后端）的 MTP / NextN 草稿头；DeepSeek V4 的 DSpark 块级起草（仅 `cuda` / `ggml_cuda`）、DeepSeek V4.1 的实验性 `deepseek41-dspark` 草稿器（仅 `ggml_cuda` / `ggml_cpu`，训练模型已在 `ggml_cuda` 双 GPU 按层切分下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证）、Muse-Glimmer 与 Qwen 3.8-27B 的 DFlash / DFlash2 块级起草（Nemotron-H 拒绝投机解码：它的 verify 与 decode 内核结果不一致，投机输出会与普通解码不同）——这些都通过 `--draft-model` 加载独立的草稿 GGUF；此外还有一个不需要任何草稿权重的 n-gram（prompt-lookup）投机器，用 `--spec-type ngram` 选择，适用于 Qwen 3.5 家族、Gemma 4、GLM 5.x 与 Qwen 3.8 Flash Next。GPT OSS、Mistral 3 与 Hunyuan Dense 没有投机路径，因此无法使用它；DeepSeek V4 / V4.1 与 Muse-Glimmer 在没有加载各自草稿器时也无法使用。每个输出 token 都取自主干的一行 logits，并由本次运行自身配置的采样器抽出，因此输出流与普通 decode 产生的完全相同。CLI 与服务端默认关闭（TensorAgent 默认开启）；内嵌草稿头在 CLI 与服务端两端均以 `--spec` 启用，而对以独立 GGUF 发布的草稿器，传入 `--draft-model` 本身即可启用投机。 |
@@ -337,7 +353,7 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 
 简要顺序如下：
 
-1. Wan 选择 step-distilled checkpoint。Qwen-Image-2.1 出草图时用 `--width 1024 --height 1024` 或 `--diffusion-steps 25`，或使用 `config/lora/` 中的步数蒸馏 LoRA 插件（4–8 步）。
+1. Wan 选择 step-distilled checkpoint。八步 Qwen-Image 生成使用显式声明的 [Turbo 变体](models/qwenimage21_zh-cn.md)。基础 Qwen-Image-2.1 出草图时用 `--width 1024 --height 1024` 或 `--diffusion-steps 25`，或使用 `config/lora/` 中的步数蒸馏 LoRA 插件（4–8 步）。
 2. 后端匹配硬件：NVIDIA 用 `ggml_cuda`，Apple Silicon 和 iOS 用 `ggml_metal`，原生 CPU 用 `ggml_cpu`。
 3. 调高级开关前，先降低分辨率、帧数或扩散步数。MiniMax-H3 的实用配置是 `--cfg 1.0` 与 4–8 步。
 4. 文本任务只有在模型和负载适合时，再尝试投机解码、CPU MoE offload 或 `--tp N`。
@@ -350,5 +366,6 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 - [计算后端](../USAGE_zh-cn.md#计算后端)——能力、构建要求与回退。
 - [Agent Skills 与智能体工作](agent_skills.md)——技能、工具、工作区与安全。
 - [子智能体](multi_agent.md)——委派工具、角色、限额与 KV 前缀共享。
+- [个人知识库](knowledge-system_zh-cn.md) — 集合、聊天导入、提取范围、引用、HTTP API 与验证限制。
 - [TensorAgent](../TensorAgent/README.md)——移动/桌面应用架构、模型、语言与验证。
 - [开发指南](../DEVELOPMENT_zh-cn.md)——项目分层与原生库构建。

@@ -1,0 +1,20 @@
+{
+  // Casual Phone Photo: rank-32 style adapter, 167.8 MB. Start at strength 0.8.
+  // Include "lbxstyle" followed by an explicit subject and setting in the prompt.
+  // Source: https://huggingface.co/19nbrown/qwen-image-2.1-casual-phone-photo-style-lora
+  // Publisher describes a small single-run fine-tune; compare several seeds/strengths.
+  // No adapter license stated; the base model's Qwen Research License still applies.
+  // Keeps the checkpoint's own schedule: official Turbo uses 8 steps and CFG 1.
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/lbxstyle-qwen-image-2.1-step-1890.safetensors",
+    "urls": [
+      "https://huggingface.co/19nbrown/qwen-image-2.1-casual-phone-photo-style-lora/resolve/3ace7de571892ac5fa6245aed4f0500ae1da795a/lbxstyle-qwen-image-2.1-step-1890.safetensors"
+    ],
+    "sha256": "c23c23e3346ab93e0af121888b34f2176347f18dac26ade87eacf21fc11bd9dc"
+  },
+  "scale": 0.8
+}

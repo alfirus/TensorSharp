@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TensorAgent Desktop — Download &amp; User Guide — TensorSharp Wiki</title>
-  <meta name="description" content="Download and install TensorAgent Desktop on macOS or Windows, choose your first local model, chat with files, and set up code and browser tools.">
+  <meta name="description" content="Download and install TensorAgent Desktop on macOS or Windows, choose a local model, use personal knowledge collections, steer replies, and set up code and browser tools.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -24,6 +24,7 @@
   </div>
   <p>Both download buttons open the official release's <strong>Assets</strong> list. Choose the <code>tensoragent-desktop-</code> file for your platform below. Desktop installers are produced by the updated Release Binaries workflow; older releases may contain only CLI/server archives. If the latest release has no desktop assets, check <a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">all releases</a> or use the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/TensorAgent/README.md" target="_blank" rel="noopener">source build instructions</a> until a desktop release is published.</p>
 
+  <p>This guide covers current source. Personal knowledge and response steering were merged after <code>v2026.10.10</code>; a downloaded package needs a newer build containing them. Catalog availability and runtime validation are described below.</p>
   <h2 id="requirements">1 · Check your computer</h2>
   <div class="table-scroll">
   <table>
@@ -85,14 +86,20 @@ Get-FileHash .\tensoragent-desktop-V-win-x64-cpu.msi -Algorithm SHA256</code></p
   </ol>
   <p>Inference runs locally. The first model download needs internet access; after the necessary model files are present, ordinary chat works offline. The <strong>Allow network access</strong> setting controls model-run code and package installation; it does not prevent the app from downloading the model you requested.</p>
 
+  <h3 id="catalog">Browse the model catalog</h3>
+  <p>The current catalog has 38 entries. Search by model name, family, quantization or input capability; use <strong>All, Compatible and Downloaded</strong> filters, expand family groups and keep track of active downloads. Additional entries include larger Gemma/Qwen, GPT OSS, Nemotron, Mistral, Hunyuan, DiffusionGemma, DeepSeek and GLM checkpoints; many remain experimental. Pinned downloads and hash checks establish file identity, while catalog metadata checks do not establish inference on every device. Follow the entry's system-memory tier, inputs and model card; large entries can require far more memory than an ordinary PC.</p>
+  <h3 id="steering">Steer a reply while it runs</h3>
+  <p>Type and send a new instruction while a reply is generating. The active generation is interrupted, its produced reply stays in the chat, and a new turn follows your instruction after the old generation has drained. With an empty composer, the send button shows <strong>Stop</strong>; with new content it offers steering. Steering does not undo tool actions already executed.</p>
   <h2 id="daily-use">5 · Photos, files, images and video</h2>
   <ul>
     <li><strong>Ask about a photo or file:</strong> choose <strong>+ → Photo</strong> or <strong>File</strong>, attach the item, and describe what you need. The loaded model must support the input. For a vision model without its optional projector, use <strong>Models → Add vision</strong>, then <strong>Enable vision</strong>. <strong>Settings → Downloads → Include optional files</strong> includes the projector and available draft head in future downloads.</li>
-    <li><strong>Generate an image:</strong> load <strong>Qwen-Image 2.1</strong> and describe the picture. To edit a photo, attach it and say what to change. <strong>Select area</strong> beside its thumbnail lets you paint the area to edit. After generation, use <strong>Compare original</strong> or <strong>Edit again</strong>. Optional <strong>Model → LoRA plug-ins</strong> adds separate downloads for styles or faster sampling. See the <a href="models-image.html#mask-editing">image editing guide</a>.</li>
+    <li><strong>Generate an image:</strong> load <strong>Qwen-Image 2.1</strong> or <strong>Qwen-Image 2.1 Turbo</strong> and describe the picture. Turbo uses its fixed 8-step, CFG 1 recipe, with AD-Q4_K at the 24 GB tier and Q8_0 at 32 GB; it shares the base model's encoder/VAE files and refuses step-distillation LoRAs. To edit a photo, attach it and say what to change. <strong>Select area</strong> beside its thumbnail lets you paint the area to edit. After generation, use <strong>Compare original</strong> or <strong>Edit again</strong>. Optional <strong>Model → LoRA plug-ins</strong> adds separate compatible downloads: fourteen on the base entry, four style/edit adapters on Turbo. See the <a href="models-image.html#mask-editing">image editing guide</a>.</li>
     <li><strong>Generate a video:</strong> load the appropriate <strong>MiniMax-H3</strong> catalog entry, describe a short clip, and use that entry's supported attachments. Video needs a GPU backend; the CPU package does not provide a video fallback. Windows audio/video generation is not covered by the recorded desktop app validation. See <a href="models-video.html#minimax-h3">video model requirements and limits</a>.</li>
     <li><strong>Keep a result:</strong> open a generated file's link and save or copy it to a folder you control. Chats retain their transcript, but generated files and uploads live in the app's cache; keep another copy of anything important before clearing caches or removing the app.</li>
   </ul>
 
+  <h3 id="knowledge">Reuse a library in your chats</h3>
+  <p>Open <strong>Menu → Knowledge</strong> to create a collection, upload files or a recursive folder, or <strong>Add chats</strong> with available attachments. Check extraction status, then select <strong>Use {collection} in this chat</strong> before asking; browsing does not select it. New chats start with no collection selected. <strong>Retrieved sources</strong> links open cited locations and originals. See the <a href="knowledge.html">knowledge guide</a> for OCR, supported formats, media-model requirements and limits.</p>
   <h2 id="tools">6 · Set up code and browser work</h2>
   <p>Text chat needs no extra developer tools. Desktop code skills use programs installed on your computer: install <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python 3</a> for Python work and <a href="https://nodejs.org/en/download" target="_blank" rel="noopener">Node.js with npm</a> for JavaScript or the bundled Playwright browser skill. The browser skill requires Node.js 20 or later. Make them available on your <code>PATH</code>, then fully quit and reopen TensorAgent so it discovers them. On Windows use native Windows Node/npm, not WSL.</p>
   <div class="table-scroll">
@@ -112,7 +119,7 @@ Get-FileHash .\tensoragent-desktop-V-win-x64-cpu.msi -Algorithm SHA256</code></p
   <p><strong>Update:</strong> quit TensorAgent, download the new matching platform package from <a href="https://github.com/zhongkaifu/TensorSharp/releases/latest" target="_blank" rel="noopener">the latest release</a>, verify it, and reinstall. On Mac replace the app in Applications. On Windows run the new MSI; for ZIP installs extract into a fresh folder and use the new copy. Updates are manual. Model files, settings and chats are stored separately from the installed app.</p>
   <div class="table-scroll">
   <table>
-    <thead><tr><th>Platform</th><th>Settings and chats — back these up</th><th>Default models, uploads and artifacts</th></tr></thead>
+    <thead><tr><th>Platform</th><th>Settings, chats and knowledge — back these up</th><th>Default models, uploads and artifacts</th></tr></thead>
     <tbody>
       <tr><td>macOS</td><td><code>~/Library/Application Support/TensorAgent</code></td><td><code>~/Library/Caches/TensorAgent</code></td></tr>
       <tr><td>Windows</td><td><code>%LOCALAPPDATA%\TensorAgent\Data</code></td><td><code>%LOCALAPPDATA%\TensorAgent\Cache</code></td></tr>
@@ -122,6 +129,7 @@ Get-FileHash .\tensoragent-desktop-V-win-x64-cpu.msi -Algorithm SHA256</code></p
   <p>Quit the app before copying these folders. If you selected a custom model folder in Settings, back up or reuse that folder separately. Mac backup tools may omit Caches. Changing the model folder leaves the old files in place; move the model subfolders yourself, with downloads finished and the app closed, if you want to reuse them.</p>
   <p><strong>Uninstall:</strong> on Mac move TensorAgent.app to Trash; a PKG install has no separate uninstaller. On Windows use <strong>Settings → Apps → Installed apps → TensorAgent → Uninstall</strong> for MSI, or delete the extracted app folder for ZIP. App removal leaves user data and models available for reinstall. To reclaim individual models, use <strong>Models → Delete</strong>; <strong>Settings → Storage → Delete all chats</strong> removes chat history. For complete removal, after backing up and quitting, also delete the data/cache folders above and any custom model folder you no longer need.</p>
 
+  <p>The knowledge library lives in <code>knowledge</code> inside the data folder, separately from models/upload caches, and retains imported originals. Quit the app and copy the data folder for backup. Deleting chats or upload caches does not remove imported sources; collection/document removal requires a second inline confirmation.</p>
   <h2 id="troubleshooting">Troubleshooting</h2>
   <div class="table-scroll">
   <table>

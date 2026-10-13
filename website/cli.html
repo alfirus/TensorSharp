@@ -476,6 +476,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 
   <h2 id="repl">Interactive REPL commands</h2>
   <p>Launch with <code>--interactive</code> / <code>-i</code>. Anything that does not start with <code>/</code> is a user turn; type <code>/help</code> for the list. The prompt header shows the current model, backend, architecture, context length, projector, conversation depth, and pending attachments. Press <kbd>Ctrl+C</kbd> while generating to interrupt; at the prompt to exit.</p>
+  <p><strong>Steering during generation:</strong> in single-line interactive mode, type a new prompt and press Enter while a reply runs to interrupt it and start the next turn; produced assistant text stays in history. Slash commands also stop and drain generation before running. Multiline input is submitted only after a <code>.</code> on its own line; redirected input runs complete turns in order and ends cleanly at EOF. This requires a build after <code>v2026.10.10</code>.</p>
   <h4>Conversation</h4>
   <div class="table-scroll">
   <table>

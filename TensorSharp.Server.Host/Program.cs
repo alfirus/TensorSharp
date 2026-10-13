@@ -24,6 +24,8 @@ using TensorSharp.Runtime.Redis;
 using TensorSharp.Server.Host.Hosting;
 using TensorSharp.Models;
 using TensorSharp.Models.Embeddings;
+using TensorSharp.Knowledge;
+using TensorSharp.Server.Knowledge;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
@@ -346,6 +348,12 @@ builder.Services.AddSingleton(sp => new ModelService(sp.GetRequiredService<ILogg
     MediaStorage = uploadPolicy,
 });
 builder.Services.AddSingleton<SessionManager>();
+// Explicit opt-in for this unauthenticated standalone host. Remote deployments must
+// put the whole library API behind their trusted authentication/authorization boundary.
+string? knowledgeDirectory = Environment.GetEnvironmentVariable("TS_KNOWLEDGE_DIRECTORY");
+if (!string.IsNullOrWhiteSpace(knowledgeDirectory))
+    builder.Services.AddSingleton<KnowledgeStore>(sp => KnowledgeRuntime.CreateStore(
+        knowledgeDirectory, sp.GetRequiredService<ModelService>()));
 if (hostingOptions.EmbeddingsEnabled)
 {
     // An explicit --backend this machine does not have. The chat path refuses the same
@@ -613,6 +621,8 @@ app.UseStaticFiles(UploadStaticFiles.BuildStaticFileOptions(hostingOptions.Uploa
 app.MapHealthEndpoints(app.Environment, hostingOptions.WebUiEnabled);
 app.MapSessionEndpoints();
 app.MapUploadEndpoints();
+if (!string.IsNullOrWhiteSpace(knowledgeDirectory))
+    app.MapKnowledgeEndpoints();
 if (hostingOptions.SkillsEnabled)
     app.MapSkillEndpoints();
 if (codeExecOptions.Enabled)

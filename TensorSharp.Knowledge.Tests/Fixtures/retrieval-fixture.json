@@ -1,0 +1,33 @@
+{
+  "description": "Small manually authored regression set with distinct policy, engineering and multilingual facts. Not a public retrieval leaderboard or representative customer corpus.",
+  "documents": [
+    { "name": "refund-policy.txt", "text": "Online store return policy: Customers may return an unopened purchase within thirty days of delivery. Refunds go to the original payment method after warehouse inspection. Items showing wear cannot be returned. Subscription cancellation is handled by the billing team." },
+    { "name": "travel-expenses.txt", "text": "Employee travel reimbursement requires an itemized receipt and manager approval. Submit the expense report within forty-five days of the business trip. Rail tickets and hotel accommodation qualify. Alcohol and commuting costs are excluded." },
+    { "name": "deployment-runbook.txt", "text": "Cedar-481 is the release approval code for the Quasar service. On-call engineer Mira owns the production deployment. Rollback is required if the five-minute error rate exceeds two percent. Use the previous signed container image and record the incident number." },
+    { "name": "greenhouse-guide.txt", "text": "Tomato seedlings become leggy when light is insufficient. Move the plants under a grow lamp for fourteen hours daily. Water at the roots when the top layer of soil dries. Basil tolerates similar conditions but should be harvested before flowering." },
+    { "name": "battery-storage.txt", "text": "Lithium-ion battery packs should be stored near half charge in a cool, dry place. Avoid leaving cells in a hot vehicle or at full charge for extended periods. A swollen battery must be removed from service and handled by trained staff." },
+    { "name": "database-recovery.txt", "text": "The database recovery procedure restores the most recent full backup and replays transaction logs up to the requested timestamp. This permits point-in-time recovery after accidental deletion. Verify record counts and integrity constraints before reopening writes." },
+    { "name": "meeting-transcript.txt", "text": "At the planning meeting, Elena agreed to deliver the accessibility audit by November seventeenth. Victor will test keyboard navigation. Screen reader labels are the highest priority. The team deferred the color palette redesign until next quarter." },
+    { "name": "car-maintenance.txt", "text": "Vehicle maintenance schedule: replace the engine oil and oil filter every eight thousand kilometers under normal driving conditions. Inspect tire pressure monthly. A squealing brake may indicate worn friction pads and requires inspection by a mechanic." },
+    { "name": "astronomy-notes.txt", "text": "A lunar eclipse occurs when Earth lies between the Sun and the Moon, casting a shadow on the lunar surface. A solar eclipse happens when the Moon blocks sunlight reaching Earth. Orbital tilt means these alignments do not occur every month." },
+    { "name": "网络维护.txt", "text": "网络维护窗口安排在每周日凌晨两点到四点。升级交换机之前需要备份配置，通知值班人员，并确认备用链路可用。发生连接中断时，先检查光纤接口，再回滚固件。" },
+    { "name": "图书借阅.txt", "text": "图书馆普通图书可借阅二十一天，读者可以续借一次。参考资料仅限馆内阅读。逾期归还需要支付管理费，遗失图书应按原价赔偿。" },
+    { "name": "音频归档.txt", "text": "会议录音归档保留两年。转录文本需要标注说话人和时间戳。包含客户信息的片段应限制访问，删除原始录音时必须同步删除派生的索引与摘要。" }
+  ],
+  "queries": [
+    { "kind": "exact", "query": "Cedar-481 Quasar release approval", "expected": "deployment-runbook.txt" },
+    { "kind": "exact", "query": "itemized receipt forty-five days", "expected": "travel-expenses.txt" },
+    { "kind": "exact", "query": "Elena accessibility November seventeenth", "expected": "meeting-transcript.txt" },
+    { "kind": "exact", "query": "point-in-time recovery transaction logs", "expected": "database-recovery.txt" },
+    { "kind": "paraphrase", "query": "Can I send back something I bought if I never opened the package?", "expected": "refund-policy.txt" },
+    { "kind": "paraphrase", "query": "How can I stop my young tomato plants from growing tall and weak?", "expected": "greenhouse-guide.txt" },
+    { "kind": "paraphrase", "query": "What is the safest way to put rechargeable cells away for a long time?", "expected": "battery-storage.txt" },
+    { "kind": "paraphrase", "query": "Someone erased important records. Can we return our data to the moment before that mistake?", "expected": "database-recovery.txt" },
+    { "kind": "paraphrase", "query": "When should the lubricant in my automobile's motor be changed?", "expected": "car-maintenance.txt" },
+    { "kind": "paraphrase", "query": "Why does our planet sometimes darken the face of the moon?", "expected": "astronomy-notes.txt" },
+    { "kind": "cjk", "query": "网络维护窗口是每周几的几点？", "expected": "网络维护.txt" },
+    { "kind": "cjk", "query": "图书可以借多久，能不能再借一次？", "expected": "图书借阅.txt" },
+    { "kind": "cjk", "query": "删除会议录音后还需要清理哪些资料？", "expected": "音频归档.txt" },
+    { "kind": "cjk", "query": "交换机升级之前要做哪些准备？", "expected": "网络维护.txt" }
+  ]
+}

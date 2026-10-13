@@ -225,7 +225,6 @@ models = json.loads(sys.argv[1])['models']
 expected_ids = [
     'gemma-4-e2b-q8',
     'gemma-4-e4b-iq4xs',
-    'gemma-4-12b-iq2m',
     'bonsai-2-27b-ptq1-0',
     'qwen3.5-9b-iq4xs',
 ]

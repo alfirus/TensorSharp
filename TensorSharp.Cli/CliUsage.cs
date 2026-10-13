@@ -457,7 +457,10 @@ namespace TensorSharp.Cli
             {
                 new OptionHelp("-i | --interactive | --chat",
                     "Start an interactive multi-turn chat session in the terminal with KV-cache reuse across " +
-                    "turns. In-session commands include /system, /model, /backend, /info, /reset, /exit; /help " +
+                    "turns. Type and submit a new prompt during reasoning or answering to interrupt and steer " +
+                    "the reply while keeping partial output in history. /cancel (or bare /stop) stops a reply. " +
+                    "Redirected stdin runs complete turns sequentially. In-session commands include " +
+                    "/system, /model, /backend, /info, /reset, /exit; /help " +
                     "lists them all. Honors " +
                     "--system, --think, --tools, and the sampling flags. Default: off (single-shot generation).",
                     "--model gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --chat"),

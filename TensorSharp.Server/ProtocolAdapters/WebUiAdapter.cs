@@ -20,6 +20,7 @@ using Microsoft.Extensions.Logging;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
+using TensorSharp.Knowledge;
 using TensorSharp.Server.Endpoints;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.RequestParsers;
@@ -63,11 +64,13 @@ public sealed class WebUiAdapter
         ICodeRunner codeRunner,
         SessionWorkspaceManager workspaces,
         CodeArtifactStore codeArtifacts,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        KnowledgeStore? knowledge = null)
     {
         _service = new WebUiChatService(
             svc, sessions, options, uploads, skills, codeRunner, workspaces, codeArtifacts, loggerFactory,
             CodeArtifactEndpoints.RoutePrefix);
+        if (knowledge != null) _service.Knowledge = knowledge;
         _svc = svc;
         _options = options;
         _uploads = uploads;
@@ -459,10 +462,17 @@ public sealed class WebUiAdapter
     {
         var webUiLogger = _loggerFactory.CreateLogger("TensorSharp.Server.WebUI.Chat");
         var body = await JsonSerializer.DeserializeAsync<JsonElement>(ctx.Request.Body).ConfigureAwait(false);
+        using var generationCancel = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
 
-        IAsyncEnumerator<object> frames = _service
-            .ChatStreamAsync(body, ctx.RequestAborted)
-            .GetAsyncEnumerator(ctx.RequestAborted);
+        await WriteChatFramesAsync(ctx, _service.ChatStreamAsync(body, generationCancel.Token),
+            generationCancel, webUiLogger).ConfigureAwait(false);
+    }
+
+    internal static async Task WriteChatFramesAsync(HttpContext ctx, IAsyncEnumerable<object> source,
+        CancellationTokenSource generationCancel, ILogger webUiLogger)
+    {
+        IAsyncEnumerator<object> frames = source
+            .GetAsyncEnumerator(generationCancel.Token);
         await using (frames.ConfigureAwait(false))
         {
 
@@ -483,21 +493,25 @@ public sealed class WebUiAdapter
                 return;
 
             SseWriter.ApplyHeaders(ctx.Response);
+            bool disconnected = false;
             do
             {
+                if (disconnected)
+                    continue;
                 try
                 {
                     await SseWriter.WriteEventAsync(ctx.Response, frames.Current, ctx.RequestAborted).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    // The client has gone (an abort, a reset). The service sees the same
-                    // token and ends its stream with done.aborted; there is nobody left
-                    // to write that to, so the remaining frames are dropped here.
+                    // Drain after cancelling: abandoning the iterator here would skip
+                    // the engine completion and partial transcript recording a steering
+                    // prompt needs. Further frames are consumed without writing them.
+                    disconnected = true;
+                    generationCancel.Cancel();
                     if (webUiLogger.IsEnabled(LogLevel.Debug))
                         webUiLogger.LogDebug(LogEventIds.ChatAborted,
                             "Web UI chat stream write failed; dropping the remaining frames: {Reason}", ex.Message);
-                    return;
                 }
             }
             while (await frames.MoveNextAsync().ConfigureAwait(false));

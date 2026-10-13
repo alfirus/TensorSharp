@@ -15,6 +15,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 
 using TensorSharp.Runtime;
 namespace TensorSharp.AgentHost.Skills
@@ -76,6 +77,7 @@ namespace TensorSharp.AgentHost.Skills
         /// </summary>
         public static bool IsBuiltInTool(string? name) =>
             IsSkillTool(name) || SkillToolNames.IsCodeTool(name)
+            || Knowledge.KnowledgeTools.IsTool(name)
             || Agents.MultiAgentTools.IsTool(name);
 
         /// <summary>
@@ -458,9 +460,11 @@ namespace TensorSharp.AgentHost.Skills
         /// tools that produce no live output never call it.
         /// </param>
         public static SkillToolResult Execute(
-            ToolCall? call, SkillToolContext context, Action<string>? onToolOutput = null)
+            ToolCall? call, SkillToolContext context, Action<string>? onToolOutput = null,
+            CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(context);
+            cancellationToken.ThrowIfCancellationRequested();
             if (call == null)
                 return SkillToolResult.Failure("No tool call was supplied.");
 
@@ -477,6 +481,9 @@ namespace TensorSharp.AgentHost.Skills
                     ListToolName => ExecuteList(context),
                     ReadToolName => ExecuteRead(call, context),
                     RunToolName => ExecuteRun(call, context, onToolOutput),
+                    _ when Knowledge.KnowledgeTools.IsTool(call.Name) =>
+                        Knowledge.KnowledgeTools.Execute(call, context.Knowledge,
+                            context.CodeRunner?.CanRun == true ? context.Workspace : null, cancellationToken, context.KnowledgeRetrieval),
 
                     // Every code tool goes to the same runner, which dispatches on the
                     // name itself. Listing them one by one here is what let apply_patch
@@ -489,7 +496,8 @@ namespace TensorSharp.AgentHost.Skills
                     _ => SkillToolResult.Failure($"'{call.Name}' is not a tool this host answers."),
                 };
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+            catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException
+                && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
             {
                 // The model is mid-task; an unexpected failure here should cost it one
                 // tool call, not the whole answer.
@@ -974,6 +982,12 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>Ceiling on one read's returned bytes.</summary>
         public int MaxReadBytes { get; }
+
+        /// <summary>Read-only knowledge access restricted to collections explicitly selected for this request.</summary>
+        public Knowledge.KnowledgeToolScope? Knowledge { get; set; }
+        /// <summary>Children share source permissions and provenance, but not the evidence
+        /// their own conversation has seen. Null uses the root scope's eager evidence.</summary>
+        public Knowledge.KnowledgeRetrievalProgress? KnowledgeRetrieval { get; init; }
 
         /// <summary>
         /// Set to enable <see cref="SkillTools.RunToolName"/>. Null — the default —

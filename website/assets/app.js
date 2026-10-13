@@ -23,6 +23,7 @@
     ]},
     { group: { en: "Run it", zh: "运行" }, items: [
       { page: "tensoragent", label: { en: "TensorAgent Desktop", zh: "TensorAgent 桌面版" } },
+      { page: "knowledge", label: { en: "Personal Knowledge Bases", zh: "个人知识库" } },
       { page: "cli",    label: { en: "Command Line (CLI)", zh: "命令行 (CLI)" } },
       { page: "server", label: { en: "Server & Web UI", zh: "服务器与 Web UI" } },
       { page: "agentic", label: { en: "Agentic Work", zh: "智能体工作流" } },

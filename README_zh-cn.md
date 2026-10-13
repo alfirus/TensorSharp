@@ -8,15 +8,17 @@
 
 **TensorSharp 是在本地运行 GGUF 模型的 .NET 10 推理引擎。** 在 Windows、macOS 或 Linux 上，通过 CLI、浏览器聊天或兼容 Ollama/OpenAI 的 API 使用，也可直接集成到自己的 .NET 应用中。可选择纯托管 C# CPU 内核或原生 CUDA、Metal、Vulkan 后端，具体支持取决于模型。
 
-当前源码涵盖文本与推理、多模态输入、嵌入、图像生成与编辑、带音频的视频，以及带代码工具的 Agent Skills。TensorSharp 也为 iPhone、iPad、Mac 和 Windows 上的本地应用 [TensorAgent](TensorAgent/README.md) 提供引擎。可直接从下文开始，或查看[项目状态](docs/PROJECT_STATUS_zh-cn.md)中的能力与验证限制；源码改动可能领先于已发布的包。
+当前源码涵盖文本与推理、多模态输入、嵌入、图像生成与编辑、带音频的视频、个人知识库，以及带代码工具的 Agent Skills。TensorSharp 也为 iPhone、iPad、Mac 和 Windows 上的本地应用 [TensorAgent](TensorAgent/README.md) 提供引擎。可直接从下文开始，或查看[项目状态](docs/PROJECT_STATUS_zh-cn.md)中的能力与验证限制；知识库与生成中追加指令在 `v2026.10.10` 标签之后加入，需要包含这些改动的构建。
 
 ## 亮点功能
 
 - **本地模型，多种入口。** 同一引擎用于 CLI、浏览器聊天及兼容 Ollama/OpenAI 的 API，支持纯托管 CPU 与原生加速后端。
 - **文本与多模态模型。** 支持稠密与 MoE GGUF 模型、推理、图像 / 音频输入和文档问答。各模型家族的能力见[支持的模型](docs/supported_models_zh-cn.md)。
-- **嵌入与媒体生成。** [文本 / 代码嵌入](docs/embeddings_zh-cn.md)、[Qwen-Image-2.1](docs/models/qwenimage21_zh-cn.md) 图像生成与蒙版编辑，以及包括 [MiniMax-H3 音视频](docs/models/minimax-h3_zh-cn.md)在内的视频模型。
+- **嵌入与媒体生成。** [文本 / 代码嵌入](docs/embeddings_zh-cn.md)、[Qwen-Image-2.1 及其 8 步 Turbo 变体](docs/models/qwenimage21_zh-cn.md) 图像生成与蒙版编辑，以及包括 [MiniMax-H3 音视频](docs/models/minimax-h3_zh-cn.md)在内的视频模型。
 - **高效服务。** 连续批处理与分页、Radix 前缀共享 KV 缓存默认开启；支持的模型还可使用投机解码与多 GPU 放置。详见[功能说明](FEATURES_zh-cn.md)。
 - **Agent Skills 与代码工具。** `TensorSharp.AgentHost` 提供文件、shell 和文档工作流。服务端与 TensorAgent 聊天还支持[有界子智能体委派](docs/multi_agent.md)（英文），子智能体拥有私有工作区并默认只读。
+- **个人知识库。** [上传文件或嵌套目录，导入已保存聊天及其附件和产物](docs/knowledge-system_zh-cn.md)。按聊天选择集合，检索带页码 / 行号 / 时间位置的引用片段、预览原件，或让代码智能体打开完整数据集。默认使用本地 BM25，可选 GGUF 嵌入提供语义搜索；兼容的媒体模型可索引图像、音频和采样视频。提取状态与警告显示覆盖边界。
+- **生成中追加指令。** CLI、服务端 Web UI 和 TensorAgent 在推理或回答时都可提交新指令；后续回答使用对话、已有部分输出与新指导。仍可单独停止当前生成。
 - **有记录的性能对比。** 与 `llama.cpp` 的测试使用相同 GGUF 文件和硬件，结果对应所测的模型、后端及工作负载。详见[性能数据](docs/benchmarks_zh-cn.md)。
 - **TensorAgent 应用。** 在手机和桌面进行本地聊天、使用附件与技能并保存工作。详见 [Mac / Windows 安装指南](docs/tensoragent_desktop_zh-cn.md)与[应用验证范围](TensorAgent/README.md)。
 
@@ -84,7 +86,7 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 各模型的后端、模态、功能支持与验证覆盖范围不同，详见[支持的模型](docs/supported_models_zh-cn.md)各表、[模型卡片](docs/models/README_zh-cn.md)及[嵌入指南](docs/embeddings_zh-cn.md)。
 
-近期源码增加了 Qwen-Image-2.1 蒙版编辑：保留保护区域的精确像素，并可仅处理选中区域；TensorAgent 提供十二款加速、风格与编辑 LoRA 插件；Qwen3.8 Flash Next 可在 48 GB Mac 上使用 SSD 支持的权重路径运行。多 GPU 的 `--layer-split` 与 `--tp` 是独立选项，支持范围和性能取决于架构与量化格式。这些源码功能可能领先于已发布的包；更新后的 Release Binaries 工作流会在新发布中提供桌面安装包，历史发布可能不包含这些资源。
+TensorAgent 当前目录包含 38 个条目，按可搜索的模型家族分组，并支持内存档位与已下载过滤；其中包括 4 位和 8 位 Qwen-Image-2.1 Turbo，以及十四款图像 LoRA 插件。扩展目录包含实验性条目，其内存档位与应用 / 设备行为尚未全部实测。Qwen3.8 Flash Next 使用 SSD 支持的权重路径；Q2 包已在 48 GB Mac 上测量，IQ1_M 另有 Windows 目录宿主验证。多 GPU 的 `--layer-split` 与 `--tp` 是独立选项，支持范围和性能取决于架构与量化格式。验证范围见 [TensorAgent 说明](TensorAgent/README.md#what-has-not-been-verified)（英文）与模型卡片。更新后的 Release Binaries 工作流会在新发布中提供桌面安装包，历史发布可能不包含这些资源。
 
 ## 实际运行效果
 
@@ -141,6 +143,7 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | [分页注意力 & 连续批处理](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md) | vLLM 风格的分页 KV 缓存、前缀共享与迭代级调度器 |
 | [Agent Skills 与智能体工作](docs/agent_skills.md)（英文） | `SKILL.md` 格式、渐进式披露与其预算、进程内工具循环、沙箱化代码执行、工作区与产物、路径 / ZIP / 执行安全模型，以及 HTTP 与 C# 两套接口 |
 | [多智能体](docs/multi_agent.md)（英文） | 自动任务委派、隔离的子上下文、并发与权限限制、服务端控制项，以及可复现的评测 |
+| [个人知识库](docs/knowledge-system_zh-cn.md) | 集合、目录和已保存聊天导入、文档 / PDF / 媒体提取、本地检索、引用预览、数据集工具、API 与验证边界 |
 | [浏览器自动化技能（Playwright）](docs/playwright_agent.md)（英文） | 运行内置的 `playwright` 技能（经 `skills_run` 通过 `@playwright/cli` 驱动浏览器）：所需参数、macOS 上的 Chromium 沙箱配置、账号交接，以及 TensorAgent 桌面托管（不支持 iOS） |
 | [投机解码](docs/speculative_decoding.md)（英文） | 三层设计（模型适配层 / 算法 / 草稿权重）、已内置的 `auto` / `draft-head` / `block` / `ngram` 四种算法，以及新增一种算法需要写什么 |
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 哪些高影响运行时开关影响哪些模型、后端与提示类型 |
@@ -160,7 +163,8 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS、MLX Metal，以及 GGML CPU/Metal/CUDA/Vulkan，各架构另有例外。 |
 | 服务能力 | 带共享前缀缓存的连续批处理、投机解码、张量并行、结构化输出与工具调用。 |
 | 智能体能力 | Agent Skills、沙箱化的文件与 shell 工具，以及有界的子智能体。见 [Agent Skills](docs/agent_skills.md)（英文）与[多智能体](docs/multi_agent.md)（英文）。 |
-| TensorAgent | 十二项内置模型、保存聊天与产物、蒙版图像编辑和 LoRA 选择、八种界面语言，以及持久保存的文本轮次统计。媒体生成已在 Mac 上实测；iOS 媒体生成及 Windows 图像 / 音频 / 视频生成仍未验证。 |
+| 知识库 | 本地文档、数据集与媒体集合；TensorAgent 支持目录和已保存聊天导入、每聊天作用域、词法 / 可选语义检索、来源预览与完整数据集智能体工具。媒体提取与 OCR 有明确的覆盖边界。见[个人知识库](docs/knowledge-system_zh-cn.md)。 |
+| TensorAgent | 38 项目录条目，支持家族搜索与过滤；保存聊天与产物、个人知识库、生成中追加指令、蒙版编辑、8 步 Turbo、十四款 LoRA、八种界面语言和持久保存的文本轮次统计。扩展目录条目仍属实验性；iOS 媒体生成及 Windows 图像 / 音频 / 视频生成仍未验证。 |
 
 逐项细节（哪个架构跑在哪个后端上、各家族分别支持哪些特性，以及已知限制）见[状态矩阵](docs/PROJECT_STATUS_zh-cn.md#状态矩阵)。
 

@@ -64,6 +64,22 @@ public class ThinkingBudgetTests
     }
 
     [Fact]
+    public void KnowledgePlanningLimitKeepsLongAnswerBudgetWithoutThousandsOfReasoningTokens()
+    {
+        WithEnv(null, () =>
+        {
+            Assert.Equal(512, ChatGenerationPipeline.ThinkingBudgetFor(8192, true, turnLimit: 512));
+            Assert.Equal(384, ChatGenerationPipeline.ThinkingBudgetFor(512, true, turnLimit: 512));
+            Assert.Equal(6144, ChatGenerationPipeline.ThinkingBudgetFor(8192, true));
+            Assert.Equal(0, ChatGenerationPipeline.ThinkingBudgetFor(8192, false, turnLimit: 512));
+        });
+        WithEnv("1200", () => Assert.Equal(1200,
+            ChatGenerationPipeline.ThinkingBudgetFor(8192, true, turnLimit: 512)));
+        WithEnv("0", () => Assert.Equal(0,
+            ChatGenerationPipeline.ThinkingBudgetFor(8192, true, turnLimit: 512)));
+    }
+
+    [Fact]
     public void ASmallAllowance_IsNotCapped()
     {
         // Capping a 200-token turn at 150 would fire on ordinary short reasoning, where

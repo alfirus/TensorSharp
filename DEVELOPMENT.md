@@ -440,7 +440,9 @@ TensorSharp/
 │   ├── Speculative/             # Speculative decoding: the draft/verify/rollback core (SpeculativeExecution), the ISpeculator algorithms (DraftHeadSpeculator, BlockDraftSpeculator, NGramSpeculator) + SpeculatorRegistry, the model-side contracts (ISpecTrunk, SpeculativeModelContracts), shared flag parsing (SpeculativeCliFlags, SpeculationOptions) and the runtime cost governor
 │   ├── PrefillChunking.cs       # Chunked-prefill helper used by SWA / very long prompts
 │   └── Logging/                 # JSON-line file logger + per-turn telemetry
+├── TensorSharp.Knowledge/       # Host-neutral durable originals, bounded text/Office/PDF extraction, chunks, BM25/hybrid retrieval and versioned source references; no inference or app dependency
 ├── TensorSharp.AgentHost/       # Agentic layer on top of the runtime: Agent Skills, code execution and sub-agent delegation
+│   ├── Knowledge/              # Scoped knowledge tools, evidence budgets, reranking contracts and citation binding
 │   ├── Agents/                  # Sub-agents: the request-scoped limits (MultiAgentOptions), the spawn_agent / wait_agent / send_input / close_agent / list_agents declarations (MultiAgentTools), the request-owned agent tree with its roles, read-only tool gating and serialized host tools (MultiAgentSession), the coordination prompt (MultiAgentPrompt), the rendered child profiles a host checkpoints before prefill (MultiAgentPromptProfile) and the progress snapshots the Web UI shows (MultiAgentProgress); see docs/multi_agent.md
 │   ├── Skills/                  # Agent Skills: SKILL.md frontmatter parsing (YamlFrontmatter, SkillManifest), the repository skill roots used when no root is configured — every existing .agents/skills from the working directory up to the Git root, nearest first, ahead of <binary dir>/skills (SkillDiscovery) — discovery / install / lookup (SkillRegistry, SkillArchive), the containment boundary (SkillPathGuard), prompt planning (SkillPrompt), the built-in skills_list / skills_read / skills_run tools and the in-process disclosure loop (SkillTools, SkillAgentLoop, SkillScriptRunner), the OS sandboxes (SkillSandbox, SkillSandboxWindows) and their violation monitor, per-session workspaces (SessionWorkspace), shared flag parsing (SkillHostOptions) and the public client (SkillsChatClient)
 │   └── CodeExec/                # The file surface (read_file, write_file), the shell and apply_patch: the engine (ShellRunner), the four declarations the model is offered — read_file, apply_patch, write_file (create-only) and shell — and the lenient argument reading a small model needs (ShellTools), reading the command argument — splitting a line into its simple commands, classifying which of them are package installs (that is what decides whether the line gets a socket at all) and intercepting an apply_patch heredoc before the shell ever sees it (ShellCommand), the per-session working directory and exported environment, persisted through files because there is no long-lived shell process (ShellSession), shell discovery and dialect (ShellProgram), the patch envelope parser (CodePatch) and its matcher, a line-for-line port of the reference V4A applier (V4ADiff), turning a failure into the next command to type (CodeDiagnostics), reading the real API out of an installed package when a run failed because the model guessed one (ApiProbe), checking that a file a command wrote or a patch changed still parses (SyntaxCheck), rewriting the host's absolute paths out of everything a command printed (OutputPaths), the string-replacement editor and its tolerance ladder, no longer advertised and kept only so a legacy edit call from an older client still dispatches (FileEdit), the one numbered-listing renderer every tool and every refusal shows a file through (NumberedListing), the eight editing rules injected into the system prompt (CodePrompt), noticing a whole file re-typed to change two lines of it (RewriteWatch), host-initiated installs for a skill script whose import failed (PackageInstaller), the host's terms (CodeExecOptions), the confined launch, which can also start a process and not wait for it — that is how background jobs work (ConfinedProcess), interpreter discovery (CodeEnvironment), produced-file capture (CodeArtifactStore), the install-time registry proxy (EgressProxy), the result record (CodeExecResult) and the ICodeRunner seam the skills layer sees (CodeRunnerAdapter)
@@ -513,6 +515,7 @@ TensorSharp/
 │   ├── ggml_ops_training.cpp              # Training-only kernels (unused at runtime)
 │   └── tests/                              # Native unit + smoke tests
 ├── TensorSharp.Chat/            # Host-neutral chat pipeline shared by the Server, the CLI and TensorAgent (no ASP.NET Core, no Distributed)
+│   ├── Knowledge/              # KnowledgeRuntime, request retrieval/context fitting, GGUF embeddings/reranking, loaded-model media extraction and platform/managed PDF OCR adapters
 │   ├── ModelService.cs          # Facade over model load/unload, the InferenceEngineHost and the generation pipeline (TensorParallelGroupFactory, SchedulerConfigOverride, UnloadModel)
 │   ├── ModelLifecycleService.cs # Model load/dispose and backend selection; the tensor-parallel group is handed in by the host
 │   ├── InferenceEngineHost.cs   # Per-model InferenceEngine singleton (continuous batching entry point)
@@ -535,6 +538,7 @@ TensorSharp/
 │   ├── ResponseSerializers/     # WebUiSseEvents (the Web UI frame shapes) + shared JSON options
 │   └── ProtocolAdapters/        # ChatStreamCollector + FinishReasonMapper (pipeline vocabulary -> protocol vocabulary)
 ├── TensorSharp.Server/          # Web chatbot + API server library (ASP.NET Core); TensorSharp.Server.Host is the runnable app
+│   ├── Knowledge/              # Per-request compatibility-protocol scope and cited-source/tool-step metadata
 │   ├── BackendCatalogProbes.cs  # CUDA / MLX / GGML availability probes behind TensorSharp.Chat's BackendCatalog
 │   ├── OpenAIResponseFormatParser.cs  # OpenAI response_format (json_object / json_schema) parsing
 │   ├── Hosting/                 # Startup-time concerns: options builder (ServerOptionsBuilder, which also parses the sub-agent limits), web root, /uploads static files and cleanup, embedding hosting, the multi-node tensor-parallel factory, continuous-batching CLI translation
@@ -542,7 +546,7 @@ TensorSharp/
 │   ├── Responses/               # Stored /v1/responses records (in-memory, or Redis via --redis-url)
 │   ├── StreamingWriters/        # SSE + NDJSON wire-format helpers
 │   ├── ProtocolAdapters/        # Per-protocol request handlers (OllamaAdapter, OpenAIChatAdapter, OpenAIResponsesAdapter, JevAdapter, EmbeddingAdapter; WebUiAdapter and SkillsAdapter are thin HTTP shells over TensorSharp.Chat)
-│   ├── Endpoints/               # ASP.NET Core endpoint mapping (one extension method per protocol)
+│   ├── Endpoints/               # ASP.NET Core endpoint mapping (one extension method per protocol), including /api/knowledge management/search/read/original downloads
 │   └── Logging/                 # Request logging middleware + low-noise path support
 ├── TensorSharp.Server.Host/     # The runnable web application
 │   ├── Program.cs               # Slim bootstrap: config-file expansion, DI wiring, middleware, endpoint mapping, continuous-batching CLI translation
@@ -571,6 +575,7 @@ TensorSharp/
 │   ├── skills/                  # The 12 skills (the desktop hosts' skill root); verdicts.json records verify-skills.py's static verdict for each (Python imports resolved against the staged interpreter, shell scripts checked for npm/npx/pnpm/yarn/parcel/vite). Ten pass and are bundled into the iOS app; playwright and web-artifacts-builder fail and TensorAgent.Maui.csproj excludes them
 │   └── scripts/                 # Desktop build/run, simulator/device build/deploy/verify, background/share probes, Python staging, skill checks and chat/media validation
 ├── InferenceWeb.Tests/          # xUnit unit tests covering ops, KV cache, paged scheduler, batched-model correctness, web/server helpers
+├── TensorSharp.Knowledge.Tests/ # Portable store/extraction/retrieval tests and fixtures; integration tests also live in InferenceWeb.Tests and TensorAgent.Tests
 ├── AdvUtils/                    # Utility library (logger)
 ├── docs/                        # Developer reference
 │   ├── models/                  # Per-model architecture cards (one .md per model, EN + 中文)
@@ -578,6 +583,7 @@ TensorSharp/
 │   ├── speculative_decoding.md  # Draft-and-verify design: the ISpeculativeTarget / ISpeculator / IDraftHead layering and the draft-head, block and ngram algorithms
 │   ├── agent_skills.md          # Agent Skills: the SKILL.md format, progressive disclosure and its budget, the in-process tool loop, the path / ZIP / script-execution security model, and the HTTP + C# surfaces
 │   ├── multi_agent.md           # Sub-agent delegation: tools, roles and read-only children, limits, prefix sharing with the parent, host integration
+│   ├── knowledge-system.md      # Knowledge collections, extraction coverage, OCR, retrieval/agent scope, citations, SDK/HTTP contracts and validation limits (EN + 中文)
 │   ├── playwright_agent.md      # The Playwright browser skill: required flags, macOS sandbox configuration, account handoff, validated hosts
 │   └── env_var_feature_matrix.md  # Runtime flag × model/backend/feature coverage for TestMatrix
 ├── benchmarks/                  # Reproducible benchmark harnesses
@@ -597,6 +603,7 @@ What is on [NuGet.org](https://www.nuget.org/profiles/TensorSharp): all thirteen
 | `TensorSharp.Core` | `TensorSharp.Tensors` | `TensorSharp` | Tensor primitives, ops, allocators, storage, and device abstraction |
 | `TensorSharp.Runtime.Logging` | `TensorSharp.Runtime.Logging` | `TensorSharp.Runtime.Logging` | Logging abstractions and sinks shared by every host, factored out so the engine layers do not carry a host's logging stack |
 | `TensorSharp.Runtime` | `TensorSharp.Runtime` | `TensorSharp.Runtime` | GGUF parsing, tokenizers, prompt rendering, sampling, output protocol parsing, paged KV cache, continuous-batching scheduler |
+| `TensorSharp.Knowledge` | `TensorSharp.Knowledge` (packable current source) | `TensorSharp.Knowledge` | Durable local collections, retained originals, bounded extraction/chunking, BM25/hybrid retrieval, embedding/extractor contracts and versioned references; no runtime, model, ASP.NET Core or TensorAgent project dependency |
 | `TensorSharp.AgentHost` | `TensorSharp.AgentHost` | `TensorSharp.AgentHost` | Agent Skills, code execution (`read_file` + `write_file` + `shell` + `apply_patch`) with OS sandboxing, per-Web/CLI-session and per-HTTP-request workspaces, and host-classified package installs, and the sub-agent delegation primitives (`MultiAgentSession`, `MultiAgentTools`, `MultiAgentOptions`) — built on `TensorSharp.Runtime` |
 | `TensorSharp.Models` | `TensorSharp.Models` | `TensorSharp.Models` | `ModelBase`, architecture implementations, multimodal encoders, batched / paged forward passes, and model-side execution helpers |
 | `TensorSharp.Backends.GGML` | `TensorSharp.Backends.GGML` | `TensorSharp.GGML` | GGML-backed execution and native interop |
@@ -673,7 +680,7 @@ TensorSharp is structured as a layered system:
 
 2. **TensorSharp.Runtime** owns runtime-facing contracts and services: GGUF parsing, tokenization (SentencePiece / BPE), chat template rendering, configurable token sampling, output parsing, paged KV cache (`Runtime/Paged/*`), the continuous-batching scheduler / engine (`Runtime/Scheduling/*`), and reusable contracts such as `IModelArchitecture`, `IBatchedPagedModel`, `IPromptRenderer`, `IOutputProtocolParser`, `IMultimodalInjector`, and `IBackendExecutionPlan`. It deliberately carries none of the agentic layer: skills, code execution and sub-agent delegation live in **TensorSharp.AgentHost**, which references the runtime and is never referenced back, so a host that serves plain OpenAI/Ollama chat completions takes the runtime alone and ships no skill registry, no sandbox and no code runner. (`AgentHostLayeringTests` fails if that direction ever inverts.)
 
-3. **TensorSharp.Models** implements `ModelBase` plus fifteen registered architecture descriptors (`Architecture/BuiltInArchitectures.cs`) and their multimodal helpers — twelve text families (DeepSeek V4 Flash, DeepSeek V4.1 Flash, GLM 5.x, Gemma 4, DiffusionGemma, Qwen 3.5/3.6-family, Qwen 3.8 Flash Next, GPT OSS, Nemotron-H, Mistral 3, Hunyuan Dense, Muse-Glimmer) and three media-out families (Qwen-Image-2.1, MiniMax-H3, Wan 2.1/2.2). Autoregressive architectures ship the per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-2.1 (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws, and image generation and editing run through `GenerateImage()` / `EditImage()`, which orchestrate the diffusion transformer, the dedicated 2.1 VAE, and the Qwen3-VL-8B text encoder. LoRA plug-ins (`--lora` / `--lora-scale` / `--lora-config`, parsed by `TensorSharp.Runtime/LoraSpec.cs` for both hosts) are applied unmerged inside the diffusion transformer (`QwenImage21LoraSet`); `config/lora/` ships twelve presets. The video families go one step further out: `MiniMaxH3Model` and `WanVideoModel` both throw from `ForwardCore()` and generate through `GenerateVideo(prompt, VideoGenerationParams)` behind the shared `IVideoGenerationModel` seam in `Models/Video/`, so the CLI and the server drive either one — and anything added later — through a single path instead of type-testing the concrete model. MiniMax-H3 denoises video and 32 kHz stereo audio *together* in one packed latent and drives seven native whole-network graphs (DiT, Qwen3-VL text encoder, vision tower, video and audio VAE encode + decode); Wan 2.1/2.2 is the video-only family and runs its DiT, UMT5-XXL encoder and causal 3D VAE the same way. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata — except files that carry no architecture metadata, which are detected from their tensors: MiniMax-H3, whose published GGUFs carry no metadata at all (`LooksLikeMiniMaxH3`, wired through `MiniMaxH3Architecture.DetectFromTensors`), and metadata-free Qwen-Image-2.1 GGUFs such as Unsloth's Q8_0 (`QwenImageArchitecture.DetectFromTensors`). A file published under a generic `llama` label is claimed per file by a descriptor's `RecognizeRelabelledFile`, which only Mistral 3 implements (for example a `llama`-labelled Mistral Small 3.1).
+3. **TensorSharp.Models** implements `ModelBase` plus fifteen registered architecture descriptors (`Architecture/BuiltInArchitectures.cs`) and their multimodal helpers — twelve text families (DeepSeek V4 Flash, DeepSeek V4.1 Flash, GLM 5.x, Gemma 4, DiffusionGemma, Qwen 3.5/3.6-family, Qwen 3.8 Flash Next, GPT OSS, Nemotron-H, Mistral 3, Hunyuan Dense, Muse-Glimmer) and three media-out families (Qwen-Image-2.1, MiniMax-H3, Wan 2.1/2.2). Autoregressive architectures ship the per-sequence forward, and most also expose an `IBatchedPagedModel.ForwardBatch` implementation (`<Family>Model.BatchedForward.cs`) for continuous batching. DiffusionGemma is intentionally different: `Forward()` is unsupported, and generation goes through `DiffusionGemmaSampler` over fixed-length denoising canvases. Qwen-Image-2.1 (`QwenImageModel`) is likewise not autoregressive — `Forward()` throws, and image generation and editing run through `GenerateImage()` / `EditImage()`, which orchestrate the diffusion transformer, the dedicated 2.1 VAE, and the Qwen3-VL-8B text encoder. LoRA plug-ins (`--lora` / `--lora-scale` / `--lora-config`, parsed by `TensorSharp.Runtime/LoraSpec.cs` for both hosts) are applied unmerged inside the diffusion transformer (`QwenImage21LoraSet`); `config/lora/` ships fourteen presets. The video families go one step further out: `MiniMaxH3Model` and `WanVideoModel` both throw from `ForwardCore()` and generate through `GenerateVideo(prompt, VideoGenerationParams)` behind the shared `IVideoGenerationModel` seam in `Models/Video/`, so the CLI and the server drive either one — and anything added later — through a single path instead of type-testing the concrete model. MiniMax-H3 denoises video and 32 kHz stereo audio *together* in one packed latent and drives seven native whole-network graphs (DiT, Qwen3-VL text encoder, vision tower, video and audio VAE encode + decode); Wan 2.1/2.2 is the video-only family and runs its DiT, UMT5-XXL encoder and causal 3D VAE the same way. Models are loaded via `ModelBase.Create()` which auto-detects the architecture from GGUF metadata — except files that carry no architecture metadata, which are detected from their tensors: MiniMax-H3, whose published GGUFs carry no metadata at all (`LooksLikeMiniMaxH3`, wired through `MiniMaxH3Architecture.DetectFromTensors`), and metadata-free Qwen-Image-2.1 GGUFs such as Unsloth's Q8_0 (`QwenImageArchitecture.DetectFromTensors`). A file published under a generic `llama` label is claimed per file by a descriptor's `RecognizeRelabelledFile`, which only Mistral 3 implements (for example a `llama`-labelled Mistral Small 3.1).
 
 4. **TensorSharp.Backends.GGML** registers accelerated implementations of the same operations via a native C++ bridge (`libGgmlOps` / `GgmlOps.dll`) that links against [ggml](https://github.com/ggml-org/ggml). On macOS this provides Metal GPU compute, and on Windows/Linux it can expose GGML CUDA for NVIDIA GPUs. Operations include native quantized matmul (Q4_K_M, Q8_0, etc.) without dequantizing to FP32, plus paged-attention (`TSGgml_PagedAttentionForward`, with and without attention sinks) and architecture-specific batched kernels (Mamba2, GatedDeltaNet).
 
@@ -684,6 +691,15 @@ TensorSharp is structured as a layered system:
 7. **TensorSharp.Server** is the HTTP/application layer: Ollama-compatible and OpenAI-compatible REST APIs, the browser-based chat UI, multipart upload handling, middleware and SSE writers. The pipeline it serves lives in **TensorSharp.Chat** — the `ModelService`, the `InferenceEngineHost` that owns the per-model continuous-batching engine for autoregressive models, the `DiffusionBatchScheduler` that denoises every DiffusionGemma chat turn (Web UI, OpenAI and Ollama alike), sessions, the skills loop and the Web UI request/stream contract (`WebUiChatService`, `SkillsService`) — so the CLI and the iOS app drive the same code without ASP.NET Core; a thin queue-status surface is kept for backward compatibility.
 
 8. **TensorSharp.Cli** is the console/application layer for local prompts, multimodal experiments, prompt inspection, JSONL batch workflows, the interactive REPL, and the built-in prefill / decode benchmarks.
+
+9. **TensorSharp.Knowledge** is the independent source/index layer. **AgentHost**
+   adds scoped tools and citation/evidence handling; **Chat** wires model-backed
+   extraction, embeddings, reranking and platform OCR. **Server** exposes HTTP
+   management and inference extensions, while **TensorAgent** provides folder and
+   saved-chat imports, previews and per-chat collection selection. These knowledge
+   additions describe source after `v2026.10.10`; a packable project does not by
+   itself establish availability in a published package. See the
+   [knowledge guide](docs/knowledge-system.md) for the exact host contracts.
 
 ### Adding a model, a modality, or a chat format
 
@@ -802,6 +818,33 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 ```
 
 TensorAgent's shared app host has its own project, `TensorAgent/tests/TensorAgent.Tests` (see [TensorAgent/README.md](TensorAgent/README.md)), which is part of `TensorSharp.slnx`; PR CI does not run it, although `InferenceWeb.Tests` does check the app's project, plist, entitlement and native-export manifests (`TensorAgentMauiProjectTests`) and how the solution build builds the app (`TensorAgentSolutionBuildTests`).
+
+#### Knowledge validation
+
+The portable core, protocol/agent integration and app-host workflows have separate
+test projects. Run from the repository root:
+
+```bash
+dotnet test TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj -c Release
+dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release --filter 'FullyQualifiedName~Knowledge'
+dotnet test TensorAgent/tests/TensorAgent.Tests/TensorAgent.Tests.csproj -c Release --filter 'FullyQualifiedName~Knowledge'
+```
+
+For real-host protocol, media, answer-quality and PDF OCR checks, follow the
+[knowledge validation guide](eng/validation/knowledge/README.md). Use an isolated
+test deployment and a dedicated data root under ignored `artifacts/` or
+`docs/validation/`. Copy a library into that root before starting the host; never
+point mutating probes at the live application's library. Reports, raw transcripts,
+screenshots and generated source snapshots stay ignored. Reusable tools belong
+in `eng/`; required fixtures belong in the relevant test project, including
+`InferenceWeb.Tests/Fixtures/Knowledge` and `TensorSharp.Knowledge.Tests/Fixtures`.
+
+Record the model/backend, OCR provider, selected protocols and actual checks run;
+unavailable models, devices or OCR providers are skipped/unavailable coverage.
+Native bridge changes must be checked against unchanged upstream ggml with its
+revision recorded. Citation identity checks alone do not establish answer quality.
+The [knowledge benchmark](eng/validation/KnowledgeBench/README.md) separates
+lexical and real embedding runs and documents its fixture and performance limits.
 
 #### Test lanes
 

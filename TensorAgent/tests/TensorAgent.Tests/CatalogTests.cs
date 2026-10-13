@@ -12,7 +12,6 @@ public sealed class CatalogTests
         {
             "gemma-4-e2b-q8",
             "gemma-4-e4b-iq4xs",
-            "gemma-4-12b-iq2m",
             "bonsai-2-27b-ptq1-0",
             "qwen3.5-9b-iq4xs",
             "qwen3.8-27b-q4kxl",
@@ -116,20 +115,6 @@ public sealed class CatalogTests
             var names = m.Files.Select(f => f.FileName).ToList();
             Assert.Equal(names.Count, names.Distinct(StringComparer.OrdinalIgnoreCase).Count());
         }
-    }
-
-    [Fact]
-    public void Gemma4TwelveBUsesThePinnedIq2MArtifact()
-    {
-        CatalogModel model = Assert.Single(ModelCatalog.BuiltIn,
-            m => m.Family == CatalogFamily.Gemma4 && m.Parameters == "12B");
-
-        Assert.Equal("gemma-4-12b-iq2m", model.Id);
-        Assert.Equal("UD-IQ2_M", model.Quantization);
-        Assert.Equal("gemma-4-12b-it-UD-IQ2_M.gguf", model.Weights.FileName);
-        Assert.Equal(4_213_353_280, model.Weights.Bytes);
-        Assert.Equal("4bd2461d35398dbcf5f3d5f0c9ad91cac78ae35b556e3a81f315a0cc0815ae8c",
-            model.Weights.Sha256);
     }
 
     /// <summary>
@@ -711,7 +696,7 @@ public sealed class CatalogTests
         Assert.True(unrecorded.Length == 0,
             $"{string.Join(", ", unrecorded)} is not in CatalogTests.Shipped; add every new entry's id there");
         Assert.True(ModelCatalog.IsRetired("GEMMA-4-12B-IQ3XXS"));
-        Assert.False(ModelCatalog.IsRetired("gemma-4-12b-iq2m"));
+        Assert.True(ModelCatalog.IsRetired("gemma-4-12b-iq2m"));
     }
 
     [Fact]

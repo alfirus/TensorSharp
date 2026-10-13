@@ -9,6 +9,7 @@ import vm from 'node:vm';
 const repo = new URL('../../', import.meta.url);
 const desktop = readFileSync(new URL('TensorSharp.Server.Host/wwwroot/index.html', repo), 'utf8');
 const agent = readFileSync(new URL('TensorAgent/src/TensorAgent.Core/WebUi/tensoragent.js', repo), 'utf8');
+const agentStrings = JSON.parse(readFileSync(new URL('TensorAgent/src/TensorAgent.Core/Localization/en/page.json', repo), 'utf8'));
 
 function section(source, start, end) {
   const first = source.indexOf(start);
@@ -32,6 +33,9 @@ function browser(kind, reply) {
     $: () => input,
     state: { attachments: [] },
     pendingAttachments: [],
+    activeImageEditTarget: null,
+    isQwenImageModel: () => false,
+    t: (key, values = {}) => (agentStrings[key] || key).replace(/\{(\w+)\}/g, (_, name) => values[name] ?? ''),
     paintChips: () => { paints++; },
     renderAttachments: () => { paints++; },
     notice: (message, kind) => (kind === 'error' ? errors : warnings).push(message),
@@ -148,6 +152,7 @@ test('desktop: every uploaded file reaches one chat turn in selection order', as
     attachmentsDiv: { innerHTML: '' },
     chatContainer: { querySelector: () => null },
     requestAssistantResponse: async () => {},
+    setSendButtonState() {},
   });
   vm.runInContext(section(desktop, 'async function sendMessage()', 'async function runImageEdit('), page.context);
   await page.context.sendMessage();
@@ -177,6 +182,7 @@ test('desktop: Send while uploading preserves the draft and waits for every sele
     attachmentsDiv: { innerHTML: '' },
     chatContainer: { querySelector: () => null },
     requestAssistantResponse: async () => { generations++; },
+    setSendButtonState() {},
   });
   vm.runInContext(section(desktop, 'async function sendMessage()', 'async function runImageEdit('), page.context);
   const first = page.select(files.slice(0, 2));

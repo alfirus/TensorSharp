@@ -24,6 +24,7 @@ using TensorSharp.Runtime.Scheduling;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.AgentHost.Knowledge;
 using TensorSharp.Server.ProtocolAdapters;
 
 namespace TensorSharp.Server.Skills
@@ -104,6 +105,31 @@ namespace TensorSharp.Server.Skills
             int maxRounds = Math.Max(1, plan.LoopOptions.MaxRounds);
             bool guardCompletion = plan.CompletionRequirement != null;
             bool repetitionRetried = false;
+            bool knowledgeSynthesis = false;
+            bool knowledgeFinished = false;
+            var activeTools = plan.Tools;
+            var retrieval = plan.ToolContext.KnowledgeRetrieval ?? plan.ToolContext.Knowledge?.Retrieval;
+            bool CanAccessOriginal() => retrieval?.CanAccessOriginal == true
+                && plan.ToolContext.Workspace != null && plan.ToolContext.CodeRunner?.CanRun == true;
+            bool terminalKnowledgeRecovery = plan.KnowledgeAnswerRecovery && !guardCompletion
+                && plan.ToolContext.Knowledge != null;
+            if (terminalKnowledgeRecovery)
+            {
+                // This is an explicit recovery after an answerless thinking-budget
+                // failure, not an inference that an ordinary mixed task needs no code.
+                // Use the final-generation path: even invented host calls cannot run.
+                maxRounds = 0;
+                knowledgeSynthesis = true;
+            }
+            if (retrieval?.ShouldSynthesize == true)
+            {
+                knowledgeFinished = true;
+                activeTools = terminalKnowledgeRecovery ? plan.ClientTools.ToList()
+                    : KnowledgeTools.WithoutRetrieval(plan.Tools, plan.ClientTools, CanAccessOriginal());
+                working = KnowledgeTools.BuildSynthesisMessages(working, plan.ToolContext.Knowledge, retrieval,
+                    !terminalKnowledgeRecovery && (guardCompletion
+                        || activeTools.Any(t => SkillTools.IsBuiltInTool(t.Name) && !KnowledgeTools.IsTool(t.Name))));
+            }
 
             int promptTokens = 0;
             int evalTokens = 0;
@@ -137,7 +163,7 @@ namespace TensorSharp.Server.Skills
                 var rawTail = new StringBuilder();
 
                 await foreach (ChatStreamUpdate update in
-                    generate(working, plan.Tools, cancellationToken).ConfigureAwait(false))
+                    generate(working, activeTools, cancellationToken).ConfigureAwait(false))
                 {
                     if (update.HistoryCompacted)
                         plan.ToolContext?.Workspace?.Reads.InvalidateReadVisibility();
@@ -277,6 +303,7 @@ namespace TensorSharp.Server.Skills
                     out List<ToolCall> skillCalls,
                     out List<ToolCall> clientCalls,
                     out List<ToolCall> unknownCalls);
+                bool originalAccessAllowedThisRound = CanAccessOriginal();
 
                 if (skillCalls.Count == 0 && unknownCalls.Count == 0)
                 {
@@ -424,22 +451,49 @@ namespace TensorSharp.Server.Skills
                         finishReason: "stop");
                     yield break;
                 }
+                // A model that ignores the disabled retrieval tools must not spend
+                // every remaining round requesting them again. Keep call/result
+                // pairing above, then make the final answer generation terminal.
+                if (knowledgeFinished && !guardCompletion && skillCalls.Any(call => KnowledgeTools.IsTool(call.Name)
+                    && !(call.Name == KnowledgeTools.Open && originalAccessAllowedThisRound)))
+                {
+                    knowledgeSynthesis = true;
+                    break;
+                }
+                if (knowledgeFinished)
+                    activeTools = KnowledgeTools.WithoutRetrieval(plan.Tools, plan.ClientTools, CanAccessOriginal());
+                if (!knowledgeFinished && retrieval?.ShouldSynthesize == true)
+                {
+                    knowledgeFinished = true;
+                    activeTools = KnowledgeTools.WithoutRetrieval(plan.Tools, plan.ClientTools, CanAccessOriginal());
+                    if (guardCompletion || activeTools.Any(t => SkillTools.IsBuiltInTool(t.Name) && !KnowledgeTools.IsTool(t.Name)))
+                        working = KnowledgeTools.BuildSynthesisMessages(working, plan.ToolContext.Knowledge, retrieval, allowOtherTools: true);
+                    else
+                    {
+                        knowledgeSynthesis = true;
+                        break;
+                    }
+                }
             }
 
             // Out of rounds. Tell the model so, in the conversation, and let it answer
             // from what it has — the alternative is returning a bare tool call to a
             // client that cannot service it, which shows the user nothing at all.
-            logger?.LogWarning(LogEventIds.SkillLoopCapped,
-                "skills.loop.capped rounds={Rounds} skills={Skills}", maxRounds, plan.DescribeSelection());
+            if (!knowledgeSynthesis)
+                logger?.LogWarning(LogEventIds.SkillLoopCapped,
+                    "skills.loop.capped rounds={Rounds} skills={Skills}", maxRounds, plan.DescribeSelection());
 
             if (plan.Agents?.HasPendingResults("/root") == true)
             {
                 await foreach (ChatStreamUpdate progress in CollectAgentResultsAsync(
                     plan, working, cancellationToken).ConfigureAwait(false)) yield return progress;
             }
-            working.Add(BuildResult(plan,
-                "Error: the limit on tool calls for this turn has been reached. Answer now using what you have "
-                + "already read, and say which part you could not check."));
+            if (plan.ToolContext.Knowledge != null)
+                working = KnowledgeTools.BuildSynthesisMessages(working, plan.ToolContext.Knowledge, retrieval, guardCompletion);
+            else
+                working.Add(BuildResult(plan,
+                    "Error: the limit on tool calls for this turn has been reached. Answer now using what you have "
+                    + "already read, and say which part you could not check."));
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -453,9 +507,11 @@ namespace TensorSharp.Server.Skills
             var finalThinking = new StringBuilder();
             var finalHeldAnswer = guardCompletion ? new List<ChatStreamUpdate>() : null;
             ChatStreamUpdate finalTerminal = default;
+            var finalTools = plan.ToolContext.Knowledge == null || guardCompletion
+                ? plan.Tools : plan.ClientTools?.ToList() ?? new List<ToolFunction>();
 
             await foreach (ChatStreamUpdate update in
-                generate(working, plan.Tools, cancellationToken).ConfigureAwait(false))
+                generate(working, finalTools, cancellationToken).ConfigureAwait(false))
             {
                 if (update.HistoryCompacted)
                     plan.ToolContext?.Workspace?.Reads.InvalidateReadVisibility();
@@ -562,7 +618,12 @@ namespace TensorSharp.Server.Skills
             // whole reply is markup this loop has just dropped and the user would get
             // an empty bubble. Say what happened and what DID get made. Appended even
             // to a non-empty lead-in: "let me try" plus a dropped call is not an answer.
-            if (!guardedCompletionVerified && (stillOurs.Count > 0 || stillUnknown.Count > 0))
+            // Let the caller's bounded thinking-off recovery see an answerless
+            // knowledge turn. Synthetic exhaustion prose would hide that signal.
+            bool awaitingKnowledgeRecovery = plan.ToolContext.Knowledge != null
+                && string.Equals(finalTerminal.FinishReason, FinishReasonMapper.PipelineThinkingBudget, StringComparison.Ordinal)
+                && string.IsNullOrWhiteSpace(finalContent.ToString());
+            if (!guardedCompletionVerified && !awaitingKnowledgeRecovery && (stillOurs.Count > 0 || stillUnknown.Count > 0))
             {
                 string exhausted = DescribeExhaustedTurn(plan, stillOurs.Concat(stillUnknown));
                 yield return ChatStreamUpdate.Parsed(
@@ -662,7 +723,7 @@ namespace TensorSharp.Server.Skills
         /// anchor. The runtime type is an in-process marker only; renderers still see an
         /// ordinary <see cref="ChatMessage"/> and no wire or persisted shape changes.
         /// </summary>
-        internal sealed class HostCompletionCorrectionMessage : ChatMessage
+        internal sealed class HostCompletionCorrectionMessage : HostContinuationMessage
         {
         }
 
@@ -829,7 +890,7 @@ namespace TensorSharp.Server.Skills
                     seconds: elapsed.Elapsed.TotalSeconds);
             }
             string reports = await collection.ConfigureAwait(false);
-            working.Add(new ChatMessage { Role = "user", Content =
+            working.Add(new HostContinuationMessage { Role = "user", Content =
                 "Host: integrate these completed subagent reports before giving your final answer. "
                 + "Check their claims against the task and resolve any conflicts.\n" + reports });
             yield return ChatStreamUpdate.ToolProgress("finished", MultiAgentTools.Wait,
@@ -906,7 +967,7 @@ namespace TensorSharp.Server.Skills
                                     return MultiAgentTools.IsTool(call.Name)
                                         ? await plan.Agents.ExecuteAsync(call, cancellationToken: cancellationToken).ConfigureAwait(false)
                                         : await plan.Agents.ExecuteHostToolAsync(call, cancellationToken, liveOutput.Add).ConfigureAwait(false);
-                                return SkillTools.Execute(call, plan.ToolContext, liveOutput.Add);
+                                return SkillTools.Execute(call, plan.ToolContext, liveOutput.Add, cancellationToken);
                             }
                         });
                     }
@@ -1466,13 +1527,21 @@ namespace TensorSharp.Server.Skills
         /// </summary>
         private static ChatMessage BuildResult(SkillRequestPlan plan, string content, string tool = null)
         {
+            if (tool == null)
+                return new HostContinuationMessage { Role = "user", Content = content };
+            if (tool is KnowledgeTools.Search or KnowledgeTools.Read)
+                return new KnowledgeToolResultMessage
+                {
+                    Role = plan.LoopOptions.ToolResultsAreRendered ? "tool" : "user",
+                    Content = plan.LoopOptions.ToolResultsAreRendered ? content : $"Result of your {tool} call:\n\n" + content,
+                };
             if (plan.LoopOptions.ToolResultsAreRendered)
                 return new ChatMessage { Role = "tool", Content = content };
 
             string prefix = tool == null
                 ? "Result of the skill lookup you requested:"
                 : $"Result of your {tool} call:";
-            return new ChatMessage { Role = "user", Content = prefix + "\n\n" + content };
+            return new HostContinuationMessage { Role = "user", Content = prefix + "\n\n" + content };
         }
     }
 }

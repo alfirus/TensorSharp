@@ -1,0 +1,20 @@
+{
+  // Voxel Style: compact 83.9 MB image-editing adapter, step-3000 checkpoint.
+  // Attach a photo with a clear subject and use "Transform the image into a voxel style".
+  // Source: https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Voxel-Style
+  // Experimental preview; evaluate subject/scene preservation on your own images.
+  // License: Qwen Research License (non-commercial).
+  // Keeps the checkpoint's own schedule: official Turbo uses 8 steps and CFG 1.
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/Qwen-Image-2.1-Voxel-Style-3000.safetensors",
+    "urls": [
+      "https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Voxel-Style/resolve/b4ccfe9333f04c2f978f2d1bfdfdafe287cbfad1/Qwen-Image-2.1-Voxel-Style-3000.safetensors"
+    ],
+    "sha256": "165e50dfe0de46276208edf76bceb075dc65ceb1867d78c5844ad23af9a14b25"
+  },
+  "scale": 1.0
+}

@@ -870,6 +870,16 @@ namespace TensorSharp.Runtime
                                 result = enableThinking
                                     ? EnsureQwen35ThinkOpen(result)
                                     : EnsureQwen35ThinkClosed(result);
+                            // Some routed templates ignore enable_thinking and leave
+                            // the recipient open, allowing a supposedly final answer to
+                            // start another long self/reasoning message. Complete the
+                            // protocol's answer header only when no tools or reasoning
+                            // are requested and the template left that exact boundary.
+                            if (addGenerationPrompt && !enableThinking && tools is not { Count: > 0 }
+                                && protocol?.DirectAnswerGenerationSuffix is { Length: > 0 } answerSuffix
+                                && protocol.TemplateAssistantHeaderAnchor is { Length: > 0 } assistantAnchor
+                                && result.EndsWith(assistantAnchor, StringComparison.Ordinal))
+                                result += answerSuffix;
                             Console.Error.WriteLine($"[ChatTemplate] Jinja2 rendering succeeded for '{architecture}', prompt length={result.Length}");
                             return result;
                         }
@@ -1643,7 +1653,13 @@ namespace TensorSharp.Runtime
             // Keep an omitted setting undefined so each published template can
             // apply its own default, rather than imposing Harmony's default.
             if (!string.IsNullOrWhiteSpace(reasoningEffort))
+            {
                 ctx["reasoning_effort"] = reasoningEffort.Trim().ToLowerInvariant();
+                // Muse's published template names the same request setting
+                // reasoning_strength; leaving it undefined silently selects high.
+                if (ChatProtocolRegistry.For(architecture)?.Id == "muse-glimmer")
+                    ctx["reasoning_strength"] = ctx["reasoning_effort"];
+            }
 
             if (tools != null && tools.Count > 0)
             {

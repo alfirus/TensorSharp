@@ -2586,7 +2586,7 @@ public sealed partial class WebUiPageTests : IDisposable
     public void TheLoraSheetTurnsOnOneSpeedPlugInAtATime()
     {
         JsonElement result = Run(ImageModel + """
-            var lorasState = { loadedModel: 'qwen-image-2.1-q4km', minStrength: 0.1, maxStrength: 1.5,
+            var lorasState = { loadedModel: 'qwen-image-2.1-q4km', loadedModelName: 'Qwen-Image 2.1', supportsLoras: true, minStrength: 0.1, maxStrength: 1.5,
               chosen: [{ id: 'pruna', strength: 1 }, { id: 'film', strength: 0.6 }], loras: [
               { id: 'viggle', name: 'Viggle Turbo', kind: 'Speed', steps: 6, purpose: 'Fast.', license: 'QRL', totalBytes: 679604800,
                 state: 'Installed', defaultStrength: 1, strengthAdjustable: false, chosen: false, strength: 1, download: null },
@@ -2651,7 +2651,7 @@ public sealed partial class WebUiPageTests : IDisposable
     private const string TwoStyles = """
         function loraRows(chosen, extra) {
           function on(id) { return chosen.some(function (c) { return c.id === id; }); }
-          return { loadedModel: 'qwen-image-2.1-q4km', minStrength: 0.1, maxStrength: 1.5, chosen: chosen, loras: [
+          return { loadedModel: 'qwen-image-2.1-q4km', loadedModelName: 'Qwen-Image 2.1', supportsLoras: true, minStrength: 0.1, maxStrength: 1.5, chosen: chosen, loras: [
             { id: 'film', name: 'Film Stills', kind: 'Style', purpose: 'Film.', license: 'QRL', totalBytes: 79743888,
               state: 'Installed', installedBytes: 79743888, defaultStrength: 0.7, strengthAdjustable: true, chosen: on('film'), strength: 0.7, download: null },
             { id: 'grain', name: 'Grainscape', kind: 'Style', purpose: 'Grain.', license: 'QRL', totalBytes: 79743888,

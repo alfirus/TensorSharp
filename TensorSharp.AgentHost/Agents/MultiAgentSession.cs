@@ -562,7 +562,7 @@ public sealed class MultiAgentSession : IAsyncDisposable
         try
         {
             linked.Token.ThrowIfCancellationRequested();
-            return await Task.Run(() => SkillTools.Execute(call, _context, onOutput), linked.Token).ConfigureAwait(false);
+            return await Task.Run(() => SkillTools.Execute(call, _context, onOutput, linked.Token), linked.Token).ConfigureAwait(false);
         }
         finally { _toolGate.Release(); }
     }
@@ -599,7 +599,7 @@ public sealed class MultiAgentSession : IAsyncDisposable
             try
             {
                 linked.Token.ThrowIfCancellationRequested();
-                result = await Task.Run(() => SkillTools.Execute(call, context), linked.Token).ConfigureAwait(false);
+                result = await Task.Run(() => SkillTools.Execute(call, context, cancellationToken: linked.Token), linked.Token).ConfigureAwait(false);
             }
             finally { gate.Release(); }
             SetToolActivity(agentId, call.Name, result.Ok ? "completed" : "failed", result.ResourcePath);

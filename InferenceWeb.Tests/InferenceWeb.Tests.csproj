@@ -12,6 +12,8 @@
   </PropertyGroup>
   <ItemGroup>
     <AdditionalFiles Include="BannedSymbols.txt" />
+    <Compile Remove="Fixtures/PdfProcessFixture/**/*.cs" />
+    <ProjectReference Include="Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" ReferenceOutputAssembly="false" />
     <Compile Include="../eng/validation/Gemma4BatchedCacheProbe/Gemma4CacheProbe.cs" Link="Validation/Gemma4CacheProbe.cs" />
     <Compile Include="../eng/validation/Qwen35BatchedDecodeProbe/Qwen35DecodeProbe.cs" Link="Validation/Qwen35DecodeProbe.cs" />
   </ItemGroup>
@@ -25,6 +27,9 @@
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
+    <EmbeddedResource Include="Fixtures/Knowledge/*.pdf" />
+    <EmbeddedResource Include="Fixtures/Knowledge/manifest.json" />
+    <EmbeddedResource Include="Fixtures/MuseGlimmer/chat_template.jinja" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/reference.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/reference128.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />

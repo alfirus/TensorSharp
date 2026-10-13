@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TensorAgent 桌面版 — 下载与使用指南 — TensorSharp 维基</title>
-  <meta name="description" content="在 macOS 或 Windows 下载、安装 TensorAgent 桌面版，设置本地模型，开始聊天、处理文件，以及启用代码和浏览器工具。">
+  <meta name="description" content="在 macOS 或 Windows 下载、安装 TensorAgent 桌面版，设置本地模型，使用个人知识库、引导回答、处理文件，以及启用代码和浏览器工具。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -24,6 +24,7 @@
   </div>
   <p>两个下载按钮均打开官方 Release 的 <strong>Assets（发行文件）</strong>列表。按下文选择适合平台的 <code>tensoragent-desktop-</code> 文件。桌面安装包由更新后的 Release Binaries 工作流生成；旧发行版可能只有 CLI/Server 归档。若最新发行版尚无桌面文件，请查看<a href="https://github.com/zhongkaifu/TensorSharp/releases" target="_blank" rel="noopener">全部发行版</a>，或在桌面发行版发布前按 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/TensorAgent/README.md" target="_blank" rel="noopener">源码构建说明</a>运行。</p>
 
+  <p>本页按当前源码说明。个人知识库与回答引导在 <code>v2026.10.10</code> 后合入；下载的包须来自包含这些功能的新构建。模型条目可用性与运行验证见下文。</p>
   <h2 id="requirements">1 · 检查电脑配置</h2>
   <div class="table-scroll">
   <table>
@@ -85,14 +86,20 @@ Get-FileHash .\tensoragent-desktop-V-win-x64-cpu.msi -Algorithm SHA256</code></p
   </ol>
   <p>推理在本机运行。首次下载模型需要联网；必要文件齐全后，普通聊天可以离线使用。<strong>允许访问网络</strong>控制模型运行的代码与软件包安装，不会阻止应用下载你主动请求的模型。</p>
 
+  <h3 id="catalog">浏览模型目录</h3>
+  <p>当前目录有 38 个条目，可按模型名称、家族、量化或输入能力搜索，并使用<strong>全部、兼容、已下载</strong>筛选；家族分组可展开，正在下载的条目保持可见。新增条目包括较大的 Gemma/Qwen、GPT OSS、Nemotron、Mistral、Hunyuan、DiffusionGemma、DeepSeek 与 GLM 检查点；许多仍标为实验性。条目有固定版本下载与哈希校验，但目录元数据检查不等于在每台设备上完成推理验证。以条目显示的系统内存档位、输入能力与模型卡为准；较大条目可能需要远超普通电脑的内存。</p>
+  <h3 id="steering">生成时引导回答</h3>
+  <p>回答尚未完成时，可在输入框输入并发送新的指令。当前生成会中断，已经产生的回答保留在聊天中，然后按新指令生成；宿主先等待旧生成清理完成。输入框为空时，发送按钮显示<strong>停止</strong>；有新内容时显示引导操作。引导不能撤销已经执行的工具动作。</p>
   <h2 id="daily-use">5 · 使用照片、文件、图片和视频</h2>
   <ul>
     <li><strong>询问照片或文件：</strong>选择 <strong>+ → 照片</strong>或<strong>文件</strong>，附上内容，并说明需求。加载的模型必须支持该输入。视觉模型缺少可选投影器时，选择<strong>模型 → 添加视觉</strong>，完成后点击<strong>启用视觉</strong>。<strong>设置 → 下载 → 包含可选文件</strong>会在后续下载中包含投影器及可用的草稿头。</li>
-    <li><strong>生成图片：</strong>加载 <strong>Qwen-Image 2.1</strong> 后描述图片。编辑照片时附上照片并说明修改；缩略图旁的<strong>选择区域</strong>可涂选要改的部分。完成后可<strong>比较原图</strong>或<strong>再次编辑</strong>。<strong>模型 → LoRA 插件</strong>可另行下载风格或加速插件。见<a href="models-image_zh-cn.html#mask-editing">图片编辑指南</a>。</li>
+    <li><strong>生成图片：</strong>加载 <strong>Qwen-Image 2.1</strong> 或 <strong>Qwen-Image 2.1 Turbo</strong> 后描述图片。Turbo 使用固定 8 步、CFG 1 配方，AD-Q4_K 为 24 GB 档位，Q8_0 为 32 GB 档位，并复用基础版的编码器/VAE 文件；它不接受步数蒸馏 LoRA。编辑照片时附上照片并说明修改；缩略图旁的<strong>选择区域</strong>可涂选要改的部分。完成后可<strong>比较原图</strong>或<strong>再次编辑</strong>。<strong>模型 → LoRA 插件</strong>可另行下载兼容插件：基础版共十四个，Turbo 为四个风格/编辑插件。见<a href="models-image_zh-cn.html#mask-editing">图片编辑指南</a>。</li>
     <li><strong>生成视频：</strong>加载适用的 <strong>MiniMax-H3</strong> 目录条目，描述短视频，并使用该条目支持的附件。视频需要 GPU 后端，CPU 发行包没有视频回退路径。已记录的 Windows 桌面应用验证不包含音视频生成。见<a href="models-video_zh-cn.html#minimax-h3">视频模型要求与限制</a>。</li>
     <li><strong>保留结果：</strong>打开生成文件的链接，保存或复制到自己的文件夹。聊天保留文字记录，但生成文件和上传附件位于应用缓存；清理缓存或移除应用前，请另存重要文件。</li>
   </ul>
 
+  <h3 id="knowledge">让资料库供聊天复用</h3>
+  <p>打开<strong>菜单 → 知识库</strong>创建集合，上传文件或递归文件夹，也可<strong>添加聊天</strong>保存已有对话与可用附件。查看提取状态，勾选<strong>在此聊天中使用 {集合}</strong>后再提问；浏览集合不会自动选中。新聊天默认不选集合。回答中的<strong>检索来源</strong>链接可打开引用位置与原文件。见<a href="knowledge_zh-cn.html">知识库指南</a>了解 OCR、支持格式、媒体模型要求与限制。</p>
   <h2 id="tools">6 · 配置代码和浏览器工作</h2>
   <p>文字聊天无需额外开发工具。桌面代码技能使用电脑上安装的程序：Python 任务需要 <a href="https://www.python.org/downloads/" target="_blank" rel="noopener">Python 3</a>，JavaScript 或内置 Playwright 浏览器技能需要 <a href="https://nodejs.org/en/download" target="_blank" rel="noopener">Node.js 与 npm</a>。浏览器技能要求 Node.js 20 或更新版本。使程序可通过 <code>PATH</code> 找到，然后完全退出并重新打开 TensorAgent。Windows 应使用原生 Windows Node/npm，而非 WSL 中的版本。</p>
   <div class="table-scroll">
@@ -122,6 +129,7 @@ Get-FileHash .\tensoragent-desktop-V-win-x64-cpu.msi -Algorithm SHA256</code></p
   <p>复制文件夹前请退出应用。若设置了自定义模型文件夹，请另外备份或复用该目录；Mac 备份工具可能不包含 Caches。更改模型文件夹不会移动旧文件；若希望复用，等下载完成并关闭应用后，手动移动对应的模型子文件夹。</p>
   <p><strong>卸载：</strong>Mac 将 TensorAgent.app 移到废纸篓，PKG 安装没有单独卸载器。Windows 的 MSI 安装使用<strong>设置 → 应用 → 已安装的应用 → TensorAgent → 卸载</strong>；ZIP 版删除解压后的程序文件夹。移除应用会保留用户数据与模型以便重新安装。清理单个模型用<strong>模型 → 删除</strong>，清理历史用<strong>设置 → 存储 → 删除所有聊天</strong>。若要完全移除，请先备份并退出，再删除上表的数据与缓存文件夹，以及不再需要的自定义模型文件夹。</p>
 
+  <p>知识库位于数据文件夹内的 <code>knowledge</code>，与模型/上传缓存分开；它保留导入原文件。备份时退出应用并复制数据文件夹。删除聊天或上传缓存不会删除已导入知识来源；删除集合/文档需要界面内的第二次确认。</p>
   <h2 id="troubleshooting">故障排查</h2>
   <div class="table-scroll">
   <table>

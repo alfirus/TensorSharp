@@ -456,9 +456,42 @@ look, and both redraw part of the scene, Film Stills more than Grainscape:
   a lower viewpoint and a tree-lined street.
 - Each adds about 5.4% per step (8.28–8.31 s against 7.86–7.88 s).
 
-TensorAgent offers these two for its Turbo entries and no other plug-in. The
-editing plug-ins and Quality Fix have not been tried on Turbo, and Object Remover works
-only at the base model's 40 steps.
+TensorAgent also offers Casual Phone Photo and Voxel Style for its Turbo entries.
+They keep Turbo's eight-step schedule and CFG 1; their purpose is a chosen visual
+style, not a further speedup. The other editing plug-ins and Quality Fix remain
+unqualified on Turbo, and Object Remover works only at the base model's 40 steps.
+
+#### Additional adapters reviewed on 2026-10-10
+
+The publisher cards identify these as adapters for **Qwen-Image 2.1**, not the
+older Qwen-Image, 2512 or Edit-2511 architectures. Their Turbo compatibility is
+checked locally on AD-Q4_K; the cards themselves demonstrate the base checkpoint. Each
+TensorSharp config and TensorAgent catalog entry pins the same commit, file,
+SHA-256, and default strength. File sizes and hashes were checked with the
+Hugging Face model API and matched against local downloads.
+The Q8 Turbo catalog entry shares the architecture and adapter mapping, so it
+offers the same choices. The current run does not validate Q8 image quality or
+latency; catalog/planner tests for Q8 are not a substitute for generating images.
+
+| Adapter and primary source | Download | Starting strength / prompt | Scope and limits |
+|---|---|---|---|
+| [Casual Phone Photo](https://huggingface.co/19nbrown/qwen-image-2.1-casual-phone-photo-style-lora/blob/3ace7de571892ac5fa6245aed4f0500ae1da795a/README.md) | `lbxstyle-qwen-image-2.1-step-1890.safetensors`, 167,830,056 bytes | Publisher recommends **0.8**, with `lbxstyle` and an explicit subject and setting | Rank 32, a small experimental style fine-tune. No adapter license is stated; the base model's research license still applies. |
+| [Voxel Style](https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Voxel-Style/blob/b4ccfe9333f04c2f978f2d1bfdfdafe287cbfad1/README.md) | `Qwen-Image-2.1-Voxel-Style-3000.safetensors`, 83,943,936 bytes | **1.0** is TensorSharp's starting value; attach a photo and request `Transform the image into a voxel style` | Experimental preview. Subjects may stay recognizable while backgrounds change substantially. Publisher refers to the Qwen Research License. |
+
+Use [`qwen-image-2.1-casual-phone.json`](../../config/lora/qwen-image-2.1-casual-phone.json)
+or [`qwen-image-2.1-voxel-style.json`](../../config/lora/qwen-image-2.1-voxel-style.json)
+with [`qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json).
+TensorAgent lists them beside Film Stills and Grainscape; Voxel Style applies only
+to an edit with a reference photo. Do not stack a second speed-distillation adapter
+on official Turbo: [Qwen's model card](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo)
+specifies the checkpoint's own eight-step schedule.
+
+The [Character Swap candidate](https://huggingface.co/akhaliq/Qwen-Image-2.1-Turbo-Character-Swap-LoRA/blob/fbdc96c6e0f15c26f07eb08de2902246b6b94c37/README.md)
+is explicitly trained for official Turbo, but is not offered: previous local
+two-reference comparisons showed blur and doubled subjects at strength 1.0, and
+no clear advantage over the no-adapter baseline at 0.6. That is an exclusion based
+on a limited sample, not a claim that every input will fail. Neither popularity
+nor a matching tensor layout establishes image quality.
 
 ### Parity with stable-diffusion.cpp
 
@@ -809,7 +842,7 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
 ```
 
-The flag reference, the plug-in config format and the table of the twelve shipped
+The flag reference, the plug-in config format and the table of the fourteen shipped
 plug-ins are in [USAGE.md](../../USAGE.md#qwen-image-21-lora-plug-ins).
 
 ### Sampling recipes
@@ -997,8 +1030,8 @@ A host that chooses plug-ins per picture passes them to `WebUiChatService`'s
 The set is swapped in under the same lock as the run, so a picture that waited behind
 another is made with the set it asked for. An unchanged set costs nothing; pass
 absolute paths, which is how the model records the set. The TensorAgent Mac app works this
-way: it offers the twelve plug-ins of [USAGE.md's table](../../USAGE.md#qwen-image-21-lora-plug-ins)
-from its own pinned catalog and applies the user's choice to each picture, its edit routes
+way: its pinned catalog contains the fourteen plug-ins of [USAGE.md's table](../../USAGE.md#qwen-image-21-lora-plug-ins),
+offers those compatible with the loaded model, and applies the user's choice to each picture, its edit routes
 included (see [TensorAgent's README](../../TensorAgent/README.md)).
 
 ### Limitations

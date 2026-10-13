@@ -392,6 +392,7 @@
     <TrimmerRootAssembly Include="TensorSharp.Backends.GGML" />
     <TrimmerRootAssembly Include="TensorSharp.AgentHost" />
     <TrimmerRootAssembly Include="TensorSharp.Chat" />
+    <TrimmerRootAssembly Include="TensorSharp.Knowledge" />
     <TrimmerRootAssembly Include="TensorAgent.Core" />
     <TrimmerRootAssembly Include="TensorAgent.Sharing" />
   </ItemGroup>

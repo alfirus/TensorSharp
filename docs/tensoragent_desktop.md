@@ -4,8 +4,13 @@
 
 TensorAgent runs AI models on your computer. This guide takes you from downloading
 the Mac or Windows application to your first chat, attachments and optional code
-tools. You do not need to build TensorSharp or install the .NET SDK to use the
-desktop packages. Model weights are downloaded separately inside the app.
+tools, including a reusable personal knowledge library. You do not need to build
+TensorSharp or install the .NET SDK to use the desktop packages. Model weights
+are downloaded separately inside the app.
+
+The knowledge library and response steering below describe current source after
+the `v2026.10.10` tag. Use a source build until a release containing those changes
+is published; the existence of a Desktop package does not imply it includes them.
 
 **[Download TensorAgent Desktop — latest release](https://github.com/zhongkaifu/TensorSharp/releases/latest)**
 · [All releases](https://github.com/zhongkaifu/TensorSharp/releases)
@@ -140,6 +145,13 @@ not work. The ZIP uses the same per-user data folders as the installed app.
    press **Enter** or the send button. **Shift+Enter** inserts a new line. Use
    **Stop** to interrupt a reply and **New chat** to start a separate conversation.
 
+While the model is reasoning or answering, you can type and send another
+instruction, such as `Focus on the installation steps.` The composer offers
+**Steer response**; sending interrupts the current response and continues with
+the conversation, partial answer and your guidance. **Stop** remains available
+to interrupt without adding a message. Rapid guidance messages wait for the
+previous generation and tool cleanup before the next response starts.
+
 Interrupted model downloads retain partial files. Return to **Models** and choose
 **Resume** or **Retry**. The app verifies downloaded model files before use; you
 do not need to download GGUFs manually for the built-in catalog.
@@ -187,7 +199,41 @@ and recordings. These are large desktop-memory workloads. Mac media generation
 has recorded app measurements; Windows image/audio/video generation has not been
 verified. See the [model and validation details](../TensorAgent/README.md#what-has-not-been-verified).
 
-## 5. Configure optional code tools
+## 5. Build and use a knowledge library
+
+1. Open **☰ → Knowledge**, enter a collection name and choose **Create**.
+2. Choose **Upload files** or **Upload folder**. Nested folders retain their
+   relative paths. **Add chats** imports selected saved conversations together
+   with available attachments and generated files; this is a snapshot, so import
+   again to refresh it after the chat changes.
+3. Inspect extraction status and warnings, then search the collection to check
+   its excerpts. `Ready`, `Partial` and `MetadataOnly` describe what was
+   indexed; a retained original does not mean all its content was understood.
+4. Choose **Use in this chat**. Selected collections appear above the composer;
+   uploading alone does not select them. A new chat starts with no selection,
+   while reopening a saved chat restores its selection.
+5. Ask a question. Relevant excerpts are retrieved automatically. Models with
+   tool support can search further, read surrounding context and open complete
+   originals for computations when code tools are enabled. Answer source links
+   and **Retrieved sources** open the cited preview and original.
+
+Text, code, CSV/TSV, JSON, HTML, subtitles and partial Office extraction work
+without a chat model during import. PDFs retain selectable text and use local
+OCR for scanned or image-bearing pages: Apple Vision on supported Macs, and
+automatically prepared Poppler/Tesseract on Windows. The initial portable OCR
+setup needs internet; later recognition runs locally. Images and sampled video frames need a compatible loaded vision model. Audio
+can use a loaded audio tower or a configured `TS_JEV_TRANSCRIPTION_URL` companion.
+After enabling the capability, **Reindex** an existing metadata-only source to
+derive content from its retained original.
+
+Retrieval defaults to local BM25 search. Optional GGUF embeddings add semantic
+retrieval. Check a citation against the original when accuracy matters: extraction
+and generated answers can omit or misread details. Collection IDs restrict the
+sources available to a request; subagents inherit the same selection.
+See the [knowledge guide](knowledge-system.md) for formats, previews, quotas,
+OCR setup, embedding configuration and API examples.
+
+## 6. Configure optional code tools
 
 Local chat and inference work without Python or Node. Desktop skills run programs
 installed on your computer; the desktop packages do **not** bundle Python, Node,
@@ -228,6 +274,7 @@ The installed program and your personal data live in different locations:
 | Content | macOS | Windows |
 |---|---|---|
 | Settings, saved conversations, installed skills | `~/Library/Application Support/TensorAgent` | `%LOCALAPPDATA%\TensorAgent\Data` |
+| Knowledge originals and indexes | `~/Library/Application Support/TensorAgent/knowledge` | `%LOCALAPPDATA%\TensorAgent\Data\knowledge` |
 | Default models, LoRAs, uploads, workspaces, artifacts and logs | `~/Library/Caches/TensorAgent` | `%LOCALAPPDATA%\TensorAgent\Cache` |
 | Warning/error log | `~/Library/Caches/TensorAgent/logs/errors.log` | `%LOCALAPPDATA%\TensorAgent\Cache\logs\errors.log` |
 
@@ -243,7 +290,9 @@ you want to retain. Back up the cache as well if you need the uploaded files and
 artifact links in saved chats to keep working. A configured model folder is
 separate and needs its own copy if you want to avoid downloading weights again.
 **Models → Delete** removes a model; **Settings → Delete all chats** removes saved
-conversations and their associated work. Deletion cannot be undone.
+conversations and their associated work. Imported knowledge originals remain in
+the separate data directory; remove sources in **Knowledge** to delete them.
+Deletion cannot be undone.
 
 ## Update or uninstall
 
@@ -267,7 +316,7 @@ listed above and any custom model folder only after saving what you need.
 
 | Problem | What to try |
 |---|---|
-| No `tensoragent-desktop-` files in Assets | This release predates Desktop packaging. Check all releases or build from source until a packaged release is available. |
+| No `tensoragent-desktop-` files in Assets | This release has no Desktop package. Check other releases or successful packaging runs, or build from source until a packaged release is available. |
 | App will not open on Mac | Confirm Apple Silicon and macOS 14+, check the checksum, and follow Apple's trusted-app procedure above. A source build's OS floor may differ from the release package. |
 | Blank Windows chat window | Install/update WebView2 Evergreen Runtime, reopen the app, and confirm you extracted or installed all files. |
 | CUDA package fails to start or load a model | Check the NVIDIA driver and GPU compatibility. Try the CPU package to separate a GPU problem from an application problem. Do not mix files from the two variants. |

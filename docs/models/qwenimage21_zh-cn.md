@@ -377,8 +377,29 @@ Film Stills 改动更多：
   把同一个电车站场景整个换掉了：没有电车，视角更低，街道两旁是树。
 - 每个插件每步约多 5.4%（8.28–8.31 秒对 7.86–7.88 秒）。
 
-TensorAgent 的 Turbo 条目只提供这两个插件。编辑类插件与 Quality Fix 尚未在 Turbo
-上试过，Object Remover 只在基础模型的 40 步下有效。
+TensorAgent 的 Turbo 条目还提供 Casual Phone Photo 与 Voxel Style，共四个兼容插件。
+它们保留 Turbo 的 8 步与 CFG 1，作用是改变视觉风格，不会进一步减少步数。其他编辑插件与
+Quality Fix 仍未在 Turbo 上获得验证；Object Remover 只在基础模型的 40 步下有效。
+
+#### 2026-10-10 新增适配器来源与使用范围
+
+发布者均将以下适配器标为适用于 **Qwen-Image 2.1**，而不是旧版 Qwen-Image、2512 或
+Edit-2511。TensorSharp 配置与 TensorAgent 目录固定使用同一提交、文件、SHA-256 和默认强度；
+大小与哈希已通过 Hugging Face API 核对，并与本地文件一致。发布者展示的是基础检查点，
+本次本地实际图像验证使用 **Turbo AD-Q4_K**。Q8 Turbo 具有相同架构与适配器映射，故提供
+相同选项，但本次没有验证这两个适配器在 Q8 上的图像质量或延迟；目录与规划测试不等于图像验证。
+
+| 适配器与原始模型卡 | 文件大小 | 默认强度与提示词 | 限制 |
+|---|---|---|---|
+| [Casual Phone Photo](https://huggingface.co/19nbrown/qwen-image-2.1-casual-phone-photo-style-lora/blob/3ace7de571892ac5fa6245aed4f0500ae1da795a/README.md) | 167,830,056 字节 | 发布者建议从 **0.8** 开始，提示词包含 `lbxstyle`、明确的主体与场景 | rank 32，小规模实验性微调；作者未声明适配器许可证，基础模型的研究许可证仍然适用。 |
+| [Voxel Style](https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Voxel-Style/blob/b4ccfe9333f04c2f978f2d1bfdfdafe287cbfad1/README.md) | 83,943,936 字节，step-3000 权重 | **1.0** 是 TensorSharp 的起始值；附加照片并使用 `Transform the image into a voxel style` | 实验性预览；主体可能保留，背景可能发生较大变化。发布者要求遵守 Qwen Research License。 |
+
+分别将 [`qwen-image-2.1-casual-phone.json`](../../config/lora/qwen-image-2.1-casual-phone.json)
+或 [`qwen-image-2.1-voxel-style.json`](../../config/lora/qwen-image-2.1-voxel-style.json)
+通过 `--lora` 加到 [`qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json)。
+Voxel Style 只在编辑附加照片时应用。不要在官方 Turbo 上叠加 Viggle、Pruna 或 Fun-Acc
+等另带采样配方的加速适配器。候选模型的筛选依据与质量限制见
+[英文来源审查](qwenimage21.md#additional-adapters-reviewed-on-2026-10-10)。
 
 ### 与 stable-diffusion.cpp 的一致性
 
@@ -652,7 +673,7 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
 ```
 
-参数说明、插件配置格式以及十二个随附插件的列表见
+参数说明、插件配置格式以及十四个随附插件的列表见
 [USAGE_zh-cn.md](../../USAGE_zh-cn.md#qwen-image-21-lora-插件)。
 
 ### 采样配方
@@ -799,8 +820,8 @@ sd.cpp 忽略 `lora_adapter_metadata` 中的 alpha，因此给它的 Pruna 倍�
 按图片选择插件的宿主把插件组传给 `WebUiChatService` 的 `ImageGenerateStreamAsync`、
 `ImageEditStreamAsync` 或 `ImageEditAsync(body, loras, ct)`：插件组在与生成相同的锁内替换，
 所以排队等候的图片使用它请求时的插件组；插件组未变时没有开销（请传绝对路径，模型按此记录
-插件组）。TensorAgent 的 Mac 应用即如此：它从自己的固定目录提供
-[USAGE_zh-cn.md 表中](../../USAGE_zh-cn.md#qwen-image-21-lora-插件)的十二个插件，并把用户的选择
+插件组）。TensorAgent 的 Mac 应用即如此：它的固定目录包含
+[USAGE_zh-cn.md 表中](../../USAGE_zh-cn.md#qwen-image-21-lora-插件)的十四个插件，只提供与当前模型兼容的选项，并把用户的选择
 应用到每张图片，包括它的编辑路由（见 [TensorAgent 的 README](../../TensorAgent/README.md)）。
 
 ### 限制

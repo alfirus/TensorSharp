@@ -46,6 +46,10 @@ namespace TensorSharp.Server.RequestParsers
                     Content = msgEl.GetProperty("content").GetString()
                 };
 
+                if (msg.Role == "assistant" && msgEl.TryGetProperty("thinking", out var thinking)
+                    && thinking.ValueKind == JsonValueKind.String)
+                    msg.Thinking = thinking.GetString();
+
                 msg.ImagePaths = StringList(msgEl, "imagePaths");
                 msg.AudioPaths = StringList(msgEl, "audioPaths");
 

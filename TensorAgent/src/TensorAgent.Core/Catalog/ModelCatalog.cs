@@ -147,58 +147,6 @@ public static partial class ModelCatalog
         },
         new CatalogModel
         {
-            Id = "gemma-4-12b-iq2m",
-            DisplayName = "Gemma 4 12B",
-            Family = CatalogFamily.Gemma4,
-            Kind = CatalogArchitectureKind.Dense,
-            Parameters = "12B",
-            Quantization = "UD-IQ2_M",
-            Files = new[]
-            {
-                new CatalogFile(CatalogFileRole.Weights, "gemma-4-12b-it-UD-IQ2_M.gguf",
-                    Hf("unsloth/gemma-4-12b-it-GGUF", "gemma-4-12b-it-UD-IQ2_M.gguf"),
-                    4_213_353_280, "4bd2461d35398dbcf5f3d5f0c9ad91cac78ae35b556e3a81f315a0cc0815ae8c"),
-                new CatalogFile(CatalogFileRole.Projector, "mmproj-F16.gguf",
-                    Hf("unsloth/gemma-4-12b-it-GGUF", "mmproj-F16.gguf"),
-                    175_115_840, "91f086971e56d7a7d8d39e271873fccdb49541bd259d6e02c401a4f1cb7a219e", Optional: true),
-                // The per-token assistant head, the same shape gemma-4-e4b-iq4xs carries.
-                new CatalogFile(CatalogFileRole.Draft, "mtp-gemma-4-12b-it.gguf",
-                    Hf("unsloth/gemma-4-12b-it-GGUF", "mtp-gemma-4-12b-it.gguf"),
-                    465_109_248, "145db9094bc0f85f1701e255a2ed216dcc9800fc8bc8631ad00905b456bd451b", Optional: true),
-            },
-            Modalities = CatalogModalities.Image | CatalogModalities.Video,
-            MinDeviceMemoryGB = 12,
-            // 32768, not 8192. The window was small because the LOAD was expensive, not
-            // because the cache was: fusing this model's 48 ffn_gate/ffn_up pairs cost
-            // gigabytes of anonymous memory duplicating bytes already mapped from the
-            // GGUF, which is what jetsam killed the app for. Gemma 4 now runs the pair
-            // as two matmuls instead (Gemma4Model.SupportsSplitGateUpFfn), and the
-            // window is affordable. MEASURED on the Q4_K_XL build of this same model,
-            // ggml_metal, where the fusion was 3,108 MB:
-            //   fused,  8192   peak footprint 4,534 MB   31.7 tok/s
-            //   split,  8192                   1,423 MB   31.5 tok/s
-            //   split, 32768                   2,187 MB   31.3 tok/s
-            // Output is byte-identical between the first two, and a 14,294-token needle
-            // prompt returns the planted value on both. THIS entry is the UD-IQ2_M
-            // build, and it reaches the split path by the same route the measurement
-            // above did: on iOS ModelBase.AllowWeightFusionCopies is false, so the
-            // fused copy is never made whatever the types are. Nothing here depends on
-            // ggml declining to requantize -- VERIFIED against the pinned file, whose
-            // 48 ffn_gate/ffn_up pairs match on BOTH sides (43 IQ2_S pairs and five
-            // IQ3_XXS pairs), so the mismatch branch that would call for a requantize
-            // is never entered at all.
-            ContextLength = 32768,
-            // f16, like every Gemma entry: Gemma 4 refuses a block-quantized cache
-            // (Gemma4Model.SupportsBlockQuantizedKvCache) because its sliding-window
-            // layers use a circular cache whose managed helpers are float-only.
-            KvCacheDtype = "f16",
-            Sampling = new CatalogSampling(1.0f, 64, 0.95f, 0.0f),
-            SupportsThinking = true,
-            License = GemmaLicense,
-            Notes = "catalog.model.gemma4Size12b.notes",
-        },
-        new CatalogModel
-        {
             Id = "bonsai-2-27b-ptq1-0",
             DisplayName = "Bonsai 2 27B",
             Family = CatalogFamily.Bonsai,
@@ -666,7 +614,7 @@ public static partial class ModelCatalog
     public static IReadOnlyList<string> Retired { get; } = new[]
     {
         // Re-pointed at another file on 2026-09-05; gemma-4-12b-iq3xxs was the 12B between
-        // the Q4_K_XL and today's UD-IQ2_M.
+        // the Q4_K_XL and UD-IQ2_M.
         "gemma-4-e4b-q4kxl",
         "gemma-4-12b-q4kxl",
         "gemma-4-12b-iq3xxs",
@@ -682,6 +630,8 @@ public static partial class ModelCatalog
         // Bonsai 1, replaced by Bonsai 2 27B on 2026-09-28.
         "bonsai-8b-q1-0",
         "bonsai-27b-q1-0",
+        // Withdrawn on 2026-10-11.
+        "gemma-4-12b-iq2m",
     };
 
     /// <summary>Whether <paramref name="id"/> is one of the <see cref="Retired"/> ids.</summary>

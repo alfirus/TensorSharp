@@ -21,8 +21,8 @@
   <p><strong>Sentence encoders:</strong> Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2, with pure C# CPU and native GGML CPU/Metal/CUDA execution, served through <code>--embeddings</code> and OpenAI/Ollama embedding APIs. <a href="embeddings.html">Embedding models, supported backends, and validation →</a></p>
 
   <h2 id="packages">Project and package boundaries</h2>
-  <p>The repository is split along publishable package boundaries. The source tree's publish set is <strong>thirteen</strong> packages — every row below — verified by <code>eng/verify-packages.ps1</code>, which gates the release workflow.</p>
-  <p>Package versions follow their release tag. Work merged after <code>v2026.09.01</code> — including Qwen-Image-2.1, mask editing and LoRA plug-ins, the Jev endpoint, DiffusionGemma image input and sub-agents — requires a current source build. Use project references when you need those APIs.</p>
+  <p>The repository is split along publishable package boundaries. The source tree's publish set is <strong>fourteen</strong> packages — every row below — verified by <code>eng/verify-packages.ps1</code>, which gates the release workflow.</p>
+  <p>Package versions and contents follow the chosen release tag. Personal knowledge and response steering were merged after <code>v2026.10.10</code> and need a newer build containing them; use current project references for unreleased APIs. The workflow can package the projects below, which does not establish that every NuGet package or installer asset from a particular release was inspected.</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Project / package</th><th>Namespace</th><th>Responsibility</th></tr></thead>
@@ -34,6 +34,7 @@
       <tr><td><code>TensorSharp.Backends.GGML</code></td><td><code>TensorSharp.GGML</code></td><td>GGML-backed execution and native interop.</td></tr>
       <tr><td><code>TensorSharp.Backends.Cuda</code></td><td><code>TensorSharp.Cuda</code></td><td>Direct CUDA allocator, storage, cuBLAS GEMM, PTX kernels, quantized CUDA ops.</td></tr>
       <tr><td><code>TensorSharp.Backends.MLX</code></td><td><code>TensorSharp.MLX</code></td><td>Apple-Silicon MLX backend (mlx-c / Metal).</td></tr>
+      <tr><td><code>TensorSharp.Knowledge</code></td><td><code>TensorSharp.Knowledge</code></td><td>Independent personal store, originals, extraction, versioned chunks, BM25 and optional embedding retrieval. <a href="knowledge.html">Knowledge guide</a>.</td></tr>
       <tr><td><code>TensorSharp.Chat</code></td><td><code>TensorSharp.Chat</code></td><td>Host-neutral chat pipeline — <code>ModelService</code>, sessions, generation, the skills loop, the Web UI request/stream contract. No ASP.NET Core; shared by the server, the CLI, and the iOS app.</td></tr>
       <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core library: OpenAI/Ollama adapters, HTTP transport over TensorSharp.Chat, web UI assets. A library — it produces no executable on its own.</td></tr>
       <tr><td><code>TensorSharp.Server.Host</code></td><td><code>TensorSharp.Server.Host</code></td><td>The runnable web application built on that library: <code>Program.cs</code>, host wiring, <code>wwwroot/</code>, and the command line. This is what you run.</td></tr>
@@ -45,8 +46,9 @@
   </div>
   <p>For a typical embedding scenario, reference <code>TensorSharp.Models.csproj</code>; it already references Core, Runtime, and the backend projects. From a sibling application beside the TensorSharp checkout:</p>
   <pre data-lang="bash"><code>dotnet add reference ../TensorSharp/TensorSharp.Models/TensorSharp.Models.csproj</code></pre>
-  <div class="callout warn"><div class="ic">📦</div><p>The NuGet packages are a snapshot of the <code>v2026.09.01</code> release; use project references when you need the current implementation. Source builds compile native GGML/MLX by default; for managed-CPU development pass <code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true</code>, or build the native libraries described under <a href="backends.html#native-build">Backends</a>.</p></div>
+  <div class="callout warn"><div class="ic">📦</div><p>Check the chosen version's release notes for its API contents; use current project references for implementation added after that tag. Source builds compile native GGML/MLX by default; for managed-CPU development pass <code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true</code>, or build the native libraries described under <a href="backends.html#native-build">Backends</a>.</p></div>
 
+  <p><strong>Knowledge SDK:</strong> <code>KnowledgeStore</code>, <code>KnowledgeOptions</code>, <code>IKnowledgeExtractor</code> and <code>IKnowledgeEmbeddingProvider</code> live in the independent project. The Chat layer's <code>KnowledgeRuntime.CreateStore</code> integrates loaded models, GGUF encoders and OCR. Applications supply explicit collection scope and their authentication boundary. <a href="knowledge.html#server">Host configuration →</a></p>
   <h2 id="quickstart">Minimal example — load, generate, decode</h2>
   <p>Every model is loaded the same way: <code>ModelBase.Create()</code> reads the GGUF metadata and instantiates the right architecture. From there you tokenize, run forward passes, sample, and decode.</p>
   <pre data-lang="csharp"><code>using System;

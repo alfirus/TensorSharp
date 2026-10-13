@@ -475,6 +475,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
 
   <h2 id="repl">交互式 REPL 命令</h2>
   <p>用 <code>--interactive</code> / <code>-i</code> 启动。任何不以 <code>/</code> 开头的内容都是一轮用户输入；输入 <code>/help</code> 查看列表。提示头显示当前模型、后端、架构、上下文长度、投影器、对话深度与待发送附件。生成时按 <kbd>Ctrl+C</kbd> 中断；在提示符处按 <kbd>Ctrl+C</kbd> 退出。</p>
+  <p><strong>生成时引导：</strong>在单行交互模式中，回答生成时输入新的提示词并按 Enter，可中断当前回答并继续新一轮；已生成的助手文本保留在历史中。斜杠命令同样先停止并清理生成，再执行。多行输入在单独一行输入 <code>.</code> 后才提交；重定向输入按顺序执行完整回合并在 EOF 干净退出。此功能需要 <code>v2026.10.10</code> 后的构建。</p>
   <h4>对话</h4>
   <div class="table-scroll">
   <table>

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>个人知识库 — TensorSharp 维基</title>
+  <meta name="description" content="在 TensorAgent 中导入文件、文件夹和已保存聊天，建立本地知识库；检索文档、OCR 与媒体派生文本，选择聊天范围并查看版本化引用。">
+  <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+  <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
+  <script defer src="assets/search-index-zh.js"></script>
+  <script defer src="assets/app.js"></script>
+</head>
+<body data-page="knowledge">
+<a class="skip" href="#content">跳到内容</a>
+<main class="content" id="content">
+  <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 个人知识库</div>
+  <h1>个人知识库</h1>
+  <p class="lede">把文档、数据集与媒体保存在可复用的本地资料库中。TensorSharp.Knowledge 保留原文件，并索引带来源位置的可检索片段。TensorAgent 提供集合管理、文件夹上传、已保存聊天导入、预览和按聊天选择范围；支持的服务端聊天 API 与智能体工具共用同一个存储。</p>
+  <p>本指南描述当前源码。个人知识库与回答引导在 <code>v2026.10.10</code> 之后加入，需要包含这些功能的新构建。发布标签或包构建成功本身不代表模型、OCR 或设备验证。</p>
+
+  <h2 id="start">创建资料库并用于聊天</h2>
+  <ol class="steps">
+    <li><h3>创建集合</h3><p>打开<strong>菜单 → 知识库</strong>，输入名称并<strong>创建</strong>。重命名不会改变集合身份。</p></li>
+    <li><h3>添加来源</h3><p>选择<strong>上传文件</strong>或<strong>上传文件夹</strong>。文件夹导入包含嵌套目录，并保留相对路径。应用使用原生文件夹选择器，浏览器使用目录选择器；进度和逐文件失败可见。清理聊天或上传缓存后，资料库仍保留原文件。</p></li>
+    <li><h3>导入已保存的对话</h3><p><strong>添加聊天</strong>打开可搜索的历史选择器，可跨页选择最多 32 个聊天，再<strong>添加并索引所选聊天</strong>。用户与助手消息、可用附件及生成文件都会索引，私有思考内容除外；缺失文件会报告。再次导入会刷新稳定来源路径，不重复保存未变化文件。这是快照，后续对话变化需要再次导入。</p></li>
+    <li><h3>检查提取结果</h3><p>查看数量、文件名/路径与类型筛选、排序及文件分页，检查每个来源的状态和警告。在集合中搜索，选择<strong>读取周围上下文</strong>，或打开索引文本与支持的原文件预览。<strong>下载原文件</strong>返回保存的来源。</p></li>
+    <li><h3>选择聊天范围</h3><p>勾选<strong>在此聊天中使用 {集合}</strong>，或集合目录中的复选框；已选集合显示在输入框上方。最多选择 32 个集合；新聊天默认不选，已保存聊天恢复原选择。浏览、导入和重新索引不会自动选中集合供推理使用。</p></li>
+    <li><h3>结合证据提问</h3><p>回答前先检索相关片段。支持工具的模型可细化搜索、扩展上下文并打开原文件分析，受宿主的证据与工具预算限制。计算数据集时，应要求智能体打开完整原文件并运行代码；几条检索记录不能代表完整数据集。</p></li>
+  </ol>
+
+  <h2 id="formats">哪些内容可以检索</h2>
+  <div class="table-scroll"><table>
+    <thead><tr><th>来源</th><th>索引内容</th><th>限制</th></tr></thead>
+    <tbody>
+      <tr><td>文本、Markdown、代码、日志、HTML</td><td>文本片段；可用时保留行号/章节位置</td><td>严格文本解码；移除 HTML 脚本与样式，不渲染或加载远程内容。</td></tr>
+      <tr><td>CSV/TSV、JSON 数组、JSONL/NDJSON</td><td>带行/项目位置的记录</td><td>有界解析与检索，不是数据库查询引擎。</td></tr>
+      <tr><td>PDF</td><td>可选文本与扫描/含图页 OCR，保留原页码</td><td>OCR 可能误读，不重建精确版式；警告标明覆盖缺口。</td></tr>
+      <tr><td>DOCX、PPTX、XLSX</td><td>段落/表格/引用注释、幻灯片文字，或工作表行/缓存值</td><td>部分提取：不渲染布局或解释嵌入图片/图表，不重新计算公式；PPTX 演讲者备注不索引。</td></tr>
+      <tr><td>图像</td><td>已加载视觉模型/投影器生成的可见文字转录与描述</td><td>部分模型派生证据，最多 16,777,216 像素；没有原生图像嵌入。</td></tr>
+      <tr><td>音频</td><td>兼容音频塔或已配置转录伴随服务生成的转录</td><td>本地输入为最多 120 秒 PCM WAV，其他格式需转换或伴随服务；不做说话人分离或逐词时间戳。</td></tr>
+      <tr><td>视频；SRT/VTT</td><td>最多八个采样帧的描述与时间；已有字幕保留时间范围</td><td>视频需兼容编解码器与视觉模型，不索引音轨或覆盖采样间事件；最多十分钟 / 36,000 帧。</td></tr>
+      <tr><td>不支持的文件或不可用媒体能力</td><td>原文件与可搜索文件名元数据</td><td><code>MetadataOnly</code>：没有理解文件内容。条件允许时加载兼容模型后重新索引。</td></tr>
+    </tbody>
+  </table></div>
+  <p><code>Ready</code> 表示提取器产生内容且没有声明覆盖警告；<code>Partial</code> 记录限制；<code>MetadataOnly</code> 只索引文件名。模型生成的描述与转录始终标为部分覆盖。重新索引使用已保存原文件以及当前可用提取器和嵌入提供器。</p>
+
+  <h2 id="ocr">PDF OCR 在宿主运行</h2>
+  <p>支持的 Apple 宿主使用 CoreGraphics 与 Apple Vision，无需另装工具。Windows TensorAgent 及 Linux 核心宿主会在某页首次需要 OCR 时，自动准备私有 Poppler/Tesseract 工具与固定版本的英文、简体/繁体中文语言数据。纯文本 PDF 不触发下载。界面显示准备进度与重试；准备失败保留已有提交文档。之后 OCR 在本地运行，混合可选文本与扫描内容的页面也会处理。</p>
+  <p>默认预算为每文档 128 个 OCR 页面、每页 16,777,216 渲染像素和 60 秒页面期限。工具安装成功与识别质量、平台覆盖是不同的验证。仓库没有发布 Linux MAUI 桌面应用；独立 Windows/Linux 宿主须配置工具或启用准备器。浏览器使用连接宿主的 OCR。</p>
+
+  <h2 id="search">检索、引用与保留原文件</h2>
+  <p>默认使用本地 BM25 文本检索，支持 Unicode 词项与 CJK n-gram。可选 <a href="embeddings_zh-cn.html">GGUF 句子嵌入</a>增加精确余弦检索，用倒数排名融合结合词法与语义排序。聊天宿主可用已加载模型做一次有界相关性重排，<code>TS_KNOWLEDGE_RERANK=0</code> 可关闭；无效输出或超时保留原排序。这些方法搜索提取文本与媒体描述，不是原始媒体嵌入。</p>
+  <p><strong>检索来源</strong>仅显示最终回答确实引用的检索来源身份。链接打开引用片段或原文件预览；图像/视频来源可显示缩略图与采样时间。<code>[K1]</code> 等引用标记绑定到宿主签发的身份；未知或过期标记不会生成来源标签。身份正确不证明回答中的每一条陈述。</p>
+  <p>原文件按 SHA-256 寻址；同一相对文件名和字节重复导入具有幂等性。文件变化或重新索引会推进版本，仅保留当前版本；旧引用报告过期，不会悄悄打开修改后的内容。提取或嵌入失败保留前一个已提交来源。此存储是嵌入式、单写入者的个人资料库。</p>
+  <p>默认限制包括每文件 64 MiB、逻辑来源存储 2 GiB、100 个集合和 10,000 个文档；索引与临时文件另需磁盘和内存。自动检索限制片段与工具调用。明确识别为单文档的证据，只有在实际提示词和回答预算通过模型上下文检查后，才能扩展为完整索引文本快照；否则保留普通检索。完整索引文本快照不代表提取完整。</p>
+
+  <h2 id="server">独立服务器与智能体集成</h2>
+  <p>启动 <code>TensorSharp.Server.Host</code> 前设置 <code>TS_KNOWLEDGE_DIRECTORY</code>，启用存储与 <code>/api/knowledge</code> 路由。可选 <code>TS_KNOWLEDGE_EMBEDDING_MODEL</code>、<code>TS_KNOWLEDGE_EMBEDDING_BACKEND</code>、<code>TS_KNOWLEDGE_QUERY_PREFIX</code> 与 <code>TS_KNOWLEDGE_DOCUMENT_PREFIX</code> 配置独立的本地编码器。身份变化后需重新索引才能语义检索；旧文档仍可词法检索。</p>
+  <pre data-lang="bash"><code>TS_KNOWLEDGE_DIRECTORY="$PWD/library" \
+dotnet run --project TensorSharp.Server.Host -- \
+  --model /path/to/chat-model.gguf --backend ggml_metal --port 5000</code></pre>
+  <p>管理 API 包括集合创建/删除、文档列表/上传/删除/重新索引、<code>POST /api/knowledge/search</code>、<code>POST /api/knowledge/read</code> 与版本化原文件下载。独立宿主上传每请求只接受一个 multipart 文件，搜索/读取显式传入 <code>collectionIds</code>。TensorAgent 另有重命名、文件夹/聊天导入与预览界面路由，独立服务器并不提供全部这些端点。</p>
+  <p>支持的推理路由使用完全一致的 camel-case 字段 <code>knowledgeCollections</code>：TensorAgent/WebUI 的 <code>POST /api/chat</code>，独立服务器的 <code>POST /v1/chat/completions</code>、<code>POST /v1/responses</code>、<code>POST /api/chat/ollama</code> 与 <code>POST /api/generate</code>。Ollama generate 支持检索和引用，没有智能体工具循环。选择为空或缺失时不检索，无效/已删除选择会拒绝。普通 TensorAgent 宿主不提供独立服务器的所有兼容 API。</p>
+  <pre data-lang="json"><code>{
+  "model": "chat-model.gguf",
+  "messages": [{ "role": "user", "content": "比较这些文档中的结论。" }],
+  "knowledgeCollections": ["collection-id"],
+  "stream": false
+}</code></pre>
+  <p>选择知识库时，OpenAI/Ollama 回复提供 <code>knowledge_sources</code>、<code>knowledge_citation_repairs</code> 与有界 <code>knowledge_tool_steps</code> 元数据。流式兼容适配器先缓冲最终回答以绑定引用，再发出只追加的回答增量；思考和工具活动可能先到达。<code>tool_choice: "none"</code> 禁用智能体工具，但保留检索。支持工具的宿主提供 <code>knowledge_list</code>、<code>knowledge_search</code>、<code>knowledge_read</code> 与 <code>knowledge_open</code>，后者可将完整原文件复制到已启用的私有代码工作区。</p>
+  <p>远程管理应放在应用的认证边界内。集合 ID 定义检索范围，不是授权凭据。独立服务器随附的 Chat 页面没有 TensorAgent 的集合管理面板，应使用 API 或 SDK。</p>
+
+  <h2 id="validation">覆盖与验证</h2>
+  <p>仓库包含存储/提取器、宿主集成、范围/引用、聊天导入、浏览器界面、OCR 和真实模型测试及探针。测试存在、fixture 测试和包构建不代表所有提取器、编解码器、模型或设备均已验证。跳过/不可用场景仍未验证。小规模干净媒体与合成扫描页是正确性诊断，不是通用回答质量、OCR 准确率或吞吐基准。</p>
+  <p>参见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/knowledge-system_zh-cn.md" target="_blank" rel="noopener">完整知识库设计与配置指南</a>及<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/eng/validation/knowledge/README.md" target="_blank" rel="noopener">验证流程与平台限制</a>。回答的事实正确性须另行对照原文件检查，不能用引用检查替代。</p>
+  <div class="content-footer"><a href="tensoragent_zh-cn.html">← TensorAgent 桌面版</a><a href="http-api_zh-cn.html#knowledge">知识库 HTTP API →</a></div>
+</main>
+</body>
+</html>

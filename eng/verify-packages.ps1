@@ -51,9 +51,15 @@ $PublicPackages = @(
         EmbeddedAssemblies = @()
     },
     @{
+        Id = "TensorSharp.Knowledge"
+        Project = "TensorSharp.Knowledge/TensorSharp.Knowledge.csproj"
+        TensorSharpDependencies = @()
+        EmbeddedAssemblies = @()
+    },
+    @{
         Id = "TensorSharp.AgentHost"
         Project = "TensorSharp.AgentHost/TensorSharp.AgentHost.csproj"
-        TensorSharpDependencies = @("TensorSharp.Runtime")
+        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Knowledge")
         EmbeddedAssemblies = @()
     },
     @{
@@ -89,13 +95,13 @@ $PublicPackages = @(
     @{
         Id = "TensorSharp.Chat"
         Project = "TensorSharp.Chat/TensorSharp.Chat.csproj"
-        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Models", "TensorSharp.Backends.GGML")
+        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Knowledge")
         EmbeddedAssemblies = @()
     },
     @{
         Id = "TensorSharp.Server"
         Project = "TensorSharp.Server/TensorSharp.Server.csproj"
-        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Chat", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Backends.Cuda", "TensorSharp.Backends.MLX", "TensorSharp.Distributed")
+        TensorSharpDependencies = @("TensorSharp.Runtime", "TensorSharp.Runtime.Logging", "TensorSharp.AgentHost", "TensorSharp.Chat", "TensorSharp.Models", "TensorSharp.Backends.GGML", "TensorSharp.Backends.Cuda", "TensorSharp.Backends.MLX", "TensorSharp.Distributed", "TensorSharp.Knowledge")
         EmbeddedAssemblies = @()
     },
     @{

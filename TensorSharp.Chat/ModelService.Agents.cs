@@ -16,6 +16,15 @@ namespace TensorSharp.Server;
 
 public partial class ModelService
 {
+    internal static ChatTurnContext CreateChildTurnContext(ChatTurnContext parent,
+        IReadOnlyList<MultiAgentPromptProfile> publicProfiles) => new()
+    {
+        PublicPrefixCandidates = publicProfiles,
+        // A descendant is part of the same bounded request. Keep its transcript
+        // and cache scope private while retaining the caller's reasoning policy.
+        ThinkingTokenLimit = parent.ThinkingTokenLimit,
+    };
+
     private async IAsyncEnumerable<ChatStreamUpdate> MultiAgentChatStreamAsync(
         List<ChatMessage> history, SkillRequestPlan plan, SkillChatGeneration generate,
         int maxTokens, SamplingConfig turnSampling, SamplingConfig sourceSampling,
@@ -35,7 +44,7 @@ public partial class ModelService
             // can still reuse the public prefix and schedule independent sequences.
             var childSession = new ChatSession();
             sessions.Add(childSession);
-            var childTurn = new ChatTurnContext { PublicPrefixCandidates = publicProfiles };
+            var childTurn = CreateChildTurnContext(rootTurn, publicProfiles);
             return async (childMessages, childTools, ct) =>
             {
                 var parser = OutputParserFactory.Create(Architecture);

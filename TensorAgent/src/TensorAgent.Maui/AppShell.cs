@@ -55,7 +55,10 @@ public sealed class AppShell : Shell
 
         var main = new ShellContent { Title = Core.Localization.Loc.T("shell.chat.title"), Route = "main", Content = chat };
         Items.Add(main);
-        Core.Localization.Loc.Changed += () => Dispatcher.Dispatch(() => main.Title = Core.Localization.Loc.T("shell.chat.title"));
+        // Keep this hidden shell item stable after it is attached. MAUI still binds a
+        // flyout cell even with FlyoutBehavior.Disabled; changing its title can reload
+        // a cell whose IndexPath is null and abort UIKit with NSInvalidArgumentException.
+        // The visible page titles and the chat's own menu localize independently.
         _pages = new Dictionary<string, Page>(StringComparer.Ordinal)
         {
             ["sessions"] = sessions,

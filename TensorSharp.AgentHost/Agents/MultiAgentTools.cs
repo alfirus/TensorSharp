@@ -23,7 +23,8 @@ public static class MultiAgentTools
     // Keep ordering and enforcement tied to the same allowlist. Coordination
     // tools are handled separately: they do not grant filesystem permissions.
     internal static bool IsReadOnlyTool(string? name) =>
-        name is SkillTools.ReadToolName or SkillTools.ListToolName or SkillToolNames.ReadFile;
+        name is SkillTools.ReadToolName or SkillTools.ListToolName or SkillToolNames.ReadFile
+        || Knowledge.KnowledgeTools.IsTool(name);
 
     public static List<ToolFunction> Merge(IReadOnlyList<ToolFunction>? tools)
     {

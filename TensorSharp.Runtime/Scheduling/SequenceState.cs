@@ -192,6 +192,13 @@ namespace TensorSharp.Runtime.Scheduling
             CachedSampler = null;
             PendingDeviceToken = null;
         }
+        /// <summary>The model reopened reasoning after the bounded sampler
+        /// handoffs. The streaming host must end this request as thinking_budget.</summary>
+        public bool MessageThinkingBudgetExhausted => CachedSampler?.MessageThinkingBudgetExhausted == true;
+        /// <summary>Only report exhaustion after a streaming consumer has reached
+        /// its committed position; the engine may have queued later tokens already.</summary>
+        public bool MessageThinkingBudgetExhaustedAt(int observedOutputCount) =>
+            CachedSampler?.MessageThinkingBudgetExhaustedAt(observedOutputCount) == true;
 
         internal TokenSampler GetOrCreateSampler()
         {

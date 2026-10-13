@@ -10,6 +10,7 @@
   </Folder>
   <Project Path="AdvUtils/AdvUtils.csproj" />
   <Project Path="InferenceWeb.Tests/InferenceWeb.Tests.csproj" />
+  <Project Path="InferenceWeb.Tests/Fixtures/PdfProcessFixture/PdfProcessFixture.csproj" />
   <Project Path="TensorSharp.AgentHost/TensorSharp.AgentHost.csproj" />
   <Project Path="TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj" />
   <Project Path="TensorSharp.Backends.GGML/TensorSharp.Backends.GGML.csproj" />
@@ -18,6 +19,8 @@
   <Project Path="TensorSharp.Cli/TensorSharp.Cli.csproj" />
   <Project Path="TensorSharp.Core/TensorSharp.Core.csproj" />
   <Project Path="TensorSharp.Distributed/TensorSharp.Distributed.csproj" />
+  <Project Path="TensorSharp.Knowledge/TensorSharp.Knowledge.csproj" />
+  <Project Path="TensorSharp.Knowledge.Tests/TensorSharp.Knowledge.Tests.csproj" />
   <Project Path="TensorSharp.Models/TensorSharp.Models.csproj" />
   <Project Path="TensorSharp.Memory/TensorSharp.Memory.csproj" />
   <Project Path="TensorSharp.Runtime.Logging/TensorSharp.Runtime.Logging.csproj" Id="987c8976-2d64-44fa-a929-6d10e691b0cc" />

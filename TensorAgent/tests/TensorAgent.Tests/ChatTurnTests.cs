@@ -35,7 +35,7 @@ namespace TensorAgent.Tests;
 /// everything, and the answer is written down whether or not anyone was listening.
 /// </para>
 /// </summary>
-public sealed class ChatTurnTests
+public sealed partial class ChatTurnTests
 {
     // ---- the manager, on its own -------------------------------------------------
 
@@ -786,12 +786,13 @@ public sealed class ChatTurnTests
             Directory.CreateDirectory(uploads);
             _conversations = new ConversationStore(Path.Combine(root, "conversations"));
             var recorder = new ConversationRecorder(_conversations);
+            Recorder = recorder;
             Turns = new ChatTurnManager(recorder);
 
             _server = new LoopbackServer(NullLogger.Instance) { RequireToken = false };
             _server.MapWebUi(
                 ChatService(root, uploads), uploads, skills: null, recorder: recorder,
-                chatFrames: (_, ct) => Frames!(ct), turns: Turns);
+                chatFrames: (body, ct) => RequestFrames?.Invoke(body, ct) ?? Frames!(ct), turns: Turns);
             _server.Start();
             Client = new HttpClient { BaseAddress = new Uri(_server.BaseUrl) };
 
@@ -802,6 +803,8 @@ public sealed class ChatTurnTests
 
         public HttpClient Client { get; }
         public ChatTurnManager Turns { get; }
+        public ConversationRecorder Recorder { get; }
+        public Func<JsonElement, CancellationToken, IAsyncEnumerable<object>>? RequestFrames { get; set; }
         public string SessionId { get; }
         public string ConversationId { get; }
         public string ConversationRoot => _conversations.Root;
@@ -817,12 +820,12 @@ public sealed class ChatTurnTests
         /// through.
         /// </para>
         /// </summary>
-        public Task<HttpResponseMessage> SendChatAsync(string prompt)
+        public Task<HttpResponseMessage> SendChatAsync(string prompt, bool steer = false)
         {
             var request = new HttpRequestMessage(HttpMethod.Post, "/api/chat")
             {
                 Content = new StringContent(
-                    $$"""{"sessionId":"{{SessionId}}","messages":[{"role":"user","content":"{{prompt}}"}]}""",
+                    JsonSerializer.Serialize(new { sessionId = SessionId, messages = new[] { new { role = "user", content = prompt } }, steer }),
                     Encoding.UTF8, "application/json"),
             };
             return Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);

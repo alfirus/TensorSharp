@@ -87,6 +87,10 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
 
   <p><strong>选区图像编辑：</strong>附加照片，在编辑目标上选择<strong>选择区域</strong>，保存选区并描述修改。Qwen-Image 2.1 保持原始尺寸并保护选区外像素。结果提供<strong>比较原图</strong>与<strong>再次编辑</strong>；其他附加照片保留为参考图。<a href="models-image_zh-cn.html#mask-editing">选区编辑器与蒙版 API →</a></p>
 
+  <h3 id="steering">生成时引导回答</h3>
+  <p>回答生成过程中输入并发送新消息，宿主会取消并清理旧生成，保留已产生的回答，再生成新一轮；单独的<strong>停止</strong>按钮仍可取消。此功能需要 <code>v2026.10.10</code> 后的构建。</p>
+  <h3 id="knowledge">个人知识库</h3>
+  <p>启动前设置 <code>TS_KNOWLEDGE_DIRECTORY</code>，启用 <code>/api/knowledge</code> 存储与管理 API。支持的聊天请求显式传入 <code>knowledgeCollections</code>；缺失或空选择不检索。独立服务器 Chat 页面没有 TensorAgent 的知识库管理面板，应使用 API/SDK。TensorAgent 应用另有集合、文件夹和聊天导入界面。<a href="knowledge_zh-cn.html#server">配置、支持路由与限制 →</a></p>
   <h2 id="agentic">Agentic Work 与代码执行</h2>
   <p>在能够完整往返工具调用的模型家族上，服务器让已加载的模型在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
   <p>同一个模型还可以委派任务：在 <code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/api/chat/ollama</code> 与 Web UI 的 <code>/api/chat</code> 上，对能渲染工具声明并解析工具调用的家族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外），子智能体委派<strong>默认开启</strong>。是否调用 <code>spawn_agent</code>、<code>wait_agent</code>、<code>send_input</code>、<code>close_agent</code> 与 <code>list_agents</code> 由模型决定；它既不依赖技能，也不依赖 <code>--code-exec</code>。每个子智能体都是同一模型上的独立对话，拥有自己的 KV 状态副本；explorer 与 reviewer 子智能体只读。<code>--no-multi-agent</code> 可关闭委派，下方的 <code>--agents-*</code> 选项为它设定上限，请求也可以用 <code>"multi_agent": false</code> 退出。项目没有发布它的延迟或质量测量数据。→ <a href="agentic_zh-cn.html#sub-agents">子智能体</a></p>
