@@ -12,6 +12,7 @@ param(
     [ValidateRange(0,2048)][int]$ExtendedMaxTokens=0,
     [int]$ReadyTimeoutSeconds=600,
     [switch]$PrefixChecks,
+    [switch]$PrefixDiagnostics,
     [switch]$HttpChecks,
     [switch]$ThreeChatRegression,
     [switch]$FusedTrace,
@@ -52,7 +53,18 @@ if($ThreeChatRegression -or $SerialThreeChatReport) {
     $ServerMaxTokens=20000
 }
 if($ServerMaxTokens -gt 0) { $launchArgs+=@('--max-tokens',"$ServerMaxTokens") }
-$audit=[ordered]@{startedUtc=[DateTime]::UtcNow.ToString('o'); command=@($exe)+$launchArgs; passed=$false; errors=@(); cleanupComplete=$false}
+$audit=[ordered]@{
+    startedUtc=[DateTime]::UtcNow.ToString('o'); command=@($exe)+$launchArgs; passed=$false; errors=@(); cleanupComplete=$false
+    prefixDiagnosticLogging=[ordered]@{
+        enabled=[bool]$PrefixDiagnostics
+        excludesDefaultLoggingPerformanceComparison=[bool]$PrefixDiagnostics
+        scope=$(if($PrefixDiagnostics) {
+            'Diagnostic logging configuration: child TENSORSHARP_LOG_LEVEL=Debug. Do not compare its performance with runs without this diagnostic logging.'
+        } else {
+            'Prefix diagnostics disabled. This flag alone does not qualify performance or exclude overhead from other trace options.'
+        })
+    }
+}
 $owned=$null; $ownedStart=$null; $checkerExit=2; $sampling=$null
 function Save($value,$name) { ConvertTo-Json -InputObject $value -Depth 32 | Set-Content -LiteralPath (Join-Path $outputPath $name) -Encoding utf8 }
 function Hash($path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -99,6 +111,7 @@ try {
     $clock=[Diagnostics.Stopwatch]::StartNew()
     $processOptions=@{FilePath=$exe;ArgumentList=$launchArgs;WorkingDirectory=$repo;WindowStyle='Hidden';PassThru=$true;RedirectStandardOutput=(Join-Path $outputPath 'stdout.log');RedirectStandardError=(Join-Path $outputPath 'stderr.log')}
     $audit.childEnvironment=@{}
+    if($PrefixDiagnostics) { $audit.childEnvironment.TENSORSHARP_LOG_LEVEL='Debug' }
     if($FusedTrace) { $audit.childEnvironment.TS_BATCHED_FUSED_TRACE='1' }
     if($TokenTrace) { $audit.childEnvironment.TS_VALIDATION_TOKEN_TRACE='1' }
     if($DiagnosticTiming) {

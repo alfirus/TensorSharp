@@ -92,7 +92,10 @@ internal sealed record GlmSelectedExpertMemoryPlan(int PrefillRows, int CpuExper
             long reserve = geometry.ExecutionPlacementReserve(context, rows, options.MaximumRunningRequests);
             int cpu;
             try { cpu = geometry.SelectCpuExpertLayers(deviceCeiling, reserve, visionBytes); }
-            catch (MemoryPressureException) when (options.EnableGlmSelectedExperts && rows > 1) { continue; }
+            // Slot, dense and vision ownership stay fixed while smaller chunks
+            // reduce scratch. This applies equally to mapped CPU experts: their
+            // placement can fit a smaller chunk without any selected CUDA tier.
+            catch (MemoryPressureException) when (rows > 1) { continue; }
             if (!options.EnableGlmSelectedExperts || cpu == 0)
                 return new(rows, cpu, reserve, 0, 0);
             long capacity = GlmUnifiedMemoryGeometry.SelectExpertCacheCapacity(deviceCeiling,

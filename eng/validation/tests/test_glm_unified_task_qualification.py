@@ -73,6 +73,34 @@ def fixture(case='extraction'):
 
 
 class GlmUnifiedTaskQualificationTests(unittest.TestCase):
+    def test_deployment_requires_exact_variant_and_application_path(self):
+        files = [dict(Name='GgmlOps.dll', Bytes=32, Sha256='a' * 64),
+            dict(Name='GlmUnifiedSessionProbe.dll', Bytes=10, Sha256='b' * 64)]
+        receipt = [dict(Variant='native17', Directory='/app17', Files=files, NativeSha256='a' * 64)]
+        _, native, managed, _ = MOD.deployment(receipt, '/app17', 'native17')
+        self.assertEqual('/app17/GgmlOps.dll', native['Path'].replace('\\', '/'))
+        self.assertEqual('b' * 64, managed[0]['Sha256'])
+        for app, variant in [('/app17', 'native16'), ('/app16', 'native17'),
+            ('/app17', 'native0'), ('/app17', 'native017'), ('/app17', True), ('/app17', 'candidate')]:
+            with self.subTest(app=app, variant=variant), self.assertRaises(ValueError):
+                MOD.deployment(receipt, app, variant)
+        with self.assertRaises(ValueError):
+            MOD.deployment(receipt + receipt, '/app17', 'native17')
+        bad = copy.deepcopy(receipt)
+        bad[0]['NativeSha256'] = 'f' * 64
+        with self.assertRaises(ValueError):
+            MOD.deployment(bad, '/app17', 'native17')
+
+    def test_default_deployment_keeps_native16_and_rejects_duplicate_files(self):
+        files = [dict(Name='GgmlOps.dll', Bytes=32, Sha256='a' * 64),
+            dict(Name='GlmUnifiedSessionProbe.dll', Bytes=10, Sha256='b' * 64)]
+        receipt = [dict(Variant='native16', Directory='/app', Files=files, NativeSha256='a' * 64)]
+        self.assertEqual('a' * 64, MOD.deployment(receipt, '/app')[1]['Sha256'])
+        bad = copy.deepcopy(receipt)
+        bad[0]['Files'].append(copy.deepcopy(files[0]))
+        with self.assertRaises(ValueError):
+            MOD.deployment(bad, '/app')
+
     def test_unknown_probe_is_graded_independently_for_all_tasks_without_mutation(self):
         for case in MOD.CASES:
             with self.subTest(case=case):

@@ -21,7 +21,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private readonly IPrefixCacheModel _cacheModel;
     private readonly ILogger _logger;
     private readonly Dictionary<SequenceState, RequestKey> _requests = new();
-    private readonly Queue<string> _invalidated = new();
+    private readonly Queue<(string Key, InvalidationReason Reason)> _invalidated = new();
     private readonly Queue<(string Key, PayloadFootprint Previous, PayloadFootprint Current)> _deviceDemotions = new(16);
     private readonly HashSet<long> _storeMisses = new();
     private readonly MatchPlan _plan = new();
@@ -610,7 +610,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         if (found is not null) ReleaseRequest(found);
     }
 
-    public void OnPayloadInvalidated(string payloadKey, InvalidationReason reason) => _invalidated.Enqueue(payloadKey);
+    public void OnPayloadInvalidated(string payloadKey, InvalidationReason reason) => _invalidated.Enqueue((payloadKey, reason));
     public void OnPayloadDeviceDemoted(string payloadKey, PayloadFootprint previous, PayloadFootprint current)
         => _deviceDemotions.Enqueue((payloadKey, previous, current));
     public bool CanMaterialize(string payloadKey, int payloadTokens, int targetTokens)
@@ -621,7 +621,37 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal void Drain()
     {
         bool hadInvalidations = _invalidated.Count > 0;
-        while (_invalidated.TryDequeue(out var key)) _tree.InvalidatePayload(key);
+        while (_invalidated.TryDequeue(out var invalidation))
+        {
+            // Callback notifications remain deferred to this worker boundary.
+            // Tree metadata is observed before detach; it describes the indexed
+            // payload, never physical release credit, a model checkpoint flag,
+            // or the pool that originally triggered the callback.
+            try
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    RadixNode? node = null;
+                    if (invalidation.Key is not null)
+                        _tree.TryGetNodeByKey(invalidation.Key, out node);
+                    EndStatePayload? payload = node?.EndState;
+                    _logger.LogDebug(
+                        "Radix payload invalidation: key={PayloadKey}, reason={InvalidationReason}, indexed={PayloadIndexed}, " +
+                        "nodeId={NodeId}, scope={ScopeIndex}, depth={NodeDepth}, kind={PayloadKind}, origin={PayloadOrigin}, " +
+                        "tokens={PayloadTokens}, capacity={PayloadCapacityTokens}, pathLocks={PathLockCount}, stateLocks={StateLockCount}, pins={PinCount}.",
+                        invalidation.Key, invalidation.Reason, node is not null,
+                        node?.Id, node?.ScopeIx, node?.Depth, payload?.Kind, payload?.Origin,
+                        payload?.Footprint.Tokens, payload?.Footprint.CapacityTokens,
+                        node?.LockRef, node?.StateLockRef, node?.PinRef);
+                }
+            }
+            catch (Exception)
+            {
+                // Optional diagnostics must not lose an already-dequeued
+                // model invalidation when a logging provider fails.
+            }
+            _tree.InvalidatePayload(invalidation.Key!);
+        }
         // Invalidations take precedence. A delayed transfer report cannot
         // revive a removed payload or change a newer holder at the same node.
         while (_deviceDemotions.TryDequeue(out var demotion))

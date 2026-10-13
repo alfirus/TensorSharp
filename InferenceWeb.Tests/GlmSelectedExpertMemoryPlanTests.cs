@@ -138,6 +138,60 @@ public sealed class GlmSelectedExpertMemoryPlanTests
         Assert.False(new UnifiedMemoryModelOptions().EnableGlmSelectedExperts);
     }
 
+    [Theory]
+    [InlineData(8)]
+    [InlineData(32)]
+    [InlineData(127)]
+    public void DefaultExpertModeSelectsLargestPrefillAtExactPlacementBudget(int rows)
+    {
+        var geometry = Geometry();
+        var options = Options(prefill: 512) with { EnableGlmSelectedExperts = false };
+        long vision = GiB / 2;
+        long reserve = geometry.ExecutionPlacementReserve(32768, rows, 3);
+        long ceiling = checked(geometry.DenseDeviceBytes + vision + reserve);
+        // The larger chunk really cannot fit even after every expert layer is
+        // offloaded. No selected-expert envelope is needed in this mode.
+        Assert.Throws<MemoryPressureException>(() => geometry.SelectCpuExpertLayers(ceiling,
+            geometry.ExecutionPlacementReserve(32768, rows + 1, 3), vision));
+
+        var exact = GlmSelectedExpertMemoryPlan.Select(geometry, options, 32768, ceiling, vision);
+        var below = GlmSelectedExpertMemoryPlan.Select(geometry, options, 32768, ceiling - 1, vision);
+        Assert.Equal(rows, exact.PrefillRows);
+        Assert.Equal(rows - 1, below.PrefillRows);
+        Assert.Equal(reserve, exact.ExecutionReserveBytes);
+        Assert.Equal(3, exact.CpuExpertLayers);
+        Assert.Equal(0, exact.CacheCapacityBytes);
+        Assert.Equal(0, exact.CacheMinimumForecastBytes);
+        Assert.Equal(new UnifiedMemoryModelOptions { PrefillChunkTokens = 512 }, options);
+    }
+
+    [Fact]
+    public void DefaultExpertModePreservesDenseVisionAndConcurrentSlotFloorAtSmallestPrefill()
+    {
+        var geometry = Geometry();
+        var options = Options(prefill: 1) with { EnableGlmSelectedExperts = false };
+        long vision = GiB / 2;
+        long reserve = geometry.ExecutionPlacementReserve(32768, 1, 3);
+        long ceiling = checked(geometry.DenseDeviceBytes + vision + reserve);
+        var exact = GlmSelectedExpertMemoryPlan.Select(geometry, options, 32768, ceiling, vision);
+        Assert.Equal(1, exact.PrefillRows);
+        Assert.Equal(reserve, exact.ExecutionReserveBytes);
+        Assert.Equal(3, exact.CpuExpertLayers);
+        Assert.Throws<MemoryPressureException>(() => GlmSelectedExpertMemoryPlan.Select(
+            geometry, options, 32768, ceiling - 1, vision));
+        Assert.Throws<MemoryPressureException>(() => GlmSelectedExpertMemoryPlan.Select(
+            geometry, options, 32768, ceiling, vision + 1));
+        Assert.Throws<MemoryPressureException>(() => GlmSelectedExpertMemoryPlan.Select(
+            geometry with { DenseDeviceBytes = geometry.DenseDeviceBytes + 1 }, options, 32768, ceiling, vision));
+        long soloCeiling = checked(geometry.DenseDeviceBytes + vision
+            + geometry.ExecutionPlacementReserve(32768, 1, 1));
+        Assert.True(soloCeiling < ceiling);
+        Assert.Throws<MemoryPressureException>(() => GlmSelectedExpertMemoryPlan.Select(
+            geometry, options, 32768, soloCeiling, vision));
+        Assert.Equal(3, options.MaximumRunningRequests);
+        Assert.False(options.EnableGlmSelectedExperts);
+    }
+
     [Fact]
     public void CheckedSixtyFourBitMathRejectsOverflowAndUnsupportedOrIncompleteLayouts()
     {

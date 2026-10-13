@@ -447,7 +447,7 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
         // Release that idle arena before forecasting a new request instead of
         // reserving a second copy. Keep all accounted CUDA expert entries warm.
         _experts!.Trim(_experts.CachedBytes);
-        var limits = PhysicalConstraints();
+        IReadOnlyList<MemoryCharge> limits = PhysicalConstraints();
         var needed = estimate();
         long previousCacheBudget = _experts!.BudgetBytes;
         if (!Fits(needed, limits))
@@ -455,10 +455,9 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             // Preserve useful exact state and warm experts before destroying
             // either cache. A retained holder already has charged host mirrors;
             // only the bounded recurrent export scratch needs a new owner.
-            while (!Fits(needed, limits) && TryDemoteRetainedHostKv(limits))
-            {
-                limits = PhysicalConstraints(); needed = estimate();
-            }
+            var demotion = UnifiedMemoryReclamationPolicy.DemoteRetainedDeviceState(
+                Budget, DevicePool, new(needed, limits), PhysicalConstraints, estimate, TryDemoteRetainedHostKv);
+            needed = demotion.Needed; limits = demotion.Limits;
             // Keep the largest optional cache that leaves the measured deficit.
             var ledger = Budget.Snapshot().ToDictionary(p => p.Pool);
             long free = Math.Max(0, limits.Single(c => c.Pool == DevicePool).Bytes

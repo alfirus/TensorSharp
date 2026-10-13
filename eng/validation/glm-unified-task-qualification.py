@@ -76,9 +76,11 @@ def utc_ns(text):
     return seconds * 1_000_000_000 + int((match[2] or '').ljust(9, '0'))
 
 
-def deployment(receipt, app):
-    variants = [x for x in receipt if x['Variant'] == 'native16' and canonical(x['Directory']) == canonical(app)]
-    if len(variants) != 1: raise ValueError('Require pinned frozen native16 app receipt')
+def deployment(receipt, app, variant='native16'):
+    if not isinstance(variant, str) or not re.fullmatch(r'native[1-9][0-9]*', variant):
+        raise ValueError('Require an explicit versioned native variant')
+    variants = [x for x in receipt if x['Variant'] == variant and canonical(x['Directory']) == canonical(app)]
+    if len(variants) != 1: raise ValueError('Require exactly one pinned frozen app receipt for ' + variant)
     files = {x['Name']: x for x in variants[0]['Files']}
     if len(files) != len(variants[0]['Files']): raise ValueError('Duplicate deployment file')
     native = dict(Path=str(pathlib.Path(app) / 'GgmlOps.dll'), Bytes=files['GgmlOps.dll']['Bytes'], Sha256=files['GgmlOps.dll']['Sha256'])
@@ -211,7 +213,8 @@ def verify_plan_files(plan):
     if canonical(plan['Model']) != canonical(binding['SourceModel']): raise ValueError('Actual source model binding differs')
     if not same_identity(plan['Oracle'], identity(fixed.__file__)) or not same_identity(plan['Checker'], identity(__file__)):
         raise ValueError('Plan names a different executing oracle/checker')
-    _, native, expected, wrapper = deployment(load(plan['DeploymentReceipt']['Path']), plan['AppDirectory'])
+    _, native, expected, wrapper = deployment(load(plan['DeploymentReceipt']['Path']), plan['AppDirectory'],
+        plan.get('NativeVariant', 'native16'))
     if plan['Native'] != native or plan['ManagedIdentities'] != expected or plan['WrapperFiles'] != wrapper \
         or plan['Managed'] != managed(expected) or plan['ModelManifest'] != load(plan['ModelIdentity']['Path']) \
         or plan['Command'] != command(plan): raise ValueError('Plan expectations differ from pinned provenance')
@@ -339,7 +342,7 @@ def qualify(plan, report, wrapper):
 def prepare(args):
     receipt = load(args.deployment_receipt)
     app = pathlib.Path(args.app).resolve()
-    files, native, managed_expected, wrapper_expected = deployment(receipt, str(app))
+    files, native, managed_expected, wrapper_expected = deployment(receipt, str(app), args.variant)
     for name in ('GgmlOps.dll', 'GlmUnifiedSessionProbe.dll'):
         if (pathlib.Path(args.app) / name).stat().st_size != files[name]['Bytes']:
             raise ValueError('Frozen app file size differs; no binary reread in preparation')
@@ -354,7 +357,7 @@ def prepare(args):
         plan = dict(SchemaVersion=1, Case=case, Binding=binding, Source=identity(source), MayaSource=identity(maya),
             DeploymentReceipt=identity(args.deployment_receipt), ModelIdentity=identity(args.model_identity), ModelManifest=load(args.model_identity),
             Oracle=identity(fixed.__file__), Checker=identity(__file__), InputFile=identity(token_file),
-            Model=args.model, EosIds=[154820, 154827, 154829], Native=native, Managed=managed(managed_expected),
+            Model=args.model, EosIds=[154820, 154827, 154829], NativeVariant=args.variant, Native=native, Managed=managed(managed_expected),
             ManagedIdentities=managed_expected, WrapperFiles=wrapper_expected, AppDirectory=str(app),
             WrapperOutput=str(out / (case + '-wrapper')), ReportOutput=str(target),
             Environment={'CUDA_VISIBLE_DEVICES': '0', 'CUDA_MODULE_LOADING': 'EAGER', 'TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS': '1'},
@@ -388,6 +391,7 @@ def main():
     prep = sub.add_parser('prepare'); prep.add_argument('--output', required=True)
     prep.add_argument('--source-directory', default=str(BASE / 'default-readiness-20261010'))
     prep.add_argument('--app', default=str(BASE / 'master-merge-20261013/glm-selected-comparison-v3-apps/native16'))
+    prep.add_argument('--variant', default='native16', help='Exact versioned Variant in the immutable deployment receipt')
     prep.add_argument('--deployment-receipt', default=str(BASE / 'master-merge-20261013/glm-selected-comparison-v3-apps/deployment-receipt.json'))
     prep.add_argument('--model', default='E:/models/GLM-5.3-Flash-GGUF/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf')
     prep.add_argument('--model-identity', default=str(BASE / 'default-readiness-20261010/glm-e-identity-v1.json'))

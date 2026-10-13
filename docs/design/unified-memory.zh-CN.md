@@ -4028,6 +4028,111 @@ N3 请求独占的完整物理所有权或操作系统硬限。
 清单保存在忽略的 `host-user-bin-deployment-v6-native16/`。用户配置、日志和上传
 数据保留；部署后本机 `--help` 退出 0。完整模型 HTTP 运行发生在发布目录，安装
 步骤验证相同文件身份，没有另称已在 bin 目录重跑整套模型性能。
+随后在安装目录启动独占端口的 `ggml_cpu` 无模型进程，`/health`、首页、
+`/api/models`、空队列和 `/v1/skills` 五项 HTTP 均返回 200；首页响应与安装的
+`wwwroot/index.html` 字节一致，八个发布文件的前后 SHA256 不变，测试进程已清理。
+证据为 `installed-host-v6-http-smoke/receipt.json`，就绪 1.929 s。
+这是发布目录和路由验收，不是模型加载、GPU 吞吐或技能实际执行验收。
+
+**GLM 紧凑预填充候选的否决结果（Native17，尚未接入正式版本）。**
+在隔离目录将预填充尾块 1–8 行与真实请求并发上限分开，提前测量全部窄图 scratch，
+按完整路由 union 缩小 microgroup；没有扩大实际请求并发。三组量化的 CUDA 尾块、
+clamp、预算拒绝、文件读失败及清账检查通过，另有 32 组微型 GLM 全 logits 逐位
+一致检查；这些不等于 86.69 GiB 整模型全 logits 验收。
+随后固定公开 Probe v3、托管依赖、输入和配额，分别执行 code39/math32 的新进程
+A/B/B/A，共八次。完整输出分别 13/4 token（包含 EOS）全部相同，独立质量、
+实际加载原生库身份、清理和零账本检查通过；原始 code unknown/exit1 保持原样。
+
+| 请求耗时中位数，每版本每任务仅两次 | Native16 | Native17 候选 | 观察变化 |
+|---|---:|---:|---:|
+| code39 | 202.279 s | 219.055 s | +8.294% |
+| math32 | 117.523 s | 124.589 s | +6.013% |
+
+code prefill 中位数 150.348→169.976 s，math prefill 101.775→106.428 s。
+候选没有性能改善证据，**未推广**。首 token 口径为引擎 token channel 的首次发布，
+不是 Server HTTP 首个可见正文；4/13 个输出的 decode 也不是稳态吞吐。
+code 测试期间另有原生验证收尾读取两份 DLL、合计 302,427,648 B；已知哈希后时间点
+为 21:16:25.5662537 UTC，未采集开始时间、PID 和总耗时。故 code 不能称完全 I/O
+隔离，不能把观察差值完全归因于候选。math 均在该时间点之后开始，仍未控制 OS
+页缓存和物理冷态。没有据此宣称与 Maya 同完整物理预算持平或胜出。
+
+八次实际 CUDA 池均为 14,897,119,232 B，host 12 GiB、专家上限 7000 MiB。
+候选缓存 975→972 slots；code 注册文件 payload 62,086,971,392→62,106,894,336 B，
+文件调用 872→621，miss 9024→9028；math payload/calls/miss 完全相同。
+这说明合批实际发生，不能把调用减少当作速度提升。`PlannedDecodeRows` 旧遥测字段
+在候选中为窄图宽度 8，真实 `MaximumRunningRequests` 始终 1，不是八请求并行。
+全八次采样峰值 RSS 2,458,185,728 B、private 19,688,169,472 B、整卡 15103 MiB；
+不代表唯一物理归属或 OS 硬限。详细事实为忽略目录
+`glm-native17-eight-case-readonly-audit-v1/facts.json`。
+检查工具现在可用 `--variant` 严格匹配部署清单；Windows/WSL 各 18 项工具测试通过，
+旧版检查器和失败结果另行保存，不重写既有捕获。
+
+Maya/Strata 的代码审查进一步确认：驻留专家权重与可借出的预填充 scratch 分开管理，
+真实尾宽变化只调整 scratch/借出槽位，不整体丢弃驻留权重。TensorSharp 的对应
+Native18 仍在隔离实现和验收中：拆分持久权重、窄图及实时宽图物理 owner，先 fence
+并释放旧宽图、归还其额度，再准入新宽图；不能提前归还仍存活权重的额度。
+GGML 上游保持未修改，不能直接删除宽度检查或对 live allocator 调用可能释放缓冲区
+的 size-only reserve 来假装保留缓存。
+
+**前缀失效归属诊断。** 回调原先只保存 key，丢弃 `InvalidationReason`；现保留
+FIFO 的 key/reason，在 worker Drain 分离节点前按 DEBUG 输出树元数据。关闭 DEBUG
+时不查询元数据或分配日志参数，日志 provider 失败不丢弃失效通知；不冒称知道物理
+释放字节、模型 checkpoint 标记或触发 pool。新增六项实际测试在 Windows/WSL
+均通过；两平台扩展前缀、共享准入与取消清理各 **433 通过、0 失败、7 跳过**。
+跳过的真实模型契约不算通过。首次测试的 fixture 直接 detach 后未走真实 eviction
+收集流程，触发 I5；改用完整 eviction 路径并保留严格不变量检查，原失败记录保留。
+证据为 `prefix-trace-v8/`。
+
+Qwen v24 首次 N2 的两请求同 prompt/hash，首条复用 1528 token、prefill 0.829 s，
+第二条复用 0、prefill 31.059 s，主导约 33.7 s 的 N2 预热。中间有回收记录，但没有
+victim key 和缺额 pool，不能完全归因。未来前缀副本数目前只增加 **Host** 预估；
+Device 为两份状态加图，不能把七份未来副本说成七倍 Device 峰值。后续须先以日志
+补足归属，再实现按缺额 pool 定向回收及受保护前缀 lease 的完整物化峰值合同，
+不能直接删除保守预留。此次诊断修改没有改变回收策略、预算或默认开关。
+
+**2026-10-13 后续修复与失败验收。** GLM 的普通 Server 命令目前仍默认关闭
+selected-expert CUDA tier：按 placement 保留可常驻 CUDA 的专家层，其余专家走
+CPU mmap；这不是 Probe 显式 selected=true 的 pooled CUDA 文件读取路径。
+Probe 的 N1、context1024、PP32、retained=0、无 mmproj 配置不能冒充默认 Server
+的 N3、自动上下文、图片与 retained=2 性能。完整 Server+mmproj 的 GLM N3 仍未
+验收，启动也仍只有两种 thinking 模式的串行预热，没有 GLM N2/N3 预热。
+入口审计为 `glm-server-entry-readonly-audit-v1/`。
+
+已独立修复默认 GLM placement 在 PP128 拒绝后不尝试较小 PP 的缺口：关闭
+selected tier 时也递减 PP，保持 dense/vision、上下文与全部活跃槽位预算，PP1
+仍不足就拒绝。旧逻辑新增用例实际 3 失败、1 通过；修复后 Windows/WSL 相关
+**52/52** 均通过，无跳过。这是预加载规划 CPU 验收，不是 GPU 吞吐结果。
+
+Qwen v27 使用 v8 托管发布、已验收 Native16 和显式 DEBUG，捕获 17 次 N3
+联合图、取消后的 171 次 N2 sibling 联合图，最终队列清空；短 N2 与串行输出
+一致、文本多轮复用 106/121 token。不过随后图片首请求在编码完成后，执行峰值
+追加准入被拒绝：Host 已有 committed=2,392,199,168 B、reserved=3,283,307,290 B，
+还需约 1008 MiB，而新鲜物理 constraint 约 6156 MiB；Device 当时仍可满足。
+整个验收严格记为 **失败**，HTTP 阶段未运行，没有部署 v8。并行 CPU 编译与
+DEBUG、未控制的页缓存使这次耗时不能用于普通配置的性能比较；原始失败保存在
+`three-chat-after-merge-v27-prefix-diagnostics-native16/`，没有覆盖 v26 成功记录。
+
+由此还修复了独立的 pool 选择错误：仅 Device 缺额才允许把 retained KV 降至
+Host；每次尝试后重新读取 ledger、物理限制及请求估算，Device 满足就停止，
+不能因 Host 仍不足继续降级。Host 后续真实回收、全部峰值和 live-child floor
+保持原样。旧语义 11 项中实际 4 失败；修复后 12 项通过，含 v27 最终账本边界。
+同一 v9 托管闭包在 Windows/WSL 的联合 CPU 检查均为 **473 通过、0 失败、
+7 跳过**。七项真实模型契约不计通过；v9+Native16 完整模型复测仍待隔离运行。
+
+Native18 工作区拆分候选另通过 27 项实际 CUDA 组件门，包含三种量化的
+32→20→21→32、真实 N3 与 N1、热权重和 LRU 保持、完整输出及故障清账。
+完整原生 DLL/微型 GLM 与整模型性能门仍在进行，候选保持隔离，没有替换生产库。
+
+还发现 MSBuild 自定义输出目录的复制缺陷：CopyNative 用 `OutputPath`，即使
+托管构建指定了另一个 OutDir，仍可能覆盖用户 Host/bin 的原生库。身份检查
+拦截后已备份错误库并恢复全部 87 个已验收 v6/Native16 文件的精确身份；配置与
+用户数据未改。后续修复复制目标为 SDK 的 TargetDir，验收使用小 sentinel 文件，
+不把未验收原生库复制到用户目录。恢复证据为 `host-native-copy-target-recovery-v1/`。
+Host 的 GGML/MLX 与两个 backend 共四个复制目标现已改为 `TargetDir`；旧目标
+4/4 实际复现错目录，修复后 Windows/WSL 各五个方法、18 次真实 MSBuild Copy
+调用均通过，无跳过。测试不传 `TargetDir`，由 SDK 从 OutDir 推导，使用私有
+ASCII 假库，保留默认输出、嵌套来源、metallib 优先级与 backend iOS 排除条件。
+这不是 Apple 真机执行；证据为 `native-copy-outdir-v1/`。
 
 上述证据保存在忽略的 `artifacts/master-merge-20261013/`、
 `artifacts/unified-server-20261011/` 和各自记录的 E 盘 validation cache；共享预算和
