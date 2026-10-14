@@ -35,6 +35,22 @@ public sealed record UnifiedMemoryModelOptions
     /// <summary>Experimental GLM5Next selected-expert CUDA tier. Requires its
     /// matching native planner and remains off until real-model qualification.</summary>
     public bool EnableGlmSelectedExperts { get; init; } = false;
+    /// <summary>Admit GLM prefill widths from each actual prompt instead of
+    /// reserving the largest width at the logical context ceiling. Requires
+    /// selected-expert planning and remains an explicit Host/session policy.</summary>
+    public bool EnableAdaptiveGlmPrefill { get; init; } = false;
+    /// <summary>Optional upper bound for adaptive GLM prefill only. Null inherits
+    /// the common prefill bound; ordinary callers and Qwen retain their existing
+    /// options. Actual GLM requests still admit a width from physical capacity.</summary>
+    public int? AdaptiveGlmPrefillChunkTokens { get; init; }
+    internal int ResolveGlmPrefillChunkTokens()
+    {
+        if (PrefillChunkTokens is < 1 or > 512)
+            throw new ArgumentOutOfRangeException(nameof(PrefillChunkTokens));
+        int rows = EnableAdaptiveGlmPrefill ? AdaptiveGlmPrefillChunkTokens ?? PrefillChunkTokens : PrefillChunkTokens;
+        if (rows is < 1 or > 1024) throw new ArgumentOutOfRangeException(nameof(AdaptiveGlmPrefillChunkTokens));
+        return rows;
+    }
 }
 
 /// <summary>One Qwen4Exp GGML CUDA model, including its optional image tower.

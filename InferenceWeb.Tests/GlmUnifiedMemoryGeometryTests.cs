@@ -47,7 +47,7 @@ public sealed class GlmUnifiedMemoryGeometryTests : IDisposable
             Assert.Equal(3L * 448 / 32 * 34, layout.TensorTailBytes);
         });
         Assert.Throws<ArgumentOutOfRangeException>(() => geometry.SlotBytes(257));
-        Assert.Throws<ArgumentOutOfRangeException>(() => geometry.Workspace(256, 129));
+        Assert.Throws<ArgumentOutOfRangeException>(() => geometry.Workspace(256, 1025));
         Assert.True(geometry.Workspace(256, 3).Device > geometry.Workspace(256, 1).Device);
     }
 

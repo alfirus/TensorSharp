@@ -13,6 +13,14 @@ namespace TensorSharp.Models;
 /// managed/native metadata, page residency and vendor pools retain headroom.</summary>
 internal sealed record GlmUnifiedMemoryGeometry
 {
+    // Explicit GLM adapter v7 uses one bounded F32 route-validation stack.
+    // The independent Qwen adapter retains its existing 4096-element bound.
+    internal const long SelectedRouteScratchHostBytes = 8192L * sizeof(float);
+    // Conservatively include the retained callback IDs, unique-union plan,
+    // remapped/route-major IDs and reserved (slot, expert) miss pairs even when
+    // their actual lifetimes do not overlap. Native heap payload is a forecast,
+    // not a fully instrumented allocation or a claim about vector capacity/GC.
+    internal const long SelectedRouteMetadataHostBytes = 8192L * (4 * sizeof(int) + 2 * sizeof(int));
     internal string Architecture { get; init; } = "";
     internal int Layers { get; init; }
     internal int DeclaredContextTokens { get; init; }
@@ -44,10 +52,12 @@ internal sealed record GlmUnifiedMemoryGeometry
         ? checked(FixedStateBytes + KvBytesPerToken * context + (64L << 10) * Layers)
         : throw new ArgumentOutOfRangeException(nameof(context));
 
-    internal InferenceMemoryBytes Workspace(int context, int rows)
+    internal InferenceMemoryBytes Workspace(int context, int rows, int? outputRows = null)
     {
-        if (context <= 0 || context > DeclaredContextTokens || rows <= 0 || rows > 128)
+        if (context <= 0 || context > DeclaredContextTokens || rows <= 0 || rows > 1024)
             throw new ArgumentOutOfRangeException(nameof(rows));
+        int outputs = outputRows ?? rows;
+        if (outputs < 1 || outputs > rows) throw new ArgumentOutOfRangeException(nameof(outputRows));
         checked
         {
             // The full-indexer masks remain alive across the graph. Include both
@@ -55,9 +65,14 @@ internal sealed record GlmUnifiedMemoryGeometry
             // intermediates and a recurrent-output generation. This is a forecast,
             // not a replacement for allocator callbacks or driver observation.
             long masks = 4L * AttentionLayers * context * rows;
-            long activation = 4L * rows * (Vocab + 32L * Hidden * HyperConnections + 8L * ExpertFf * UsedExperts);
+            // The non-speculative serial executor selects the final hidden row
+            // before its LM head. Joint decode emits one logits row per lane.
+            // Trunk intermediates and masks still scale with every input row.
+            long logits = 4L * outputs * Vocab;
+            long activation = logits + 4L * rows * (32L * Hidden * HyperConnections + 8L * ExpertFf * UsedExperts);
             long device = (64L << 20) + masks + activation + FixedStateBytes;
-            long host = (32L << 20) + 4L * rows * (Vocab + 8L * Hidden + 8L * ExpertFf * UsedExperts)
+            long host = (32L << 20) + SelectedRouteScratchHostBytes + SelectedRouteMetadataHostBytes + logits
+                + 4L * rows * (8L * Hidden + 8L * ExpertFf * UsedExperts)
                 + 4L * context * rows;
             return new(host, device);
         }
@@ -66,7 +81,7 @@ internal sealed record GlmUnifiedMemoryGeometry
     internal InferenceMemoryBytes GraphPeak(int context, int rows, bool batched, int generations = 2)
     {
         if (generations < 1 || generations > 33) throw new ArgumentOutOfRangeException(nameof(generations));
-        var workspace = Workspace(context, rows);
+        var workspace = Workspace(context, rows, batched ? rows : 1);
         return new(checked(generations * workspace.Host), checked(generations *
             (workspace.Device + (batched ? (rows - 1L) * FixedStateBytes : 0))));
     }
@@ -78,6 +93,17 @@ internal sealed record GlmUnifiedMemoryGeometry
         var prefill = GraphPeak(context, prefillRows, false);
         var joint = GraphPeak(context, requests, requests > 1);
         return checked(SlotBytes(context) * requests + Math.Max(solo.Device, Math.Max(prefill.Device, joint.Device)));
+    }
+
+    // Wider prefill is separately admitted from the actual prompt. This
+    // placement still protects every full physical slot and full-context joint
+    // decode; it neither promises nor authorizes a maximum-width, full-context graph.
+    internal long AdaptiveExecutionPlacementReserve(int context, int requests)
+    {
+        if (requests < 1 || requests > 8) throw new ArgumentOutOfRangeException(nameof(requests));
+        var solo = GraphPeak(context, 1, false);
+        var joint = GraphPeak(context, requests, requests > 1);
+        return checked(SlotBytes(context) * requests + Math.Max(solo.Device, joint.Device));
     }
 
     internal int SelectCpuExpertLayers(long deviceCeiling, long executionReserve, long visionBytes)
@@ -210,7 +236,7 @@ public partial class GlmDsaModel
             throw new NotSupportedException("Unified GLM requires one native GGML CUDA device.");
         if (!policy.OmitEmbeddedDraftWeights || policy.NativeMoeCpuLayers is null)
             throw new NotSupportedException("Unified GLM requires explicit trunk-only placement.");
-        if (policy.NativeMoeCpuLayers < 0 || policy.PrefillChunkTokens > 128 || policy.DeviceExecutionReserveBytes < 0)
+        if (policy.NativeMoeCpuLayers < 0 || policy.PrefillChunkTokens > 1024 || policy.DeviceExecutionReserveBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(policy));
     }
     internal void ConfigureUnifiedMemory(int retainedSlots)
@@ -252,11 +278,18 @@ public partial class GlmDsaModel
         if (_unifiedGraphAdmission == null) throw new InvalidOperationException("Unified GLM graph admission is not configured.");
         _unifiedGraphAdmission(new(context, rows, batched));
     }
-    internal bool CanReuseUnifiedSlot(string requestId)
+    internal bool CanReuseUnifiedSlot(string requestId, bool includeIdlePrimary = true)
     {
         lock (_nativeSync)
             return _slotByRequest?.ContainsKey(requestId) == true
-                || (_primarySlot >= 0 && (_slotByRequest == null || !_slotByRequest.ContainsValue(_primarySlot)));
+                || (includeIdlePrimary && _primarySlot >= 0
+                    && (_slotByRequest == null || !_slotByRequest.ContainsValue(_primarySlot)));
+    }
+    private Func<string, bool>? _unifiedPrimarySlotReuse;
+    internal void ConfigureUnifiedPrimarySlotReuse(Func<string, bool> canReuse)
+    {
+        ArgumentNullException.ThrowIfNull(canReuse);
+        lock (_nativeSync) _unifiedPrimarySlotReuse = canReuse;
     }
     internal void TrimUnifiedGraphs(bool onlyPrefill = false)
     {

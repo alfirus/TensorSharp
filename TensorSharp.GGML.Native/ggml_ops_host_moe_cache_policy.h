@@ -9,14 +9,36 @@
 namespace tsg
 {
     constexpr int kHostMoeCacheMaxPrefillRows = 128;
+    // GLM's explicit selected-expert adapter plans a serialized whole union.
+    // Keep Qwen's environment/caller bound unchanged while permitting larger
+    // admitted GLM chunks to amortize the same source-file expert reads.
+    constexpr int kHostMoeCacheMaxGlmPrefillRows = 1024;
     constexpr int kHostMoeCacheMaxDecodeRows = 8;
-    // The routing validation scratch stays 16 KiB independently of the
-    // opt-in row ceiling. Larger selected-expert sets permit fewer rows.
+    // Qwen keeps its original 16 KiB routing validation bound. The explicit
+    // GLM adapter owns a separate 32 KiB bound for a complete1024/top8 block.
     constexpr int kHostMoeCacheMaxRouteElements = 4096;
+    constexpr int kHostMoeCacheMaxGlmRouteElements = 8192;
 
-    inline bool host_moe_cache_routes_fit(int rows, int selected)
+    // Experimental uncached reads only serve a genuine GLM bulk prefill.
+    // Scalar, short prefill/MTP verification and independent fused decode must
+    // retain buffered reads: repeatedly bypassing the OS cache regressed decode.
+    inline bool host_moe_cache_direct_read_phase(bool glm_bulk_prefill, int rows,
+        bool independent_decode_rows) noexcept
     {
-        return rows > 0 && selected > 0 && rows <= kHostMoeCacheMaxRouteElements / selected;
+        return glm_bulk_prefill && !independent_decode_rows
+            && rows > kHostMoeCacheMaxDecodeRows && rows <= kHostMoeCacheMaxGlmPrefillRows;
+    }
+
+    inline bool host_moe_cache_routes_fit(int rows, int selected, bool explicit_glm = false)
+    {
+        return rows > 0 && selected > 0
+            && rows <= (explicit_glm ? kHostMoeCacheMaxGlmRouteElements : kHostMoeCacheMaxRouteElements) / selected;
+    }
+
+    inline bool host_moe_cache_prefill_fits(int rows, int selected, bool explicit_glm)
+    {
+        return rows <= (explicit_glm ? kHostMoeCacheMaxGlmPrefillRows : kHostMoeCacheMaxPrefillRows)
+            && host_moe_cache_routes_fit(rows, selected, explicit_glm);
     }
 
     // Expert FFNs are independent for every token row. Select the largest

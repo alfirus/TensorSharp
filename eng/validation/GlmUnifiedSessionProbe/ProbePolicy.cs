@@ -7,6 +7,12 @@ namespace GlmUnifiedSessionProbe;
 internal static class ProbePolicy
 {
     public const string MathPrompt = "Compute 17 + 25. Reply with only the integer.";
+    public static bool AdaptivePrefill(string text, bool selected)
+    {
+        if (text is not ("true" or "false")) throw new ArgumentException("adaptive-prefill must be true or false.");
+        if (text == "true" && !selected) throw new ArgumentException("adaptive-prefill requires selected=true.");
+        return text == "true";
+    }
     public static int[] ParseTokens(string text)
     {
         if (text.Length is 0 or > 4_194_304) throw new ArgumentException("Raw token file is empty or too large.");
@@ -28,8 +34,12 @@ internal static class ProbePolicy
         => content == "42" && toolCalls == 0 && thinkingClosed;
     public static void SelfTest()
     {
+        FinalLogitCapture.SelfTest();
         int checks = 0;
         void Check(bool condition) { checks++; if (!condition) throw new Exception("Self-test " + checks + " failed."); }
+        Check(!AdaptivePrefill("false", false)); Check(!AdaptivePrefill("false", true)); Check(AdaptivePrefill("true", true));
+        foreach (var pair in new[] { ("true", false), ("1", true), ("TRUE", true), ("", true) })
+        { bool rejected = false; try { AdaptivePrefill(pair.Item1, pair.Item2); } catch (ArgumentException) { rejected = true; } Check(rejected); }
         Check(ParseTokens("1,2,2147483647\n").SequenceEqual(new[] { 1, 2, int.MaxValue }));
         foreach (string bad in new[] { "", "-1", "1.0", "01", "NaN", "2147483648", "true", "١", "1,,2", "1,", ",1" })
         { bool rejected = false; try { ParseTokens(bad); } catch (ArgumentException) { rejected = true; } Check(rejected); }

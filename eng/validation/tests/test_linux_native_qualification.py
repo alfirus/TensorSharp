@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 source = Path(__file__).resolve().parents[1] / "linux-native-qualification.py"
 spec = importlib.util.spec_from_file_location("linux_native_qualification", source)
@@ -34,15 +35,37 @@ def evidence(selected=False, flags=None):
     return actual, compare
 
 
+def final_drain_proof(seams=2):
+    return dict(selected_final_drain_failure=True, stage=5, kind=1, participating_rows=3,
+                expert_seams=seams, completed_helper_rows=3 * seams, successful_graphs_unchanged=True,
+                logits_unpublished=True, heads_unpublished=True, slots_fenced=True,
+                reset_recovered_n3=True, primary_departure_recovered_n2=True)
+
+
 class LinuxNativeQualificationTests(unittest.TestCase):
     def accept(self, actual, comparison, flags=None):
         tool.validate_glm_report(actual, comparison, Path("/mnt/e/prod/libGgmlOps.so"),
                                  "b" * 64, "CUDA", flags or [])
 
+    def test_adapter7_capability_required_without_loading_native(self):
+        native = Path('/mnt/e/prod/libGgmlOps.so')
+        expected = {'TSGgml_GlmUnifiedBudgetVersion': 2, 'TSGgml_GlmSelectedExpertAdapterVersion': 7,
+                    'TSGgml_HostMoeFilePipelineVersion': 2, 'TSGgml_Qwen4ExpArenaBudgetKind': 5,
+                    'TSGgml_HostMoeExpertCacheBudgetKind': 4}
+        with patch.object(tool, 'require_elf', return_value=native), patch.object(tool, 'sha', return_value='a' * 64), \
+                patch.object(tool.subprocess, 'check_output', return_value=json.dumps(expected)) as query:
+            self.assertEqual(expected, tool.abi_evidence(native, {})['capabilities'])
+            self.assertEqual(expected, json.loads(query.call_args.args[0][-1]))
+            for bad in [expected | {'TSGgml_GlmSelectedExpertAdapterVersion': 6},
+                        expected | {'TSGgml_GlmSelectedExpertAdapterVersion': 8}]:
+                query.return_value = json.dumps(bad)
+                with self.assertRaises(RuntimeError):
+                    tool.abi_evidence(native, {})
+
     def test_exact_case_counts_and_native16_new_regressions(self):
         self.assertEqual(12, len(tool.cpu_cases()))
         self.assertEqual(21, len(tool.cuda_cases()))
-        self.assertEqual(32, len(tool.glm_cases("/mnt/e/model.gguf")))
+        self.assertEqual(48, len(tool.glm_cases("/mnt/e/model.gguf")))
         names = {c[0]: c[2] for c in tool.cuda_cases()}
         self.assertEqual(["--glm-scalar-file-window"], names["scalar-large-file-q8"])
         self.assertEqual(["--pooled-quota", "--quantization", "iq1_m"], names["pooled-largest-quota-iq1"])
@@ -52,7 +75,7 @@ class LinuxNativeQualificationTests(unittest.TestCase):
         cases = tool.glm_cases("/mnt/e/model with spaces.gguf")
         for mode in ("production", "hooks"):
             for kind in ("q8", "iq"):
-                for rows in (8, 9, 10, 16, 128):
+                for rows in (8, 9, 10, 16, 128, 256, 384, 512, 1024):
                     case = next(c for c in cases if c[0] == f"{mode}-{kind}-rows{rows}")
                     self.assertIn("--prefill-rows=" + str(rows), case[3])
                     self.assertEqual(mode == "hooks", "--dispatch-faults" in case[3])
@@ -91,6 +114,58 @@ class LinuxNativeQualificationTests(unittest.TestCase):
     def test_accepts_complete_exact_native_and_ledger_evidence(self):
         self.accept(*evidence())
         self.accept(*evidence(True), flags=["--selected-experts"])
+
+    def test_selected_hook_run_requires_unique_id_download_failure_proof(self):
+        actual, comparison = evidence(True)
+        actual['dispatch_faults_tested'] = True
+        flags = ['--selected-experts', '--dispatch-faults']
+        actual['executions'].append(final_drain_proof())
+        with self.assertRaises(RuntimeError): self.accept(actual, comparison, flags)
+        proof = dict(selected_ids_download_failure=True, stage=4, kind=1,
+                     cache_unchanged=True, logits_unpublished=True, heads_unpublished=True)
+        actual['executions'].append(proof)
+        self.accept(actual, comparison, flags)
+        for key, value in [('selected_ids_download_failure', False), ('stage', 3), ('kind', True),
+                           ('cache_unchanged', False), ('logits_unpublished', False), ('heads_unpublished', False)]:
+            bad = copy.deepcopy(actual); bad['executions'][-1][key] = value
+            with self.subTest(key=key), self.assertRaises(RuntimeError): self.accept(bad, comparison, flags)
+        bad = copy.deepcopy(actual); bad['executions'].append(proof)
+        with self.assertRaises(RuntimeError): self.accept(bad, comparison, flags)
+
+    def test_selected_hook_final_drain_proof_requires_last_seam_complete_and_reset_recovery(self):
+        actual, comparison = evidence(True)
+        actual['dispatch_faults_tested'] = True
+        flags = ['--selected-experts', '--dispatch-faults']
+        actual['executions'].append(dict(selected_ids_download_failure=True, stage=4, kind=1,
+                                         cache_unchanged=True, logits_unpublished=True, heads_unpublished=True))
+        with self.assertRaises(RuntimeError): self.accept(actual, comparison, flags)
+        proof = final_drain_proof()
+        actual['executions'].append(proof)
+        self.accept(actual, comparison, flags)
+        for key in proof:
+            bad = copy.deepcopy(actual); del bad['executions'][-1][key]
+            with self.subTest(missing=key), self.assertRaises(RuntimeError): self.accept(bad, comparison, flags)
+            value = proof[key]
+            for invalid in [False, True] if type(value) is int else [False, 1]:
+                bad = copy.deepcopy(actual); bad['executions'][-1][key] = invalid
+                with self.subTest(key=key, value=invalid), self.assertRaises(RuntimeError): self.accept(bad, comparison, flags)
+        for key, value in [('stage', 4), ('kind', 2), ('participating_rows', 2), ('expert_seams', 1),
+                           ('completed_helper_rows', 3), ('completed_helper_rows', 7)]:
+            bad = copy.deepcopy(actual); bad['executions'][-1][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(RuntimeError): self.accept(bad, comparison, flags)
+        bad = copy.deepcopy(actual); bad['executions'].append(proof)
+        with self.assertRaises(RuntimeError): self.accept(bad, comparison, flags)
+
+    def test_quantized_final_drain_proof_requires_all_three_expert_seams(self):
+        actual, comparison = evidence(True)
+        actual.update(dispatch_faults_tested=True, quantized_source='/mnt/e/model.gguf', expert_groups=3, swiglu_clamp=10)
+        flags = ['--selected-experts', '--dispatch-faults', '--quantized-source=/mnt/e/model.gguf']
+        actual['executions'].append(dict(selected_ids_download_failure=True, stage=4, kind=1,
+                                         cache_unchanged=True, logits_unpublished=True, heads_unpublished=True))
+        actual['executions'].append(final_drain_proof())
+        with self.assertRaises(RuntimeError): self.accept(actual, comparison, flags)
+        actual['executions'][-1] = final_drain_proof(3)
+        self.accept(actual, comparison, flags)
 
     def test_rejects_missing_or_tolerance_based_logit_acceptance(self):
         actual, comparison = evidence()

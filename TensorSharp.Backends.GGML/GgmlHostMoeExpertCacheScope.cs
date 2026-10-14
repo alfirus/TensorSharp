@@ -139,7 +139,7 @@ internal interface IHostMoeExpertCacheScopeNative
     GgmlHostMoeExpertCacheUsage ReadUsage();
 }
 
-/// <summary>Exclusive, process-wide configuration of the optional Qwen4Exp CUDA
+/// <summary>Exclusive, process-wide configuration of the optional Qwen4Exp/GLM CUDA
 /// compact expert cache. This changes no environment variable or model placement.
 /// Install the shared budget first and create this scope before loading the model,
 /// with the expert cache empty. Quiesce all model work before changing or releasing
@@ -160,7 +160,9 @@ public sealed class GgmlHostMoeExpertCacheScope : IDisposable
 
     /// <summary>Plan exact-width decode variants up to the session's actual
     /// supported concurrency. Variants share the same resident expert weights;
-    /// their measured allocation remains inside the cache capacity.</summary>
+    /// their measured allocation remains inside the cache capacity. GLM's
+    /// explicitly installed phase plan permits prefill widths through 1024;
+    /// ordinary Qwen compact-prefill policy retains its separate 128-row cap.</summary>
     public GgmlHostMoeExpertCacheScope(long capacityBytes, int maxPrefillRows, int layerCount, int maxDecodeRows)
         : this(capacityBytes, maxPrefillRows, layerCount, NativeApi.Instance, maxDecodeRows) { }
 
@@ -176,7 +178,7 @@ public sealed class GgmlHostMoeExpertCacheScope : IDisposable
         IHostMoeExpertCacheScopeNative native, int maxDecodeRows = 1, bool enableCapacityGrowth = false)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(capacityBytes);
-        if (maxPrefillRows is < 1 or > 128) throw new ArgumentOutOfRangeException(nameof(maxPrefillRows));
+        if (maxPrefillRows is < 1 or > 1024) throw new ArgumentOutOfRangeException(nameof(maxPrefillRows));
         if (maxDecodeRows is < 1 or > 8) throw new ArgumentOutOfRangeException(nameof(maxDecodeRows));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layerCount);
         ArgumentNullException.ThrowIfNull(native);

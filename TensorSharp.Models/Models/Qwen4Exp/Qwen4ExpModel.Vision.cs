@@ -87,10 +87,10 @@ namespace TensorSharp.Models
         public void LoadVisionEncoder(string mmProjPath)
         {
             if (VisionEncoder != null) throw new InvalidOperationException("The qwen4exp vision projector is already loaded.");
-            // The published Qwen4ExpVisionPatchMerger uses nn.GELU() (erf),
-            // independently of the block MLP's gelu_pytorch_tanh. Preserve the
-            // supplied GGUF path's existing tanh default; erf is an explicit
-            // fidelity experiment until matching trained-image controls qualify it.
+            // Keep the existing GGUF path until representative image generation
+            // qualifies a change. The HF-reference erf merger remains available
+            // for explicit diagnostics; scalar activation goldens alone do not
+            // certify continuation quality. Block MLP activation is independent.
             bool mergerErf = Environment.GetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF") == "1";
             Qwen35VisionEncoder encoder;
             try { encoder = new Qwen35VisionEncoder(mmProjPath, _allocator, mergerGeluErf: mergerErf); }

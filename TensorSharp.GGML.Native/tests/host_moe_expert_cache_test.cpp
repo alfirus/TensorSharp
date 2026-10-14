@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 // The optional expert tier against an independent full-resident CUDA graph.
 #include "ggml_ops_internal.h"
+#include "host_moe_cache_lifecycle_test_hooks.h"
 #include "ggml_ops_moe_prefetch.h"
 #include "ggml_ops_file_source.h"
 #include "ggml_ops_moe_prefetch_policy.h"
@@ -50,6 +51,7 @@ namespace tsg
     int g_test_copy_failure_countdown = 0;
     int g_test_file_failure_countdown = 0;
     std::uint64_t g_test_file_reads = 0;
+    std::uint64_t g_test_direct_file_reads = 0;
     void set_last_error(const std::string& message) { std::fprintf(stderr, "%s\n", message.c_str()); }
     void clear_last_error() { }
     struct CacheOperatorShape {
@@ -116,6 +118,7 @@ namespace tsg
             if (g_test_file_failure_countdown > 0 && --g_test_file_failure_countdown == 0)
                 throw std::runtime_error("Injected interrupted expert file read");
             tasks[i].prepare();
+            if (tasks[i].direct_completed) ++g_test_direct_file_reads;
             ++g_test_file_reads;
             consume(i);
         }
@@ -214,7 +217,7 @@ namespace
 
     void prefill_limit_checks()
     {
-        const char* invalid_values[] = {nullptr, "", "0", "1", "8", "129", "+64", " 64", "64 ",
+        const char* invalid_values[] = {nullptr, "", "0", "1", "8", "129", "256", "512", "+64", " 64", "64 ",
                                        "-1", "18446744073709551616", "64x"};
         for (const char* invalid : invalid_values)
             require(tsg::host_moe_cache_prefill_rows(invalid) == TSG_PRECISION_DECODE_COLUMNS,
@@ -222,6 +225,14 @@ namespace
         for (const int value : {9, 31, 63, 64, 88, 128})
             require(tsg::host_moe_cache_prefill_rows(std::to_string(value).c_str()) == value,
                 "Bounded opt-in prefill row limit was not parsed exactly");
+        require(tsg::host_moe_cache_prefill_fits(1024, 8, true)
+            && tsg::host_moe_cache_prefill_fits(512, 16, true)
+            && !tsg::host_moe_cache_prefill_fits(1025, 8, true)
+            && !tsg::host_moe_cache_prefill_fits(1024, 9, true)
+            && !tsg::host_moe_cache_prefill_fits(129, 8, false)
+            && tsg::host_moe_cache_prefill_fits(128, 32, false)
+            && !tsg::host_moe_cache_prefill_fits(0, 8, true),
+            "Explicit GLM1024/8192-route bound changed the independent Qwen128/4096-route bounds");
     }
 
     struct Stats
@@ -253,11 +264,57 @@ namespace
         const auto env_budget = env_value("TS_HOST_MOE_EXPERT_CACHE_MB");
         const auto env_layers = env_value("TS_HOST_MOE_EXPERT_CACHE_LAYERS");
         const auto env_rows = env_value("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS");
+        {
+            // Configuration alone must never allocate or consume shared credit,
+            // even at the new maximum. Observe real callbacks, not inferred zero
+            // ownership from process exit or a successful metadata API result.
+            struct MetadataProbe {
+                int reserves = 0, commits = 0, releases = 0;
+                bool attached = false; std::uint64_t token = 0;
+                static std::uint64_t reserve(void* context, int, int, std::int64_t) {
+                    ++static_cast<MetadataProbe*>(context)->reserves; return 0;
+                }
+                static int commit(void* context, std::uint64_t) {
+                    ++static_cast<MetadataProbe*>(context)->commits; return 0;
+                }
+                static void release(void* context, std::uint64_t) {
+                    ++static_cast<MetadataProbe*>(context)->releases;
+                }
+                ~MetadataProbe() {
+                    if (token) { std::int64_t released = 0; TSGgml_EndHostMoeExpertCacheScope(token, &released); }
+                    if (attached) tsg::SharedCacheCharge::detach(this);
+                }
+            } probe;
+            require(tsg::host_moe_expert_cache_test_physical_bytes() == 0
+                && tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0 && original.reserved == 0,
+                "Maximum scope metadata probe requires no live physical owner");
+            probe.attached = tsg::SharedCacheCharge::attach(&probe, MetadataProbe::reserve,
+                MetadataProbe::commit, MetadataProbe::release, true, true);
+            require(probe.attached, "Cannot attach maximum-scope zero-credit probe");
+            require(TSGgml_BeginHostMoeExpertCacheScopeWithDecodeRows(1, 1024, 4, 3, &probe.token) == 1
+                && probe.token != 0 && Stats().budget == 1 && Stats().reserved == 0,
+                "Valid1024-row metadata scope refused or allocated a payload");
+            std::int64_t released = 99;
+            require(TSGgml_EndHostMoeExpertCacheScope(probe.token, &released) == 1 && released == 0,
+                "Maximum metadata scope did not end without physical ownership");
+            probe.token = 0;
+            require(probe.reserves == 0 && probe.commits == 0 && probe.releases == 0
+                && tsg::host_moe_expert_cache_test_physical_bytes() == 0
+                && tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0
+                && Stats().budget == original.budget && Stats().reserved == 0
+                && env_budget == env_value("TS_HOST_MOE_EXPERT_CACHE_MB")
+                && env_layers == env_value("TS_HOST_MOE_EXPERT_CACHE_LAYERS")
+                && env_rows == env_value("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS"),
+                "Maximum scope allocated/touched credit/changed environment or failed restoration");
+            require(tsg::SharedCacheCharge::detach(&probe), "Maximum metadata scope retained a shared owner");
+            probe.attached = false;
+            std::puts("PASS: max1024 native scope metadata-only; callbacks0 physical0 credit0 environment restored");
+        }
         std::uint64_t token = 99, second = 99;
         std::int64_t released = 99;
         require(TSGgml_BeginHostMoeExpertCacheScope(-1, 64, 4, &token) == 0 && token == 0,
             "Negative scope capacity did not fail before ownership");
-        require(TSGgml_BeginHostMoeExpertCacheScope(1, 129, 4, &token) == 0 && token == 0
+        require(TSGgml_BeginHostMoeExpertCacheScope(1, 1025, 4, &token) == 0 && token == 0
             && TSGgml_BeginHostMoeExpertCacheScope(1, 64, 0, &token) == 0 && token == 0
             && TSGgml_BeginHostMoeExpertCacheScope(1, 64, 4, nullptr) == 0,
             "Invalid scope settings or null output acquired ownership");
@@ -299,7 +356,8 @@ namespace
 
     struct SharedLedger
     {
-        struct Allocation { std::int64_t bytes; bool committed = false; bool host = false; std::size_t physical = 0; };
+        struct Allocation { std::int64_t bytes; bool committed = false; bool host = false; std::size_t physical = 0;
+            int split_role = -1; std::uintptr_t split_identity = 0; };
         std::int64_t capacity = 2 << 20, pending = 0, committed = 0;
         std::int64_t host_capacity = 32 << 20, host_pending = 0, host_committed = 0;
         std::uint64_t next = 0, reserve_calls = 0, commit_calls = 0, release_calls = 0;
@@ -327,7 +385,17 @@ namespace
             const bool host = kind == 3;
             if (bytes > (host ? l.host_capacity - l.host_pending - l.host_committed : l.capacity - l.pending - l.committed)) return 0;
             const auto token = ++l.next;
-            l.allocations.emplace(token, Allocation{bytes, false, host});
+            auto inserted = l.allocations.emplace(token, Allocation{bytes, false, host});
+#ifdef TSG_GGML_USE_CUDA
+            if (!host) {
+                int role = -1; std::uintptr_t identity = 0; std::size_t physical = 0;
+                if (tsg::host_moe_expert_cache_test_current_split_owner(role, identity, physical)) {
+                    if (role < 0 || role > 2 || !identity || physical != 0) l.valid = false;
+                    inserted.first->second.split_role = role;
+                    inserted.first->second.split_identity = identity;
+                }
+            }
+#endif
             (host ? l.host_pending : l.pending) += bytes;
             if (!host) l.peak_owned = (std::max)(l.peak_owned, l.pending + l.committed);
             return token;
@@ -338,17 +406,31 @@ namespace
             ++l.commit_calls;
             auto found = l.allocations.find(token);
             if (found == l.allocations.end() || found->second.committed) { l.valid = false; return 0; }
-            const auto physical = found->second.host ? tsg::host_moe_expert_cache_test_file_workspace_bytes()
+            auto physical = found->second.host ? tsg::host_moe_expert_cache_test_file_workspace_bytes()
                 : tsg::host_moe_expert_cache_test_physical_bytes();
+#ifdef TSG_GGML_USE_CUDA
+            if (found->second.split_role >= 0) {
+                int role = -1; std::uintptr_t identity = 0; std::size_t actual = 0;
+                if (!tsg::host_moe_expert_cache_test_current_split_owner(role, identity, actual)
+                    || role != found->second.split_role || identity != found->second.split_identity
+                    || actual == 0 || actual > static_cast<std::size_t>(found->second.bytes)) { l.valid = false; return 0; }
+                physical = actual;
+            }
+#endif
             if (physical == 0) { l.valid = false; return 0; }
             if (l.fail_commit) return 0;
             auto& allocation = found->second;
             if (!allocation.host) {
-                std::size_t others = 0;
-                for (const auto& item : l.allocations) if (item.first != token && !item.second.host) others += item.second.physical;
-                if (physical <= others) { l.valid = false; return 0; }
-                allocation.physical = physical - others;
-                l.peak_physical = (std::max)(l.peak_physical, physical);
+                if (allocation.split_role >= 0) {
+                    allocation.physical = physical;
+                    l.peak_physical = (std::max)(l.peak_physical, tsg::host_moe_expert_cache_test_physical_bytes());
+                } else {
+                    std::size_t others = 0;
+                    for (const auto& item : l.allocations) if (item.first != token && !item.second.host) others += item.second.physical;
+                    if (physical <= others) { l.valid = false; return 0; }
+                    allocation.physical = physical - others;
+                    l.peak_physical = (std::max)(l.peak_physical, physical);
+                }
             }
             (allocation.host ? l.host_pending : l.pending) -= allocation.bytes;
             (allocation.host ? l.host_committed : l.committed) += allocation.bytes;
@@ -363,13 +445,23 @@ namespace
             // These ownership fixtures keep one cache entry alive at a time;
             // the separate full-resident oracle is not charged to this cache.
             if (found == l.allocations.end()) { l.valid = false; return; }
-            std::size_t remaining_physical = 0;
-            if (l.multiple_cache_entries && !found->second.host)
-                for (const auto& item : l.allocations)
-                    if (item.first != token && !item.second.host) remaining_physical += item.second.physical;
-            if ((found->second.host ? tsg::host_moe_expert_cache_test_file_workspace_bytes()
-                    : tsg::host_moe_expert_cache_test_physical_bytes()) != remaining_physical)
-            { l.valid = false; return; }
+#ifdef TSG_GGML_USE_CUDA
+            if (found->second.split_role >= 0) {
+                int role = -1; std::uintptr_t identity = 0; std::size_t physical = 1;
+                if (!tsg::host_moe_expert_cache_test_current_split_owner(role, identity, physical)
+                    || role != found->second.split_role || identity != found->second.split_identity || physical != 0)
+                { l.valid = false; return; }
+            } else
+#endif
+            {
+                std::size_t remaining_physical = 0;
+                if (l.multiple_cache_entries && !found->second.host)
+                    for (const auto& item : l.allocations)
+                        if (item.first != token && !item.second.host) remaining_physical += item.second.physical;
+                if ((found->second.host ? tsg::host_moe_expert_cache_test_file_workspace_bytes()
+                        : tsg::host_moe_expert_cache_test_physical_bytes()) != remaining_physical)
+                { l.valid = false; return; }
+            }
             auto& allocation = found->second;
             (allocation.host ? (allocation.committed ? l.host_committed : l.host_pending)
                 : (allocation.committed ? l.committed : l.pending)) -= allocation.bytes;
@@ -509,6 +601,10 @@ namespace
             ggml_set_output(routes);
             auto* g = ggml_mul_mat_id(context, gate, x, ids);
             auto* u = ggml_mul_mat_id(context, up, x, ids);
+            if (weights.segment.swiglu_clamp > 0.0f) {
+                g = ggml_clamp(context, g, -INFINITY, weights.segment.swiglu_clamp);
+                u = ggml_clamp(context, u, -weights.segment.swiglu_clamp, weights.segment.swiglu_clamp);
+            }
             auto* h = ggml_mul(context, ggml_silu(context, g), u);
             auto* parts = ggml_mul_mat_id(context, down, h, ids);
             if (rows <= TSG_PRECISION_DECODE_COLUMNS) ggml_set_output(parts);
@@ -573,9 +669,15 @@ namespace
         tsg::host_moe_expert_cache_release();
         Weights weights; weights.types = types; weights.fill(.7f, 64);
         weights.segment.pooled_model_experts = 64;
-        constexpr int planned_rows = 3;
-        const auto top_bytes = tsg::host_moe_expert_cache_test_plan_capacity(weights.segment, 64, planned_rows, g_backend);
-        const auto previous_bytes = tsg::host_moe_expert_cache_test_plan_capacity(weights.segment, 63, planned_rows, g_backend);
+        constexpr int planned_rows = 3, helper_rows = 8;
+        tsg::HostMoeCacheTestPlan top_plan{}, previous_plan{};
+        require(tsg::host_moe_expert_cache_test_split_plan(weights.segment, 64, planned_rows, helper_rows, g_backend, top_plan)
+            && tsg::host_moe_expert_cache_test_split_plan(weights.segment, 63, planned_rows, helper_rows, g_backend, previous_plan)
+            && top_plan.narrow_rows == helper_rows && previous_plan.narrow_rows == helper_rows
+            && top_plan.wide_bytes == 0 && previous_plan.wide_bytes == 0,
+            "Pooled quota planner confused three admitted requests with eight helper variants");
+        const auto top_bytes = top_plan.weight_bytes + top_plan.narrow_bytes;
+        const auto previous_bytes = previous_plan.weight_bytes + previous_plan.narrow_bytes;
         const auto quota = top_bytes - 1;
         require(top_bytes > previous_bytes && previous_bytes > 0,
             "Fixture did not distinguish the last two measured capacities");
@@ -597,14 +699,14 @@ namespace
             actual.data(), "glm5-next selected expert seam", g_backend); };
         const auto before = ledger.reserve_calls;
         tsg::host_moe_expert_cache_test_fail_next(2);
-        require(call() == 0 && ledger.reserve_calls == before + 1,
-            "Pooled fitting hid a physical allocation failure by retrying a smaller table");
+        require(call() == 0 && ledger.reserve_calls == before + 2,
+            "Pooled fitting retried or failed to reserve exactly weight+narrow owners before one physical admission");
         ledger.check_empty();
         require(call() == 1 && std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
             "Largest-fitting pooled table changed scalar expert arithmetic");
         std::array<std::int64_t, 8> entry{}; int count = 0;
         require(TSGgml_HostMoeExpertCacheEntryStats(entry.data(), 1, &count) == 1 && count == 1
-            && entry[1] == 63 && entry[4] == static_cast<std::int64_t>(previous_bytes)
+            && entry[1] == 63 && entry[3] == helper_rows && entry[4] == static_cast<std::int64_t>(previous_bytes)
             && ledger.committed == static_cast<std::int64_t>(previous_bytes),
             "One-byte scratch miss wasted the pool quota instead of selecting the actual largest fitting table");
         const auto reservations = ledger.reserve_calls;
@@ -706,6 +808,160 @@ namespace
         tsg::host_moe_expert_cache_release();
         require(std::remove(path.c_str()) == 0, "Scalar file source handle survived teardown");
         std::printf("PASS: GLM scalar top8 selected payload=%lld exceeds32MiB, poisoned mmap identity, exact CUDA output, fixed32MiB arena/one-byte refusal, warm reuse, interrupted1MiB ring and cleanup\n", static_cast<long long>(miss_bytes));
+    }
+
+    void glm_compact_prefill_checks(const std::array<ggml_type, 3>& types)
+    {
+        static constexpr int count = 64, top = 8, limit = 8;
+        for (float clamp : {0.0f, 0.0001f}) {
+            tsg::host_moe_expert_cache_release();
+            Weights weights; weights.types = types; weights.fill(.71f, count, top);
+            weights.segment.pooled_model_experts = count;
+            weights.segment.swiglu_clamp = clamp;
+            FullResidentGraph oracle(weights);
+            DeviceInputs device(limit, top);
+            const auto path = fixture_file_path("glm-private-compact-tail-");
+            std::array<std::int64_t, 3> offsets{};
+            {
+                std::ofstream file(path, std::ios::binary | std::ios::trunc);
+                require(bool(file), "Cannot create compact GLM registered source");
+                for (int part = 0; part < 3; ++part) {
+                    file.write("nonzero-offset!", 15);
+                    offsets[part] = static_cast<std::int64_t>(file.tellp());
+                    file.write(reinterpret_cast<const char*>(weights.quantized[part].data()), weights.quantized[part].size());
+                    require(bool(file), "Cannot write compact GLM exact source extent");
+                }
+            }
+            for (int part = 0; part < 3; ++part)
+                require(TSGgml_RegisterHostFileSource(weights.quantized[part].data(),
+                    weights.quantized[part].size(), path.c_str(), offsets[part]) == 1,
+                    "Cannot register compact GLM exact source extent");
+            // The full-resident oracle already owns the original bytes. A mapped
+            // fallback now produces different output and cannot pass this gate.
+            for (auto& part : weights.quantized) std::fill(part.begin(), part.end(), 0);
+            SharedLedger ledger; ledger.capacity = 32LL << 20; ledger.host_capacity = 65536;
+            require(ledger.attach(true), "Cannot attach compact GLM physical ledger");
+            tsg::host_moe_expert_cache_test_file_slice_limit(65536);
+            std::uint64_t token = 0;
+            require(TSGgml_BeginHostMoeExpertCacheScopeWithDecodeRows(32LL << 20, limit, 1, 1, &token) == 1,
+                "Cannot begin genuine single-request compact GLM scope");
+            std::size_t minimum = 0, joint_minimum = 0;
+            require(tsg::host_moe_expert_cache_minimum_prefill_plan(weights.segment, 1, limit, g_backend, minimum)
+                && tsg::host_moe_expert_cache_minimum_plan(weights.segment, 1, g_backend, joint_minimum)
+                && minimum == joint_minimum && minimum > 0 && Stats().reserved == 0,
+                "Compact planner does not measure exactly the same retained graph policy");
+            require(tsg::host_moe_expert_cache_scope_matches_plan(minimum, 1, limit, 1)
+                && !tsg::host_moe_expert_cache_scope_matches_plan(minimum, 1, limit - 1, 1)
+                && !tsg::host_moe_expert_cache_scope_matches_plan(minimum, 1, limit, 2),
+                "Compact compatibility confused helper variants with request concurrency");
+            std::vector<float> input(limit * hidden), routes(limit * top), expected(limit * hidden), actual(limit * hidden);
+            std::vector<std::int32_t> ids(limit * top);
+            auto prepare = [&](int rows, bool repeated = false) {
+                for (int row = 0; row < rows; ++row) {
+                    std::array<float, hidden> x{};
+                    std::array<std::int32_t, top> selected{};
+                    std::array<float, top> probabilities{};
+                    for (int h = 0; h < hidden; ++h) x[h] = input[row * hidden + h] = std::cos(h * .041f + row * .31f);
+                    for (int k = 0; k < top; ++k) {
+                        selected[k] = ids[row * top + k] = count - 1 - ((repeated ? 0 : row * top) + k);
+                        probabilities[k] = routes[row * top + k] = (k + 1.f) / 36.f;
+                    }
+                    const auto answer = oracle.compute(x, selected, probabilities);
+                    std::copy(answer.begin(), answer.end(), expected.begin() + row * hidden);
+                }
+                ggml_backend_tensor_set(device.x, input.data(), 0, rows * hidden * sizeof(float));
+                ggml_backend_tensor_set(device.routes, routes.data(), 0, rows * top * sizeof(float));
+                std::fill(actual.begin(), actual.end(), -999.f);
+                ggml_backend_tensor_set(device.output, actual.data(), 0, rows * hidden * sizeof(float));
+            };
+            auto call = [&](int rows, int bridge = 0) {
+                auto hm = weights.segment; hm.seq_len = rows; hm.independent_decode_rows = false;
+                hm.moe_in = device.x; hm.weights = device.routes; hm.moe_out = device.output;
+                const auto result = tsg::host_moe_cached_experts(hm, bridge ? nullptr : input.data(), ids.data(),
+                    bridge ? nullptr : routes.data(), bridge == 2 ? nullptr : actual.data(),
+                    "glm5-next selected expert seam", g_backend);
+                if (bridge == 2 && result == 1) {
+                    tsg::sync_backend(g_backend);
+                    ggml_backend_tensor_get(device.output, actual.data(), 0, rows * hidden * sizeof(float));
+                }
+                return result;
+            };
+            auto exact = [&](int rows) { return std::memcmp(actual.data(), expected.data(), rows * hidden * sizeof(float)) == 0; };
+            auto untouched = [&](int rows) { return std::all_of(actual.begin(), actual.begin() + rows * hidden,
+                [](float v) { return v == -999.f; }); };
+            std::int64_t released = 0;
+            prepare(8);
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, minimum - 1, &released) == 1, "Cannot set compact min-1 budget");
+            const auto before_minimum = ledger.reserve_calls;
+            require(call(8) == 0 && untouched(8) && ledger.reserve_calls == before_minimum,
+                "Compact min-1 allocated, submitted, published output or fell back");
+            ledger.check_empty();
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, 32LL << 20, &released) == 1, "Cannot restore compact budget");
+            tsg::host_moe_expert_cache_test_available_bytes((std::size_t(512) << 20) + minimum - 1);
+            require(call(8) == 0 && untouched(8) && ledger.reserve_calls == before_minimum,
+                "Compact physical refusal reached shared allocation or dispatch");
+            tsg::host_moe_expert_cache_test_available_bytes((std::numeric_limits<std::size_t>::max)());
+            ledger.check_empty();
+            for (int fault : {1, 2, 3}) {
+                tsg::host_moe_expert_cache_test_fail_next(fault);
+                require(call(8) == 0 && untouched(8), "Compact physical/commit fault did not fail closed");
+                ledger.check_empty();
+            }
+            ledger.host_capacity = 65535;
+            const auto reads_before_refusal = tsg::g_test_file_reads;
+            bool refused = false;
+            try { call(8); } catch (const std::runtime_error&) { refused = true; }
+            require(refused && untouched(8) && tsg::g_test_file_reads == reads_before_refusal
+                && ledger.host_committed == 0 && ledger.host_pending == 0,
+                "Compact host min-1 read source, allocated uncharged ring, or fell back to mmap");
+            TSGgml_TrimHostMoeExpertCache(0); ledger.check_empty(); ledger.host_capacity = 65536;
+            std::uint64_t first_device_ticket = 0; std::int64_t first_device_bytes = 0;
+            for (int rows = 1; rows <= limit; ++rows) {
+                prepare(rows);
+                for (int bridge = 0; bridge < 3; ++bridge) {
+                    const auto before = ExecutionStats();
+                    require(call(rows, bridge) == 1 && exact(rows), "Compact tail differs from complete scalar CUDA output");
+                    require_operator_batch_shape(rows, top);
+                    const auto after = ExecutionStats();
+                    require(after.submissions == before.submissions + 1 && after.joint == before.joint,
+                        "Compact tail ran scalar submissions or claimed extra concurrent requests");
+                    std::int64_t entry[8]{}; int entries = 0;
+                    require(TSGgml_HostMoeExpertCacheEntryStats(entry, 1, &entries) == 1 && entries == 1
+                        && entry[3] == limit && entry[2] <= count, "Compact retained variants or resident source keys are invalid");
+                    if (!first_device_ticket) { first_device_ticket = ledger.next; first_device_bytes = ledger.committed; }
+                    require(ledger.next == first_device_ticket && ledger.committed == first_device_bytes
+                        && ledger.host_committed == 65536 && tsg::host_moe_expert_cache_test_file_workspace_bytes() == 65536,
+                        "Compact tail width rebuilt weight generation or lost measured host/device ownership");
+                }
+            }
+            TSGgml_TrimHostMoeExpertCache(0); ledger.check_empty();
+            // At the exact smallest device quota, disjoint routes split into N1
+            // while repeated routes still use one N8 graph in the same 8 slots.
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, minimum, &released) == 1, "Cannot set compact exact minimum");
+            ledger.capacity = minimum;
+            prepare(8); auto before = ExecutionStats();
+            require(call(8) == 1 && exact(8) && ExecutionStats().submissions == before.submissions + 8,
+                "Exact compact minimum did not preserve bounded full-union microgroups");
+            const auto minimum_reserves = ledger.reserve_calls;
+            prepare(8, true); before = ExecutionStats();
+            require(call(8, 2) == 1 && exact(8) && ExecutionStats().submissions == before.submissions + 1
+                && ledger.reserve_calls == minimum_reserves && ExecutionStats().joint == before.joint,
+                "Repeated routed union cannot use N8 without changing true decode admission");
+            TSGgml_TrimHostMoeExpertCache(0); ledger.check_empty();
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, 32LL << 20, &released) == 1, "Cannot restore compact fault budget");
+            ledger.capacity = 32LL << 20; prepare(8); tsg::g_test_file_failure_countdown = 2;
+            refused = false;
+            try { call(8); } catch (const std::runtime_error&) { refused = true; }
+            require(refused && untouched(8) && tsg::g_test_file_failure_countdown == 0,
+                "Interrupted compact ring published output or silently fell back");
+            require(call(8, 2) == 1 && exact(8), "Compact ring failed to drain and recover exact CUDA output");
+            require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1, "Compact scope did not end");
+            ledger.check_empty(); require(ledger.detach(), "Compact ledger retained physical ownership");
+            tsg::host_moe_expert_cache_release();
+            tsg::host_moe_expert_cache_test_file_slice_limit(32u << 20);
+            require(std::remove(path.c_str()) == 0, "Compact source handle survived teardown");
+            std::printf("PASS: GLM actualdecode1 tails1..8, K8/64expert route union, 3 bridges, scalar CUDA bitexact clamp=%g; shared8variant generation, exact minimum/N1 vs N8 repeated union, host64KiB min-1, physical/commit/partial-read failure and cleanup\n", clamp);
+        }
     }
 
     void glm_bulk_union_checks(const std::array<ggml_type, 3>& types)
@@ -2173,7 +2429,7 @@ int main(int argc, char** argv)
         }
         Weights weights;
         bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false, scoped = false, arena = false, growth = false, bulk_union = false;
-        bool pooled_quota = false, scalar_file_window = false;
+        bool pooled_quota = false, scalar_file_window = false, compact_prefill = false, direct_reads = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
@@ -2182,7 +2438,9 @@ int main(int argc, char** argv)
             else if (std::strcmp(argv[arg], "--capacity-growth") == 0) growth = true;
             else if (std::strcmp(argv[arg], "--bulk-union") == 0) bulk_union = true;
             else if (std::strcmp(argv[arg], "--pooled-quota") == 0) pooled_quota = true;
+            else if (std::strcmp(argv[arg], "--glm-compact-prefill") == 0) compact_prefill = true;
             else if (std::strcmp(argv[arg], "--glm-scalar-file-window") == 0) scalar_file_window = true;
+            else if (std::strcmp(argv[arg], "--direct-reads") == 0) direct_reads = true;
             else if (std::strcmp(argv[arg], "--trim") == 0 && trim_only) { }
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
             else if (std::strcmp(argv[arg], "--file-read") == 0) file_read = true;
@@ -2200,6 +2458,9 @@ int main(int argc, char** argv)
             else throw std::runtime_error("Unsupported expert-cache test argument");
         }
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
+        require(!direct_reads || scalar_file_window || compact_prefill,
+            "Direct-read qualification requires complete scalar/short file-window lifecycle gates");
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_DIRECT_READS", direct_reads ? "1" : "0");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_LFU", lfu ? "1" : "0");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS", wide_prefill ? "128" : "");
         if (wide_prefill) set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", "32");
@@ -2215,10 +2476,25 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+            if (compact_prefill) {
+                glm_compact_prefill_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                if (direct_reads) {
+                    require(tsg::g_test_direct_file_reads == 0,
+                        "Direct read opt-in bypassed buffered short prefill/MTP-class rows");
+                    std::puts("PASS: short-prefill buffered under direct opt-in completed_direct_reads=0; tails1..8, exact CUDA output, min-1/fault/warm/teardown proof");
+                }
+                return 0;
+            }
             if (pooled_quota || scalar_file_window) {
                 if (pooled_quota) glm_pooled_quota_checks(weights.types);
                 if (scalar_file_window) glm_scalar_file_window_checks(weights.types);
                 ggml_backend_free(g_backend); g_backend = nullptr;
+                if (direct_reads) {
+                    require(tsg::g_test_direct_file_reads == 0,
+                        "Direct read opt-in bypassed the buffered scalar/decode source path");
+                    std::puts("PASS: scalar buffered under direct opt-in completed_direct_reads=0; fixed32MiB/min-1, poisoned mmap, exact output, warm reuse, interrupted ring and teardown");
+                }
                 return 0;
             }
             if (bulk_union) {

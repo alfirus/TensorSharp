@@ -118,6 +118,82 @@ def relocated_fixture():
 
 
 class GlmUnifiedTaskQualificationTests(unittest.TestCase):
+    def test_explicit_recursive_runtime_collection_requires_every_manifest_file(self):
+        plan, report, wrapper = fixture()
+        expected = copy.deepcopy(plan['WrapperFiles'])
+        expected.update({'/app/runtimes/linux-x64/native/libopencv.so.4.11':'7'*64,
+            '/app/runtimes/osx-arm64/native/libexample.dylib':'8'*64,
+            '/app/GlmUnifiedSessionProbe.exe':'9'*64, '/app/cuda_kernels/test.ptx':'6'*64})
+        plan.update(RuntimeCaptureScope=copy.deepcopy(MOD.RUNTIME_CAPTURE_SCOPE), RuntimeFiles=expected)
+        wrapper['telemetry']['capture_scope'] = copy.deepcopy(MOD.RUNTIME_CAPTURE_SCOPE)
+        for field in ('managed_files_before','managed_files_after'):
+            wrapper['telemetry'][field] = copy.deepcopy(expected)
+        self.assertTrue(MOD.qualify(plan, report, wrapper)['Passed'])
+        for field in ('managed_files_before','managed_files_after'):
+            for mutation in ('missing','changed','extra'):
+                with self.subTest(field=field, mutation=mutation):
+                    bad=copy.deepcopy(wrapper)
+                    if mutation=='missing':bad['telemetry'][field].pop('/app/cuda_kernels/test.ptx')
+                    elif mutation=='changed':bad['telemetry'][field]['/app/runtimes/linux-x64/native/libopencv.so.4.11']='0'*64
+                    else:bad['telemetry'][field]['/app/runtimes/unknown.dll']='0'*64
+                    self.assertFalse(MOD.qualify(plan,report,bad)['Passed'])
+
+    def test_unknown_or_missing_recursive_capture_scope_never_downgrades(self):
+        for scope in ({},'recursive',{'Schema':'unknown'},dict(MOD.RUNTIME_CAPTURE_SCOPE,Traversal='top-level')):
+            plan, report, wrapper=fixture()
+            wrapper['telemetry']['capture_scope']=scope
+            self.assertFalse(MOD.qualify(plan,report,wrapper)['Passed'])
+        plan,report,wrapper=fixture()
+        plan.update(RuntimeCaptureScope=copy.deepcopy(MOD.RUNTIME_CAPTURE_SCOPE),RuntimeFiles=copy.deepcopy(plan['WrapperFiles']))
+        self.assertFalse(MOD.qualify(plan,report,wrapper)['Passed'])
+
+    def test_runtime_manifest_kind_predicate_does_not_fold_nested_names(self):
+        files={n:{'Sha256':str(i)*64} for i,n in enumerate(['a.dll','a.exe','x.deps.json','x.runtimeconfig.json','k.ptx',
+            'runtimes/linux/libx.so','runtimes/linux/libx.so.4.11','runtimes/osx/libx.dylib','a.pdb','notes.txt'])}
+        result=MOD.runtime_manifest(files,'/app')
+        self.assertEqual(8,len(result));self.assertIn('/app/runtimes/linux/libx.so.4.11',result)
+        self.assertNotIn('/app/a.pdb',result)
+        self.assertTrue(MOD.runtime_artifact('runtimes/other/EXAMPLE.DYLIB'))
+        self.assertTrue(MOD.runtime_artifact('PROBE.EXE'))
+
+    def test_sdk_nested_runtime_is_pinned_but_not_in_top_level_wrapper_collection(self):
+        plan, report, wrapper = fixture()
+        plan['WrapperFiles']['/app/runtimes/win-x64/native/OpenCvSharpExtern.dll'] = '7' * 64
+        plan['WrapperFiles']['/app/runtimes/win-arm64/native/Magick.Native.dll'] = '8' * 64
+        original_plan = copy.deepcopy(plan)
+        result = MOD.qualify(plan, report, wrapper)
+        self.assertTrue(result['Passed'], result)
+        self.assertEqual(original_plan, plan)
+
+    def test_top_level_collection_still_rejects_every_missing_extra_or_changed_file(self):
+        for field in ('managed_files_before', 'managed_files_after'):
+            for mutation in ('missing-native', 'missing-managed', 'changed', 'extra-top-level', 'unexpected-nested'):
+                with self.subTest(field=field, mutation=mutation):
+                    plan, report, wrapper = fixture()
+                    plan['WrapperFiles']['/app/runtimes/win-x64/native/OpenCvSharpExtern.dll'] = '7' * 64
+                    actual = wrapper['telemetry'][field]
+                    if mutation == 'missing-native': actual.pop('/app/GgmlOps.dll')
+                    elif mutation == 'missing-managed': actual.pop('/app/TensorSharp.Models.dll')
+                    elif mutation == 'changed': actual['/app/TensorSharp.Models.dll'] = '0' * 64
+                    elif mutation == 'extra-top-level': actual['/app/Unknown.dll'] = '9' * 64
+                    else: actual['/app/runtimes/win-x64/native/OpenCvSharpExtern.dll'] = '7' * 64
+                    result = MOD.qualify(plan, report, wrapper)
+                    self.assertFalse(result['Passed'])
+                    self.assertIn('Wrapper deployment hashes: ' + field, result['Errors'])
+
+    def test_sdk_manifest_retains_nested_native_apphost_and_ptx_entries(self):
+        files = [dict(Name='GgmlOps.dll', Bytes=32, Sha256='a' * 64),
+            dict(Name='GlmUnifiedSessionProbe.dll', Bytes=10, Sha256='b' * 64),
+            dict(Name='runtimes/win-x64/native/OpenCvSharpExtern.dll', Bytes=11, Sha256='c' * 64),
+            dict(Name='GlmUnifiedSessionProbe.exe', Bytes=12, Sha256='d' * 64),
+            dict(Name='cuda_kernels/qwen.ptx', Bytes=13, Sha256='e' * 64)]
+        receipt = [dict(Variant='native20', Directory='/app', Files=files, NativeSha256='a' * 64)]
+        complete, native, managed, wrapper = MOD.deployment(receipt, '/app', 'native20')
+        self.assertEqual({x['Name'] for x in files}, set(complete))
+        self.assertIn('/app/runtimes/win-x64/native/OpenCvSharpExtern.dll', wrapper)
+        self.assertEqual('d' * 64, complete['GlmUnifiedSessionProbe.exe']['Sha256'])
+        self.assertEqual('e' * 64, complete['cuda_kernels/qwen.ptx']['Sha256'])
+
     def test_prepare_relocated_plans_pins_small_provenance_without_opening_models(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -411,6 +487,36 @@ class GlmUnifiedTaskQualificationTests(unittest.TestCase):
             self.assertFalse(MOD.qualify(p, r, w)['Passed'])
         p, r, w = fixture(); r['Scheduler']['Enabled'] = 0
         self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+
+    def test_explicit_width_sweep_keeps_budget_and_actual_shape_exact(self):
+        for rows in (32, 64, 128):
+            with self.subTest(rows=rows):
+                p, r, w = fixture()
+                p['BenchmarkPrefillRows'] = rows
+                p['RequestedOptions'] = MOD.OPTIONS | {'PrefillChunkTokens': rows}
+                p['Command'] = MOD.command(p)
+                w['command'] = p['Command'].copy()
+                r['SessionOptions']['PrefillChunkTokens'] = rows
+                r['Arguments']['prefill'] = str(rows)
+                r['EffectivePrefillChunkTokens'] = rows
+                for key in ('PrefillChunkTokenLimit', 'MaxPrefillChunkSize', 'SoloPrefillChunkSize', 'MaxNumBatchedTokens'):
+                    r['Scheduler'][key] = rows
+                self.assertTrue(MOD.qualify(p, r, w)['Passed'])
+                self.assertEqual(str(7000 << 20), r['Arguments']['expert-bytes'])
+                self.assertEqual(str(14 << 30), r['Arguments']['device-bytes'])
+                r['EffectivePrefillChunkTokens'] = rows - 1
+                self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+
+    def test_width_profile_rejects_implicit_budget_changes_and_ambiguous_types(self):
+        for rows in (True, False, '64', 0, 33, 512):
+            with self.subTest(rows=rows):
+                p, _, _ = fixture(); p['BenchmarkPrefillRows'] = rows
+                with self.assertRaises(ValueError): MOD.command(p)
+        for key, value in [('MaximumDeviceBytes', 15 << 30), ('MaximumRunningRequests', True),
+                           ('EnableAsyncExpertPrefill', 0), ('MaximumExpertCacheBytes', 8000 << 20)]:
+            with self.subTest(key=key):
+                p, _, _ = fixture(); p['RequestedOptions'] = MOD.OPTIONS | {key: value}
+                with self.assertRaises(ValueError): MOD.command(p)
 
     def test_thinking_reopening_or_real_tool_call_fails(self):
         p, r, w = fixture(); r['RawText'] += '<think>'; r['RawTextAfterCleanup'] = r['RawText']

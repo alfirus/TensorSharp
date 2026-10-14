@@ -38,7 +38,7 @@ public:
     std::uint64_t growth_generation() const noexcept { return growth_generation_; }
     static bool valid(HostMoeCacheSettings value) noexcept {
         return value.budget <= static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())
-            && value.layers > 0 && value.max_rows > 0 && value.max_rows <= kHostMoeCacheMaxPrefillRows
+            && value.layers > 0 && value.max_rows > 0 && value.max_rows <= kHostMoeCacheMaxGlmPrefillRows
             && value.max_decode_rows > 0 && value.max_decode_rows <= kHostMoeCacheMaxDecodeRows;
     }
     std::uint64_t begin(HostMoeCacheSettings value, bool cache_empty) noexcept {

@@ -129,7 +129,12 @@ internal sealed record QwenVisionPreparationPlan(IReadOnlyList<QwenVisionImagePl
             // Bound known encoded/RGBA/normalized representations, with codec
             // scratch allowance. GC timing and opaque codec allocations remain
             // uninstrumented; native/Tensor children are separately accounted.
-            long preparation = checked(bytes + sourcePixels * 32 + 12L * h * w);
+            // Byte-domain bicubic retains a horizontal uint8 intermediate and
+            // both axes' bounds/double/22-bit coefficient arrays. Account them
+            // explicitly before decoding, rather than hiding them inside the
+            // codec allowance or assuming a GC between resampling passes.
+            long resizeScratch = ImageProcessorUtils.GetByteBicubicResizeScratchBytes(width, height, w, h);
+            long preparation = checked(bytes + sourcePixels * 32 + 12L * h * w + resizeScratch);
             var execution = geometry.ExecutionPeak(h, w);
             images.Add(new(path, bytes, ticks, height, width, h, w, tokens, embedding, preparation, execution));
             retained = checked(retained + embedding);

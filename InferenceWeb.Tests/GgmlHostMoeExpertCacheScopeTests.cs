@@ -75,13 +75,32 @@ public sealed class GgmlHostMoeExpertCacheScopeTests
     [Theory]
     [InlineData(-1, 64, 48)]
     [InlineData(100, 0, 48)]
-    [InlineData(100, 129, 48)]
+    [InlineData(100, 1025, 48)]
     [InlineData(100, 64, 0)]
     public void InvalidSettingsDoNotEnterNative(long bytes, int rows, int layers)
     {
         var native = new Native();
         Assert.Throws<ArgumentOutOfRangeException>(() => new GgmlHostMoeExpertCacheScope(bytes, rows, layers, native));
         Assert.Equal(0, native.Begins);
+    }
+
+    [Theory]
+    [InlineData(129)]
+    [InlineData(256)]
+    [InlineData(512)]
+    [InlineData(1024)]
+    public void WideScopedGlmPrefillPreservesTheAdmittedCapAndDecodeWidth(int rows)
+    {
+        var native = new Native();
+        using (var scope = new GgmlHostMoeExpertCacheScope(100, rows, 3, native, 3))
+        {
+            Assert.Equal(rows, scope.MaxPrefillRows);
+            Assert.Equal(3, scope.MaxDecodeRows);
+            Assert.Equal(3, native.MaxDecodeRows);
+            Assert.Equal(1, native.Begins);
+        }
+        Assert.Equal(1, native.Ends);
+        Assert.False(native.Active);
     }
 
     [Fact]

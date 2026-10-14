@@ -36,8 +36,9 @@ def save(path, value):
 
 
 class Stream:
-    def __init__(self, client, name, prompt, limit):
+    def __init__(self, client, name, prompt, limit, plain_chat=False):
         self.client = client
+        self.plain_chat = plain_chat
         self.folder = client.output / name
         self.folder.mkdir()
         self.row = dict(name=name, prompt=prompt, tokens=[], frames=[], completed=False,
@@ -66,6 +67,8 @@ class Stream:
             row["session"] = session
             body = dict(sessionId=session["sessionId"], messages=[dict(role="user", content=row["prompt"])],
                         maxTokens=self.limit, think=False, temperature=0, topP=1, topK=0, repeatPenalty=1, seed=17)
+            if self.plain_chat:
+                body.update(skills=[], skills_discovery=False, multi_agent=False, tools=[])
             row["request"] = body
             save(self.folder / "request.json", row)
             row["started"] = time.perf_counter()
@@ -181,6 +184,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--join-timeout", type=float, default=60)
     parser.add_argument("--expect-stall", action="store_true", help="Record the immutable pre-fix failure, not a passing fix")
+    parser.add_argument("--plain-chat", action="store_true",
+        help="Explicit controlled prose-only requests; disables skills/agent/tool injection. Does not qualify agentic work.")
     args = parser.parse_args()
     if not 32 <= args.max_tokens <= 20000 or not 1 <= args.timeout <= 1200 or not 1 <= args.join_timeout <= 120:
         parser.error("Invalid bounded test limits")
@@ -198,7 +203,7 @@ def main():
         if report["model"].get("unifiedMemory") is not True: raise RuntimeError("No unified session")
         with ThreadPoolExecutor(max_workers=3) as pool:
             for i, prompt in enumerate(PROMPTS):
-                stream = Stream(client, "chat-" + str(i), prompt, args.max_tokens)
+                stream = Stream(client, "chat-" + str(i), prompt, args.max_tokens, args.plain_chat)
                 streams.append(stream)
                 futures.append(pool.submit(stream.run))
                 if i == 0:
@@ -252,7 +257,9 @@ def main():
                         and not r["terminal"].get("aborted") and r["tokens"] for r in siblings)
                 and all(sum(t > report["cancel_at"] for t, _ in r["tokens"]) >= 8 for r in siblings)
                 and not report["final_queue"].get("busy") and report["final_queue"].get("pending_requests") == 0)
-        report["validation_scope"] = "20K output allowance admission, actual N3→N2 execution and cancelled first chat; exact prompts but fixed greedy controls. Natural EOS only when sibling terminal and attributed finish reason say EOS. Read answers separately for factual quality."
+        report["validation_scope"] = (f"{args.max_tokens}-token output allowance admission, actual N3→N2 execution and cancelled first chat; exact prompts but fixed greedy controls. "
+            + ("Controlled plain chat with skills/agents/tools disabled; no agentic qualification. " if args.plain_chat else "Default tool/agent routing retained. ")
+            + "Natural EOS only when sibling terminal and attributed finish reason say EOS. Read answers separately for factual quality.")
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
         for stream in streams: stream.cancel()

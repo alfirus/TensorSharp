@@ -47,14 +47,19 @@ internal sealed class UnifiedMemorySessionHandle
     internal static UnifiedMemoryModelOptions ResolveHostOptions()
     {
         const string chunkVariable = "TS_SCHED_PREFILL_CHUNK";
-        var options = new UnifiedMemoryModelOptions();
+        // This path is already an explicit --unified-memory opt-in. GLM's
+        // matching native planner admits its serialized selected-expert tier;
+        // Qwen ignores this architecture-specific option. Public API defaults
+        // stay independent of this Host policy.
+        var options = new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true,
+            EnableAdaptiveGlmPrefill = true, AdaptiveGlmPrefillChunkTokens = 1024 };
         string chunk = Environment.GetEnvironmentVariable(chunkVariable);
         if (chunk != null)
         {
             if (!int.TryParse(chunk, NumberStyles.None, CultureInfo.InvariantCulture, out int rows)
                 || rows is < 1 or > 512)
                 throw new ArgumentException("--unified-memory requires TS_SCHED_PREFILL_CHUNK (--prefill-chunk-size) to be an integer from 1 through 512.");
-            options = options with { PrefillChunkTokens = rows };
+            options = options with { PrefillChunkTokens = rows, AdaptiveGlmPrefillChunkTokens = rows };
         }
         foreach (string variable in new[] { "TS_PER_SEQ_FUSED", "TS_BATCHED_FUSED_DECODE" })
         {

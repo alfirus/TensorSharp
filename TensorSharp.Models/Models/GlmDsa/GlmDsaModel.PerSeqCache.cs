@@ -98,10 +98,16 @@ namespace TensorSharp.Models
                 {
                     // Memory full: the idle primary first (its contents are nobody's during a fused step),
                     // then a retained conversation's slot (a cached next turn is lost).
-                    slot = MemoryPolicy != null
+                    // Several requests may be admitted before any binds. A
+                    // zero-extra-slot request has the unique primary promise;
+                    // a full-credit neighbour must not steal it when execution
+                    // order changes or the previous claimant is cancelled.
+                    bool canTakePrimary = _unifiedPrimarySlotReuse?.Invoke(requestId) ?? true;
+                    slot = MemoryPolicy != null && canTakePrimary
                         ? SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new ExecutorGlmSlotStore(_exec)) : -1;
                     if (slot < 0) slot = _exec.SlotAlloc();
-                    if (slot < 0) slot = SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new ExecutorGlmSlotStore(_exec));
+                    if (slot < 0 && canTakePrimary)
+                        slot = SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new ExecutorGlmSlotStore(_exec));
                     if (slot < 0 && _retainedSlots is { Count: > 0 }) slot = AllocSlotReclaimingRetained();
                     if (slot < 0)
                         throw new SequenceSlotUnavailableException(

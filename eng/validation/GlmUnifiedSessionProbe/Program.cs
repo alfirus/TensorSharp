@@ -23,7 +23,8 @@ internal static class Program
         "GGML_N_THREADS", "TS_CPU_MOE_THREADS", "TS_GLM_LOAD_THREADS", "TS_GLM_NATIVE", "TS_HOST_MOE_FILE_READ",
         "TS_N_CPU_MOE", "TS_CPU_MOE", "TS_SPEC", "TS_SPEC_TYPE", "TS_SPEC_DRAFT", "TS_SPEC_DRAFT_MODEL",
         "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "CUDA_VISIBLE_DEVICES", "CUDA_MODULE_LOADING",
-        "MAX_CONTEXT", "KV_CACHE_DTYPE", "TS_GLM_FORCE_FAIL_STEP", "TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS"];
+        "MAX_CONTEXT", "KV_CACHE_DTYPE", "TS_GLM_FORCE_FAIL_STEP", "TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS",
+        "TS_HOST_MOE_EXPERT_CACHE_TIMING", "TS_HOST_MOE_EXPERT_CACHE_ORDERED_READS", "TS_HOST_MOE_EXPERT_CACHE_DIRECT_READS"];
     private static string Hash(string path) { using var f = File.OpenRead(path); return Convert.ToHexString(SHA256.HashData(f)).ToLowerInvariant(); }
     private static object Identity(string path) => new { Path = Path.GetFullPath(path), Bytes = new FileInfo(path).Length, Sha256 = Hash(path) };
     private static object Stat(string path) => new { Path = Path.GetFullPath(path), Bytes = new FileInfo(path).Length,
@@ -64,7 +65,7 @@ internal static class Program
         }
         string[] allowed = ["output", "model", "tokens-file", "context", "max-new", "prefill", "expert-prefill-rows",
             "host-bytes", "device-bytes", "expert-bytes", "selected", "deadline-seconds", "cpu-threads", "task",
-            "model-identity", "native-sha256", "repetitions", "cache-telemetry", "cache-token-snapshots"];
+            "model-identity", "native-sha256", "repetitions", "cache-telemetry", "cache-token-snapshots", "adaptive-prefill", "capture-final-logits"];
         if (arguments.Keys.Except(allowed).Any()) throw new ArgumentException("Unknown option.");
         string output = Path.GetFullPath(arguments["output"]);
         if (Directory.Exists(output) || File.Exists(output)) throw new ArgumentException("Fresh output directory required.");
@@ -107,6 +108,9 @@ internal static class Program
             }
             string selectedText = arguments.GetValueOrDefault("selected", "false");
             if (selectedText is not ("true" or "false")) throw new ArgumentException("selected must be true or false.");
+            bool adaptivePrefill = ProbePolicy.AdaptivePrefill(arguments.GetValueOrDefault("adaptive-prefill", "false"), selectedText == "true");
+            bool captureFinalLogits = CacheTelemetryPolicy.ParseBoolean(arguments.GetValueOrDefault("capture-final-logits", "false"));
+            report["FinalModelLogitsCaptureEnabled"] = captureFinalLogits;
             string task = arguments.GetValueOrDefault("task", "math42");
             if (task is not ("math42" or "unknown")) throw new ArgumentException("task must be math42 or unknown.");
             repetitions = CacheTelemetryPolicy.ParseRepetitions(arguments.GetValueOrDefault("repetitions", "1"));
@@ -122,7 +126,8 @@ internal static class Program
                 : cacheTelemetry ? "Cache observations only at quiescent boundaries outside the measured request window. No token-level gate pauses. Completion wall/publication timings are consumer observations, not independently measured device execution; no exact prefill-only cache observation is available."
                 : "No token-level gating or cache reads. Completion wall/publication timings are still consumer observations, not independently measured device execution.";
             report["Rounds"] = rounds; report["CacheSnapshots"] = cacheSnapshots;
-            int context = Integer("context", 1024), maxNew = Integer("max-new", 128), prefill = Integer("prefill", 32, 1, 512);
+            int context = Integer("context", 1024), maxNew = Integer("max-new", 128),
+                prefill = Integer("prefill", 32, 1, adaptivePrefill ? 1024 : 512);
             int threads = Integer("cpu-threads", 8, 1, 1024), deadline = Integer("deadline-seconds", 1200, 1, 86400);
             string modelPath = Path.GetFullPath(arguments.GetValueOrDefault("model",
                 "E:/models/GLM-5.3-Flash-GGUF/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf"));
@@ -178,11 +183,13 @@ internal static class Program
             report["EffectiveCpuThreads"] = MoeCpuOffloadConfig.CpuThreads;
             report["EnvironmentEffective"] = EnvironmentKeys.ToDictionary(k => k, Environment.GetEnvironmentVariable);
             report["PhysicalBeforeLoad"] = Physical(); cudaObserved = true;
-            UnifiedMemoryModelOptions options = new() { ContextTokens = context, PrefillChunkTokens = prefill,
+            UnifiedMemoryModelOptions options = new() { ContextTokens = context, PrefillChunkTokens = Math.Min(prefill, 512),
                 ExpertCachePrefillRows = Integer("expert-prefill-rows", 32, 1, 128), MaximumRunningRequests = 1,
                 PrefixCheckpointCount = 0, RetainedConversationCount = 0,
                 MaximumHostBytes = Bytes("host-bytes", long.MaxValue, 1), MaximumDeviceBytes = Bytes("device-bytes", long.MaxValue, 1),
                 MaximumExpertCacheBytes = Bytes("expert-bytes", long.MaxValue, 0), EnableGlmSelectedExperts = selectedText == "true",
+                EnableAdaptiveGlmPrefill = adaptivePrefill,
+                AdaptiveGlmPrefillChunkTokens = adaptivePrefill ? prefill : null,
                 EnableAsyncExpertPrefill = false, EnableExpertCacheCapacityGrowth = false };
             report["SessionOptions"] = options;
             Save(Path.Combine(output, "execution-started.json"), report);
@@ -271,6 +278,26 @@ internal static class Program
             }
             completion = await handle.Completion.WaitAsync(cancellation.Token);
             requestWall.Stop(); completed = true;
+            if (captureFinalLogits)
+            {
+                // Validation-only snapshot at a quiescent single-request boundary.
+                // This is after forwarding the terminal sampled token (P+O),
+                // not the prefill-only prediction or SequenceState.LastLogits.
+                float[] captured;
+                lock (model.GpuComputeLock)
+                {
+                    var field = typeof(ModelBase).GetField("_logitsBuffer", BindingFlags.Instance | BindingFlags.NonPublic)
+                        ?? throw new MissingFieldException("ModelBase logits diagnostic field is unavailable.");
+                    captured = FinalLogitCapture.Copy(field.GetValue(model) as float[], model.Config.VocabSize);
+                }
+                string capturePath = Path.Combine(output, $"round-{round:D2}-final-logits.f32");
+                using (var writer = new BinaryWriter(new FileStream(capturePath, FileMode.CreateNew, FileAccess.Write)))
+                    foreach (float value in captured) writer.Write(value);
+                report["FinalModelLogitsCapture"] = new { File = Identity(capturePath), Elements = captured.Length,
+                    AllFinite = true, ComputedTokens = sequence.NumComputedTokens,
+                    OutputTokens = sequence.OutputTokens.ToArray(),
+                    Scope = "Validation-only copied GLM model buffer after the terminal sampled token forward, under GpuComputeLock. Compare only identical full prompt and consumed output history. Outside request timing; no teacher or independent arithmetic oracle." };
+            }
             report["Completion"] = completion; report["BudgetAfterCompletion"] = Ledger(budget);
             report["PhysicalAfterCompletion"] = Physical();
             ObserveCache("after-completion", round);
@@ -290,6 +317,8 @@ internal static class Program
             report["ToolCalls"] = parsed.ToolCalls; report["ThinkingClosed"] = thinkingClosed;
             report["OutputTokens"] = tokens; report["PublishedTokens"] = stream.ToArray();
             report["ComputedTokens"] = sequence.NumComputedTokens; report["StatusBeforeDispose"] = sequence.Status;
+            report["RequestAdmittedPrefillChunkTokens"] = config.MemoryAdmission?.PrefillTokenLimit?.Invoke(sequence);
+            report["PrefillShapeEvidenceScope"] = "Session ceiling and request-admitted limit are size promises; actual forward widths require execution trace. Engine step/output counts supply separate consumed-work evidence.";
             report["ComputedTokenConvention"] = "Non-speculative prompt-plus-all-sampled-outputs-forwarded (P+O). Includes terminal sampled EOS.";
             report["NaturalEos"] = natural; report["StructuralPassed"] = structural; report["SemanticPassed"] = semantic;
             report["SemanticPolicy"] = "Exact production-parsed content42 for the independently specified17+25 prompt; no trimming/repair. Other tasks unknown.";
@@ -430,6 +459,7 @@ internal static class Program
             report["EngineCompletionObserved"] = completed;
             report["CompletedRepetitions"] = rounds.Count(r => r.GetValueOrDefault("Completion") != null);
             report["TopLevelRequestFieldsScope"] = "Last started request. Rounds contains every repetition, including an incomplete final request; overall Passed requires all requested rounds to pass and complete cleanup/identity checks.";
+            report["EnvironmentAfter"] = EnvironmentKeys.ToDictionary(k => k, Environment.GetEnvironmentVariable);
             report["Errors"] = errors; report["FinishedUtc"] = DateTime.UtcNow; report["TotalProbeWallMs"] = total.Elapsed.TotalMilliseconds;
             if (errors.Count != 0 || (session != null && !sessionDisposed) || (budget != null && report.GetValueOrDefault("LedgerZeroAfterCleanup") is not true))
             { report["Passed"] = false; report["Status"] = "failed"; }

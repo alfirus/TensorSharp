@@ -14,6 +14,27 @@ SPEC.loader.exec_module(PROBE)
 
 
 class BoundedProbeTests(unittest.TestCase):
+    def test_recursive_runtime_capture_includes_nested_native_apphost_and_ptx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            names=['GgmlOps.dll','GlmUnifiedSessionProbe.exe','p.deps.json','p.runtimeconfig.json','cuda_kernels/p.ptx',
+                'runtimes/linux-x64/native/libx.so.4.11','runtimes/osx-arm64/native/libx.dylib','runtimes/win-x64/native/x.dll']
+            for name in names+['debug.pdb','readme.txt']:
+                path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(name.encode())
+            capture=PROBE.ProbeTelemetry(root,'0'*64,SimpleNamespace()).managed_files()
+            self.assertEqual({str(root/name) for name in names},set(capture))
+            self.assertEqual(PROBE.digest(root/names[-1]),capture[str(root/names[-1])])
+            before=capture[str(root/names[-1])];(root/names[-1]).write_bytes(b'changed nested runtime')
+            self.assertNotEqual(before,PROBE.ProbeTelemetry(root,'0'*64,SimpleNamespace()).managed_files()[str(root/names[-1])])
+
+    def test_recursive_capture_rejects_symbolic_links_instead_of_escaping_app(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'a.dll').write_bytes(b'a')
+            try:(root/'linked.dll').symlink_to(root/'a.dll')
+            except OSError as error:self.skipTest('Symlink creation unavailable: '+str(error))
+            with self.assertRaisesRegex(ValueError,'reparse/symlink'):
+                PROBE.ProbeTelemetry(root,'0'*64,SimpleNamespace()).managed_files()
+
     def test_telemetry_finish_error_keeps_durable_child_outcome(self):
         class BrokenFinish:
             report = {'passed': False}

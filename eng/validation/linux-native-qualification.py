@@ -73,7 +73,7 @@ def glm_cases(quantized_source):
         for clamp in (False, True):
             cases.append((mode + "-iq-" + ("clamp" if clamp else "checkpoint"), mode, "CUDA",
                           ["--selected-experts", quant] + faults + (["--swiglu-clamp"] if clamp else [])))
-        for rows in (8, 9, 10, 16, 128):
+        for rows in (8, 9, 10, 16, 128, 256, 384, 512, 1024):
             for kind in ("q8", "iq"):
                 cases.append((mode + "-" + kind + "-rows" + str(rows), mode, "CUDA",
                               ["--selected-experts"] + ([quant] if kind == "iq" else [])
@@ -127,7 +127,7 @@ def abi_evidence(native, environment):
     # ELF loaders can cache their search path before Python changes os.environ.
     # A fresh child sees LD_LIBRARY_PATH and CUDA visibility before dlopen.
     native = require_elf(native)
-    expected = {"TSGgml_GlmUnifiedBudgetVersion": 2, "TSGgml_GlmSelectedExpertAdapterVersion": 3,
+    expected = {"TSGgml_GlmUnifiedBudgetVersion": 2, "TSGgml_GlmSelectedExpertAdapterVersion": 7,
                 "TSGgml_HostMoeFilePipelineVersion": 2, "TSGgml_Qwen4ExpArenaBudgetKind": 5,
                 "TSGgml_HostMoeExpertCacheBudgetKind": 4}
     code = ("import ctypes,json,sys; lib=ctypes.CDLL(sys.argv[1]); "
@@ -158,6 +158,27 @@ def validate_glm_report(actual, comparison, native, native_sha, backend, flags):
     selected, faults = "--selected-experts" in flags, "--dispatch-faults" in flags
     if actual.get("selected_experts_tested") is not selected or actual.get("dispatch_faults_tested") is not faults:
         raise RuntimeError("Selected-expert/fault coverage does not match requested mode.")
+    if selected and faults:
+        id_failures = [row for row in actual.get('executions', []) if 'selected_ids_download_failure' in row]
+        if len(id_failures) != 1 or id_failures[0].get('selected_ids_download_failure') is not True \
+                or type(id_failures[0].get('stage')) is not int or id_failures[0]['stage'] != 4 \
+                or type(id_failures[0].get('kind')) is not int or id_failures[0]['kind'] != 1 \
+                or id_failures[0].get('cache_unchanged') is not True or id_failures[0].get('logits_unpublished') is not True \
+                or id_failures[0].get('heads_unpublished') is not True:
+            raise RuntimeError('Selected-ID reported download error must stop before expert cache mutation or logits publication.')
+        drain_failures = [row for row in actual.get('executions', []) if 'selected_final_drain_failure' in row]
+        expected_seams = 3 if any(f.startswith('--quantized-source=') for f in flags) else 2
+        if len(drain_failures) != 1:
+            raise RuntimeError('Missing or duplicated last selected-seam reported drain failure proof.')
+        drain = drain_failures[0]
+        expected_counts = {'stage': 5, 'kind': 1, 'participating_rows': 3, 'expert_seams': expected_seams,
+                           'completed_helper_rows': 3 * expected_seams}
+        if (any(type(drain.get(key)) is not int or drain[key] != value for key, value in expected_counts.items())
+                or any(drain.get(key) is not True for key in (
+                    'selected_final_drain_failure', 'successful_graphs_unchanged', 'logits_unpublished',
+                    'heads_unpublished', 'slots_fenced', 'reset_recovered_n3', 'primary_departure_recovered_n2'))):
+            raise RuntimeError('Reported final drain error must follow every N3 expert helper, fence all slots, '
+                               'reject logits/heads/success publication and recover reset N3/departure N2.')
     quant = next((f.split("=", 1)[1] for f in flags if f.startswith("--quantized-source=")), None)
     rows = next((int(f.split("=", 1)[1]) for f in flags if f.startswith("--prefill-rows=")), None)
     if actual.get("prefill_rows") != rows or actual.get("quantized_source") != quant:

@@ -20,10 +20,21 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
 import time
+
+RUNTIME_CAPTURE_SCOPE = dict(Schema='tensorsharp.probe-runtime-capture.v1', Traversal='recursive',
+    FileKinds=['dll', 'exe', 'deps.json', 'runtimeconfig.json', 'ptx', 'so', 'versioned-so', 'dylib'],
+    ReparsePoints='reject')
+
+
+def runtime_artifact(path):
+    name = Path(path).name.lower()
+    return name.endswith(('.dll', '.exe', '.deps.json', '.runtimeconfig.json', '.ptx', '.so', '.dylib')) \
+        or re.search(r'\.so\.[0-9]+(?:\.[0-9]+)*$', name) is not None
 
 
 def digest(path):
@@ -51,15 +62,20 @@ class ProbeTelemetry:
         self.stop = threading.Event()
         self.native, self.error, self.sampler, self.worker = None, None, None, None
         self.report = {'passed': False, 'native_verified': False, 'loaded_managed_modules_verified': False,
+                       'capture_scope': RUNTIME_CAPTURE_SCOPE,
                        'expected_native_sha256': self.expected,
                        'runner_sha256': digest(__file__),
                        'sampler_sha256': digest(bench.__file__) if getattr(bench, '__file__', None) else None,
                        'native_observation_mode': 'Stop module polling after first verified live observation; hash observed file again after exit.',
-                       'scope': 'Native path observed once in the owned live process, with on-disk hash at observation and after exit; later module replacements/unloads are not continuously monitored. Top-level managed files hashed before/after, not loaded managed-module enumeration. Memory is sampled; board VRAM includes other processes. Sampling/identity overhead is unquantified. No model hashes, hard-limit or semantic/performance qualification.'}
+                       'scope': 'Native path observed once in the owned live process, with on-disk hash at observation and after exit; later module replacements/unloads are not continuously monitored. Declared recursive runtime artifact set hashed before/after, not loaded managed-module enumeration. Memory is sampled; board VRAM includes other processes. Sampling/identity overhead is unquantified. No model hashes, hard-limit or semantic/performance qualification.'}
 
     def managed_files(self):
-        files = {str(p): digest(p) for p in sorted(self.directory.iterdir())
-                 if p.is_file() and (p.suffix == '.dll' or p.name.endswith(('.deps.json', '.runtimeconfig.json')))}
+        files = {}
+        for path in sorted(self.directory.rglob('*')):
+            if path.is_symlink() or getattr(path.lstat(), 'st_file_attributes', 0) & 0x400:
+                raise ValueError('Runtime capture refuses reparse/symlink entries: ' + str(path))
+            if path.is_file() and runtime_artifact(path):
+                files[str(path)] = digest(path)
         if not any(name.endswith('.dll') for name in files):
             raise ValueError('Managed directory contains no DLLs')
         return files
@@ -221,7 +237,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument('--telemetry', action='store_true', help='Opt-in live native identity and sampled memory on Windows/Linux; requires psutil and nvidia-smi')
-    parser.add_argument('--managed-directory', type=Path, help='Application directory whose top-level DLL/deps/runtimeconfig files are hashed before/after')
+    parser.add_argument('--managed-directory', type=Path, help='Immutable application directory whose declared recursive runtime artifacts are hashed before/after')
     parser.add_argument('--expected-native-sha256', help='Required lowercase loaded-native SHA256 when telemetry is enabled')
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()

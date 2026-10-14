@@ -19,10 +19,16 @@ public sealed class StartupWarmupStatus
 
     public StartupWarmupStatus(IEnumerable<Stage> stages, bool prefixRetentionRequested,
         IEnumerable<JointStage>? jointStages = null, bool jointWarmupRequested = false, string? jointWarmupSkipReason = null)
+        : this(stages, prefixRetentionRequested, jointStages, jointWarmupRequested, jointWarmupSkipReason, false) { }
+
+    public StartupWarmupStatus(IEnumerable<Stage> stages, bool prefixRetentionRequested,
+        IEnumerable<JointStage>? jointStages, bool jointWarmupRequested, string? jointWarmupSkipReason,
+        bool kernelInitializationOnly)
     {
         var snapshot = stages?.ToArray() ?? throw new ArgumentNullException(nameof(stages));
         Stages = Array.AsReadOnly(snapshot);
         PrefixRetentionRequested = prefixRetentionRequested;
+        Scope = kernelInitializationOnly ? "kernel-initialization" : "default-chat-prefix";
         Completed = snapshot.Length == 2 && snapshot.All(s => s.Completed)
             && snapshot.Any(s => s.Thinking) && snapshot.Any(s => !s.Thinking);
         ElapsedMilliseconds = snapshot.Sum(s => s.ElapsedMilliseconds);
@@ -37,6 +43,7 @@ public sealed class StartupWarmupStatus
     }
 
     public string Mode => "scheduled";
+    public string Scope { get; }
     public bool Completed { get; }
     public bool PrefixRetentionRequested { get; }
     public double ElapsedMilliseconds { get; }

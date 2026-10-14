@@ -104,14 +104,18 @@ namespace TensorSharp.GGML
         {
             try
             {
-                if (TSGgml_GlmSelectedExpertAdapterVersion() != 3)
-                    throw new NotSupportedException("GLM selected-expert execution requires bulk-prefill union and exact decode cache planning (adapter version 3).");
+                ValidateSelectedExpertAdapterVersion(TSGgml_GlmSelectedExpertAdapterVersion());
                 _ = TSGgml_GlmSelectedExpertMinimumBudget(IntPtr.Zero, 1, out _);
             }
             catch (EntryPointNotFoundException error)
             {
                 throw new NotSupportedException("GLM selected-expert execution requires its matching updated native library.", error);
             }
+        }
+        internal static void ValidateSelectedExpertAdapterVersion(int version)
+        {
+            if (version != 7)
+                throw new NotSupportedException("GLM selected-expert execution requires split scratch ownership, exact serialized phase borrowing and admitted prefill widths through 1024 with 8192 route elements (adapter version 7).");
         }
         /// <summary>Quiescent size-only native plan. Includes complete quantized
         /// tables for every possible routed union and all planned graph variants;

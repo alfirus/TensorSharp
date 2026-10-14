@@ -42,6 +42,20 @@ ARGS = dict(context='1024', **{'max-new': '128', 'prefill': '32', 'expert-prefil
     'repetitions': '1', 'cache-telemetry': 'true', 'cache-token-snapshots': 'false'})
 IDENTITY_FLAGS = ('ModelStatsUnchanged', 'ManagedUnchanged', 'SourceToolsUnchanged',
     'NativeUnchanged', 'InputFileUnchanged', 'HistoricalModelIdentityUnchanged')
+RUNTIME_CAPTURE_SCOPE = dict(Schema='tensorsharp.probe-runtime-capture.v1', Traversal='recursive',
+    FileKinds=['dll', 'exe', 'deps.json', 'runtimeconfig.json', 'ptx', 'so', 'versioned-so', 'dylib'],
+    ReparsePoints='reject')
+
+
+def runtime_artifact(path):
+    name = basename(path).lower()
+    return name.endswith(('.dll', '.exe', '.deps.json', '.runtimeconfig.json', '.ptx', '.so', '.dylib')) \
+        or re.search(r'\.so\.[0-9]+(?:\.[0-9]+)*$', name) is not None
+
+
+def runtime_manifest(files, app):
+    return {canonical(str(pathlib.Path(app) / name)): metadata['Sha256']
+            for name, metadata in files.items() if runtime_artifact(name)}
 
 
 def sha(path):
@@ -99,11 +113,41 @@ def deployment(receipt, app, variant='native16'):
     return files, native, managed_expected, wrapper_expected
 
 
+def legacy_wrapper_collection(files, app):
+    """The historical owned wrapper enumerated immediate files, not rglob.
+
+    Keep the full SDK receipt pinned separately. Do not pretend that nested
+    runtime assets, apphost or PTX were captured in old before/after telemetry.
+    """
+    directory = canonical(app).rstrip('/')
+    return {canonical(path): digest for path, digest in files.items()
+            if canonical(path).rsplit('/', 1)[0] == directory}
+
+
+def controls(plan):
+    """Pinned width sweep only; every other resource/request control is fixed.
+
+    Historical plans have no width field and retain their exact PP32 command.
+    A requested width is never silently replaced with a smaller effective one.
+    """
+    rows = plan.get('BenchmarkPrefillRows', 32)
+    if type(rows) is not int or rows not in (32, 64, 128):
+        raise ValueError('Benchmark prefill must be exactly32,64 or128')
+    options = OPTIONS | {'PrefillChunkTokens': rows}
+    arguments = ARGS | {'prefill': str(rows)}
+    if 'RequestedOptions' in plan:
+        claimed = plan['RequestedOptions']
+        if not isinstance(claimed, dict) or claimed.keys() != options.keys() or any(
+                type(claimed[key]) is not type(value) or claimed[key] != value for key, value in options.items()):
+            raise ValueError('Requested options differ from the fixed budget/width profile')
+    return options, arguments
+
+
 def command(plan):
     values = ['dotnet', str(pathlib.Path(plan['AppDirectory']) / 'GlmUnifiedSessionProbe.dll'),
         '--output', plan['ReportOutput'], '--model', plan['Model'], '--tokens-file', plan['InputFile']['Path'],
         '--model-identity', plan['ModelIdentity']['Path'], '--native-sha256', plan['Native']['Sha256']]
-    for key, value in ARGS.items(): values += ['--' + key, value]
+    for key, value in controls(plan)[1].items(): values += ['--' + key, value]
     return values
 
 
@@ -360,11 +404,15 @@ def verify_plan_files(plan):
     if canonical(plan['Model']) != canonical(runtime_binding['SourceModel']): raise ValueError('Actual verified source/runtime model binding differs')
     if not same_identity(plan['Oracle'], identity(fixed.__file__)) or not same_identity(plan['Checker'], identity(__file__)):
         raise ValueError('Plan names a different executing oracle/checker')
-    _, native, expected, wrapper = deployment(load(plan['DeploymentReceipt']['Path']), plan['AppDirectory'],
+    sdk_files, native, expected, wrapper = deployment(load(plan['DeploymentReceipt']['Path']), plan['AppDirectory'],
         plan.get('NativeVariant', 'native16'))
     if plan['Native'] != native or plan['ManagedIdentities'] != expected or plan['WrapperFiles'] != wrapper \
         or plan['Managed'] != managed(expected) or plan['ModelManifest'] != load(plan['ModelIdentity']['Path']) \
         or plan['Command'] != command(plan): raise ValueError('Plan expectations differ from pinned provenance')
+    if 'RuntimeCaptureScope' in plan or 'RuntimeFiles' in plan:
+        if plan.get('RuntimeCaptureScope') != RUNTIME_CAPTURE_SCOPE \
+            or plan.get('RuntimeFiles') != runtime_manifest(sdk_files, plan['AppDirectory']):
+            raise ValueError('Plan recursive runtime collection differs from complete pinned SDK receipt')
     text = pathlib.Path(plan['InputFile']['Path']).read_text(encoding='utf-8')
     if text != ','.join(map(str, binding['PromptTokens'])) + '\n':
         raise ValueError('Original raw input file differs from pinned source')
@@ -405,15 +453,17 @@ def qualify(plan, report, wrapper):
             and report['SemanticPassed'] is None and report['AllRoundsSemanticPassed'] is None, 'Unknown remains unassessed in original probe')
         check(report['CompletedRepetitions'] == 1 and report['RequestedRepetitions'] == 1
             and report['EngineCompletionObserved'] is True, 'Exactly one completed request')
-        check(all(type(report['SessionOptions'][k]) is type(v) and report['SessionOptions'][k] == v for k, v in OPTIONS.items()), 'Exact public session options')
-        check(all(report['Arguments'][k] == v for k, v in ARGS.items()), 'Exact request controls')
+        options, arguments = controls(plan)
+        rows = options['PrefillChunkTokens']
+        check(all(type(report['SessionOptions'][k]) is type(v) and report['SessionOptions'][k] == v for k, v in options.items()), 'Exact public session options')
+        check(all(report['Arguments'][k] == v for k, v in arguments.items()), 'Exact request controls')
         for key, expected in [('model', plan['Model']), ('tokens-file', plan['InputFile']['Path']), ('model-identity', plan['ModelIdentity']['Path'])]:
             check(canonical(report['Arguments'][key]) == canonical(expected), 'Request argument path: ' + key)
-        check(report['EffectiveContextTokens'] == 1024 and report['EffectivePrefillChunkTokens'] == 32
+        check(report['EffectiveContextTokens'] == 1024 and report['EffectivePrefillChunkTokens'] == rows
             and report['EffectiveCpuThreads'] == 8, 'Effective shapes/threads')
         scheduler = report['Scheduler']
-        check(all(type(scheduler[k]) is type(v) and scheduler[k] == v for k, v in dict(PrefillChunkTokenLimit=32, MaxPrefillChunkSize=32,
-            SoloPrefillChunkSize=32, MaxNumBatchedTokens=32, MaxNumRunningSequences=1,
+        check(all(type(scheduler[k]) is type(v) and scheduler[k] == v for k, v in dict(PrefillChunkTokenLimit=rows, MaxPrefillChunkSize=rows,
+            SoloPrefillChunkSize=rows, MaxNumBatchedTokens=rows, MaxNumRunningSequences=1,
             EnablePrefixCaching=False, StopRepetition=False, SharedAdmission=True, Enabled=False).items()), 'Scheduler uses effective cap/shared admission/no spec')
         rounds = report['Rounds']; check(len(rounds) == 1, 'Single round array')
         if len(rounds) == 1:
@@ -463,8 +513,22 @@ def qualify(plan, report, wrapper):
         check(len(wrapper['command']) == len(plan['Command']) and all(canonical(a) == canonical(b)
             for a, b in zip(wrapper['command'], plan['Command'])), 'Exact owned wrapper command')
         check(canonical(report['Arguments']['output']) == canonical(plan['ReportOutput']), 'Report output belongs to planned execution')
+        capture_scope = telemetry.get('capture_scope')
+        if capture_scope is None:
+            check('RuntimeCaptureScope' not in plan and 'RuntimeFiles' not in plan,
+                'Legacy wrapper capture cannot satisfy a recursive runtime plan')
+            expected_wrapper = legacy_wrapper_collection(plan['WrapperFiles'], plan['AppDirectory'])
+            collection_scope = 'historical top-level DLL/deps/runtimeconfig files; absent schema is legacy only'
+        elif capture_scope == RUNTIME_CAPTURE_SCOPE and plan.get('RuntimeCaptureScope') == RUNTIME_CAPTURE_SCOPE \
+                and isinstance(plan.get('RuntimeFiles'), dict):
+            expected_wrapper = plan['RuntimeFiles']
+            collection_scope = 'explicit recursive runtime artifacts, exact set from pinned complete SDK receipt'
+        else:
+            expected_wrapper = {}
+            collection_scope = 'unsupported runtime capture schema'
+            check(False, 'Unsupported wrapper runtime capture scope')
         for field in ('managed_files_before', 'managed_files_after'):
-            check({canonical(p): value for p, value in telemetry[field].items()} == plan['WrapperFiles'], 'Wrapper deployment hashes: ' + field)
+            check({canonical(p): value for p, value in telemetry[field].items()} == expected_wrapper, 'Wrapper deployment hashes: ' + field)
         engine = report['EngineCountersBeforeDispose']
         check(engine['TotalSubmitted'] == 1 and engine['TotalCompleted'] == 1
             and all(engine[k] == 0 for k in ('RunningCount', 'WaitingCount', 'PendingRequestCount')), 'One completed quiescent engine request')
@@ -481,6 +545,12 @@ def qualify(plan, report, wrapper):
             Timing=report['Timing'], BudgetAfterCompletion=report['BudgetAfterCompletion'],
             BudgetAfterCleanup=report['BudgetAfterSessionDisposed'], FinalLogitsFinite=report['FinalLogitsFinite'],
             ModelMetadataBinding=model_binding,
+            WrapperIntegrityScope=dict(Collection=collection_scope,
+                ExpectedCapturedFiles=expected_wrapper,
+                StaticSdkReceiptOnlyFiles={p: value for p, value in plan['WrapperFiles'].items()
+                    if canonical(p) not in expected_wrapper},
+                Limitation=('Nested/runtimeTargets, apphost and PTX remain static SDK/deployment receipt evidence; old wrapper did not dynamically capture them.'
+                    if capture_scope is None else 'Recursive on-disk before/after identities, not continuously observed loaded-module identities. Other SDK files remain static receipt evidence.')),
             Limits=['Only independent fixed task, no reference-answer equality or output repair.',
                 'Code oracle compares safe AST; no generated code execution. Literal tool JSON is not tool execution/agent acceptance.',
                 'Logits null means unavailable, not numerical acceptance. Parsed output is supplied by pinned production parser.',
@@ -515,11 +585,14 @@ def prepare(args):
             Oracle=identity(fixed.__file__), Checker=identity(__file__), InputFile=identity(token_file),
             Model=args.model, EosIds=[154820, 154827, 154829], NativeVariant=args.variant, Native=native, Managed=managed(managed_expected),
             ManagedIdentities=managed_expected, WrapperFiles=wrapper_expected, AppDirectory=str(app),
+            RuntimeCaptureScope=copy.deepcopy(RUNTIME_CAPTURE_SCOPE), RuntimeFiles=runtime_manifest(files, str(app)),
             WrapperOutput=str(out / (case + '-wrapper')), ReportOutput=str(target),
             Environment={'CUDA_VISIBLE_DEVICES': '0', 'CUDA_MODULE_LOADING': 'EAGER', 'TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS': '1'},
-            DeadlineSeconds=900, RequestedOptions=OPTIONS,
+            DeadlineSeconds=900, RequestedOptions=OPTIONS | {'PrefillChunkTokens': getattr(args, 'prefill', 32)},
             Scope='Preparation only; source input IDs, not generated answers. Same historical Maya conditioning, not equivalent physical resource or current Maya performance acceptance.',
             ExpectedProbeUnknownExit=1, ExecutionStatus='not-run')
+        if getattr(args, 'prefill', 32) != 32:
+            plan['BenchmarkPrefillRows'] = args.prefill
         if relocation_path:
             raw = load(relocation_path); original_manifest = load(original_manifest_path)
             plan['Relocation'] = dict(Receipt=identity(relocation_path), ReceiptData=raw,
@@ -553,6 +626,8 @@ def main():
     prep.add_argument('--source-directory', default=str(BASE / 'default-readiness-20261010'))
     prep.add_argument('--app', default=str(BASE / 'master-merge-20261013/glm-selected-comparison-v3-apps/native16'))
     prep.add_argument('--variant', default='native16', help='Exact versioned Variant in the immutable deployment receipt')
+    prep.add_argument('--prefill', type=int, choices=(32, 64, 128), default=32,
+        help='Exact admitted prefill width; budgets, conditioning and all other controls stay fixed')
     prep.add_argument('--deployment-receipt', default=str(BASE / 'master-merge-20261013/glm-selected-comparison-v3-apps/deployment-receipt.json'))
     prep.add_argument('--model', default='E:/models/GLM-5.3-Flash-GGUF/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf')
     prep.add_argument('--model-identity', default=str(BASE / 'default-readiness-20261010/glm-e-identity-v1.json'))

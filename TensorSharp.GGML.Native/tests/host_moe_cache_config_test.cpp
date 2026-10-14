@@ -23,7 +23,7 @@ int main() {
     require(config.fast_budget() == 17 && config.settings().layers == 48 && config.settings().max_rows == 8);
     require(config.settings().max_decode_rows == 1);
     require(!config.settings().capacity_growth && config.growth_generation() == 0);
-    for (auto value : {HostMoeCacheSettings{100, 0, 64}, {100, 48, 0}, {100, 48, 129},
+    for (auto value : {HostMoeCacheSettings{100, 0, 64}, {100, 48, 0}, {100, 48, 1025},
             {100, 48, 32, 0}, {100, 48, 32, 9}})
         require(config.begin(value, true) == 0);
     require(config.begin({100, 12, 64}, false) == 0); // A live legacy cache is never adopted.
@@ -60,6 +60,9 @@ int main() {
     require(second != 0 && second != token && config.fast_budget() == 0);
     require(!config.end(token, [] {}) && config.owns(second));
     require(config.end(second, [] {}) && config.fast_budget() == 17);
+    const auto wide_glm = config.begin({100, 12, 1024, 3}, true);
+    require(wide_glm != 0 && config.settings().max_rows == 1024 && config.settings().max_decode_rows == 3);
+    require(config.end(wide_glm, [] {}) && config.settings().max_rows == 8);
 
     const auto growth = config.begin({100, 12, 32, 3, true}, true);
     require(growth != 0 && config.settings().capacity_growth && config.growth_generation() == 1);

@@ -47,6 +47,7 @@
 #include "ggml_ops_internal.h"
 #include "dsv4_file_warm.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_host_moe_cache_policy.h"
 #include "glm_file_strip.h"
 #include "glm_joined_workers.h"
 #include "glm_metadata_owner.h"
@@ -440,6 +441,7 @@ struct graph_build_result
     std::vector<int32_t> selected_expert_ids;
     size_t selected_expert_completed = 0;
     bool selected_expert_failed = false;
+    std::uint64_t selected_expert_error_epoch = 0;
     int64_t n_ovr = 0;   // glm5next vision-override rows this graph expects
 
     ggml_context * ctx = nullptr;
@@ -496,6 +498,7 @@ struct glm_model
     bool selected_expert_seams = false;
     int selected_expert_groups = 0;
     size_t selected_expert_minimum_bytes = 0;
+    std::vector<tsg::HostMoePhaseGroupMinimum> selected_expert_group_minima;
     int selected_expert_planned_rows = 0;
     struct expert_file_range {
         const void* pointer; int64_t bytes; std::string path; int64_t offset;
@@ -1517,6 +1520,12 @@ static void glm_test_batched_dispatch_fault(int stage)
     if (glm_test_batched_dispatch_stage == stage)
     {
         glm_test_batched_dispatch_stage = 0;
+        if ((stage == 4 || stage == 5) && glm_test_batched_dispatch_kind == 1) {
+            // Reported IDs download or last-seam drain error only, not a real
+            // driver failure. The production epoch guards reject publication.
+            tsg::g_ggml_error_count.fetch_add(1, std::memory_order_acq_rel);
+            return;
+        }
         if (glm_test_batched_dispatch_kind == 1) throw std::bad_alloc();
         throw 17;
     }
@@ -5486,9 +5495,21 @@ static bool glm_selected_expert_callback(ggml_tensor* tensor, bool ask, void* da
     try {
         if (found->second != graph.selected_expert_completed) throw std::runtime_error("GLM expert boundaries executed out of order");
         const auto& seam = graph.selected_expert_seams[found->second];
+        if (seam.segment.n_used < 1 || seam.segment.n_used > 64
+            || !tsg::host_moe_cache_prefill_fits(seam.segment.seq_len, seam.segment.n_used, true)
+            || (seam.segment.independent_decode_rows && seam.segment.seq_len > tsg::kHostMoeCacheMaxDecodeRows))
+            throw std::runtime_error("GLM selected-expert callback exceeds its complete row/route bound");
         const auto routes = static_cast<size_t>(seam.segment.n_used) * seam.segment.seq_len;
         graph.selected_expert_ids.resize(routes);
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != graph.selected_expert_error_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
+            throw std::runtime_error("GLM selected-expert producer failed before IDs download");
+        const auto errors_before_ids = tsg::g_ggml_error_count.load(std::memory_order_acquire);
         ggml_backend_tensor_get(seam.segment.sel_ids, graph.selected_expert_ids.data(), 0, routes * sizeof(int32_t));
+        glm_test_batched_dispatch_fault(4);
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != errors_before_ids
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
+            throw std::runtime_error("GLM selected expert IDs download failed before cache dispatch");
         const int cached = tsg::host_moe_cached_experts(seam.segment, nullptr, graph.selected_expert_ids.data(),
             nullptr, nullptr,
             !seam.segment.independent_decode_rows
@@ -5498,9 +5519,16 @@ static bool glm_selected_expert_callback(ggml_tensor* tensor, bool ask, void* da
         // place to silently change expert arithmetic. Fence this request and
         // retain its state until explicit reset instead of mixing CPU/GPU rows.
         if (cached != 1) throw std::runtime_error(std::string("GLM selected-expert CUDA cache declined the dispatched route union: ") + tsg::g_last_error);
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != graph.selected_expert_error_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
+            throw std::runtime_error("GLM selected-expert helper failed before final drain");
         // Even the device bridge can leave a final copy queued. Drain the same
         // actual model stream before a consumer or cache eviction observes it.
         tsg::sync_backend(seam.backend);
+        if (found->second + 1 == graph.selected_expert_seams.size()) glm_test_batched_dispatch_fault(5);
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != graph.selected_expert_error_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
+            throw std::runtime_error("GLM selected-expert final drain failed before seam completion");
         glm_test_batched_dispatch_fault(3);
         ++graph.selected_expert_completed;
         return true;
@@ -5533,6 +5561,12 @@ static bool glm_prepare_selected_expert_graph(glm_model& model, graph_build_resu
         ggml_backend_sched_set_tensor_backend(graph.sched, node, backend);
     }
     for (const auto& seam : graph.selected_expert_seams) {
+        if (seam.segment.n_used < 1 || seam.segment.n_used > 64
+            || !tsg::host_moe_cache_prefill_fits(seam.segment.seq_len, seam.segment.n_used, true)
+            || (seam.segment.independent_decode_rows && seam.segment.seq_len > tsg::kHostMoeCacheMaxDecodeRows)) {
+            tsg::set_last_error("GLM selected-expert graph exceeds its complete row/route bound");
+            return false;
+        }
         ggml_backend_sched_set_tensor_backend(graph.sched, seam.segment.moe_out, backend);
         ggml_backend_sched_set_tensor_backend(graph.sched, seam.segment.moe_in, backend);
         ggml_backend_sched_set_tensor_backend(graph.sched, seam.segment.sel_ids, backend);
@@ -5556,12 +5590,19 @@ static bool glm_check_selected_expert_assignment(glm_model& model, graph_build_r
 static void glm_begin_selected_expert_graph(graph_build_result& graph)
 {
     graph.selected_expert_completed = 0; graph.selected_expert_failed = false;
+    if (!graph.selected_expert_seams.empty())
+        graph.selected_expert_error_epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
 }
 
 static bool glm_finish_selected_expert_graph(glm_model& model, const graph_build_result& graph)
 {
     if (graph.selected_expert_failed || graph.selected_expert_completed != graph.selected_expert_seams.size()) return false;
     if (!graph.selected_expert_seams.empty()) {
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != graph.selected_expert_error_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire)) {
+            tsg::set_last_error("GLM selected-expert graph completion failed before logits publication");
+            return false;
+        }
         ++model.selected_expert_graphs;
         model.selected_expert_calls += graph.selected_expert_completed;
     }
@@ -5741,6 +5782,7 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
     bool reused = false;
     graph_build_result * gr = acquire_batched_graph(m, n, slot_ids, positions, &reused);
     if (!gr) { bd_log("no graph\n"); return false; }
+    glm_begin_selected_expert_graph(*gr);
     bd_log("graph %s\n", reused ? "reused" : "built");
 
     const bool f16_mask = m.flash_attn;
@@ -5864,7 +5906,6 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
         }
     } dispatch_guard{m, gr};
     if (!m.batched_execution.begin_dispatch(n, slot_ids)) return false;
-    glm_begin_selected_expert_graph(*gr);
     if (ggml_backend_sched_graph_compute_async(gr->sched, gr->gf) != GGML_STATUS_SUCCESS) return false;
     ggml_backend_sched_synchronize(gr->sched);
     if (!glm_finish_selected_expert_graph(m, *gr)) return false;
@@ -6236,6 +6277,7 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     bool reused = false;
     graph_build_result * gr = acquire_graph(m, slot, nt, p0, n_out, want_logits, &reused, want_h, /*kind=*/0, n_ovr);
     if (!gr) return false;
+    glm_begin_selected_expert_graph(*gr);
 
     const int64_t n_kv = gr->n_kv;
     std::vector<graph_build_result *> exec_graphs;
@@ -6387,7 +6429,6 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
             slot.kda_restore_failed = true; model.kda_snap.valid = false;
         }
     } selected_guard{m, slot, *gr, !gr->selected_expert_seams.empty()};
-    glm_begin_selected_expert_graph(*gr);
     if (gr->tp_fused)
     {
         if (!execute_fused_tp(m, *gr))
@@ -6513,7 +6554,7 @@ using namespace tsg_glm;
 
 // Version 1 accounts native GLM weights/constants/slots and cached schedulers.
 TSG_EXPORT int TSGgml_GlmUnifiedBudgetVersion() { return 2; }
-TSG_EXPORT int TSGgml_GlmSelectedExpertAdapterVersion() { return 3; }
+TSG_EXPORT int TSGgml_GlmSelectedExpertAdapterVersion() { return 7; }
 TSG_EXPORT int TSGgml_GlmTrimMappedResidency(void* handle)
 {
     auto* m = static_cast<glm_model*>(handle);
@@ -6536,26 +6577,34 @@ TSG_EXPORT int TSGgml_GlmSelectedExpertMinimumBudget(void* handle, int rows, int
     if (bytes) *bytes = 0;
     if (!m || !bytes || rows < 1 || rows > 3 || !m->hp.g5n || m->tp != 1 || m->n_gpu != 1
         || m->has_mtp || m->selected_expert_groups <= 0 || m->selected_expert_seams || !m->graph_cache.empty()) return 0;
+    if (m->hp.n_expert_used < 1 || m->hp.n_expert_used > 64
+        || !tsg::host_moe_cache_prefill_fits(m->n_ubatch, m->hp.n_expert_used, true)) return 0;
     for (const auto& slot : m->slots) if (slot.second->n_past != 0) return 0;
     try {
-        size_t group_minimum = 0;
+        std::vector<tsg::HostMoePhaseGroupMinimum> groups;
+        groups.reserve(static_cast<size_t>(m->selected_expert_groups));
         for (int il = 0; il < m->hp.n_layer; ++il) {
             const auto& layer = m->layers[il];
             if (!layer.cpu_moe || !layer.w[0].ffn_gate_exps) continue;
             const auto segment = selected_expert_segment(*m, il, rows, rows > 1);
             if (segment.n_ff != m->hp.n_ff_exp)
                 throw std::runtime_error("GLM pooled groups require their declared uniform expert geometry");
-            size_t planned = 0;
-            if (!tsg::host_moe_expert_cache_minimum_prefill_plan(segment, rows, m->n_ubatch, m->backends[0], planned))
+            const auto key = tsg::host_moe_expert_group_key(segment);
+            if (std::any_of(groups.begin(), groups.end(), [&](const auto& group) { return group.key == key; })) continue;
+            size_t narrow = 0, wide = 0;
+            if (!tsg::host_moe_expert_cache_minimum_phase_plan(segment, rows, m->n_ubatch, m->backends[0], narrow, wide))
                 throw std::runtime_error("GLM compact expert layout or exact-width graph cannot be planned");
-            group_minimum = std::max(group_minimum, planned);
+            groups.push_back({key, narrow, wide});
         }
-        // Scope quotas are equal per distinct layout. The largest measured
-        // group sets their common minimum, including all variant scratch,
-        // quantized tails/alignment and the existing workspace allowance.
-        if (!group_minimum || group_minimum > static_cast<uint64_t>(INT64_MAX) / m->selected_expert_groups)
-            throw std::runtime_error("GLM minimum expert plan exceeds supported byte geometry");
-        const size_t total = group_minimum * m->selected_expert_groups;
+        // Only one serialized helper is wide at a time. Its whole union and
+        // the other groups' narrow floors define the measured phase minimum.
+        // Actual inactive owners are physically evicted before any credit reuse.
+        tsg::HostMoePhaseQuotaPlan plan(std::move(groups));
+        if (plan.size() != static_cast<size_t>(m->selected_expert_groups))
+            throw std::runtime_error("GLM group identities disagree with the loaded trunk");
+        const size_t total = plan.minimum();
+        auto published = plan.groups(); // Any metadata allocation precedes model publication.
+        m->selected_expert_group_minima.swap(published);
         m->selected_expert_minimum_bytes = total; m->selected_expert_planned_rows = rows;
         *bytes = static_cast<int64_t>(total);
         return 1;
@@ -6576,6 +6625,8 @@ TSG_EXPORT int TSGgml_GlmConfigureSelectedExpertSeams(void* handle, int enabled)
     auto* m = static_cast<glm_model*>(handle);
     if (!m || (enabled != 0 && enabled != 1) || !m->hp.g5n || m->tp != 1 || m->n_gpu != 1
         || m->has_mtp || m->selected_expert_groups <= 0 || m->selected_expert_ranges.empty()) return 0;
+    if (enabled && (m->hp.n_expert_used < 1 || m->hp.n_expert_used > 64
+        || !tsg::host_moe_cache_prefill_fits(m->n_ubatch, m->hp.n_expert_used, true))) return 0;
     if (enabled && !tsg::host_moe_expert_cache_scope_matches_plan(m->selected_expert_minimum_bytes,
         m->selected_expert_groups, m->n_ubatch, m->selected_expert_planned_rows)) {
         tsg::set_last_error("GLM expert scope cannot protect the measured admitted union and graph variants before dispatch");
@@ -6596,6 +6647,9 @@ TSG_EXPORT int TSGgml_GlmConfigureSelectedExpertSeams(void* handle, int enabled)
                     throw std::runtime_error("GLM expert source already registered or invalid");
                 m->registered_expert_ranges.push_back(range.pointer);
             }
+            if (!tsg::host_moe_expert_cache_install_phase_plan(m->selected_expert_group_minima,
+                m->n_ubatch, m->selected_expert_planned_rows, m->backends[0]))
+                throw std::runtime_error("GLM measured group floors cannot be installed in this empty exclusive scope");
         } else {
             tsg::host_moe_expert_cache_release_backend(m->backends[0]);
             for (const void* pointer : m->registered_expert_ranges) tsg::host_moe_expert_cache_on_drop(pointer);

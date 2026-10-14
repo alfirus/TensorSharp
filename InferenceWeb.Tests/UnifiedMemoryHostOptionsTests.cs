@@ -25,14 +25,20 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
     }
 
     [Fact]
-    public void AbsentTuningPreservesUnifiedDefaultsAndLeavesProcessEnvironmentUntouched()
+    public void ExplicitUnifiedHostSelectsThePlannedGlmTierWithoutChangingApiDefaultsOrEnvironment()
     {
-        var expected = new UnifiedMemoryModelOptions();
+        var expected = new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
+            AdaptiveGlmPrefillChunkTokens = 1024 };
         Assert.Equal(expected, UnifiedMemorySessionHandle.ResolveHostOptions());
         Assert.Equal(512, expected.PrefillChunkTokens);
+        Assert.Equal(1024, expected.ResolveGlmPrefillChunkTokens());
+        Assert.Null(new UnifiedMemoryModelOptions().AdaptiveGlmPrefillChunkTokens);
         Assert.Equal(0, expected.ContextTokens);
         Assert.Equal(3, expected.MaximumRunningRequests);
-        Assert.False(expected.EnableGlmSelectedExperts);
+        Assert.True(expected.EnableGlmSelectedExperts);
+        Assert.False(new UnifiedMemoryModelOptions().EnableGlmSelectedExperts);
+        Assert.True(expected.EnableAdaptiveGlmPrefill);
+        Assert.False(new UnifiedMemoryModelOptions().EnableAdaptiveGlmPrefill);
         Assert.False(expected.EnableAsyncExpertPrefill);
         Assert.False(expected.EnableExpertCacheCapacityGrowth);
         Assert.All(_previous.Keys, name => Assert.Null(Environment.GetEnvironmentVariable(name)));
@@ -43,17 +49,21 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
     [InlineData("16", 16)]
     [InlineData("128", 128)]
     [InlineData("512", 512)]
-    public void ExplicitPrefillCapChangesOnlyTheCommonModelLoadOptions(string value, int expected)
+    public void ExplicitPrefillCapConstrainsBothCommonAndAdaptiveGlmModelLoadOptions(string value, int expected)
     {
         Environment.SetEnvironmentVariable("TS_SCHED_PREFILL_CHUNK", value);
         var options = UnifiedMemorySessionHandle.ResolveHostOptions();
-        Assert.Equal(new UnifiedMemoryModelOptions { PrefillChunkTokens = expected }, options);
+        Assert.Equal(new UnifiedMemoryModelOptions { PrefillChunkTokens = expected,
+            EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
+            AdaptiveGlmPrefillChunkTokens = expected }, options);
+        Assert.Equal(expected, options.ResolveGlmPrefillChunkTokens());
         Assert.Equal(value, Environment.GetEnvironmentVariable("TS_SCHED_PREFILL_CHUNK"));
         // A later load receives a fresh snapshot, rather than mutating a prior
         // session's immutable options or resetting the operator's environment.
         Environment.SetEnvironmentVariable("TS_SCHED_PREFILL_CHUNK", "32");
         Assert.Equal(32, UnifiedMemorySessionHandle.ResolveHostOptions().PrefillChunkTokens);
         Assert.Equal(expected, options.PrefillChunkTokens);
+        Assert.Equal(expected, options.AdaptiveGlmPrefillChunkTokens);
     }
 
     [Theory]
@@ -112,6 +122,7 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
         Assert.True(ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(args));
         Assert.True(ServerOptionsBuilder.Build(args, Path.GetTempPath()).UnifiedMemoryEnabled);
         Assert.Equal(expected, UnifiedMemorySessionHandle.ResolveHostOptions().PrefillChunkTokens);
+        Assert.Equal(expected, UnifiedMemorySessionHandle.ResolveHostOptions().AdaptiveGlmPrefillChunkTokens);
     }
 
     [Fact]
@@ -133,6 +144,8 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
     {
         Environment.SetEnvironmentVariable("TS_PER_SEQ_FUSED", value);
         Environment.SetEnvironmentVariable("TS_BATCHED_FUSED_DECODE", value);
-        Assert.Equal(new UnifiedMemoryModelOptions(), UnifiedMemorySessionHandle.ResolveHostOptions());
+        Assert.Equal(new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
+                AdaptiveGlmPrefillChunkTokens = 1024 },
+            UnifiedMemorySessionHandle.ResolveHostOptions());
     }
 }

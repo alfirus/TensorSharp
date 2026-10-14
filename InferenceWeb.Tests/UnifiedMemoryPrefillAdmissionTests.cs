@@ -207,6 +207,141 @@ public sealed class RequestPrefillLimitExecutionTests
     }
 
     [Fact]
+    public async Task GlmAdaptiveSelectionDrivesRealChunksAndLatePressureRefusesImmutableWorkBeforeForward()
+    {
+        const long unit = 1L << 20;
+        const string host = UnifiedMemoryModelSession.HostPool, device = UnifiedMemoryModelSession.DevicePool;
+        MemoryCharge[] Charges(long h, long d) => [new(host, h * unit), new(device, d * unit)];
+        var budget = new MemoryBudget(Charges(1000, 1000));
+        using var dense = budget.Reserve(Charges(0, 100));
+        using var expert = budget.Reserve([new(device, 600 * unit)]);
+        using var joint = budget.Reserve(Charges(0, 0));
+        var caps = new Dictionary<SequenceState, int>();
+        bool pressure = false;
+        InferenceMemoryBytes Bytes(BudgetReservation owner) => new(
+            owner.OwnedCharges.Single(c => c.Pool == host).Bytes,
+            owner.OwnedCharges.Single(c => c.Pool == device).Bytes);
+        var admission = new RequestMemoryAdmission(budget, _ => Charges(10, 10))
+        {
+            UsePerSequenceHolders = true, ReestimateAfterPhysicalCheck = true,
+            BeforeAdmissionWithRunning = (_, _) => Charges(1000, 1000),
+            EnterSerialExecution = _ => new Scope(), PrefillTokenLimit = seq => caps[seq],
+            AfterPrefixMaterialization = seq =>
+            {
+                long cache = expert.OwnedCharges.Single().Bytes;
+                Assert.True(GlmUnifiedPrefillAdmission.TrySelect(budget.Snapshot(), Charges(1000, 1000),
+                    Bytes(joint), Bytes(seq.MemoryEnvelope!), cache, 200 * unit,
+                    Math.Min(64, seq.PromptTokens.Count - seq.NumComputedTokens),
+                    rows => (new(20 * unit, rows * 10L * unit), new(10 * unit, 10 * unit)), out var selected));
+                // This fixture's cache has only unused credit; fenced physical
+                // release ordering is covered separately with native fault seams.
+                Assert.True(expert.TryResizeTotal([new(device, selected.ExpertTargetBytes)]));
+                Assert.True(budget.TryResizeTotals([(joint, new MemoryCharge[] {new(host, selected.JointTarget.Host), new(device, selected.JointTarget.Device)}),
+                    (seq.MemoryEnvelope!, new MemoryCharge[] {new(host, selected.RequestTarget.Host), new(device, selected.RequestTarget.Device)})],
+                    Charges(1000, 1000), requirePhysicalFit: true));
+                caps[seq] = selected.Rows;
+            },
+            RevalidateExecution = seq =>
+            {
+                // The already-scheduled cap is immutable. A lower observation
+                // cannot turn its work into a smaller, silently forwarded chunk.
+                if (!budget.TryResizeTotals([(joint, joint.OwnedCharges),
+                    (seq.MemoryEnvelope!, seq.MemoryEnvelope!.OwnedCharges)],
+                    Charges(1000, pressure ? 900 : 1000), requirePhysicalFit: true))
+                    throw new MemoryPressureException("late GLM physical pressure");
+            },
+            AfterSequenceMemoryRelease = running => { if (running.Count == 0) Assert.True(joint.TryResizeTotal(Charges(0, 0))); }
+        };
+        var config = Config(admission);
+        var pool = new BlockPool(256, 4, 0); using var storage = pool.Storage;
+        using var model = new RecordingModel();
+        var scheduler = new ContinuousBatchScheduler(config, pool);
+        var executor = new BatchExecutor(model, pool, scheduler);
+        var denied = new SequenceState("glm-pressure", Enumerable.Range(1, 70).ToArray(), 2, 4, SamplingConfig.Greedy);
+        scheduler.Submit(denied);
+        var first = scheduler.Schedule();
+        Assert.Equal(64, Assert.Single(first.ScheduledWork).NumScheduledTokens);
+        Assert.Null(Assert.Single(executor.ExecuteStep(first)).Error);
+        Assert.Equal(new[] {64}, model.ForwardRows);
+        pressure = true;
+        var immutable = scheduler.Schedule();
+        Assert.Equal(6, Assert.Single(immutable.ScheduledWork).NumScheduledTokens);
+        var refusal = Assert.Single(executor.ExecuteStep(immutable));
+        Assert.IsType<MemoryPressureException>(refusal.Error);
+        Assert.Equal(64, caps[denied]);
+        Assert.Equal(64, denied.NumComputedTokens);
+        Assert.Equal(new[] {64}, model.ForwardRows);
+        scheduler.Abort(denied.RequestId); scheduler.NotifyMemoryReleased(denied.RequestId);
+        Assert.True(joint.TryResizeTotal(Charges(0, 0)));
+        pressure = false;
+        using var healthyModel = new RecordingModel();
+        using var engine = new InferenceEngine(healthyModel, config);
+        var healthy = new SequenceState("glm-healthy", [101, 102], 2, 4, SamplingConfig.Greedy);
+        await engine.SubmitRequest(healthy).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] {103, 104}, healthy.OutputTokens);
+        Assert.Equal(0, engine.WaitingCount);
+    }
+
+    [Fact]
+    public async Task WiderGlmAdmissionDrivesRealLargeChunksWhileKeepingTwoGenerationsAndFullSlotCredit()
+    {
+        const long unit = 1L << 20;
+        const string host = UnifiedMemoryModelSession.HostPool, device = UnifiedMemoryModelSession.DevicePool;
+        MemoryCharge[] Charges(long h, long d) => [new(host, h * unit), new(device, d * unit)];
+        var budget = new MemoryBudget(Charges(4096, 2048));
+        using var dense = budget.Reserve(Charges(0, 128)); dense.Commit();
+        using var expert = budget.Reserve([new(device, 384 * unit)]);
+        using var joint = budget.Reserve(Charges(0, 0));
+        var caps = new Dictionary<SequenceState, int>();
+        var admission = new RequestMemoryAdmission(budget, _ => Charges(32, 128))
+        {
+            UsePerSequenceHolders = true, ReestimateAfterPhysicalCheck = true,
+            BeforeAdmissionWithRunning = (_, _) => Charges(4096, 2048),
+            EnterSerialExecution = _ => new Scope(), PrefillTokenLimit = seq => caps[seq],
+            AfterPrefixMaterialization = seq =>
+            {
+                long cache = expert.OwnedCharges.Single().Bytes;
+                Assert.True(GlmUnifiedPrefillAdmission.TrySelect(budget.Snapshot(), Charges(4096, 2048),
+                    new(joint.OwnedCharges.Single(c => c.Pool == host).Bytes, joint.OwnedCharges.Single(c => c.Pool == device).Bytes),
+                    new(seq.MemoryEnvelope!.OwnedCharges.Single(c => c.Pool == host).Bytes,
+                        seq.MemoryEnvelope.OwnedCharges.Single(c => c.Pool == device).Bytes),
+                    cache, 128 * unit, 1024,
+                    // Both scratch generations and the complete new slot are
+                    // explicitly owned. This fixture has unused expert credit;
+                    // native physical trim/fence ordering is covered separately.
+                    rows => (new(64 * unit, 2L * rows * unit), new(32 * unit, 128 * unit)), out var selected));
+                Assert.Equal(832, selected.Rows);
+                Assert.True(expert.TryResizeTotal([new(device, selected.ExpertTargetBytes)]));
+                Assert.True(budget.TryResizeTotals([(joint, new MemoryCharge[] {new(host, selected.JointTarget.Host),
+                        new(device, selected.JointTarget.Device)}),
+                    (seq.MemoryEnvelope, new MemoryCharge[] {new(host, selected.RequestTarget.Host),
+                        new(device, selected.RequestTarget.Device)})], Charges(4096, 2048), requirePhysicalFit: true));
+                caps[seq] = selected.Rows;
+            },
+            AfterSequenceMemoryRelease = running =>
+            { if (running.Count == 0) Assert.True(joint.TryResizeTotal(Charges(0, 0))); }
+        };
+        var config = new SchedulerConfig
+        {
+            BlockSize = 4, NumBlocks = 1024, MaxNumRunningSequences = 3,
+            MaxNumBatchedTokens = 1024, MaxPrefillChunkSize = 1024, SoloPrefillChunkSize = 1024,
+            PrefillChunkTokenLimit = 1024, EnablePrefixCaching = false, StopRepetition = false,
+            ExecutionOptionsOverride = new() { BatchedPathDisabled = true, PerSeqFusedEnabled = true,
+                BatchedFusedDecodeEnabled = false, KvHolderPoolMax = 0 }, MemoryAdmission = admission
+        };
+        using var model = new RecordingModel();
+        using var engine = new InferenceEngine(model, config);
+        var request = new SequenceState("wide-glm", Enumerable.Repeat(1, 1340).ToArray(), 2, 4, SamplingConfig.Greedy);
+        await engine.SubmitRequest(request).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { 832, 508 }, model.ForwardRows.Where(n => n > 1));
+        Assert.Equal(new[] { 2, 3 }, request.OutputTokens);
+        Assert.Equal(832, caps[request]);
+        Assert.Equal(0, engine.WaitingCount);
+        Assert.Equal(0, budget.Snapshot().Single(p => p.Pool == device).Reserved
+            - expert.OwnedCharges.Single().Bytes);
+    }
+
+    [Fact]
     public async Task MediaPromptSlicesCrossRequestCapsWithoutGapsOrCrossRequestReuse()
     {
         var budget = new MemoryBudget([new("host", 100)]); var media = new RecordingMedia();

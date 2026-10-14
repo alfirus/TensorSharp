@@ -36,6 +36,8 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "ggml_ops_graph_budget.h"
+#include "ggml_ops_host_moe_group_quota.h"
+#include "ggml_ops_host_moe_phase_quota.h"
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -1309,6 +1311,16 @@ namespace tsg
         int prefill_rows, ggml_backend_t backend, std::size_t& bytes);
     bool host_moe_expert_cache_scope_matches_plan(std::size_t minimum_bytes,
         int groups, int prefill_rows, int decode_rows);
+    HostMoeGroupKey host_moe_expert_group_key(const HostMoeSegment& hm);
+    // Install once, before dispatch, under the exclusive empty cache scope.
+    // Its complete measured group floors are bound to the loaded backend and
+    // planned row limits. Release-backend/scope-end clear it after physical free.
+    bool host_moe_expert_cache_install_group_plan(const std::vector<HostMoeGroupMinimum>& groups,
+        int prefill_rows, int decode_rows, ggml_backend_t backend);
+    bool host_moe_expert_cache_minimum_phase_plan(const HostMoeSegment& hm, int rows,
+        int prefill_rows, ggml_backend_t backend, std::size_t& narrow_bytes, std::size_t& wide_bytes);
+    bool host_moe_expert_cache_install_phase_plan(const std::vector<HostMoePhaseGroupMinimum>& groups,
+        int prefill_rows, int decode_rows, ggml_backend_t backend);
     bool register_host_file_source(const void* pointer, std::int64_t bytes,
                                    const char* path, std::int64_t offset);
     void host_moe_expert_cache_release();

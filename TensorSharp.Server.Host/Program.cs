@@ -712,6 +712,8 @@ if (!hostingOptions.EmbeddingsEnabled && PrefixCacheWarmup.ShouldRun(hostingOpti
     var warmupSessions = app.Services.GetRequiredService<SessionManager>();
     var warmupModelService = app.Services.GetRequiredService<ModelService>();
     var warmupModel = warmupModelService.Model;
+    bool kernelInitializationOnly = hostingOptions.UnifiedMemoryEnabled
+        && warmupModel.Config.Architecture is "glm5next" or "glm5-next";
     var warmupStages = new List<StartupWarmupStatus.Stage>();
     var jointWarmupStages = new List<StartupWarmupStatus.JointStage>();
     bool jointWarmupRequested = false;
@@ -721,8 +723,10 @@ if (!hostingOptions.EmbeddingsEnabled && PrefixCacheWarmup.ShouldRun(hostingOpti
     // sends. A dedicated id also keeps the warm-up turn out of any transcript a host keeps.
     ChatSession warmupSession = warmupSessions.CreateSession();
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Preparing admitted execution and the shared prompt before opening the port. The first launch after a prompt, "
-        + "skills or model change pays for initialization here instead of on the first message.");
+        kernelInitializationOnly
+            ? "Preparing admitted kernels before opening the port. This model has no shared prompt checkpoints; the first user prompt still requires prefill."
+            : "Preparing admitted execution and the shared prompt before opening the port. The first launch after a prompt, "
+                + "skills or model change pays for initialization here instead of on the first message.");
 
     // Initialize the thinking-on prefix for the joint cohorts first. The ordinary
     // thinking-off stage runs last, after their pressure/reclamation, so a client
@@ -767,13 +771,17 @@ if (!hostingOptions.EmbeddingsEnabled && PrefixCacheWarmup.ShouldRun(hostingOpti
     {
         warmupModelService.RecordStartupWarmup(warmupModel, new StartupWarmupStatus(warmupStages,
             hostingOptions.PrefixCacheEnabled && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching,
-            jointWarmupStages, jointWarmupRequested, jointWarmupSkipReason));
+            jointWarmupStages, jointWarmupRequested, jointWarmupSkipReason, kernelInitializationOnly));
         ReleaseWarmupSession(warmupSession.Id);
     }
     bool RunSerialWarmup(bool think)
     {
-        var warmed = PrefixCacheWarmup.RunAsync(warmupAdapter.Chat.ChatStreamAsync, warmupSession.Id,
-            think, startupLogger, app.Lifetime.ApplicationStopping).GetAwaiter().GetResult();
+        var warmupTask = kernelInitializationOnly
+            ? PrefixCacheWarmup.RunKernelInitializationAsync(warmupAdapter.Chat.ChatStreamAsync,
+                warmupSession.Id, think, startupLogger, app.Lifetime.ApplicationStopping)
+            : PrefixCacheWarmup.RunAsync(warmupAdapter.Chat.ChatStreamAsync,
+                warmupSession.Id, think, startupLogger, app.Lifetime.ApplicationStopping);
+        var warmed = warmupTask.GetAwaiter().GetResult();
         warmupStages.Add(new StartupWarmupStatus.Stage(think, warmed.Warmed, warmed.Elapsed.TotalMilliseconds));
         startupLogger.LogInformation(LogEventIds.HostConfiguration,
             "Scheduled startup warmup (thinking {Think}): {Outcome}", think ? "on" : "off", warmed.ToString());

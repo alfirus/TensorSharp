@@ -10,7 +10,7 @@ using TensorSharp.Memory;
 if (args.Length is < 2 or > 8 || args[0] is not ("CPU" or "CUDA")
     || args.Skip(2).Any(flag => flag is not ("--shared-graphs" or "--dispatch-faults" or "--selected-experts" or "--swiglu-clamp")
         && !flag.StartsWith("--quantized-source=", StringComparison.Ordinal) && !flag.StartsWith("--prefill-rows=", StringComparison.Ordinal)))
-    throw new ArgumentException("Usage: GlmGraphBudgetProbe CPU|CUDA <new-output-directory> [--shared-graphs] [--dispatch-faults] [--selected-experts] [--swiglu-clamp] [--quantized-source=<GLM-GGUF>] [--prefill-rows=1..128]");
+    throw new ArgumentException("Usage: GlmGraphBudgetProbe CPU|CUDA <new-output-directory> [--shared-graphs] [--dispatch-faults] [--selected-experts] [--swiglu-clamp] [--quantized-source=<GLM-GGUF>] [--prefill-rows=1..1024]");
 bool sharedGraphs = args.Skip(2).Contains("--shared-graphs"), testDispatchFaults = args.Skip(2).Contains("--dispatch-faults");
 bool selectedExperts = args.Skip(2).Contains("--selected-experts");
 string? quantizedSource = args.Skip(2).SingleOrDefault(flag => flag.StartsWith("--quantized-source=", StringComparison.Ordinal))?["--quantized-source=".Length..];
@@ -19,8 +19,14 @@ int vocab = quantizedSource != null ? 256 : 128, fixtureLayers = quantizedSource
 int expertGroups = quantizedSource != null ? 3 : 1, seamsPerGraph = quantizedSource != null ? 3 : 2;
 string? rowsOption = args.Skip(2).SingleOrDefault(flag => flag.StartsWith("--prefill-rows=", StringComparison.Ordinal));
 int? explicitPrefillRows = rowsOption == null ? null : int.Parse(rowsOption["--prefill-rows=".Length..], System.Globalization.CultureInfo.InvariantCulture);
-if (explicitPrefillRows is < 1 or > 128) throw new ArgumentOutOfRangeException(nameof(explicitPrefillRows));
-int context = explicitPrefillRows != null ? 256 : 128, prefillChunk = explicitPrefillRows ?? 16;
+if (explicitPrefillRows is < 1 or > 1024) throw new ArgumentOutOfRangeException(nameof(explicitPrefillRows));
+// Preserve historical fixture geometry through 128. Wider cases need room for
+// the complete prefill and the subsequent independent/joint decode checks.
+int context = explicitPrefillRows != null ? Math.Max(256, explicitPrefillRows.Value * 2) : 128;
+int prefillChunk = explicitPrefillRows ?? 16;
+// Larger synthetic cases explicitly own a larger selected graph floor. Keep
+// the historical <=512 quota and all pressure/refusal checks unchanged.
+long expertBudget = prefillChunk > 512 ? 64L << 20 : 32L << 20;
 string backend = args[0], directory = Path.GetFullPath(args[1]);
 if (selectedExperts && backend != "CUDA") throw new ArgumentException("Selected-expert qualification requires actual CUDA.");
 if (Directory.Exists(directory)) throw new IOException("Use a fresh evidence directory.");
@@ -55,7 +61,8 @@ IntPtr Load(bool selected = false) => GgmlGlmNative.LoadModel(model, backend == 
 var samples = new List<GgmlAllocationUsage[]>();
 var executions = new List<object>();
 GgmlHostMoeExpertCacheScope? selectedScope = null;
-float[] Evaluate(IntPtr handle, GgmlCacheBudgetScope? scope = null, MemoryBudget? budget = null, bool selected = false)
+float[] Evaluate(IntPtr handle, GgmlCacheBudgetScope? scope = null, MemoryBudget? budget = null,
+    bool selected = false, BudgetReservation? expertEnvelope = null)
 {
     Require(handle != IntPtr.Zero, "Successful load returned null.");
     Require(GgmlGlmNative.ConfigureGraphCache(handle, 1), "Graph-cache capacity configuration failed.");
@@ -211,10 +218,30 @@ float[] Evaluate(IntPtr handle, GgmlCacheBudgetScope? scope = null, MemoryBudget
         // leave any sibling row eligible for a serial retry.
         var faults = testDispatchFaults ? new List<(int, int)> { (1, 1), (1, 2), (2, 1), (2, 2) } : [];
         if (selected) faults.Insert(0, (0, 0)); // Actual active-scope quota refusal after routing.
-        if (selected && testDispatchFaults) faults.AddRange([(3, 1), (3, 2)]);
+        if (selected && testDispatchFaults) faults.AddRange([(3, 1), (3, 2), (4, 1), (5, 1)]);
+        long finalDrainHelperRows = 0;
         foreach (var (stage, kind) in faults)
         {
-            if (stage == 0) selectedScope!.UpdateBudget(0);
+            var failureCacheBefore = stage is 4 or 5 ? GgmlBasicOps.GetHostMoeExpertCacheUsage() : default;
+            var finalDrainExecutionBefore = stage == 5 ? GgmlGlmNative.SelectedExpertExecutionStats(handle) : default;
+            const float unpublishedLogit = -12345.25f;
+            if (stage is 4 or 5) Array.Fill(batch, unpublishedLogit);
+            using var refusedExpertOwner = stage == 0 ? budget!.Reserve([new("cuda", 1)]) : null;
+            if (stage == 0)
+            {
+                // An installed phase plan protects its immutable minimum.
+                // Refuse a real payload allocation instead of invalidating that
+                // plan; retire the old physical owner before changing envelopes.
+                long originalBudget = selectedScope!.BudgetBytes;
+                var before = selectedScope.ReadUsage();
+                bool rejected = false;
+                try { selectedScope.UpdateBudget(0); }
+                catch (InvalidOperationException) { rejected = true; }
+                Require(rejected && selectedScope.BudgetBytes == originalBudget
+                    && selectedScope.ReadUsage() == before, "Sub-floor update mutated the installed phase plan or cache.");
+                selectedScope.Trim(0);
+                scope!.SetSharedExpertEnvelope(refusedExpertOwner);
+            }
             else injectDispatchFault!(stage, kind);
             bool threw = false;
             try
@@ -225,16 +252,42 @@ float[] Evaluate(IntPtr handle, GgmlCacheBudgetScope? scope = null, MemoryBudget
             catch (InvalidOperationException error) when (error.Message.Contains("after dispatch", StringComparison.Ordinal)) { threw = true; }
             Require(threw, $"Post-dispatch stage {stage}/kind {kind} did not throw before serial fallback.");
             Require(GgmlGlmNative.TryGetLastBatchedExecution(handle) == null, "Post-dispatch failure published success evidence.");
+            if (stage is 4 or 5)
+            {
+                if (stage == 4)
+                    Require(GgmlBasicOps.GetHostMoeExpertCacheUsage() == failureCacheBefore,
+                        "Failed selected-ID download reached or mutated the expert cache.");
+                else
+                {
+                    finalDrainHelperRows = GgmlBasicOps.GetHostMoeExpertCacheUsage().Calls - failureCacheBefore.Calls;
+                    Require(finalDrainHelperRows == 3L * seamsPerGraph,
+                        "Reported final drain error was not injected after every expert helper completed all N3 rows.");
+                    Require(GgmlGlmNative.SelectedExpertExecutionStats(handle) == finalDrainExecutionBefore,
+                        "Reported final drain error published successful selected graph/seam counters.");
+                }
+                Require(batch.All(value => BitConverter.SingleToInt32Bits(value) == BitConverter.SingleToInt32Bits(unpublishedLogit)),
+                    "Reported selected-expert download/drain error published logits.");
+            }
             using (scope?.EnterExecution(serial!))
                 for (int lane = 0; lane < 3; ++lane)
                 {
                     Require(GgmlGlmNative.SetActiveSlot(handle, slots[lane]), "Cannot select a failed participating slot.");
                     int head = GgmlGlmNative.NPast(handle);
+                    if (stage is 4 or 5) Require(head == positions[lane], "Reported selected-expert download/drain error published a participating slot head.");
                     Require(!GgmlGlmNative.Forward(handle, [91], new float[GgmlGlmNative.VocabSize(handle)]),
                         "A partially mutated slot accepted an unsafe serial retry.");
                     Require(GgmlGlmNative.NPast(handle) == head, "Fenced serial retry mutated its slot head.");
                 }
-            if (stage == 0) selectedScope!.UpdateBudget(selectedScope.MaximumBudgetBytes);
+            if (stage == 4)
+                executions.Add(new { selected_ids_download_failure = true, stage, kind,
+                    cache_unchanged = true, logits_unpublished = true, heads_unpublished = true,
+                    scope = "Injected reported download error, not an actual CUDA driver fault; participating slots remain fenced until explicit reset." });
+            if (stage == 0)
+            {
+                selectedScope!.Trim(0);
+                scope!.SetSharedExpertEnvelope(expertEnvelope
+                    ?? throw new InvalidOperationException("Actual expert ownership is required for retry."));
+            }
             using (scope?.EnterExecution(serial!))
                 for (int lane = 0; lane < 3; ++lane)
                 {
@@ -278,6 +331,12 @@ float[] Evaluate(IntPtr handle, GgmlCacheBudgetScope? scope = null, MemoryBudget
             Require(pair.All(float.IsFinite), "N2 sibling continuation produced nonfinite logits.");
             output.AddRange(pair); executions.Add(new { row_departure = departure });
             Require(GgmlGlmNative.ConfigureGraphCache(handle, 1, 1), "N2 graph physical reclamation failed.");
+            if (selected && testDispatchFaults)
+                executions.Add(new { selected_final_drain_failure = true, stage = 5, kind = 1,
+                    participating_rows = 3, expert_seams = seamsPerGraph, completed_helper_rows = finalDrainHelperRows,
+                    successful_graphs_unchanged = true, logits_unpublished = true, heads_unpublished = true,
+                    slots_fenced = true, reset_recovered_n3 = true, primary_departure_recovered_n2 = true,
+                    scope = "Injected reported error after the last expert seam drain, not an actual CUDA driver fault; cache helpers completed but logits, heads and success counters remained unpublished." });
         }
         if (selected)
         {
@@ -313,17 +372,17 @@ using (var scope = new GgmlCacheBudgetScope(budget,
     backend == "CUDA" ? new[] { new[] { "cuda" }, new[] { "ram" } } : new[] { new[] { "ram" } },
     includeGraphBuffers: true, hostPools: ["ram"]))
 {
-    using var experts = selectedExperts ? new GgmlHostMoeExpertCacheScope(32L << 20, prefillChunk, expertGroups, 3) : null;
+    using var experts = selectedExperts ? new GgmlHostMoeExpertCacheScope(expertBudget, prefillChunk, expertGroups, 3) : null;
     selectedScope = experts;
     IntPtr refused = Load();
     try { Require(refused == IntPtr.Zero, "One-byte physical payload quota did not refuse model loading."); }
     finally { if (refused != IntPtr.Zero) GgmlGlmNative.Free(refused); }
     Require(scope.ActiveAllocations == 0 && budget.Snapshot().All(p => p.Reserved + p.Committed == 0), "Refused load leaked payload ownership.");
     Require(budget.TrySetCapacity("ram", 1L << 30) && budget.TrySetCapacity("cuda", 1L << 30), "Failed to raise quota after refusal.");
-    using var expertOwner = selectedExperts ? budget.Reserve([new("cuda", 32L << 20)]) : null;
+    using var expertOwner = selectedExperts ? budget.Reserve([new("cuda", expertBudget)]) : null;
     if (expertOwner != null) scope.SetSharedExpertEnvelope(expertOwner);
     IntPtr handle = Load(selectedExperts);
-    try { actual = Evaluate(handle, scope, budget, selectedExperts); }
+    try { actual = Evaluate(handle, scope, budget, selectedExperts, expertOwner); }
     finally { if (handle != IntPtr.Zero) GgmlGlmNative.Free(handle); }
     experts?.Dispose(); // Retire shared host file workspace while accounting is attached.
     if (expertOwner != null) { scope.SetSharedExpertEnvelope(null); expertOwner.Dispose(); }

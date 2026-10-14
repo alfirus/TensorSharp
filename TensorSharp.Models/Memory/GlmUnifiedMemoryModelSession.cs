@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using TensorSharp.GGML;
 using TensorSharp.Memory;
 using TensorSharp.Memory.Planning;
@@ -40,6 +41,15 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
     private int _cpuLayers;
     private GlmUnifiedGraphShape? _lastGraphShape;
     private BudgetReservation? _executingRequest;
+    private SequenceState? _executingSequence;
+    private sealed class PrefillState(int cap)
+    {
+        internal int Cap = cap;
+        internal InferenceMemoryBytes Peak;
+        internal WeakReference<SequenceState>[] Siblings = [];
+    }
+    private readonly ConditionalWeakTable<SequenceState, PrefillState> _requestPrefill = new();
+    private readonly GlmUnifiedPrimarySlotClaim _primarySlotClaim = new();
 
     private GlmUnifiedMemoryModelSession(UnifiedMemoryModelOptions options, GlmUnifiedMemoryGeometry geometry,
         GlmUnifiedVisionMemoryGeometry? vision, InferenceHardwareMemory hardware, int context)
@@ -51,7 +61,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         _hostCeiling = Math.Min(options.MaximumHostBytes, Math.Max(0, host.Available - _hostHeadroom));
         _deviceCeiling = Math.Min(options.MaximumDeviceBytes, Math.Max(0, hardware.DeviceAvailable - _deviceHeadroom));
         if (_hostCeiling <= 0 || _deviceCeiling <= 0) throw new MemoryPressureException("No GLM RAM/commit/CUDA capacity remains after headroom.");
-        var plan = GlmSelectedExpertMemoryPlan.Select(geometry, options, context, _deviceCeiling, vision?.DeviceWeightBytes ?? 0);
+        var plan = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, options, context, _deviceCeiling, vision?.DeviceWeightBytes ?? 0);
         _prefill = plan.PrefillRows;
         _cpuLayers = plan.CpuExpertLayers;
         _expertCacheBytes = plan.CacheCapacityBytes;
@@ -71,7 +81,9 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
             ? (_options.EnableGlmSelectedExperts && _cpuLayers == 0
                 ? "[unified-memory] GLM experts: all routed weights are resident on CUDA; a compact selected-expert tier is unnecessary for this capacity plan\n"
                 : "[unified-memory] GLM experts: capacity-placed resident CUDA layers and pageable mapped CPU layers; selected-expert CUDA reuse is off pending full-model qualification\n")
-            : $"[unified-memory] GLM experts: experimental pooled CUDA reuse; groups={_expertGroups}, budget={_expertCacheBytes / 1048576.0:F0} MiB, metadata forecast={_expertMinimumForecastBytes / 1048576.0:F0} MiB, exact minimum={_expertMinimumBytes / 1048576.0:F0} MiB, planned decode widths=1..{_options.MaximumRunningRequests}, prefill rows up to {_prefill} (requested {_options.PrefillChunkTokens}); wide prefill protects its entire routed union; bounded source-file staging; full-model performance remains unqualified\n") +
+            : $"[unified-memory] GLM experts: experimental pooled CUDA reuse; groups={_expertGroups}, budget={_expertCacheBytes / 1048576.0:F0} MiB, metadata forecast={_expertMinimumForecastBytes / 1048576.0:F0} MiB, exact minimum={_expertMinimumBytes / 1048576.0:F0} MiB, planned decode widths=1..{_options.MaximumRunningRequests}, prefill rows up to {_prefill} (requested {_options.ResolveGlmPrefillChunkTokens()}); wide prefill protects its entire routed union; bounded source-file staging; full-model performance remains unqualified\n") +
+        (_options.EnableAdaptiveGlmPrefill
+            ? "[unified-memory] adaptive GLM prefill: actual prompt/joint shapes, full physical KV slots, immutable expert phase floor, fenced request-boundary cache reclaim; widths may decrease before scheduling under pressure\n" : "") +
         "[unified-memory] asynchronous file/transfer/compute overlap is off pending GLM qualification\n" +
         "[unified-memory] off: host KV paging, MTP/draft and TP (complete shared-budget adapters remain unqualified), video/audio\n" +
         "[unified-memory] limits: mapping/page-cache residency, GC, native metadata and vendor/driver pools retain observed headroom; no complete OS RAM/VRAM hard-cap claim.";
@@ -89,6 +101,9 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
             throw new NotSupportedException("Unified GLM requires its native, non-speculative executor.");
         if (options.EnableAsyncExpertPrefill || (options.EnableGlmSelectedExperts && options.MaximumRunningRequests > 3))
             throw new NotSupportedException("Experimental unified GLM supports at most three selected-expert decode rows and no asynchronous expert pipeline.");
+        if (options.EnableAdaptiveGlmPrefill && !options.EnableGlmSelectedExperts)
+            throw new NotSupportedException("Adaptive GLM prefill requires its complete selected-expert planning policy.");
+        _ = options.ResolveGlmPrefillChunkTokens(); // Validate the separate GLM bound before native/model allocation.
         GgmlGlmNative.RequireUnifiedBudgetSupport();
         if (options.EnableGlmSelectedExperts) GgmlGlmNative.RequireSelectedExpertPlanningSupport();
         GlmUnifiedMemoryGeometry geometry;
@@ -138,6 +153,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
                 owner._model.TrimUnifiedMappedResidency(); // Advisory only; no imputed released-byte credit.
             }
             owner._model.ConfigureUnifiedGraphAdmission(owner.PrepareGraph);
+            owner._model.ConfigureUnifiedPrimarySlotReuse(requestId => owner._primarySlotClaim.AllowsBinding(requestId, owner.HasNativeSlot));
             if (vision != null) owner._model.LoadVisionEncoder(mmprojPath!);
             owner._model.ConfigureUnifiedVisionAdmission(owner.EnterVisionPreparation);
             Console.WriteLine(owner.FeatureReport);
@@ -178,6 +194,8 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
                 EstimateMaterializationPeak = EstimateMaterialization,
                 BeforeAdmissionWithRunning = PrepareAdmission,
                 AfterPrefixMaterialization = CompletePrefix, AfterPrefill = CompletePrefill,
+                PrefillTokenLimit = AdmittedPrefillLimit,
+                AfterSequenceMemoryRelease = RecoverReleasedCapacity,
                 EnterSerialExecution = EnterSerial,
                 EnterBatchedExecution = _ => EnterAllocations(_joint
                     ?? throw new InvalidOperationException("GLM joint execution requires its shared graph envelope."))
@@ -185,85 +203,307 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         };
     }
     private InferenceMemoryBytes RequestPeak(SequenceState seq, bool materializing = false)
+        => RequestPeakForRows(seq, AdmittedPrefillLimit(seq), materializing);
+    private int AdmittedPrefillLimit(SequenceState seq)
+        => _requestPrefill.TryGetValue(seq, out var state) ? state.Cap : _prefill;
+    private InferenceMemoryBytes RequestPeakForRows(SequenceState seq, int maximumRows, bool materializing)
     {
         int tokens = checked(seq.PromptTokens.Count + seq.MaxNewTokens);
         if (tokens > _context) throw new MemoryPressureException("GLM request exceeds its unified context.");
-        int rows = Math.Min(_prefill, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens));
-        var staging = _geometry.Workspace(Math.Max(1, seq.PromptTokens.Count), rows);
+        int rows = Math.Min(maximumRows, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens));
+        var staging = _geometry.Workspace(Math.Max(1, seq.PromptTokens.Count), rows, outputRows: 1);
         // A Submit estimate always includes a new full slot. At the fenced
         // materialization boundary the model can reuse an actual idle primary
         // or donated holder. Existing child ownership is never revoked.
-        long slot = materializing && _model!.CanReuseUnifiedSlot(seq.RequestId) ? 0 : _geometry.SlotBytes(_context);
+        long slot = materializing && CanReuseSlotFor(seq) ? 0 : _geometry.SlotBytes(_context);
         return new(staging.Host, slot);
+    }
+    private bool HasNativeSlot(SequenceState seq) => _model!.CanReuseUnifiedSlot(seq.RequestId, includeIdlePrimary: false);
+    private bool CanReuseSlotFor(SequenceState seq) => _primarySlotClaim.CanReuse(seq, HasNativeSlot(seq),
+        _model!.CanReuseUnifiedSlot(seq.RequestId), HasNativeSlot);
+    private void PublishPrimarySlotClaim(WeakReference<SequenceState> prepared)
+    {
+        if (!prepared.TryGetTarget(out var seq)) throw new InvalidOperationException("GLM materialization lost its live request.");
+        if (!CanReuseSlotFor(seq)) return; // This request owns its complete new-slot allowance instead.
+        _primarySlotClaim.PublishAfterMaterialization(prepared, HasNativeSlot(seq),
+            _model!.CanReuseUnifiedSlot(seq.RequestId), HasNativeSlot);
     }
     private IReadOnlyList<MemoryCharge> EstimateRequest(SequenceState seq) => Charges(RequestPeak(seq));
     private IReadOnlyList<MemoryCharge> EstimateMaterialization(SequenceState seq) => Charges(RequestPeak(seq, true));
     private static MemoryCharge[] Charges(InferenceMemoryBytes bytes) => [new(HostPool, bytes.Host), new(DevicePool, bytes.Device)];
     private IReadOnlyList<MemoryCharge> PrepareAdmission(SequenceState seq, IReadOnlyList<SequenceState> running)
     {
+        if (_options.EnableAdaptiveGlmPrefill) return PrepareAdaptiveAdmission(seq, running);
         if (_native!.CallbackError != null) throw new InvalidOperationException("GLM allocation accounting failed.", _native.CallbackError);
-        var limits = PhysicalConstraints();
-        int context = Math.Max(1, seq.PromptTokens.Count);
-        foreach (var live in running) context = Math.Max(context, checked(live.NumComputedTokens + 1));
-        context = PaddedContext(context);
-        int rows = Math.Min(_prefill, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens));
-        var prefill = _geometry.GraphPeak(context, rows, false, GraphEntriesWithTransient);
-        var joint = _geometry.GraphPeak(context, running.Count + 1, running.Count > 0, GraphEntriesWithTransient);
-        var target = PreserveReplacement(new(Math.Max(prefill.Host, joint.Host), Math.Max(prefill.Device, joint.Device)));
+        var physical = ObservePhysicalConstraints();
+        var limits = physical.Limits;
+        var graphs = GlmUnifiedAdmissionGraphPlan.Create(_geometry, _context, _prefill,
+            seq.PromptTokens.Count, seq.NumComputedTokens, running.Select(live => live.NumComputedTokens).ToArray(),
+            GraphEntriesWithTransient);
+        var target = PreserveReplacement(graphs.MaximumPeak);
         var needed = EstimateMaterialization(seq);
+        MemoryCharge[] growth = [];
+        bool? mappedTrimHint = null;
         bool FitsCombined()
         {
             var owned = _joint!.OwnedCharges.ToDictionary(c => c.Pool, c => c.Bytes);
-            var growth = Charges(target).Select(c => new MemoryCharge(c.Pool,
+            growth = Charges(target).Select(c => new MemoryCharge(c.Pool,
                 checked(c.Bytes - owned[c.Pool] + needed.Single(n => n.Pool == c.Pool).Bytes))).ToArray();
-            return Fits(growth, limits);
+            physical = physical with { Ledger = Budget.Snapshot() };
+            return physical.Fits(growth);
+        }
+        MemoryPressureException Refusal(string message)
+        {
+            string Describe(IEnumerable<MemoryCharge> charges) => string.Join(", ", charges.Select(c =>
+                FormattableString.Invariant($"{c.Pool}={c.Bytes}")));
+            return new MemoryPressureException(message + " " + FormattableString.Invariant(
+                $"request={seq.RequestId}; prompt={seq.PromptTokens.Count}; computed={seq.NumComputedTokens}; max-new={seq.MaxNewTokens}; logical-context={_context}; serial-graph-context={graphs.SerialContext}; joint-graph-context={graphs.JointContext}; prefill-rows={graphs.PrefillRows}; joint-rows={graphs.JointRows}; active-requests={running.Count}; joint-target=[{Describe(Charges(target))}]; joint-owned=[{Describe(_joint!.OwnedCharges)}]; joint-children=[{Describe(_joint.LiveChildCharges)}]; materialization=[{Describe(needed)}]; mapped-trim-hint={mappedTrimHint?.ToString() ?? "not-attempted"}; ")
+                + physical.Describe(growth));
         }
         if (!FitsCombined())
         {
-            _model!.TrimUnifiedGraphs(); _model.TrimUnifiedRetainedSlots(); limits = PhysicalConstraints();
+            _model!.TrimUnifiedGraphs(); _model.TrimUnifiedRetainedSlots();
+            physical = ObservePhysicalConstraints(); limits = physical.Limits;
             _lastGraphShape = null;
-            target = PreserveReplacement(new(Math.Max(prefill.Host, joint.Host), Math.Max(prefill.Device, joint.Device)));
+            target = PreserveReplacement(graphs.MaximumPeak);
             needed = EstimateMaterialization(seq);
-            if (!FitsCombined()) throw new MemoryPressureException("GLM slot and shared graph peak exceed current RAM/commit/VRAM after idle graph/prefix reclamation.");
+            if (!FitsCombined())
+            {
+                // Pageable expert scans can consume observed RAM without an
+                // anonymous Host ticket. At this quiescent boundary hint only
+                // those mappings, and accept no imputed released-byte credit.
+                if (physical.TryRefreshMappedHostPressure(growth, _model.TrimUnifiedMappedResidency,
+                    ObservePhysicalConstraints, out var refreshed, out mappedTrimHint))
+                {
+                    physical = refreshed; limits = physical.Limits;
+                }
+                if (!FitsCombined()) throw Refusal("GLM slot and shared graph peak exceed current RAM/commit/VRAM after idle graph/prefix reclamation.");
+            }
         }
         // Combined capacity is checked before consuming any shared credit. The
         // scheduler then acquires the separate materialization envelope under
         // its compute lock; live shared children preserve their physical floor.
-        if (!_joint!.TryResizeTotal(Charges(target), limits)) throw new MemoryPressureException("GLM shared graph admission could not reserve its replacement peak.");
+        if (!_joint!.TryResizeTotal(Charges(target), limits))
+        {
+            FitsCombined(); // Refresh the observed ledger if another owner changed it before the atomic reserve.
+            throw Refusal("GLM shared graph admission could not reserve its replacement peak.");
+        }
         return limits;
     }
     private void CompletePrefix(SequenceState seq)
     {
+        // Allocate claim bookkeeping before native/ledger mutations. Admission
+        // estimates do not claim anything: several waiting requests may sample
+        // an idle primary, but only a successfully materialized first request
+        // may promise its reuse before BindSequenceCache actually checks it out.
+        var primaryClaim = GlmUnifiedPrimarySlotClaim.Prepare(seq);
+        if (_options.EnableAdaptiveGlmPrefill)
+        {
+            var state = _requestPrefill.GetValue(seq, _ => new(_prefill));
+            var running = state.Siblings.Select(reference => reference.TryGetTarget(out var live) ? live : null)
+                .Where(live => live != null && !live.Status.IsFinished()).Cast<SequenceState>().ToArray();
+            PrepareAdaptiveAdmission(seq, running, materialized: true);
+            PublishPrimarySlotClaim(primaryClaim);
+            RecoverExpertCapacity();
+            return;
+        }
         if (!seq.MemoryEnvelope!.TryResizeTotal(EstimateMaterialization(seq))) throw new MemoryPressureException("GLM prefix transition cannot preserve its request state/staging peak.");
+        PublishPrimarySlotClaim(primaryClaim);
     }
     private void CompletePrefill(SequenceState seq)
     {
         _model!.TrimUnifiedGraphs(onlyPrefill: true);
+        _experts?.Trim(_experts.CachedBytes); // Return charged idle file staging; retain CUDA weights.
         _lastGraphShape = null;
         int context = PaddedContext(Math.Max(1, checked(seq.NumComputedTokens + 1)));
-        var graph = PreserveReplacement(_geometry.GraphPeak(context, 1, false, GraphEntriesWithTransient));
+        var graph = PreserveReplacement(WithLivePrefillPromises(
+            _geometry.GraphPeak(context, 1, false, GraphEntriesWithTransient), except: seq));
         if (!Budget.TryResizeTotals([(_joint!, Charges(graph)), (seq.MemoryEnvelope!, EstimateMaterialization(seq))]))
             throw new MemoryPressureException("GLM prefill transition cannot preserve its shared graph and request state peak.");
+        RecoverExpertCapacity();
+    }
+
+    private static InferenceMemoryBytes Bytes(IReadOnlyList<MemoryCharge> charges)
+        => new(charges.Single(c => c.Pool == HostPool).Bytes, charges.Single(c => c.Pool == DevicePool).Bytes);
+    private InferenceMemoryBytes WithLivePrefillPromises(InferenceMemoryBytes graph, SequenceState? except = null)
+    {
+        if (!_options.EnableAdaptiveGlmPrefill) return graph;
+        foreach (var entry in _requestPrefill)
+        {
+            var sequence = entry.Key;
+            if (ReferenceEquals(sequence, except) || sequence.MemoryEnvelope == null
+                || sequence.Status.IsFinished() || sequence.NumComputedTokens >= sequence.PromptTokens.Count) continue;
+            graph = new(Math.Max(graph.Host, entry.Value.Peak.Host), Math.Max(graph.Device, entry.Value.Peak.Device));
+        }
+        return graph;
+    }
+
+    private IReadOnlyList<MemoryCharge> PrepareAdaptiveAdmission(SequenceState seq,
+        IReadOnlyList<SequenceState> running, bool materialized = false)
+    {
+        if (_native!.CallbackError is { } callback) throw new InvalidOperationException("GLM allocation accounting failed.", callback);
+        // Allocate all publication bookkeeping before native or ledger mutation.
+        var state = _requestPrefill.GetValue(seq, _ => new(_prefill));
+        var siblings = running.Select(live => new WeakReference<SequenceState>(live)).ToArray();
+        var heads = running.Select(live => live.NumComputedTokens).ToArray();
+        int maximum = Math.Min(_prefill, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens));
+        var physical = ObservePhysicalConstraints();
+        bool mayReclaimExperts = true;
+        GlmUnifiedPrefillCandidate selected = default;
+        (InferenceMemoryBytes Joint, InferenceMemoryBytes Request) Estimate(int rows)
+        {
+            var graphs = GlmUnifiedAdmissionGraphPlan.Create(_geometry, _context, rows,
+                seq.PromptTokens.Count, seq.NumComputedTokens, heads, GraphEntriesWithTransient);
+            var target = PreserveReplacement(WithLivePrefillPromises(graphs.MaximumPeak, except: seq));
+            var request = RequestPeakForRows(seq, rows, materializing: true);
+            if (materialized) request = GlmUnifiedPrefillAdmission.Floor(request, Bytes(seq.MemoryEnvelope!.LiveChildCharges));
+            return (target, request);
+        }
+        bool Select()
+        {
+            physical = physical with { Ledger = Budget.Snapshot() };
+            return GlmUnifiedPrefillAdmission.TrySelect(physical.Ledger, physical.Limits,
+                Bytes(_joint!.OwnedCharges), materialized ? Bytes(seq.MemoryEnvelope!.OwnedCharges) : default,
+                _experts?.BudgetBytes ?? 0,
+                mayReclaimExperts ? _expertMinimumBytes : _experts?.BudgetBytes ?? 0, maximum, Estimate, out selected);
+        }
+        if (!Select())
+        {
+            _model!.TrimUnifiedGraphs(); _model.TrimUnifiedRetainedSlots();
+            _experts?.Trim(_experts.CachedBytes);
+            _lastGraphShape = null; physical = ObservePhysicalConstraints();
+            if (!Select())
+            {
+                // This advisory hint has no imputed refund. Re-sample tracked
+                // physical capacity before retrying the complete candidate set.
+                var smallest = Estimate(1);
+                var ownedJoint = Bytes(_joint!.OwnedCharges);
+                var ownedRequest = materialized ? Bytes(seq.MemoryEnvelope!.OwnedCharges) : default;
+                var minimumGrowth = new InferenceMemoryBytes(
+                    checked(smallest.Joint.Host - ownedJoint.Host + smallest.Request.Host - ownedRequest.Host),
+                    checked(smallest.Joint.Device - ownedJoint.Device + smallest.Request.Device - ownedRequest.Device));
+                var charges = Charges(minimumGrowth);
+                long reclaimableExperts = (_experts?.BudgetBytes ?? 0) - _expertMinimumBytes;
+                if (physical.Shortfall(HostPool, charges) > 0 && physical.Shortfall(DevicePool, charges) <= reclaimableExperts)
+                {
+                    _model.TrimUnifiedMappedResidency(); physical = ObservePhysicalConstraints();
+                }
+                if (!Select()) throw new MemoryPressureException(
+                    $"GLM adaptive prefill cannot preserve its complete request, graph and expert phase floors: request={seq.RequestId}; prompt={seq.PromptTokens.Count}; logical-context={_context}; maximum-rows={maximum}; "
+                    + physical.Describe(charges));
+            }
+        }
+        if (GlmUnifiedPrefillAdmission.ShouldReclaimRetained(materialized, seq.NumComputedTokens,
+            seq.PrefixCacheReusedTokens, selected.Rows, maximum))
+        {
+            // The completed lookup confirmed no usable state for this request.
+            // Only idle terminal holders are eligible; active slots and every
+            // pending prefill promise remain charged throughout the retry.
+            _model!.TrimUnifiedRetainedSlots(); _lastGraphShape = null;
+            physical = ObservePhysicalConstraints();
+            if (!Select()) throw new MemoryPressureException("GLM adaptive prefill failed its fresh physical check after idle terminal-state reclamation.");
+        }
+        if (_experts != null && selected.ExpertTargetBytes < _experts.BudgetBytes)
+        {
+            long previous = _experts.BudgetBytes;
+            GlmUnifiedExpertCapacity.Resize(_experts, _expertEnvelope!, selected.ExpertTargetBytes,
+                _expertMinimumBytes, physical.Limits);
+            // Native release does not prove equivalent physical availability.
+            physical = ObservePhysicalConstraints();
+            mayReclaimExperts = false;
+            if (!Select()) throw new MemoryPressureException("GLM adaptive prefill failed its fresh physical check after fenced expert reclamation.");
+            Console.WriteLine($"[unified-memory] request {seq.RequestId}: fenced expert cache {previous / 1048576.0:F0} -> {_experts.BudgetBytes / 1048576.0:F0} MiB for actual prefill shape");
+        }
+        var admittedGraph = GlmUnifiedAdmissionGraphPlan.Create(_geometry, _context, selected.Rows,
+            seq.PromptTokens.Count, seq.NumComputedTokens, heads, GraphEntriesWithTransient);
+        var targets = new List<(BudgetReservation Envelope, IReadOnlyList<MemoryCharge> TotalTarget)>
+            { (_joint!, Charges(selected.JointTarget)) };
+        if (materialized) targets.Add((seq.MemoryEnvelope!, Charges(selected.RequestTarget)));
+        // A new request's separate materialization envelope is acquired next by
+        // the scheduler. Include its whole growth in this pre-transaction check.
+        if (!materialized)
+        {
+            var owned = Bytes(_joint!.OwnedCharges);
+            var growth = new InferenceMemoryBytes(checked(selected.JointTarget.Host - owned.Host + selected.RequestTarget.Host),
+                checked(selected.JointTarget.Device - owned.Device + selected.RequestTarget.Device));
+            physical = physical with { Ledger = Budget.Snapshot() };
+            if (!physical.Fits(Charges(growth))) throw new MemoryPressureException("GLM adaptive prefill combined materialization peak changed before reservation.");
+        }
+        if (!Budget.TryResizeTotals(targets, physical.Limits, requirePhysicalFit: true))
+            throw new MemoryPressureException("GLM adaptive prefill could not atomically admit its actual graph/request targets.");
+        state.Cap = selected.Rows; state.Siblings = siblings;
+        state.Peak = admittedGraph.PrefillPeak;
+        if (selected.Rows < maximum)
+            Console.WriteLine($"[unified-memory] request {seq.RequestId}: prefill {maximum} -> {selected.Rows} rows for actual prompt/joint shapes and immutable expert floor");
+        return physical.Limits;
+    }
+
+    private void RecoverExpertCapacity()
+    {
+        if (!_options.EnableAdaptiveGlmPrefill || _experts == null) return;
+        if (_native!.CallbackError is { } callback) throw new InvalidOperationException("GLM optional expert recovery is disabled after an accounting failure.", callback);
+        var physical = ObservePhysicalConstraints();
+        var device = physical.Ledger.Single(p => p.Pool == DevicePool);
+        long limit = Math.Min(device.Capacity, physical.Limits.Single(c => c.Pool == DevicePool).Bytes);
+        long slack = Math.Max(0, limit - device.Committed - device.Reserved);
+        long increase = Math.Max(0, slack - (128L << 20));
+        long previous = _experts.BudgetBytes;
+        long target = Math.Min(_experts.MaximumBudgetBytes, checked(previous + increase));
+        target = Math.Max(previous, target / (1L << 20) * (1L << 20));
+        if (target - previous < (512L << 20)) return;
+        if (GlmUnifiedExpertCapacity.Resize(_experts, _expertEnvelope!, target, _expertMinimumBytes, physical.Limits))
+            Console.WriteLine($"[unified-memory] released request workspace: expert-cache ceiling {previous / 1048576.0:F0} -> {target / 1048576.0:F0} MiB within live reservations; retained tables grow only for an admitted route/shape requirement");
+    }
+
+    private void RecoverReleasedCapacity(IReadOnlyList<SequenceState> running)
+    {
+        if (!_options.EnableAdaptiveGlmPrefill) return;
+        if (_native!.CallbackError is { } callback)
+            throw new InvalidOperationException("GLM released-capacity recovery is disabled after an accounting failure.", callback);
+        // The engine has fenced model release and disposed this request's root.
+        // Invalidate only managed shape bookkeeping: native decode graphs may
+        // remain reusable, but their unused large-prefill credit must not stay
+        // hidden until a 256-token graph boundary happens to change the shape.
+        _lastGraphShape = null;
+        InferenceMemoryBytes PrefillPeak(SequenceState sequence)
+            => _requestPrefill.TryGetValue(sequence, out var state) ? state.Peak : default;
+        var plan = GlmUnifiedReleaseGraphPlan.Create(_geometry, _context, running, PrefillPeak,
+            default, GraphEntriesWithTransient);
+        if (plan.RunningRows == 0)
+            _model!.TrimUnifiedGraphs(); // All graphs are idle; terminal KV slots stay live.
+        else if (!plan.HasRunningPrefill)
+            _model!.TrimUnifiedGraphs(onlyPrefill: true); // No surviving request needs a PP graph.
+        plan = GlmUnifiedReleaseGraphPlan.Create(_geometry, _context, running, PrefillPeak,
+            default, GraphEntriesWithTransient);
+        var target = plan.RunningRows == 0
+            ? GlmUnifiedPrefillAdmission.Floor(default, Bytes(_joint!.LiveChildCharges))
+            : PreserveReplacement(WithLivePrefillPromises(plan.Target));
+        if (!_joint.TryResizeTotal(Charges(target)))
+            throw new MemoryPressureException("GLM sequence release could not preserve the remaining graph and physical-child floors.");
+        // Cache recovery sees the corrected shared ownership and a fresh
+        // physical sample only after graph retirement/credit shrink complete.
+        RecoverExpertCapacity();
     }
 
     private int PaddedContext(int tokens)
         => Math.Min(_context, checked((Math.Max(1, tokens) + 255) / 256 * 256));
     private InferenceMemoryBytes PreserveReplacement(InferenceMemoryBytes twoGraphs)
     {
-        var children = _joint!.LiveChildCharges.ToDictionary(c => c.Pool, c => c.Bytes);
         // The native cache retains one graph while allocating its replacement.
         // An earlier wider PP graph can be larger than this next decode graph.
-        return new(Math.Max(twoGraphs.Host, checked(children[HostPool] + twoGraphs.Host / GraphEntriesWithTransient)),
-            Math.Max(twoGraphs.Device, checked(children[DevicePool] + twoGraphs.Device / GraphEntriesWithTransient)));
+        return GlmUnifiedPrefillAdmission.PreserveReplacement(twoGraphs,
+            Bytes(_joint!.LiveChildCharges), GraphEntriesWithTransient);
     }
     private void PrepareGraph(GlmUnifiedGraphShape shape)
     {
-        int rowLimit = shape.Batched ? _options.MaximumRunningRequests : _prefill;
+        int rowLimit = shape.Batched ? _options.MaximumRunningRequests
+            : _executingSequence is { } sequence ? AdmittedPrefillLimit(sequence) : _prefill;
         if (shape.Rows <= 0 || shape.Rows > rowLimit || shape.ContextTokens <= 0 || shape.ContextTokens > _context)
             throw new MemoryPressureException("GLM graph shape exceeds the admitted execution geometry.");
         shape = shape with { ContextTokens = PaddedContext(shape.ContextTokens) };
         if (_lastGraphShape == shape) return;
-        var target = PreserveReplacement(_geometry.GraphPeak(shape.ContextTokens, shape.Rows, shape.Batched, GraphEntriesWithTransient));
+        var target = PreserveReplacement(WithLivePrefillPromises(
+            _geometry.GraphPeak(shape.ContextTokens, shape.Rows, shape.Batched, GraphEntriesWithTransient)));
         bool Resize(IReadOnlyList<MemoryCharge>? limits = null) => _executingRequest is { } request
             ? Budget.TryResizeTotals([(_joint!, Charges(target)), (request, request.OwnedCharges)], limits)
             : _joint!.TryResizeTotal(Charges(target), limits);
@@ -272,7 +512,8 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         if (!Resize(grows ? PhysicalConstraints() : null))
         {
             _model!.TrimUnifiedGraphs(); _model.TrimUnifiedRetainedSlots(); _lastGraphShape = null;
-            target = PreserveReplacement(_geometry.GraphPeak(shape.ContextTokens, shape.Rows, shape.Batched, GraphEntriesWithTransient));
+            target = PreserveReplacement(WithLivePrefillPromises(
+                _geometry.GraphPeak(shape.ContextTokens, shape.Rows, shape.Batched, GraphEntriesWithTransient)));
             var limits = PhysicalConstraints();
             if (!Resize(limits))
             {
@@ -305,29 +546,24 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         {
             var execution = new SerialExecution(this, scope);
             _executingRequest = request;
+            _executingSequence = seq;
             return execution;
         }
         catch { scope.Dispose(); throw; }
     }
     private sealed class SerialExecution(GlmUnifiedMemoryModelSession owner, IDisposable scope) : IDisposable
     {
-        public void Dispose() { try { scope.Dispose(); } finally { owner._executingRequest = null; } }
+        public void Dispose() { try { scope.Dispose(); } finally { owner._executingRequest = null; owner._executingSequence = null; } }
     }
     private bool Fits(IReadOnlyList<MemoryCharge> bytes, IReadOnlyList<MemoryCharge> limits)
     {
         var owned = Budget.Snapshot().ToDictionary(p => p.Pool);
         return bytes.All(c => (decimal)c.Bytes + owned[c.Pool].Reserved + owned[c.Pool].Committed <= limits.Single(p => p.Pool == c.Pool).Bytes);
     }
-    private MemoryCharge[] PhysicalConstraints()
-    {
-        var hardware = InferenceHardwareMemory.CaptureCuda();
-        var owned = Budget.Snapshot().ToDictionary(p => p.Pool);
-        long host = (long)Math.Min(_hostCeiling, (decimal)owned[HostPool].Committed
-            + Math.Max(0, hardware.HostAllocationCapacity().Available - _hostHeadroom));
-        long device = (long)Math.Min(_deviceCeiling, (decimal)owned[DevicePool].Committed
-            + Math.Max(0, hardware.DeviceAvailable - _deviceHeadroom));
-        return [new(HostPool, host), new(DevicePool, device)];
-    }
+    private GlmUnifiedPhysicalObservation ObservePhysicalConstraints()
+        => GlmUnifiedPhysicalObservation.Create(InferenceHardwareMemory.CaptureCuda(), Budget.Snapshot(),
+            _hostCeiling, _deviceCeiling, _hostHeadroom, _deviceHeadroom);
+    private MemoryCharge[] PhysicalConstraints() => ObservePhysicalConstraints().Limits;
     private IDisposable EnterVisionPreparation(GlmVisionPreparationPlan plan)
     {
         var limits = PhysicalConstraints();
