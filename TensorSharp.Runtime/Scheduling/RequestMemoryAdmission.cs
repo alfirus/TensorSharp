@@ -81,6 +81,23 @@ public sealed class RequestMemoryAdmission
     /// owned. Failure is isolated to this newly admitted destination.</summary>
     public Action<SequenceState>? AfterPrefixMaterialization { get; init; }
 
+    /// <summary>Optional admitted per-request prefill width. This getter must be
+    /// side-effect free and return a positive bound without hardware probes or IO.
+    /// Scheduling and every actual replay/prefill slice preserve this bound.</summary>
+    public Func<SequenceState, int>? PrefillTokenLimit { get; init; }
+
+    /// <summary>Revalidate a revoked prefix's actual execution peak before its
+    /// replay or next prefill Forward. Runs inside the existing request scope;
+    /// it must not enter another execution scope. A refusal fails only that request.</summary>
+    public Action<SequenceState>? RevalidateExecution { get; init; }
+
+    internal int GetPrefillTokenLimit(SequenceState sequence)
+    {
+        int limit = PrefillTokenLimit?.Invoke(sequence) ?? int.MaxValue;
+        if (limit <= 0) throw new InvalidOperationException("An admitted prefill limit must be positive.");
+        return limit;
+    }
+
     /// <summary>Optional cache-capacity recovery after model release, native
     /// fences, prefix maintenance and disposal of a finished request's root
     /// reservation. Called under the model compute lock with the gate open,

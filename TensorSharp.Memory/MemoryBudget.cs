@@ -426,10 +426,21 @@ public sealed class MemoryBudget
     /// unchanged and released credit can fund another owner's growth.</summary>
     public bool TryResizeTotals(IEnumerable<(BudgetReservation Envelope, IReadOnlyList<MemoryCharge> TotalTarget)> targets,
         IEnumerable<MemoryCharge>? capacityConstraints = null)
+        => TryResizeTotals(targets, capacityConstraints, requirePhysicalFit: false);
+
+    /// <summary>Admission variant of the envelope transaction. When physical fit
+    /// is required, every supplied constraint checks the complete post-transaction
+    /// ledger even if ownership only shrinks. The ordinary overload deliberately
+    /// permits cleanup under pressure. False leaves every owner unchanged.</summary>
+    public bool TryResizeTotals(IEnumerable<(BudgetReservation Envelope, IReadOnlyList<MemoryCharge> TotalTarget)> targets,
+        IEnumerable<MemoryCharge>? capacityConstraints, bool requirePhysicalFit)
     {
+        if (requirePhysicalFit) ArgumentNullException.ThrowIfNull(capacityConstraints);
         ArgumentNullException.ThrowIfNull(targets);
         var plans = targets.Select(t => (t.Envelope, Requested: Normalize(t.TotalTarget))).ToArray();
         var limits = capacityConstraints == null ? null : NormalizeCapacityConstraints(capacityConstraints);
+        if (requirePhysicalFit && limits!.Count == 0)
+            throw new ArgumentException("Strict admission requires at least one physical capacity constraint.", nameof(capacityConstraints));
         var unique = new HashSet<BudgetReservation>(ReferenceEqualityComparer.Instance);
         var deltas = new Dictionary<string, long>(StringComparer.Ordinal);
         TaskCompletionSource? releasedSignal = null;
@@ -464,7 +475,7 @@ public sealed class MemoryBudget
                 if (delta > 0 && (delta > pool.Ceiling - pool.Reserved - pool.Committed
                     || delta > pool.Capacity - pool.Reserved - pool.Committed)) return false;
             }
-            if (grows && limits != null)
+            if ((grows || requirePhysicalFit) && limits != null)
                 foreach (var (name, capacity) in limits)
                 {
                     var pool = _pools[name];

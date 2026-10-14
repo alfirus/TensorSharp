@@ -424,7 +424,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int promptUncomputed = Math.Max(
                     0, seq.PromptTokens.Count - seq.NumComputedTokens);
                 int cap = GetPrefillCap(
-                    noContention, hasActiveDecode, tokenBudget,
+                    seq, noContention, hasActiveDecode, tokenBudget,
                     prefillCandidatesRemaining, soloPrefillCap);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, tokenBudget);
@@ -635,7 +635,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
 
                 int cap = GetPrefillCap(
-                    noContention, hasActiveDecode, tokenBudget,
+                    seq, noContention, hasActiveDecode, tokenBudget,
                     Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, tokenBudget);
@@ -731,6 +731,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Choose a latency cap for mixed work, or an even share of the
         /// full device token budget when all contenders are still prefilling.</summary>
         private int GetPrefillCap(
+            SequenceState sequence,
             bool noContention,
             bool hasActiveDecode,
             int tokenBudget,
@@ -744,6 +745,7 @@ namespace TensorSharp.Runtime.Scheduling
             int cap = noContention ? soloPrefillCap : hasActiveDecode
                 ? _cfg.MaxPrefillChunkSize : Math.Max(1, evenShare);
             cap = Math.Min(cap, _cfg.PrefillChunkTokenLimit);
+            cap = Math.Min(cap, _cfg.MemoryAdmission?.GetPrefillTokenLimit(sequence) ?? int.MaxValue);
             // Fairness and solo-throughput policies may increase a chunk, but
             // cannot exceed the shape whose workspace was admitted. Apply this
             // to both existing and newly admitted prefills.

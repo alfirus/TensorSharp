@@ -354,15 +354,20 @@ namespace TensorSharp.Models
             PrepareQsaHistory(startPos, seqLen);
 
             long tEmb = Stopwatch.GetTimestamp();
-            Tensor embd = Embedding(tokens);           // [T, n_embd]
-            InjectVisionEmbeddings(embd, seqLen);
-            _embTicks += Stopwatch.GetTimestamp() - tEmb;
-            PhaseLog(seqLen, "embedding", tEmb);
+            Tensor res;
+            long tBr;
+            using (Tensor embd = Embedding(tokens))   // [T, n_embd]
+            {
+                InjectVisionEmbeddings(embd, seqLen);
+                _embTicks += Stopwatch.GetTimestamp() - tEmb;
+                PhaseLog(seqLen, "embedding", tEmb);
 
-            // The wide residual starts as hc identical copies of the embedding.
-            long tBr = Stopwatch.GetTimestamp();
-            Tensor res = BroadcastToStreams(embd, seqLen);
-            embd.Dispose();
+                // The wide residual starts as hc identical copies of the embedding.
+                // Keep the embedding owned until either injection/broadcast fails
+                // or the residual has successfully taken over the forward.
+                tBr = Stopwatch.GetTimestamp();
+                res = BroadcastToStreams(embd, seqLen);
+            }
             PhaseLog(seqLen, "broadcast", tBr);
 
             // The whole token as (almost) one graph: every PLE-free run of layers -
@@ -574,20 +579,24 @@ namespace TensorSharp.Models
         {
             int n = Config.HiddenSize;
             var res = new Tensor(_allocator, DType.Float32, seqLen, _hcDim);
-            long srcA = (long)GetFloatPtr(x);
-            long dstA = (long)GetFloatPtr(res);
-            int hc = _hc, hcDim = _hcDim;
-            void CopyToken(int t)
+            try
             {
-                float* s = (float*)srcA + (long)t * n;
-                float* d = (float*)dstA + (long)t * hcDim;
-                for (int c = 0; c < hc; c++)
-                    Buffer.MemoryCopy(s, d + (long)c * n, n * 4L, n * 4L);
+                long srcA = (long)GetFloatPtr(x);
+                long dstA = (long)GetFloatPtr(res);
+                int hc = _hc, hcDim = _hcDim;
+                void CopyToken(int t)
+                {
+                    float* s = (float*)srcA + (long)t * n;
+                    float* d = (float*)dstA + (long)t * hcDim;
+                    for (int c = 0; c < hc; c++)
+                        Buffer.MemoryCopy(s, d + (long)c * n, n * 4L, n * 4L);
+                }
+                if (seqLen >= 16) System.Threading.Tasks.Parallel.For(0, seqLen, CopyToken);
+                else for (int t = 0; t < seqLen; t++) CopyToken(t);
+                InvalidateTensorDeviceCache(res);
+                return res;
             }
-            if (seqLen >= 16) System.Threading.Tasks.Parallel.For(0, seqLen, CopyToken);
-            else for (int t = 0; t < seqLen; t++) CopyToken(t);
-            InvalidateTensorDeviceCache(res);
-            return res;
+            catch { res.Dispose(); throw; }
         }
 
         /// <summary>

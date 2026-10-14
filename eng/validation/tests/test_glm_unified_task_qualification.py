@@ -4,6 +4,7 @@ import importlib.util
 import json
 import pathlib
 import tempfile
+import types
 import unittest
 
 TOOL = pathlib.Path(__file__).resolve().parents[1] / 'glm-unified-task-qualification.py'
@@ -72,7 +73,206 @@ def fixture(case='extraction'):
     return plan, report, wrapper
 
 
+def relocated_fixture():
+    plan, report, wrapper = fixture()
+    names = ['glm-00001-of-00003.gguf', 'glm-00002-of-00003.gguf',
+             'glm-00003-of-00003.gguf', 'mmproj.gguf']
+    source, destination = 'E:/models/glm', 'C:/models/glm'
+    original_rows = [dict(path=source + '/' + name, bytes=(index + 1) * 10,
+        mtime_ns=(index + 1) * 100, sha256=str(index + 1) * 64) for index, name in enumerate(names)]
+    runtime_rows = [dict(row, path=destination + '/' + name, mtime_ns=row['mtime_ns'] + 1000)
+                    for row, name in zip(original_rows, names)]
+    original_manifest, runtime_manifest = dict(files=original_rows), dict(files=runtime_rows)
+    binding = plan['Binding']
+    binding['SourceModel'] = original_rows[0]['path']
+    binding['SourceModelFiles'] = [dict(Path=row['path'], Bytes=row['bytes'], MtimeNs=row['mtime_ns'])
+                                   for row in original_rows[:3]]
+    snapshot = lambda row: dict(size=row['bytes'], mtime_ns=row['mtime_ns'], ctime_ns=100,
+                               device=1, inode=2, mode=0o100666)
+    receipt = dict(schema='tensorsharp.verified-relocation.v1', status='copy_complete',
+        config=dict(kind='directory', source=source, destination=destination,
+                    source_root='E:/models', destination_root='C:/models',
+                    include_files=names.copy(), retire_source=False, junction=False),
+        logical_source_bytes=100,
+        files={name: dict(source_snapshot=snapshot(old), destination_snapshot=snapshot(new),
+                         sha256=old['sha256'], state='verified')
+               for name, old, new in zip(names, original_rows, runtime_rows)})
+    plan['ModelManifest'] = runtime_manifest
+    plan['ModelIdentity'] = dict(Path='/runtime-model.json', Bytes=100, Sha256='9' * 64)
+    plan['Relocation'] = dict(Receipt=dict(Path='/relocation.json', Bytes=100, Sha256='8' * 64),
+        ReceiptData=receipt, SourceManifest=original_manifest,
+        SourceManifestIdentity=dict(Path='/original-model.json', Bytes=100, Sha256='7' * 64),
+        RuntimeBinding=MOD.relocation_runtime_binding(binding, original_manifest, runtime_manifest, receipt))
+    plan['Model'] = runtime_rows[0]['path']
+    report['Arguments'].update(model=plan['Model'], **{'model-identity': plan['ModelIdentity']['Path']})
+    report['HistoricalModelIdentity'] = copy.deepcopy(plan['ModelIdentity'])
+    report['HistoricalModelIdentityAfter'] = copy.deepcopy(plan['ModelIdentity'])
+    report['HistoricalModelManifest'] = runtime_manifest
+    stats = {row['path']: dict(Path=row['path'], Bytes=row['bytes'],
+        LastWriteTimeUtcTicks=621355968000000000 + row['mtime_ns'] // 100) for row in runtime_rows[:3]}
+    report['ModelStatsBefore'] = stats
+    report['ModelStatsAfter'] = copy.deepcopy(stats)
+    plan['Command'] = MOD.command(plan)
+    wrapper['command'] = copy.deepcopy(plan['Command'])
+    return plan, report, wrapper
+
+
 class GlmUnifiedTaskQualificationTests(unittest.TestCase):
+    def test_prepare_relocated_plans_pins_small_provenance_without_opening_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            p, _, _ = relocated_fixture()
+            relocation = p['Relocation']
+            source_dir, app = root / 'source', root / 'app'
+            source_dir.mkdir(); app.mkdir()
+            for name in ('GgmlOps.dll', 'GlmUnifiedSessionProbe.dll'):
+                (app / name).write_bytes(b'tiny fake fixture, never executed')
+            native_sha = MOD.sha(app / 'GgmlOps.dll')
+            deployment = [dict(Variant='native16', Directory=str(app), NativeSha256=native_sha,
+                Files=[dict(Name=item.name, Bytes=item.stat().st_size, Sha256=MOD.sha(item)) for item in app.iterdir()])]
+            paths = {}
+            for name, data in [('deployment', deployment), ('receipt', relocation['ReceiptData']),
+                ('original', relocation['SourceManifest']), ('runtime', p['ModelManifest'])]:
+                paths[name] = root / (name + '.json')
+                paths[name].write_text(json.dumps(data), encoding='utf-8')
+            quality = []
+            for case in MOD.CASES:
+                rendered = MOD.PREFIX + MOD.fixed.PROMPTS[case] + MOD.SUFFIX
+                quality.append(dict(name=case, prompt=MOD.fixed.PROMPTS[case], rendered_prompt=rendered,
+                    rendered_prompt_utf8_sha256=hashlib.sha256(rendered.encode()).hexdigest(), prompt_tokens=[1, 2, 3]))
+                maya_dir = source_dir / ('maya-e-extraction-batch32-v4' if case == 'extraction' else 'maya-e-' + case + '-batch32-v6')
+                maya_dir.mkdir()
+                (maya_dir / 'report.json').write_text(json.dumps(dict(prompt_tokenizer_exact=True,
+                    reference=dict(name=case, prompt=MOD.fixed.PROMPTS[case], rendered_prompt=rendered, prompt_tokens=[1, 2, 3]))), encoding='utf-8')
+            original = dict(synthetic=False, architecture='glm5-next', model_path=p['Binding']['SourceModel'],
+                dimensions={'VocabSize': 154880}, source_dimensions={'glm5-next.vocab_size': 154880}, quality=quality,
+                model_files=[dict(path=row['Path'], bytes=row['Bytes'],
+                    last_write_utc='1970-01-01T00:00:00.' + str(row['MtimeNs']).zfill(9) + 'Z') for row in p['Binding']['SourceModelFiles']])
+            for name in ('glm-e-budget-c2f-v1.json', 'glm-extended-quality-autoplan-v1.json'):
+                (source_dir / name).write_text(json.dumps(original), encoding='utf-8')
+            args = types.SimpleNamespace(deployment_receipt=paths['deployment'], app=app, variant='native16',
+                output=root / 'plans', source_directory=source_dir, model=p['Model'], model_identity=paths['runtime'],
+                relocation_receipt=paths['receipt'], relocation_source_manifest=paths['original'])
+            MOD.prepare(args)
+            for case in MOD.CASES:
+                plan = MOD.load(args.output / (case + '-plan.json'))
+                MOD.verify_plan_files(plan)
+                self.assertEqual(original['model_path'], plan['Binding']['SourceModel'])
+                self.assertEqual(p['Model'], plan['Model'])
+                self.assertEqual([1, 2, 3], plan['Binding']['PromptTokens'])
+                self.assertEqual(plan['Binding']['PromptTokens'], plan['Relocation']['RuntimeBinding']['PromptTokens'])
+            paths['receipt'].write_text('{}', encoding='utf-8')
+            with self.assertRaises(ValueError): MOD.verify_plan_files(plan)
+
+    def test_completed_relocation_preserves_original_binding_and_checks_runtime_shards(self):
+        p, r, w = relocated_fixture()
+        original_binding, original_report = copy.deepcopy(p['Binding']), copy.deepcopy(r)
+        result = MOD.qualify(p, r, w)
+        self.assertTrue(result['Passed'], result)
+        self.assertEqual(original_binding, p['Binding'])
+        self.assertEqual(original_report, r)
+        self.assertTrue(all(path.startswith('e:/') for path in result['ModelMetadataBinding']['OriginalRequiredModelPaths']))
+        self.assertTrue(all(path.startswith('c:/') for path in result['ModelMetadataBinding']['RequiredModelPaths']))
+        self.assertEqual(['c:/models/glm/mmproj.gguf'], result['ModelMetadataBinding']['AdditionalManifestPaths'])
+        self.assertNotIn('C:/models/glm/mmproj.gguf', r['ModelStatsBefore'])
+
+    def test_changing_only_model_path_never_enables_relocation(self):
+        p, r, w = relocated_fixture()
+        del p['Relocation']
+        self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+        p, r, w = fixture()
+        p['Model'] = 'C:/models/guess.gguf'
+        self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+
+    def test_unfinished_or_incompatible_relocation_states_fail(self):
+        for state in ('copying', 'part_verified', 'publishing', 'verified', 'failed', 'complete', None, True):
+            p, r, w = relocated_fixture()
+            p['Relocation']['ReceiptData']['status'] = state
+            self.assertFalse(MOD.qualify(p, r, w)['Passed'], state)
+        for state in ('pending', 'part_verified', 'publishing', 'retired', 'failed', True):
+            p, r, w = relocated_fixture()
+            next(iter(p['Relocation']['ReceiptData']['files'].values()))['state'] = state
+            self.assertFalse(MOD.qualify(p, r, w)['Passed'], state)
+
+    def test_complete_retirement_requires_full_scope_not_a_selected_subset(self):
+        p, r, w = relocated_fixture()
+        raw = p['Relocation']['ReceiptData']
+        raw.update(status='complete')
+        raw['config'].update(retire_source=True, junction=True)
+        for item in raw['files'].values(): item['state'] = 'retired'
+        self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+        raw['config']['include_files'] = []
+        self.assertTrue(MOD.qualify(p, r, w)['Passed'])
+
+    def test_receipt_hashes_sizes_timestamps_and_runtime_binding_are_not_trusted_flags(self):
+        changes = [
+            lambda p: p['Relocation']['ReceiptData']['files']['glm-00002-of-00003.gguf'].update(sha256='f' * 64),
+            lambda p: p['ModelManifest']['files'][1].update(sha256='f' * 64),
+            lambda p: p['Relocation']['SourceManifest']['files'][1].update(sha256='f' * 64),
+            lambda p: p['Relocation']['ReceiptData']['files']['glm-00002-of-00003.gguf']['source_snapshot'].update(size=21),
+            lambda p: p['Relocation']['ReceiptData']['files']['glm-00002-of-00003.gguf']['destination_snapshot'].update(mtime_ns=1201),
+            lambda p: p['Relocation']['SourceManifest']['files'][1].update(mtime_ns=201),
+            lambda p: p['Relocation']['RuntimeBinding'].update(PromptTokens=[1, 2, 4]),
+            lambda p: p['Relocation']['RuntimeBinding'].update(SourceModel='C:/models/other.gguf'),
+            lambda p: p['Relocation']['RuntimeBinding']['SourceModelFiles'][0].update(MtimeNs=999),
+            lambda p: p['Relocation']['ReceiptData'].update(logical_source_bytes=99),
+            lambda p: p['Relocation']['ReceiptData']['config'].update(retire_source=0),
+            lambda p: p['Relocation']['ReceiptData']['config'].update(junction=True),
+        ]
+        for index, change in enumerate(changes):
+            p, r, w = relocated_fixture(); change(p)
+            with self.subTest(index=index):
+                self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+
+    def test_missing_extra_duplicate_or_guessed_relocation_mappings_fail(self):
+        def rename_mapping(p, name):
+            rows = p['Relocation']['ReceiptData']['files']
+            rows[name] = rows.pop('glm-00002-of-00003.gguf')
+        changes = [
+            lambda p: p['Relocation']['ReceiptData']['files'].pop('glm-00002-of-00003.gguf'),
+            lambda p: p['Relocation']['ReceiptData']['files'].update({'GLM-00002-OF-00003.GGUF': copy.deepcopy(p['Relocation']['ReceiptData']['files']['glm-00002-of-00003.gguf'])}),
+            lambda p: p['ModelManifest']['files'].append(copy.deepcopy(p['ModelManifest']['files'][1])),
+            lambda p: p['Relocation']['SourceManifest']['files'].pop(1),
+            lambda p: rename_mapping(p, '../glm-00002-of-00003.gguf'),
+            lambda p: rename_mapping(p, '/glm-00002-of-00003.gguf'),
+            lambda p: rename_mapping(p, 'sub/../glm-00002-of-00003.gguf'),
+            lambda p: p['Relocation']['ReceiptData']['config'].update(destination='C:/models/other'),
+            lambda p: p['Relocation']['ReceiptData']['config'].update(source='E:/models/glm/../glm'),
+            lambda p: p['Relocation']['ReceiptData']['config']['include_files'].pop(),
+            lambda p: p['Relocation']['ReceiptData']['config']['include_files'].append('GLM-00001-OF-00003.GGUF'),
+        ]
+        for index, change in enumerate(changes):
+            p, r, w = relocated_fixture(); change(p)
+            with self.subTest(index=index):
+                self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+
+    def test_relocated_runtime_requires_exact_new_metadata_for_every_required_shard(self):
+        for field, value in [('Bytes', 11), ('LastWriteTimeUtcTicks', 621355968000000012)]:
+            p, r, w = relocated_fixture()
+            r['ModelStatsBefore']['C:/models/glm/glm-00001-of-00003.gguf'][field] = value
+            r['ModelStatsAfter'] = copy.deepcopy(r['ModelStatsBefore'])
+            self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+        p, r, w = relocated_fixture()
+        r['ModelStatsBefore'].pop('C:/models/glm/glm-00003-of-00003.gguf')
+        r['ModelStatsAfter'] = copy.deepcopy(r['ModelStatsBefore'])
+        self.assertFalse(MOD.qualify(p, r, w)['Passed'])
+
+    def test_relocation_source_and_receipt_small_file_identities_are_rechecked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            p, _, _ = relocated_fixture()
+            root = pathlib.Path(directory)
+            receipt = root / 'receipt.json'; source = root / 'source.json'
+            receipt.write_text(json.dumps(p['Relocation']['ReceiptData']), encoding='utf-8')
+            source.write_text(json.dumps(p['Relocation']['SourceManifest']), encoding='utf-8')
+            p['Relocation']['Receipt'] = MOD.identity(receipt)
+            p['Relocation']['SourceManifestIdentity'] = MOD.identity(source)
+            MOD.verify_relocation_files(p)
+            receipt.write_text('{}', encoding='utf-8')
+            with self.assertRaises(ValueError): MOD.verify_relocation_files(p)
+            receipt.write_text(json.dumps(p['Relocation']['ReceiptData']), encoding='utf-8')
+            source.write_text('{}', encoding='utf-8')
+            with self.assertRaises(ValueError): MOD.verify_relocation_files(p)
+
     def test_deployment_requires_exact_variant_and_application_path(self):
         files = [dict(Name='GgmlOps.dll', Bytes=32, Sha256='a' * 64),
             dict(Name='GlmUnifiedSessionProbe.dll', Bytes=10, Sha256='b' * 64)]

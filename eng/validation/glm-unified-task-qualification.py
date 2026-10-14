@@ -5,6 +5,12 @@ Never launches a process/model. Inputs come only from the Direct quality row's
 prompt_tokens, cross-checked against the historical Maya input. Reference model
 answers are never oracles. --task unknown deliberately exits1 in frozen Probev3;
 this checker independently establishes semantics, integrity and cleanup.
+
+Relocated preparation requires --relocation-receipt (completed raw
+tensorsharp.verified-relocation.v1) and --relocation-source-manifest (the
+original full-SHA manifest), plus the new --model/--model-identity. Original
+conditioning/Binding/Source stay unchanged. Explicit per-shard mappings derive
+the runtime binding; only small evidence files are read here, never model data.
 """
 import argparse
 import calendar
@@ -15,6 +21,7 @@ import importlib.util
 import json
 import pathlib
 import re
+import stat
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -181,6 +188,144 @@ def model_metadata(binding, manifest, before, after):
         Scope='All required model shards before/after; additional manifest attachments are not live-validated by this text-only probe.')
 
 
+def absolute_manifest_path(path):
+    """Lexical explicit paths only: never find a relocated shard by basename."""
+    if not isinstance(path, str) or not path or '\0' in path:
+        raise ValueError('Relocation requires explicit absolute paths')
+    value = path.replace('\\', '/')
+    if not (re.match(r'^[A-Za-z]:/', value) or value.startswith('/')) \
+        or any(piece in ('.', '..', '') for piece in value.rstrip('/').split('/')[1:]):
+        raise ValueError('Ambiguous/relative relocation path')
+    return canonical(value).rstrip('/')
+
+
+def full_manifest_rows(manifest):
+    rows = manifest['files']
+    metadata = metadata_rows(rows, 'path', 'bytes', 'mtime_ns')
+    result = {}
+    for row in rows:
+        key = absolute_manifest_path(row['path'])
+        if not isinstance(row.get('sha256'), str) or not re.fullmatch('[0-9a-fA-F]{64}', row['sha256']):
+            raise ValueError('Relocation requires full SHA256 for every manifest row')
+        result[key] = dict(row, sha256=row['sha256'].lower())
+    if set(result) != set(metadata):
+        raise ValueError('Relocation manifest canonical path mismatch')
+    return result
+
+
+def relocation_runtime_binding(binding, original_manifest, runtime_manifest, receipt):
+    """Validate completed raw relocate-verified-files.py v1 evidence, without data IO.
+
+    Historical source and destination full-file hashes must both match each raw
+    receipt mapping. Runtime before/after metadata is checked separately. This is
+    not a new live model hash, source rewrite, or a controlled cold-start claim.
+    """
+    if receipt.get('schema') != 'tensorsharp.verified-relocation.v1':
+        raise ValueError('Unsupported relocation receipt schema')
+    config, rows = receipt['config'], receipt['files']
+    if config.get('kind') != 'directory' or not isinstance(rows, dict) or not rows:
+        raise ValueError('Require a nonempty directory checkpoint relocation receipt')
+    if type(config.get('retire_source')) is not bool or type(config.get('junction')) is not bool \
+        or (config['junction'] and not config['retire_source']):
+        raise ValueError('Invalid relocation retirement/junction controls')
+    retiring = config['retire_source']
+    if receipt.get('status') != ('complete' if retiring else 'copy_complete'):
+        raise ValueError('Relocation is not completely verified/published')
+    source = absolute_manifest_path(config['source'])
+    destination = absolute_manifest_path(config['destination'])
+    if not source.startswith(absolute_manifest_path(config['source_root']) + '/') \
+        or not destination.startswith(absolute_manifest_path(config['destination_root']) + '/') \
+        or source == destination or source.startswith(destination + '/') or destination.startswith(source + '/'):
+        raise ValueError('Relocation roots overlap or explicit scope differs')
+    original, runtime = full_manifest_rows(original_manifest), full_manifest_rows(runtime_manifest)
+    required = metadata_rows(binding['SourceModelFiles'], 'Path', 'Bytes', 'MtimeNs')
+    for key, expected in required.items():
+        if key not in original or (original[key]['bytes'], original[key]['mtime_ns']) != expected:
+            raise ValueError('Original full-hash manifest differs from required historical source metadata')
+    included = config.get('include_files')
+    if not isinstance(included, list) or any(not isinstance(item, str) for item in included):
+        raise ValueError('Invalid explicit include_files list')
+    if included and retiring:
+        raise ValueError('Subset relocation cannot retire the source scope')
+    mapping, seen_destinations, normalized_relatives, logical_bytes = {}, set(), set(), 0
+    snapshot_fields = ('size', 'mtime_ns', 'ctime_ns', 'device', 'inode', 'mode')
+    for relative, row in rows.items():
+        if not isinstance(relative, str) or not relative or '\\' in relative or ':' in relative \
+            or any(piece in ('', '.', '..') for piece in relative.split('/')):
+            raise ValueError('Invalid relative relocation mapping; no path guessing')
+        source_path = absolute_manifest_path(source + '/' + relative)
+        destination_path = absolute_manifest_path(destination + '/' + relative)
+        normalized = canonical(source + '/' + relative)[len(source) + 1:]
+        if source_path in mapping or destination_path in seen_destinations or normalized in normalized_relatives:
+            raise ValueError('Duplicate canonical relocation mapping')
+        if source_path not in original or destination_path not in runtime:
+            raise ValueError('Explicit relocation mapping missing from source/destination full manifest')
+        if row.get('state') != ('retired' if retiring else 'verified'):
+            raise ValueError('Incomplete or incompatible per-file relocation state')
+        if not isinstance(row.get('sha256'), str) or not re.fullmatch('[0-9a-fA-F]{64}', row['sha256']):
+            raise ValueError('Missing/invalid verified relocation SHA256')
+        for name, manifest_row in (('source_snapshot', original[source_path]),
+                                   ('destination_snapshot', runtime[destination_path])):
+            snapshot = row[name]
+            if not isinstance(snapshot, dict) or any(type(snapshot.get(key)) is not int or snapshot[key] < 0 for key in snapshot_fields) \
+                or snapshot['size'] <= 0 or not stat.S_ISREG(snapshot['mode']) \
+                or (snapshot['size'], snapshot['mtime_ns']) != (manifest_row['bytes'], manifest_row['mtime_ns']):
+                raise ValueError('Relocation source/destination size/mtime/file snapshot differs')
+        if not (original[source_path]['sha256'] == row['sha256'].lower() == runtime[destination_path]['sha256']) \
+            or original[source_path]['bytes'] != runtime[destination_path]['bytes']:
+            raise ValueError('Relocated content differs from original full-file SHA256/size')
+        mapping[source_path] = destination_path
+        seen_destinations.add(destination_path)
+        normalized_relatives.add(normalized)
+        logical_bytes += original[source_path]['bytes']
+    if type(receipt.get('logical_source_bytes')) is not int or receipt['logical_source_bytes'] != logical_bytes \
+        or set(mapping) != set(original) or seen_destinations != set(runtime) or not set(required).issubset(mapping):
+        raise ValueError('Relocation must cover every full-manifest row and required shard exactly once')
+    if included:
+        expected_included = {canonical(source + '/' + name)[len(source) + 1:] for name in included}
+        if len(expected_included) != len(included) or expected_included != normalized_relatives:
+            raise ValueError('Explicit relocation selection differs from complete file mapping')
+        # Validate original spelling too; normalization must never hide traversal.
+        for name in included:
+            if '\\' in name or ':' in name or any(piece in ('', '.', '..') for piece in name.split('/')):
+                raise ValueError('Invalid include_files path')
+    source_model = absolute_manifest_path(binding['SourceModel'])
+    if source_model not in required or source_model not in mapping:
+        raise ValueError('Original entry shard has no explicit relocation mapping')
+    result = copy.deepcopy(binding)
+    result['SourceModel'] = runtime[mapping[source_model]]['path']
+    result['SourceModelFiles'] = [dict(Path=runtime[mapping[canonical(row['Path'])]]['path'],
+        Bytes=runtime[mapping[canonical(row['Path'])]]['bytes'],
+        MtimeNs=runtime[mapping[canonical(row['Path'])]]['mtime_ns']) for row in binding['SourceModelFiles']]
+    return result
+
+
+def runtime_binding_for_plan(plan):
+    if 'Relocation' not in plan:
+        return plan['Binding']
+    relocation = plan['Relocation']
+    if not isinstance(relocation, dict) or set(relocation) != {
+        'Receipt', 'ReceiptData', 'SourceManifestIdentity', 'SourceManifest', 'RuntimeBinding'}:
+        raise ValueError('Incomplete/ambiguous relocation provenance')
+    derived = relocation_runtime_binding(plan['Binding'], relocation['SourceManifest'],
+                                         plan['ModelManifest'], relocation['ReceiptData'])
+    if derived != relocation['RuntimeBinding']:
+        raise ValueError('Runtime binding differs from exact verified relocation')
+    return derived
+
+
+def verify_relocation_files(plan):
+    if 'Relocation' not in plan:
+        return
+    relocation = plan['Relocation']
+    for name in ('Receipt', 'SourceManifestIdentity'):
+        if identity(relocation[name]['Path']) != relocation[name]:
+            raise ValueError('Pinned relocation provenance changed: ' + name)
+    if load(relocation['Receipt']['Path']) != relocation['ReceiptData'] \
+        or load(relocation['SourceManifestIdentity']['Path']) != relocation['SourceManifest']:
+        raise ValueError('Relocation data differs from pinned small provenance files')
+
+
 def verify_revalidation_origin(plan):
     if 'OriginPlan' not in plan:
         return
@@ -210,7 +355,9 @@ def verify_plan_files(plan):
     if binding != plan['Binding']:
         raise ValueError('Plan original binding altered')
     bind_maya(load(plan['MayaSource']['Path']), binding)
-    if canonical(plan['Model']) != canonical(binding['SourceModel']): raise ValueError('Actual source model binding differs')
+    verify_relocation_files(plan)
+    runtime_binding = runtime_binding_for_plan(plan)
+    if canonical(plan['Model']) != canonical(runtime_binding['SourceModel']): raise ValueError('Actual verified source/runtime model binding differs')
     if not same_identity(plan['Oracle'], identity(fixed.__file__)) or not same_identity(plan['Checker'], identity(__file__)):
         raise ValueError('Plan names a different executing oracle/checker')
     _, native, expected, wrapper = deployment(load(plan['DeploymentReceipt']['Path']), plan['AppDirectory'],
@@ -231,10 +378,11 @@ def qualify(plan, report, wrapper):
             errors.append(label)
     try:
         case = plan['Case']; binding = plan['Binding']; vocab = binding['VocabSize']
+        runtime_binding = runtime_binding_for_plan(plan)
         check(plan['SchemaVersion'] == 1 and report['SchemaVersion'] == 2, 'Pinned plan/Probev3 report schema')
         check(case in CASES and binding['Case'] == case and binding['Prompt'] == fixed.PROMPTS.get(case), 'Independent task binding')
         check(binding['RenderedPrompt'] == PREFIX + binding['Prompt'] + SUFFIX, 'Exact rendered conditioning')
-        check(canonical(plan['Model']) == canonical(binding['SourceModel']), 'Actual original model binding')
+        check(canonical(plan['Model']) == canonical(runtime_binding['SourceModel']), 'Actual original or verified relocated model binding')
         prompt = tokens(binding['PromptTokens'], vocab); output = tokens(report['OutputTokens'], vocab)
         for name in ('PromptTokens', 'PublishedTokens', 'OutputTokensAfterCleanup'):
             tokens(report[name], vocab)
@@ -277,7 +425,11 @@ def qualify(plan, report, wrapper):
         check(report['ModelIdentityLinked'] is True and report['HistoricalModelIdentity']['Sha256'] == plan['ModelIdentity']['Sha256'], 'Original model full-hash linkage')
         check(report['HistoricalModelManifest'] == plan['ModelManifest']
             and same_identity(report['HistoricalModelIdentityAfter'], plan['ModelIdentity']), 'Original manifest before/after linkage')
-        model_binding = model_metadata(binding, plan['ModelManifest'], report['ModelStatsBefore'], report['ModelStatsAfter'])
+        model_binding = model_metadata(runtime_binding, plan['ModelManifest'], report['ModelStatsBefore'], report['ModelStatsAfter'])
+        if 'Relocation' in plan:
+            model_binding.update(OriginalRequiredModelPaths=sorted(canonical(row['Path']) for row in binding['SourceModelFiles']),
+                RelocationReceipt=plan['Relocation']['Receipt'], OriginalFullHashManifest=plan['Relocation']['SourceManifestIdentity'],
+                ContentIdentityScope='Completed raw relocation receipt + original/destination full SHA256 manifests; runtime required-shard size/mtime exact before/after, no new full model hash or live inode/device attestation.')
         check(model_binding['Matches'], 'All required original model shards size/mtime binding')
         check(same_identity(report['InputFile'], plan['InputFile']) and same_identity(report['InputFileAfter'], plan['InputFile']), 'Exact pinned original input identity')
         check(managed(report['ManagedBefore']) == plan['Managed'] and managed(report['ManagedAfter']) == plan['Managed'], 'Pinned actual managed/tool identities')
@@ -346,6 +498,10 @@ def prepare(args):
     for name in ('GgmlOps.dll', 'GlmUnifiedSessionProbe.dll'):
         if (pathlib.Path(args.app) / name).stat().st_size != files[name]['Bytes']:
             raise ValueError('Frozen app file size differs; no binary reread in preparation')
+    relocation_path = getattr(args, 'relocation_receipt', None)
+    original_manifest_path = getattr(args, 'relocation_source_manifest', None)
+    if bool(relocation_path) != bool(original_manifest_path):
+        raise ValueError('Relocation requires both --relocation-receipt and --relocation-source-manifest')
     out = pathlib.Path(args.output).resolve(); out.mkdir(parents=True, exist_ok=False)
     plans = []
     for case in CASES:
@@ -364,6 +520,11 @@ def prepare(args):
             DeadlineSeconds=900, RequestedOptions=OPTIONS,
             Scope='Preparation only; source input IDs, not generated answers. Same historical Maya conditioning, not equivalent physical resource or current Maya performance acceptance.',
             ExpectedProbeUnknownExit=1, ExecutionStatus='not-run')
+        if relocation_path:
+            raw = load(relocation_path); original_manifest = load(original_manifest_path)
+            plan['Relocation'] = dict(Receipt=identity(relocation_path), ReceiptData=raw,
+                SourceManifestIdentity=identity(original_manifest_path), SourceManifest=original_manifest,
+                RuntimeBinding=relocation_runtime_binding(binding, original_manifest, plan['ModelManifest'], raw))
         plan['Command'] = command(plan)
         verify_plan_files(plan)
         (out / (case + '-plan.json')).write_text(json.dumps(plan, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'); plans.append(case)
@@ -395,6 +556,8 @@ def main():
     prep.add_argument('--deployment-receipt', default=str(BASE / 'master-merge-20261013/glm-selected-comparison-v3-apps/deployment-receipt.json'))
     prep.add_argument('--model', default='E:/models/GLM-5.3-Flash-GGUF/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf')
     prep.add_argument('--model-identity', default=str(BASE / 'default-readiness-20261010/glm-e-identity-v1.json'))
+    prep.add_argument('--relocation-receipt', help='Explicit completed raw verified-relocation.v1 receipt; no inferred paths')
+    prep.add_argument('--relocation-source-manifest', help='Original historical full-SHA model manifest, required with --relocation-receipt')
     reval = sub.add_parser('revalidate-plan'); reval.add_argument('--plan', required=True)
     reval.add_argument('--origin-checker', required=True); reval.add_argument('--output', required=True)
     check = sub.add_parser('check'); check.add_argument('--plan', required=True); check.add_argument('--report', required=True)

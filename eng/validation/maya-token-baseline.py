@@ -13,6 +13,8 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
+import stat
 import subprocess
 import sys
 import threading
@@ -112,7 +114,181 @@ def prefill_argument(plan):
     return str(int(text))
 
 
-def verify_inputs(plan):
+def relocation_path(value):
+    """Explicit absolute, canonical lexical paths; never guess shard basenames."""
+    if isinstance(value, Path):
+        value = str(value)
+    if not isinstance(value, str) or not value or '\0' in value:
+        raise ValueError('Invalid relocation path')
+    path = Path(value)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('Relocation requires absolute paths without traversal')
+    return os.path.normcase(os.path.abspath(path)).replace('\\', '/')
+
+
+def ordinary_snapshot(path):
+    path = Path(path)
+    for component in [*reversed(path.parents), path]:
+        info = component.lstat()
+        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise ValueError('Relocated runtime cannot use symlinks/reparse points: ' + str(component))
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError('Relocation file must be ordinary: ' + str(path))
+    return dict(size=info.st_size, mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns,
+                device=info.st_dev, inode=info.st_ino, mode=info.st_mode)
+
+
+def strict_full_rows(rows):
+    result = {}
+    for row in rows:
+        path = relocation_path(row['path'])
+        if path in result or type(row.get('bytes')) is not int or row['bytes'] < 0 \
+                or not isinstance(row.get('sha256'), str) or not re.fullmatch('[0-9a-fA-F]{64}', row['sha256']):
+            raise ValueError('Duplicate or incomplete historical full-file identity')
+        result[path] = row
+    if not result:
+        raise ValueError('Empty historical identity')
+    return result
+
+
+def completed_copy_mapping(receipt, historical_rows, source_directory, destination_directory):
+    """Validate the frozen relocation tool's raw copy-only v1 receipt.
+
+    SHA256 is historical content + independently verified copy evidence, not a
+    new full-model scan. Live source/destination file metadata is sampled below.
+    """
+    if receipt.get('schema') != 'tensorsharp.verified-relocation.v1' or receipt.get('status') != 'copy_complete':
+        raise ValueError('Require a completed verified copy receipt')
+    config = receipt['config']
+    if config.get('kind') != 'directory' or config.get('retire_source') is not False or config.get('junction') is not False:
+        raise ValueError('Maya relocation requires ordinary copy-only directory scopes')
+    source = relocation_path(config['source'])
+    destination = relocation_path(config['destination'])
+    if source != relocation_path(source_directory) or destination != relocation_path(destination_directory):
+        raise ValueError('Relocation source/destination differs from explicit runtime pack/model roots')
+    if not source.startswith(relocation_path(config['source_root']) + '/') \
+            or not destination.startswith(relocation_path(config['destination_root']) + '/') \
+            or source == destination or source.startswith(destination + '/') or destination.startswith(source + '/'):
+        raise ValueError('Relocation must stay inside distinct named roots')
+    expected = strict_full_rows(historical_rows)
+    files = receipt['files']
+    if not isinstance(files, dict) or not files:
+        raise ValueError('Empty relocation file mapping')
+    selected = config.get('include_files')
+    if not isinstance(selected, list) or any(not isinstance(name, str) for name in selected):
+        raise ValueError('Invalid relocation include selection')
+    def relative_name(value):
+        if not isinstance(value, str) or not value or '\\' in value or ':' in value \
+                or any(part in ('', '.', '..') for part in value.split('/')):
+            raise ValueError('Relocation relative file must be explicit and traversal-free')
+        return value
+    if selected and (len(selected) != len(set(selected)) or set(map(relative_name, selected)) != set(files)):
+        raise ValueError('Relocation include selection differs from complete mapping')
+    mapping, seen_targets, logical_bytes = {}, set(), 0
+    snapshot_fields = ('size', 'mtime_ns', 'ctime_ns', 'device', 'inode', 'mode')
+    for relative, record in files.items():
+        relative_name(relative)
+        old = relocation_path(source + '/' + relative)
+        new = relocation_path(destination + '/' + relative)
+        if old in mapping or new in seen_targets or old not in expected or record.get('state') != 'verified':
+            raise ValueError('Duplicate, foreign or unverified relocation file')
+        original = expected[old]
+        if not isinstance(record.get('sha256'), str) or record['sha256'].lower() != original['sha256'].lower():
+            raise ValueError('Relocation SHA256 differs from original full-file identity')
+        for key, path in (('source_snapshot', old), ('destination_snapshot', new)):
+            snapshot = record[key]
+            if not isinstance(snapshot, dict) or set(snapshot) != set(snapshot_fields) \
+                    or any(type(snapshot[name]) is not int or snapshot[name] < 0 for name in snapshot_fields) \
+                    or snapshot['size'] != original['bytes'] or not stat.S_ISREG(snapshot['mode']):
+                raise ValueError('Invalid relocation source/destination snapshot')
+            if key == 'source_snapshot' and 'mtime_ns' in original and snapshot['mtime_ns'] != original['mtime_ns']:
+                raise ValueError('Relocation source timestamp differs from original full identity')
+            if ordinary_snapshot(path) != snapshot:
+                raise ValueError('Relocated source/destination metadata changed: ' + path)
+        mapping[old] = dict(path=new, bytes=original['bytes'], sha256=record['sha256'].lower(),
+                            source_path=old, destination_snapshot=record['destination_snapshot'])
+        seen_targets.add(new)
+        logical_bytes += original['bytes']
+    if set(mapping) != set(expected) or type(receipt.get('logical_source_bytes')) is not int \
+            or receipt['logical_source_bytes'] != logical_bytes:
+        raise ValueError('Relocation omits or adds historical full-file rows')
+    return mapping
+
+
+def regular_tree_files(root):
+    paths, stack = set(), [Path(root)]
+    while stack:
+        parent = stack.pop()
+        for entry in os.scandir(parent):
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                raise ValueError('Runtime pack contains a symlink/reparse point')
+            if stat.S_ISDIR(info.st_mode):
+                stack.append(Path(entry.path))
+            elif stat.S_ISREG(info.st_mode):
+                paths.add(relocation_path(entry.path))
+            else:
+                raise ValueError('Runtime pack contains a special file')
+    return paths
+
+
+def verify_relocated_pack(plan, evidence, runtime_evidence):
+    relocation = plan['relocation']
+    if not isinstance(relocation, dict) or set(relocation) != {'schema', 'model_receipt', 'pack_receipt'} \
+            or relocation['schema'] != 'maya-verified-pack-relocation.v1':
+        raise ValueError('Require explicit model and pack relocation receipt identities')
+    receipts = {}
+    for role in ('model_receipt', 'pack_receipt'):
+        identity = relocation[role]
+        if not isinstance(identity, dict) or set(identity) != {'path', 'sha256'} \
+                or not isinstance(identity['sha256'], str) or not re.fullmatch('[0-9a-fA-F]{64}', identity['sha256']) \
+                or bench.sha(identity['path']).lower() != identity['sha256'].lower():
+            raise ValueError('Pinned relocation receipt changed: ' + role)
+        receipts[role] = json.loads(Path(identity['path']).read_text(encoding='utf-8'))
+    if not receipts['model_receipt'].get('config', {}).get('include_files') \
+            or receipts['pack_receipt'].get('config', {}).get('include_files') != []:
+        raise ValueError('Require exact selected checkpoint files and an entire unfiltered pack copy')
+    manifest_identity = evidence['original_checkpoint_identity']
+    if bench.sha(manifest_identity['path']) != manifest_identity['sha256']:
+        raise ValueError('Original full-checkpoint identity manifest changed')
+    manifest = json.loads(Path(manifest_identity['path']).read_text(encoding='utf-8'))
+    original_models = strict_full_rows(manifest['files'])
+    strict_full_rows(evidence['generated_files'])
+    pack_sources = {Path(row['path']).parent for row in evidence['generated_files'] if Path(row['path']).name == 'native_experts.txt'}
+    if len(pack_sources) != 1:
+        raise ValueError('Original qualified pack has no unique native expert index')
+    source_pack = pack_sources.pop()
+    if any(not Path(row['path']).is_relative_to(source_pack) for row in evidence['generated_files']):
+        raise ValueError('Historical derived files escape their qualified pack')
+    if any(Path(row['path']).parent != source_pack.parent for row in manifest['files']):
+        raise ValueError('Original complete checkpoint is not alongside its qualified pack')
+    for row in evidence['model_stat_after']:
+        original = original_models.get(relocation_path(row['path']))
+        if original is None or (original['bytes'], original['mtime_ns']) != (row['bytes'], row['mtime_ns']):
+            raise ValueError('Original pack source shards differ from original full identity')
+    runtime_pack = Path(plan['pack'])
+    model_mapping = completed_copy_mapping(receipts['model_receipt'], manifest['files'], source_pack.parent, runtime_pack.parent)
+    pack_mapping = completed_copy_mapping(receipts['pack_receipt'], evidence['generated_files'], source_pack, runtime_pack)
+    expected_paths = {row['path'] for row in pack_mapping.values()}
+    if regular_tree_files(runtime_pack) != expected_paths:
+        raise ValueError('Unrecorded or missing relocated pack files, including expert/profile overrides')
+    result = []
+    for row in pack_mapping.values():
+        if bench.sha(row['path']) != row['sha256']:
+            raise ValueError('Relocated derived pack content changed: ' + row['path'])
+        if ordinary_snapshot(row['path']) != row['destination_snapshot']:
+            raise ValueError('Runtime pack file changed during its full hash')
+        result.append(dict(path=row['path'], bytes=row['bytes'], sha256=row['sha256']))
+    if runtime_evidence is not None:
+        runtime_evidence.update(schema=relocation['schema'], receipt_identities=relocation,
+            model_files=list(model_mapping.values()), pack_files=list(pack_mapping.values()),
+            payload_location='Runtime GGUF shards, dense.bin and tokenizer are all in the explicit destination tree; no source payload was rehashed.',
+            limitation='Model content relies on original full SHA256 plus completed verified-copy receipts and current exact file metadata; no new live full-shard SHA scan. The original BF16 compatibility conversion remains unchanged.')
+    return result
+
+
+def verify_inputs(plan, *, runtime_evidence=None):
     source = Path(plan['source_path'])
     revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     dirty = subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True).strip()
@@ -126,27 +302,29 @@ def verify_inputs(plan):
     evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
     if evidence.get('exit_code') != 0 or not evidence.get('original_checkpoint_stat_unchanged') or not evidence.get('source_unchanged'):
         raise ValueError('Pack was not successfully qualified')
-    pack = Path(plan['pack']).resolve()
-    expected_paths = {Path(item['path']).resolve() for item in evidence['generated_files']}
-    if not expected_paths or any(not p.is_relative_to(pack) for p in expected_paths):
-        raise ValueError('Pack path differs from the qualified derived files')
-    # In particular, an unrecorded experts.bin supersedes the GGUF expert views.
-    if {p.resolve() for p in pack.rglob('*') if p.is_file()} != expected_paths:
-        raise ValueError('Unrecorded or missing pack files (including expert/profile overrides)')
-    # Hash derived files, never reread the 93 GB original checkpoint here. This
-    # occurs outside timing, but warms the derived-weight cache: no cold-cache claim.
-    files = []
-    for item in evidence['generated_files']:
-        p = Path(item['path'])
-        if p.stat().st_size != item['bytes'] or bench.sha(p) != item['sha256']:
-            raise ValueError(f'Derived pack changed: {p}')
-        files.append(item)
-    for item in evidence['model_stat_after']:
-        if Path(item['path']).resolve().parent != pack.parent:
-            raise ValueError('The indexed shards are not alongside the qualified pack')
-        stat = Path(item['path']).stat()
-        if stat.st_size != item['bytes'] or stat.st_mtime_ns != item['mtime_ns']:
-            raise ValueError(f'Original checkpoint changed: {item["path"]}')
+    if 'relocation' in plan:
+        files = verify_relocated_pack(plan, evidence, runtime_evidence)
+    else:
+        pack = Path(plan['pack']).resolve()
+        expected_paths = {Path(item['path']).resolve() for item in evidence['generated_files']}
+        if not expected_paths or any(not p.is_relative_to(pack) for p in expected_paths):
+            raise ValueError('Pack path differs from the qualified derived files')
+        # In particular, an unrecorded experts.bin supersedes the GGUF expert views.
+        if {p.resolve() for p in pack.rglob('*') if p.is_file()} != expected_paths:
+            raise ValueError('Unrecorded or missing pack files (including expert/profile overrides)')
+        # Hash derived files, never reread the 93 GB original checkpoint here.
+        files = []
+        for item in evidence['generated_files']:
+            p = Path(item['path'])
+            if p.stat().st_size != item['bytes'] or bench.sha(p) != item['sha256']:
+                raise ValueError(f'Derived pack changed: {p}')
+            files.append(item)
+        for item in evidence['model_stat_after']:
+            if Path(item['path']).resolve().parent != pack.parent:
+                raise ValueError('The indexed shards are not alongside the qualified pack')
+            info = Path(item['path']).stat()
+            if info.st_size != item['bytes'] or info.st_mtime_ns != item['mtime_ns']:
+                raise ValueError(f'Original checkpoint changed: {item["path"]}')
     manifest = evidence['original_checkpoint_identity']
     if bench.sha(manifest['path']) != manifest['sha256']:
         raise ValueError('Original full-checkpoint identity manifest changed')
@@ -235,7 +413,10 @@ def main():
     lines = queue.Queue()
     save()
     try:
-        reference, files = verify_inputs(plan)
+        runtime_before = {}
+        reference, files = verify_inputs(plan, runtime_evidence=runtime_before)
+        if runtime_before:
+            result['relocation_before'] = runtime_before
         tokenizer, parser_class = load_maya_text(plan['source_path'], plan['pack'])
         if tokenizer.encode(reference['rendered_prompt'], parse_special=True) != reference['prompt_tokens']:
             raise ValueError('Maya tokenizer does not reproduce the exact Direct prompt IDs')
@@ -338,7 +519,10 @@ def main():
             result['performance_observation_complete'] = bool(sampler.rows) and not sampler.errors and not cleanup_errors
         result['timed_out'] = timed_out.is_set()
         try:
-            _, after = verify_inputs(plan)
+            runtime_after = {}
+            _, after = verify_inputs(plan, runtime_evidence=runtime_after)
+            if runtime_after:
+                result['relocation_after'] = runtime_after
             result['derived_files_after'] = after
             result['semantic_checker_sha256_after'] = bench.sha(fixed_tasks.__file__)
             result['identities_unchanged'] = (after == result.get('derived_files_before')

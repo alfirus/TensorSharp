@@ -65,7 +65,8 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     private BudgetReservation? _expertEnvelope;
     private Qwen4ExpModel? _model;
     private readonly Dictionary<string, SequenceState> _requestOwners = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, (int Capacity, int Prefill)> _requestShapes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (int Capacity, int Prefill, bool IsPrefill)> _requestShapes = new(StringComparer.Ordinal);
+    private readonly Dictionary<SequenceState, int> _requestPrefillCaps = new();
     private bool _disposed;
 
     private UnifiedMemoryModelSession(UnifiedMemoryModelOptions options, Qwen4ExpUnifiedGeometry geometry,
@@ -95,7 +96,7 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
         $"[unified-memory] on: shared native/host payload accounting, hardware/commit headroom, request admission, " +
         $"bounded expert reuse and pressure trimming, file staging for CUDA/CPU expert execution, fused model kernels{(_vision != null ? ", image preparation admission" : "")}\n" +
         "[unified-memory] concurrency: continuous batching with admitted hybrid holders and a separately charged joint fused-decode arena; bounded in-memory exact-state prefix checkpoints when enabled\n" +
-        "[unified-memory] pressure: inactive retained complete-holder GPU state can demote to its charged host mirrors; wide prefill is admitted after actual prefix materialization\n" +
+        "[unified-memory] pressure: inactive retained complete-holder GPU state can demote to its charged host mirrors; request prefill width is admitted after actual prefix materialization, with one bounded device-cache tradeoff for long prefills\n" +
         (_filePipeline?.Enabled == true
             ? "[unified-memory] async expert file prefill: eligible one-device CUDA graphs, at least 64 rows and 32 MiB payload; two charged pinned slots bounded to 16 MiB\n"
             : "[unified-memory] async expert file prefill: off (parallel reads passed model correctness and improved isolated prefill; server/shared-budget and cross-platform qualification are pending)\n") +
@@ -245,6 +246,8 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
                 UsePerSequenceHolders = true,
                 BeforeAdmissionWithRunning = PrepareRequestCapacity,
                 AfterPrefixMaterialization = CompletePrefixMaterialization,
+                PrefillTokenLimit = AdmittedPrefillLimit,
+                RevalidateExecution = RevalidateSequenceAllocations,
                 AfterPrefill = CompletePrefill,
                 AfterSequenceMemoryRelease = RecoverReleasedSequenceCapacity,
                 EnterSerialExecution = EnterSequenceAllocations,
@@ -254,10 +257,28 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
         };
     }
 
-    private InferenceMemoryBytes RequestPeak(SequenceState seq)
+    private int AdmittedPrefillLimit(SequenceState sequence)
+        => _requestPrefillCaps != null && _requestPrefillCaps.TryGetValue(sequence, out int rows) ? rows : _prefillTokens;
+
+    private InferenceMemoryBytes RequestPeak(SequenceState seq) => RequestPeakForRows(seq, AdmittedPrefillLimit(seq));
+
+    private int ForecastPrefillRows(SequenceState sequence, int maximum)
+    {
+        if (sequence.NumComputedTokens >= sequence.PromptTokens.Count) return 1;
+        // The last, smaller Forward can reuse an outstanding/pooled wide input
+        // and allocate a different scratch bucket at the same time. Keep the
+        // width already granted to this request until CompletePrefill releases
+        // its transient state. Before selection, each candidate is still priced
+        // independently; a lower candidate must not inherit the global ceiling.
+        if (_requestPrefillCaps != null && _requestPrefillCaps.TryGetValue(sequence, out int admitted))
+            return admitted;
+        return Math.Min(maximum, Math.Max(1, sequence.PromptTokens.Count - sequence.NumComputedTokens));
+    }
+
+    private InferenceMemoryBytes RequestPeakForRows(SequenceState seq, int prefillRows)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        int rows = Math.Min(_prefillTokens, Math.Max(1, seq.PromptTokens.Count - seq.NumComputedTokens));
+        int rows = ForecastPrefillRows(seq, prefillRows);
         var peak = _model!.GetUnifiedMemoryRequestPeak(RequiredContext(seq), rows,
             // Copies can be published at exact prefill boundaries, including
             // the prompt end. After that publication completed, their fixed
@@ -290,9 +311,10 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     private static int RequiredContext(SequenceState sequence)
         => Math.Max(sequence.PromptTokens.Count, checked(sequence.NumComputedTokens + 1));
 
-    private (int Capacity, int Prefill) RequestShape(SequenceState sequence)
+    private (int Capacity, int Prefill, bool IsPrefill) RequestShape(SequenceState sequence)
         => (_model!.GetUnifiedMemoryCapacity(RequiredContext(sequence), requestId: sequence.RequestId),
-            Math.Min(_prefillTokens, Math.Max(1, sequence.PromptTokens.Count - sequence.NumComputedTokens)));
+            ForecastPrefillRows(sequence, AdmittedPrefillLimit(sequence)),
+            sequence.NumComputedTokens < sequence.PromptTokens.Count);
 
     private IReadOnlyList<MemoryCharge> EstimateRequest(SequenceState seq) => IncrementalPeak(RequestPeak(seq));
 
@@ -359,19 +381,63 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
         // computed-token count now chooses the remaining prefill shape. Admit
         // its net growth before Forward, preserving every live child charge.
         PruneFinishedRequestOwners();
-        var peak = IncrementalPeak(RequestPeak(sequence));
         var (joint, tokens) = ExecutionJointTarget(sequence);
-        IReadOnlyList<MemoryCharge>? limits = null;
-        var growth = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
-        if (growth.Host > 0 || growth.Device > 0)
-            limits = PrepareCapacity(() =>
+        if (_native!.CallbackError is { } error)
+            throw new InvalidOperationException("Unified allocation accounting failed.", error);
+        // Allocate bookkeeping before the successful ledger transaction; publishing
+        // its selected width must not fail afterwards with an allocation error.
+        _requestOwners.EnsureCapacity(_requestOwners.Count + 1);
+        _requestShapes.EnsureCapacity(_requestShapes.Count + 1);
+        _requestPrefillCaps.EnsureCapacity(_requestPrefillCaps.Count + 1);
+        bool alreadyAdmitted = _requestPrefillCaps.ContainsKey(sequence);
+        bool preferredReclaimAttempted = false;
+        int maximum = Math.Min(AdmittedPrefillLimit(sequence), Math.Max(1, sequence.PromptTokens.Count - sequence.NumComputedTokens));
+        bool TrySelect(out UnifiedMemoryPrefillPlan plan)
+        {
+            // One quiescent native observation per bounded pass, not per candidate.
+            long boundTrunk = BoundTrunkWeights();
+            IReadOnlyList<MemoryCharge> Estimate(int rows) => IncrementalPeak(RequestPeakForRows(sequence, rows), boundTrunk);
+            if (alreadyAdmitted)
+                return UnifiedMemoryPrefillAdmission.TrySelect(Budget, envelope, _jointEnvelope!, joint, maximum,
+                    Estimate, PhysicalConstraints(), out plan, allowDowngrade: false);
+            return UnifiedMemoryPrefillAdmission.TrySelectPerformance(Budget, envelope, _jointEnvelope!, joint, maximum,
+                Estimate, PhysicalConstraints, _experts!.BudgetBytes, _geometry.AllLayerExpertCacheMinimumBytes,
+                (reclaim, limits) =>
+                {
+                    long previous = _experts.BudgetBytes;
+                    ResizeExpertCache(reclaim.TargetCacheBytes, limits);
+                    Console.WriteLine($"[unified-memory] request {sequence.RequestId}: preferred prefill {reclaim.PreferredRows} rows, " +
+                        $"CUDA shortfall={reclaim.DeviceShortfallBytes / 1048576.0:F0} MiB; " +
+                        $"expert cache {previous / 1048576.0:F0} -> {_experts.BudgetBytes / 1048576.0:F0} MiB (one admission-boundary reclaim)");
+                }, ref preferredReclaimAttempted, out plan);
+        }
+        if (!TrySelect(out var selected))
+        {
+            if (preferredReclaimAttempted)
+                throw new MemoryPressureException("No admitted prefill width fits after one bounded device-cache reclaim.");
+            // Pure candidates never trim a cache. Reclamation is a separate,
+            // bounded phase for the smallest actual execution shape, followed by
+            // a fresh complete pass; it cannot manufacture live-owner refunds.
+            long previousCache = _experts!.BudgetBytes;
+            PrepareCapacity(() =>
             {
-                var additional = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
+                var additional = ExecutionEnvelopeGrowth(envelope,
+                    IncrementalPeak(RequestPeakForRows(sequence, alreadyAdmitted ? maximum : 1)), _jointEnvelope!, joint);
                 return [new(HostPool, additional.Host), new(DevicePool, additional.Device)];
             }, recoverExpertCache: false);
-        ResizeExecutionEnvelopes(envelope, peak, joint, tokens, limits);
+            // The minimum-shape maintenance may itself retire optional cache.
+            // Do not add a second preference-driven trim on its retry.
+            preferredReclaimAttempted = _experts.BudgetBytes != previousCache;
+            if (!TrySelect(out selected))
+                throw new MemoryPressureException("No admitted prefill width fits the current shared physical constraints.");
+        }
+        _jointTarget = joint;
+        _jointContextHighWater = tokens;
+        if (!alreadyAdmitted) _requestPrefillCaps[sequence] = selected.Rows;
         _requestOwners[sequence.RequestId] = sequence;
         _requestShapes[sequence.RequestId] = RequestShape(sequence);
+        if (!alreadyAdmitted && selected.Rows < maximum)
+            Console.WriteLine($"[unified-memory] request {sequence.RequestId}: prefill width {maximum} -> {selected.Rows} rows within shared physical constraints.");
         RecoverExpertCache(PhysicalConstraints(), additionalDeviceBytes: 0, "prefix-materialized");
     }
 
@@ -410,10 +476,11 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
         // This exclusive, trunk-only adapter preloads non-expert quantized
         // weights only. The explicit preload registry excludes both lazy KV
         // copies and the selected-expert cache (separate charge kind 4).
-        long boundWeights = GgmlBasicOps.TryGetCacheMemoryUsage(0, out var cache)
-            ? cache.PreloadCommittedBytes : 0;
-        return IncrementalPeak(peak, boundWeights);
+        return IncrementalPeak(peak, BoundTrunkWeights());
     }
+
+    private static long BoundTrunkWeights()
+        => GgmlBasicOps.TryGetCacheMemoryUsage(0, out var cache) ? cache.PreloadCommittedBytes : 0;
 
     internal MemoryCharge[] IncrementalPeak(InferenceMemoryBytes peak, long boundTrunkWeights)
     {
@@ -648,6 +715,15 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
 
     private IDisposable EnterSequenceAllocations(SequenceState sequence)
     {
+        EnsureSequenceCapacity(sequence, allowReclamation: true);
+        return EnterAllocations(sequence.MemoryEnvelope!);
+    }
+
+    private void RevalidateSequenceAllocations(SequenceState sequence)
+        => EnsureSequenceCapacity(sequence, allowReclamation: false);
+
+    private void EnsureSequenceCapacity(SequenceState sequence, bool allowReclamation)
+    {
         var envelope = sequence.MemoryEnvelope
             ?? throw new InvalidOperationException("Unified execution requires an admitted envelope.");
         var shape = RequestShape(sequence);
@@ -659,7 +735,14 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             var peak = IncrementalPeak(RequestPeak(sequence));
             var (joint, tokens) = ExecutionJointTarget(sequence);
             var additional = ExecutionEnvelopeGrowth(envelope, peak, _jointEnvelope!, joint);
-            if (additional.Host > 0 || additional.Device > 0)
+            if (!allowReclamation)
+            {
+                // A revoked prefix can change phase even at row1. Its full peak
+                // must fit before replay/Forward; current scopes cannot be nested
+                // by optional cache-demotion maintenance. Refusal stays local.
+                ResizeExecutionEnvelopes(envelope, peak, joint, tokens, PhysicalConstraints(), requirePhysicalFit: true);
+            }
+            else if (additional.Host > 0 || additional.Device > 0)
             {
                 // These are already incremental ledger charges. Adding pending
                 // trunk weights or the request's 64-MiB host margin again would
@@ -674,7 +757,6 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             else ResizeExecutionEnvelopes(envelope, peak, joint, tokens);
             _requestShapes[sequence.RequestId] = shape;
         }
-        return EnterAllocations(envelope);
     }
 
     private (InferenceMemoryBytes Target, int ContextTokens) ExecutionJointTarget(SequenceState sequence)
@@ -690,6 +772,7 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     {
         foreach (var stale in _requestOwners.Where(p => p.Value.Status.IsFinished()).Select(p => p.Key).ToArray())
         {
+            _requestPrefillCaps.Remove(_requestOwners[stale]);
             _requestOwners.Remove(stale);
             _requestShapes.Remove(stale);
         }
@@ -709,10 +792,10 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     }
 
     internal void ResizeExecutionEnvelopes(BudgetReservation request, IReadOnlyList<MemoryCharge> requestPeak,
-        InferenceMemoryBytes joint, int contextTokens, IReadOnlyList<MemoryCharge>? limits = null)
+        InferenceMemoryBytes joint, int contextTokens, IReadOnlyList<MemoryCharge>? limits = null, bool requirePhysicalFit = false)
     {
         if (!Budget.TryResizeTotals([(_jointEnvelope!, [new(HostPool, joint.Host), new(DevicePool, joint.Device)]),
-            (request, requestPeak)], limits))
+            (request, requestPeak)], limits, requirePhysicalFit))
             throw new MemoryPressureException("The next holder growth cannot fit the shared budget; generation was stopped before allocation.");
         _jointTarget = joint;
         _jointContextHighWater = contextTokens;
@@ -761,6 +844,114 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             || options.RetainedConversationCount is < 0 or > 8
             || options.MaximumHostBytes <= 0 || options.MaximumDeviceBytes <= 0 || options.MaximumExpertCacheBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(options));
+    }
+}
+
+internal readonly record struct UnifiedMemoryPrefillPlan(int Rows, IReadOnlyList<MemoryCharge> Peak);
+internal readonly record struct UnifiedMemoryPrefillCacheReclaim(int PreferredRows, long TargetCacheBytes, long DeviceShortfallBytes);
+
+/// <summary>Actual prefill-shape admission. The pure pass never reclaims; the
+/// performance pass can trade optional cache for a wider shape once, then must
+/// re-sample and pass the same strict atomic ownership transaction.</summary>
+internal static class UnifiedMemoryPrefillAdmission
+{
+    internal static IEnumerable<int> Candidates(int maximum)
+    {
+        if (maximum is < 1 or > 512) throw new ArgumentOutOfRangeException(nameof(maximum));
+        yield return maximum;
+        // Evaluate each actual shape; do not infer a fit by binary search or
+        // assume every backend's graph/cache geometry is monotonic in rows.
+        for (int rows = 256; rows >= 1; rows /= 2)
+            if (rows < maximum) yield return rows;
+    }
+
+    internal static bool TrySelect(MemoryBudget budget, BudgetReservation request, BudgetReservation joint,
+        InferenceMemoryBytes jointTarget, int maximum, Func<int, IReadOnlyList<MemoryCharge>> estimate,
+        IReadOnlyList<MemoryCharge> limits, out UnifiedMemoryPrefillPlan selected, bool allowDowngrade = true, int minimumRows = 1)
+    {
+        if (minimumRows < 1 || minimumRows > maximum) throw new ArgumentOutOfRangeException(nameof(minimumRows));
+        foreach (int rows in Candidates(maximum))
+        {
+            if (rows < minimumRows) break;
+            var peak = estimate(rows);
+            if (!TryAdmit(budget, request, joint, jointTarget, peak, limits))
+            {
+                if (!allowDowngrade) break;
+                continue;
+            }
+            selected = new(rows, peak);
+            return true;
+        }
+        selected = default;
+        return false;
+    }
+
+    private static bool TryAdmit(MemoryBudget budget, BudgetReservation request, BudgetReservation joint,
+        InferenceMemoryBytes jointTarget, IReadOnlyList<MemoryCharge> peak, IReadOnlyList<MemoryCharge> limits)
+        => budget.TryResizeTotals([(joint, [new(UnifiedMemoryModelSession.HostPool, jointTarget.Host),
+            new(UnifiedMemoryModelSession.DevicePool, jointTarget.Device)]), (request, peak)],
+            limits, requirePhysicalFit: true);
+
+    internal static bool TrySelectPerformance(MemoryBudget budget, BudgetReservation request, BudgetReservation joint,
+        InferenceMemoryBytes jointTarget, int maximum, Func<int, IReadOnlyList<MemoryCharge>> estimate,
+        Func<IReadOnlyList<MemoryCharge>> constraints, long cacheBytes, long minimumCacheBytes,
+        Action<UnifiedMemoryPrefillCacheReclaim, IReadOnlyList<MemoryCharge>> reclaim, ref bool reclaimAttempted,
+        out UnifiedMemoryPrefillPlan selected)
+    {
+        if (reclaimAttempted)
+            return TrySelect(budget, request, joint, jointTarget, maximum, estimate, constraints(), out selected);
+        var limits = constraints();
+        // Preserve the widest affordable actual shape before accepting a
+        // smaller one. A pure 128-row fit must not hide a cheap cache tradeoff
+        // that would protect the configured 512-row prefill. Conversely a host
+        // shortfall cannot be cured by retiring CUDA weights. Price every shape
+        // independently; short prefixes keep the original no-maintenance path.
+        foreach (int rows in Candidates(maximum))
+        {
+            var peak = estimate(rows);
+            if (TryAdmit(budget, request, joint, jointTarget, peak, limits))
+            {
+                selected = new(rows, peak);
+                return true;
+            }
+            if (rows < 32 || !TryPlanDeviceCacheReclaim(budget, request, joint, jointTarget, rows, peak, limits,
+                    cacheBytes, minimumCacheBytes, out var reduction)) continue;
+            // Native releases/fences physical entries before their persistent
+            // owner refunds credit. At most one coarse trim per admission;
+            // every retry observes fresh hardware and an atomic post-ledger fit.
+            reclaimAttempted = true;
+            reclaim(reduction, limits);
+            limits = constraints();
+            return TrySelect(budget, request, joint, jointTarget, maximum, estimate, limits, out selected);
+        }
+        selected = default;
+        return false;
+    }
+
+    private static bool TryPlanDeviceCacheReclaim(MemoryBudget budget, BudgetReservation request, BudgetReservation joint,
+        InferenceMemoryBytes jointTarget, int rows, IReadOnlyList<MemoryCharge> requestPeak, IReadOnlyList<MemoryCharge> limits,
+        long cacheBytes, long minimumCacheBytes, out UnifiedMemoryPrefillCacheReclaim reduction)
+    {
+        reduction = default;
+        if (minimumCacheBytes <= 0 || cacheBytes <= minimumCacheBytes) return false;
+        var ledger = budget.Snapshot().ToDictionary(p => p.Pool);
+        var requestOwned = request.OwnedCharges; var requestChildren = request.LiveChildCharges;
+        var jointOwned = joint.OwnedCharges; var jointChildren = joint.LiveChildCharges;
+        long Bytes(IReadOnlyList<MemoryCharge> charges, string pool) => charges.Single(c => c.Pool == pool).Bytes;
+        long Shortfall(string pool, long jointBytes)
+        {
+            var current = ledger[pool];
+            long post = checked(current.Committed + current.Reserved
+                + Math.Max(Bytes(requestPeak, pool), Bytes(requestChildren, pool)) - Bytes(requestOwned, pool)
+                + Math.Max(jointBytes, Bytes(jointChildren, pool)) - Bytes(jointOwned, pool));
+            return Math.Max(0, checked(post - Math.Min(current.Capacity, Bytes(limits, pool))));
+        }
+        if (Shortfall(UnifiedMemoryModelSession.HostPool, jointTarget.Host) != 0) return false;
+        long deficit = Shortfall(UnifiedMemoryModelSession.DevicePool, jointTarget.Device);
+        if (deficit <= 0 || deficit > cacheBytes - minimumCacheBytes) return false;
+        long target = Math.Max(minimumCacheBytes, cacheBytes - deficit - Math.Min(64L << 20, cacheBytes - deficit - minimumCacheBytes));
+        reduction = new(rows, target, deficit);
+        return true;
     }
 }
 

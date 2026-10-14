@@ -13,6 +13,7 @@ using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Memory;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
 
@@ -1436,6 +1437,11 @@ namespace TensorSharp.Runtime.Scheduling
                             "execution (the claimed live state is gone); re-prefilling the full prompt.",
                             seq.RequestId);
                         seq.ClearLiveCacheContinuation();
+                        // Both decode and prefill work describe the old head.
+                        // In particular prevComputed still names that old media
+                        // slice. Re-plan before forwarding or sampling anything.
+                        results.Add(new SequenceStepResult { Sequence = seq, TokensForwarded = 0, IsPrefill = true });
+                        continue;
                     }
 
                     // Prefix-cache reuse: a freshly-created cache whose sequence
@@ -2655,6 +2661,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         private int[] BuildPrefillChunk(SequenceState seq, ScheduledSequenceWork work)
         {
+            // Validate immutable scheduled work before reserving KV or allocating
+            // the actual input array. Reducing only an estimate is insufficient.
+            var admission = _scheduler.Config.MemoryAdmission;
+            int limit = admission?.GetPrefillTokenLimit(seq) ?? int.MaxValue;
+            if (work.NumScheduledTokens > limit)
+                throw new MemoryPressureException("Scheduled prefill exceeds its admitted request width.");
+            admission?.RevalidateExecution?.Invoke(seq);
             if (!seq.PrefillReservationTaken)
             {
                 // Reserve the prompt plus its declared generation budget in a
@@ -3136,6 +3149,7 @@ namespace TensorSharp.Runtime.Scheduling
             float[]? lastLogits = null;
             int chunk = Math.Max(1, _scheduler.Config.MaxNumBatchedTokens);
             chunk = Math.Min(chunk, _scheduler.Config.PrefillChunkTokenLimit);
+            chunk = Math.Min(chunk, _scheduler.Config.MemoryAdmission?.GetPrefillTokenLimit(seq) ?? int.MaxValue);
             if (_scheduler.Config.MemoryAdmission?.ExecutionShape is { } shape)
                 chunk = Math.Min(chunk, shape.MaximumPrefillTokens);
             int promptTokens = seq.PromptTokens.Count;
@@ -3148,6 +3162,12 @@ namespace TensorSharp.Runtime.Scheduling
                 // into generated tokens would carry a position table shorter than itself.
                 if (start < promptTokens)
                     n = Math.Min(n, promptTokens - start);
+                else if (_scheduler.Config.MemoryAdmission?.UsePerSequenceHolders == true)
+                    n = 1; // The admitted generated-token peak is a decode row.
+                // Restore may have reduced the holder's real capacity. Validate
+                // each actual phase/growth boundary before its Forward, inside
+                // the existing scope; unchanged shapes perform no hardware IO.
+                _scheduler.Config.MemoryAdmission?.RevalidateExecution?.Invoke(seq);
                 var tokens = new int[n];
                 for (int i = 0; i < n; i++)
                     tokens[i] = seq.TokenAt(start + i);

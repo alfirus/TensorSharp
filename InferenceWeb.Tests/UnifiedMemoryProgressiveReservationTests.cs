@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using TensorSharp.GGML;
 using TensorSharp.Memory;
 using TensorSharp.Memory.Planning;
 using TensorSharp.Models;
@@ -76,6 +77,136 @@ public sealed class UnifiedMemoryProgressiveReservationTests
         Assert.Equal((4096, 1), Shape(session, request));
         Assert.Equal(model.GetUnifiedMemoryRequestPeak(2049, 1, checkpointCopies: 0,
             requestId: "growing"), Peak(session, request));
+    }
+
+    [Fact]
+    public void SelectedRequestWidthBoundsTheRealForecastAndDoesNotLeakAcrossReusedIds()
+    {
+        var model = MetadataModel(); var session = UninitializedSession(model);
+        var selected = new SequenceState("reused", Enumerable.Repeat(1, 1479).ToArray(), 20000, 256, SamplingConfig.Greedy);
+        var fresh = new SequenceState("reused", selected.PromptTokens.ToArray(), 20000, 256, SamplingConfig.Greedy);
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [selected] = 32 });
+        Assert.Equal((1479, 32), Shape(session, selected)); Assert.Equal((1479, 512), Shape(session, fresh));
+        Assert.Equal(model.GetUnifiedMemoryRequestPeak(1479, 32, checkpointCopies: 7, independentHolder: true,
+            requestId: selected.RequestId), Peak(session, selected));
+        Assert.True(Peak(session, selected).Host < Peak(session, fresh).Host);
+        Assert.True(Peak(session, selected).Device < Peak(session, fresh).Device);
+        SetComputed(selected, 1478); Assert.Equal((1479, 32), Shape(session, selected)); // Granted prefill credit survives the tail.
+        SetComputed(selected, 1479); Assert.Equal((1480, 1), Shape(session, selected)); // decode reserves the next real token.
+    }
+
+    [Theory]
+    [InlineData(512)]
+    [InlineData(128)]
+    [InlineData(32)]
+    public void AdmittedPrefillTailRetainsItsOwnGrantedForecastUntilPrefillCompletes(int admitted)
+    {
+        var model = MetadataModel(); var session = UninitializedSession(model);
+        var request = new SequenceState("tail", Enumerable.Repeat(1, 1539).ToArray(), 128, 256, SamplingConfig.Greedy);
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [request] = admitted });
+        var granted = Peak(session, request);
+        SetComputed(request, 1536); // The next real Forward has only three rows.
+        Assert.Equal((1539, admitted), Shape(session, request));
+        Assert.Equal(granted, Peak(session, request));
+        Assert.Equal(model.GetUnifiedMemoryRequestPeak(1539, admitted, checkpointCopies: 7,
+            independentHolder: true, requestId: request.RequestId), Peak(session, request));
+        SetComputed(request, 1539);
+        Assert.Equal((1540, 1), Shape(session, request));
+        Assert.Equal(model.GetUnifiedMemoryRequestPeak(1540, 1, checkpointCopies: 0,
+            independentHolder: true, requestId: request.RequestId), Peak(session, request));
+    }
+
+    [Fact]
+    public void CandidateSelectionPricesEachWidthBeforeFreezingOnlyTheSelectedTailForecast()
+    {
+        var model = MetadataModel(); var session = UninitializedSession(model);
+        var request = new SequenceState("selected-tail", Enumerable.Repeat(1, 1539).ToArray(), 128, 256, SamplingConfig.Greedy);
+        var ceiling = model.GetUnifiedMemoryRequestPeak(1539, 128, checkpointCopies: 7,
+            independentHolder: true, requestId: request.RequestId);
+        MemoryCharge[] Charges(InferenceMemoryBytes peak) => [new(Host, peak.Host), new(Device, peak.Device)];
+        var budget = new MemoryBudget(Charges(ceiling));
+        using var envelope = budget.Reserve(Charges(new(0, 0))); using var joint = budget.Reserve(Charges(new(0, 0)));
+        var seen = new List<int>();
+        var estimate = typeof(UnifiedMemoryModelSession).GetMethod("RequestPeakForRows", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        Assert.True(UnifiedMemoryPrefillAdmission.TrySelect(budget, envelope, joint, new(0, 0), 512,
+            rows => { seen.Add(rows); return Charges((InferenceMemoryBytes)estimate.Invoke(session, [request, rows])!); },
+            Charges(ceiling), out var selected));
+        Assert.Equal(new[] { 512, 256, 128 }, seen); Assert.Equal(128, selected.Rows);
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [request] = selected.Rows });
+        request.MemoryEnvelope = envelope;
+        SetComputed(request, 1536);
+        Assert.Equal((1539, 128), Shape(session, request)); Assert.Equal(ceiling, Peak(session, request));
+        Assert.Equal(ceiling.Host, envelope.OwnedCharges.Single(c => c.Pool == Host).Bytes);
+        Assert.Equal(ceiling.Device, envelope.OwnedCharges.Single(c => c.Pool == Device).Bytes);
+        Assert.True(ceiling.Host < model.GetUnifiedMemoryRequestPeak(1539, 512, checkpointCopies: 7,
+            independentHolder: true, requestId: request.RequestId).Host);
+    }
+
+    [Fact]
+    public void AShortAdmittedPromptKeepsOnlyItsSeventeenRowForecastAtTheTail()
+    {
+        var model = MetadataModel(); var session = UninitializedSession(model);
+        var request = new SequenceState("short-tail", Enumerable.Repeat(1, 17).ToArray(), 128, 256, SamplingConfig.Greedy);
+        var actualPromptPeak = Peak(session, request);
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [request] = 17 });
+        SetComputed(request, 14);
+        Assert.Equal((512, 17), Shape(session, request)); Assert.Equal(actualPromptPeak, Peak(session, request));
+        Assert.Equal(model.GetUnifiedMemoryRequestPeak(17, 17, checkpointCopies: 7,
+            independentHolder: true, requestId: request.RequestId), Peak(session, request));
+    }
+
+    [Fact]
+    public void TailCanReuseTheWideHostInputAndAllocateAnotherBucketWithoutIncreasingItsGrantedBudget()
+    {
+        var model = MetadataModel();
+        Set(model, "_unifiedGeometry", Get<Qwen4ExpUnifiedGeometry>(model, "_unifiedGeometry") with { Hidden = 2560, HyperHidden = 10240 });
+        var session = UninitializedSession(model);
+        var request = new SequenceState("physical-tail", Enumerable.Repeat(1, 1539).ToArray(), 128, 256, SamplingConfig.Greedy);
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [request] = 512 });
+        var granted = Peak(session, request);
+        var tailOnly = model.GetUnifiedMemoryRequestPeak(1539, 3, checkpointCopies: 7,
+            independentHolder: true, requestId: request.RequestId);
+        const long wideInputBytes = 512L * 2560 * 4, tailInputBytes = 3L * 2560 * 4, tailResidualBytes = 3L * 10240 * 4;
+        Assert.True(granted.Host > tailOnly.Host + wideInputBytes + tailResidualBytes);
+        var budget = new MemoryBudget([new(Host, granted.Host), new(Device, granted.Device)]);
+        using var envelope = budget.Reserve([new(Host, granted.Host), new(Device, granted.Device)]);
+        request.MemoryEnvelope = envelope;
+        // The existing holder/native host payload is represented by its real
+        // child charge; only the input/scratch below allocate CPU OS memory.
+        using var state = envelope.TryTake([new(Host, tailOnly.Host)])!; state.Commit();
+        using var scope = new HostAllocationBudgetScope(budget, [Host]);
+        var pool = new GgmlMemoryPool(GgmlBackendType.Cuda);
+        IntPtr embedding = IntPtr.Zero, residual = IntPtr.Zero;
+        try
+        {
+            IntPtr wide;
+            using (scope.EnterExecution(envelope))
+            {
+                wide = pool.Allocate(wideInputBytes);
+                pool.Free(wide, wideInputBytes); // A physically retained 5-MiB input block.
+            }
+            SetComputed(request, 1536);
+            var tail = Peak(session, request);
+            Assert.True(budget.TryResizeTotals([(envelope, [new(Host, tail.Host), new(Device, tail.Device)])],
+                [new(Host, granted.Host), new(Device, granted.Device)], requirePhysicalFit: true));
+            Assert.Equal(granted.Host, envelope.OwnedCharges.Single(c => c.Pool == Host).Bytes);
+            using (scope.EnterExecution(envelope))
+            {
+                embedding = pool.Allocate(tailInputBytes);
+                Assert.Equal(wide, embedding); // Smaller reuse keeps the real wide allocation charged.
+                residual = pool.Allocate(tailResidualBytes); // A second live bucket must still fit.
+                Assert.InRange(scope.Usage.Bytes - wideInputBytes, tailResidualBytes,
+                    tailResidualBytes + Math.Max(16 * 1024, Environment.SystemPageSize) - 1); // OS/Apple page rounding.
+            }
+        }
+        finally
+        {
+            if (residual != IntPtr.Zero) pool.Free(residual, tailResidualBytes);
+            if (embedding != IntPtr.Zero) pool.Free(embedding, tailInputBytes);
+            pool.Close();
+        }
+        Assert.Equal(0, scope.Usage.Bytes); state.Dispose(); envelope.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Reserved + p.Committed));
     }
 
     [Fact]
@@ -258,8 +389,12 @@ public sealed class UnifiedMemoryProgressiveReservationTests
         => (InferenceMemoryBytes)typeof(UnifiedMemoryModelSession).GetMethod("RequestPeak", BindingFlags.NonPublic | BindingFlags.Instance)!
             .Invoke(session, [request])!;
     private static (int, int) Shape(UnifiedMemoryModelSession session, SequenceState request)
-        => ((int, int))typeof(UnifiedMemoryModelSession).GetMethod("RequestShape", BindingFlags.NonPublic | BindingFlags.Instance)!
-            .Invoke(session, [request])!;
+    {
+        var shape = ((int Capacity, int Prefill, bool IsPrefill))typeof(UnifiedMemoryModelSession)
+            .GetMethod("RequestShape", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(session, [request])!;
+        Assert.Equal(request.NumComputedTokens < request.PromptTokens.Count, shape.IsPrefill);
+        return (shape.Capacity, shape.Prefill);
+    }
     private static FieldInfo Field(object instance, string name) => instance.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!;
     private static void Set(object instance, string name, object value) => Field(instance, name).SetValue(instance, value);
     private static T Get<T>(object instance, string name) => (T)Field(instance, name).GetValue(instance)!;
