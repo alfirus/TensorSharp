@@ -37,7 +37,7 @@ public sealed class UnifiedMemoryProgressiveReservationTests
     public void LayerMajorForwardWidthIsGrantedOnlyToTextPromptsAndPricedOnTheHost()
     {
         var model = MetadataModel(); var session = UninitializedSession(model);
-        Set(session, "_forwardTokens", 8192);
+        Set(session, "_forwardTokens", 8192); Set(session, "_options", new UnifiedMemoryModelOptions());
         var limit = typeof(UnifiedMemoryModelSession).GetMethod("ForwardPrefillLimit", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var prompt = Enumerable.Repeat(1, 3000).ToArray();
         var text = new SequenceState("text", prompt, 64, 256, SamplingConfig.Greedy);
@@ -54,6 +54,11 @@ public sealed class UnifiedMemoryProgressiveReservationTests
         // A narrow admission never routes a layer-major forward.
         Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [text] = 32 });
         Assert.Equal(32, (int)limit.Invoke(session, [text])!);
+        // Disabled, an admission narrower than the configured width keeps it.
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [text] = 256 });
+        Assert.Equal(8192, (int)limit.Invoke(session, [text])!);
+        Set(session, "_options", new UnifiedMemoryModelOptions { LayerMajorPrefillTokens = 0 });
+        Assert.Equal(256, (int)limit.Invoke(session, [text])!);
     }
 
     [Fact]

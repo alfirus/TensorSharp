@@ -298,7 +298,10 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     // (M-RoPE positions, injected embeddings) only through ordinary spans.
     private bool LayerMajor(SequenceState sequence, int rows) => sequence.MediaSpans.Count == 0 && LayerMajor(rows);
 
-    private bool LayerMajor(int rows) => _forwardTokens > rows && rows >= Qwen4ExpModel.LayerMajorMinimumChunkTokens;
+    // LayerMajorPrefillTokens = 0 disables it outright: an admission narrower
+    // than the configured width must then keep that narrower Forward.
+    private bool LayerMajor(int rows) => _forwardTokens > rows && _options.LayerMajorPrefillTokens > 0
+        && rows >= Qwen4ExpModel.LayerMajorMinimumChunkTokens;
 
     // Host scratch of the largest Forward this request can still issue.
     private int ForwardTokensForPeak(SequenceState sequence, int rows)

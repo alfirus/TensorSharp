@@ -145,6 +145,8 @@ namespace TensorSharp.GGML
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern unsafe int TSGgml_GlmForward(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_GlmForwardLayerMajor(IntPtr handle, int* tokens, int nTokens, float* logitsOut, int chunkRows);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern void TSGgml_GlmReset(IntPtr handle);
@@ -282,6 +284,20 @@ namespace TensorSharp.GGML
             fixed (float* l = logitsOut)
             {
                 return TSGgml_GlmForward(handle, t, tokens.Length, l) != 0;
+            }
+        }
+
+        /// <summary>Layer-major prefill of <paramref name="tokens"/> in chunks of at
+        /// most <paramref name="chunkRows"/>: each trunk layer runs over every chunk
+        /// before the next layer, so its routed experts are staged once. 1 on success,
+        /// 0 on failure (the slot then needs a reset), -1 when this configuration
+        /// requires the ordinary <see cref="Forward"/>.</summary>
+        public static unsafe int ForwardLayerMajor(IntPtr handle, int[] tokens, float[] logitsOut, int chunkRows)
+        {
+            fixed (int* t = tokens)
+            fixed (float* l = logitsOut)
+            {
+                return TSGgml_GlmForwardLayerMajor(handle, t, tokens.Length, l, chunkRows);
             }
         }
 

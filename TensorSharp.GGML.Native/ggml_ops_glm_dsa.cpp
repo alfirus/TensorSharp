@@ -365,6 +365,9 @@ struct graph_inputs
     /// NextN/MTP only: the trunk hidden state of the token preceding each row,
     /// F32 [n_embd, nt]. Lives on the embedding device like inp.tokens.
     ggml_tensor * h_in[MAX_GPUS + 1] = {};
+    /// Layer-range graphs that do not start at layer 0: the hyper-connection
+    /// residual stream entering layer_begin, F32 [n_embd, hc_mult, nt].
+    ggml_tensor * hidden = nullptr;
 };
 
 /// Named intermediates kept as graph outputs when TS_GLM_TRACE names layers,
@@ -548,6 +551,12 @@ struct graph_build_result
     /// 0 = trunk, 1 = the NextN/MTP draft block. Part of the cache key: the two
     /// graphs have different shapes at the same (nt, n_kv).
     int kind = 0;
+    /// Trunk layers [layer_begin, layer_end) of a layer-major prefill; 0/0 is
+    /// the whole trunk. Part of the cache key. A range that stops before the
+    /// last layer returns the residual stream in hidden_out instead of logits.
+    int layer_begin = 0;
+    int layer_end = 0;
+    ggml_tensor * hidden_out = nullptr;
     int slot_id = 0;
     /// Non-empty when this is a batched-decode graph; one entry per token.
     std::vector<bd_token> bd;
@@ -5200,19 +5209,22 @@ struct graph_builder
         const int64_t hcm = hp.hc_mult;
         const int64_t r = hp.indexer_kpool;
         const int64_t n_pools = n_kv / r;
+        // Layer-major prefill builds one trunk layer range at a time.
+        const int l0 = res.layer_begin;
+        const int l1 = res.layer_end > 0 ? res.layer_end : hp.n_layer;
 
         std::vector<uint8_t> used_dev((size_t) m.n_gpu + 1, 0);
         if (m.tp > 1)
             for (int rank = 0; rank < m.tp; rank++) used_dev[(size_t) m.rank_device(rank)] = 1;
         else
-            for (int il = 0; il < hp.n_layer; il++) used_dev[(size_t) m.layers[il].device] = 1;
+            for (int il = l0; il < l1; il++) used_dev[(size_t) m.layers[il].device] = 1;
 
         // Only MLA layers read the mask, the cache indices and the pool inputs;
         // a KDA-only device gets none (an input no node reads is never
         // allocated, and writing to it would fault).
         const ggml_type mask_type = m.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
         std::vector<uint8_t> dev_mla((size_t) m.n_gpu + 1, 0);
-        for (int il = 0; il < hp.n_layer; il++)
+        for (int il = l0; il < l1; il++)
         {
             if (m.layers[il].recurrent) continue;
             if (m.tp > 1 && m.tp_heads())
@@ -5243,42 +5255,51 @@ struct graph_builder
         }
 
         const int dev_embd = m.tp > 1 ? m.rank_device(0) : m.layers[0].device;
-        {
-            char nb[64];
-            snprintf(nb, sizeof(nb), "inp_tokens.%d", dev_embd);
-            inp.tokens[dev_embd] = new_input(GGML_TYPE_I32, nt, 0, nb, dev_embd);
-        }
         const int dev_last = m.tp > 1 ? m.rank_device(0) : m.layers[(size_t) hp.n_layer - 1].device;
         if (res.want_logits)
             inp.out_ids = new_input(GGML_TYPE_I32, res.n_out, 0, "inp_out_ids", dev_last);
 
-        // hc_mult exact copies of the embedding: no scaling, no one-hot.
-        ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[dev_embd]);
-        if (res.n_ovr > 0)
+        ggml_tensor * inpL = nullptr;
+        if (l0 > 0)
         {
-            // Vision rows: the projected image embeddings replace the token
-            // embeddings of the placeholder positions before the stream fans
-            // out. get_rows leaves `emb` contiguous, so set_rows may write
-            // straight through it.
-            inp.embd_rows = new_input(GGML_TYPE_F32, hp.n_embd, res.n_ovr, "embd_rows", dev_embd);
-            inp.embd_idx = new_input(GGML_TYPE_I64, res.n_ovr, 0, "embd_idx", dev_embd);
-            emb = ggml_set_rows(ctx, emb, inp.embd_rows, inp.embd_idx);
+            // Continue the residual stream a previous layer range produced.
+            const int dev_first = m.tp > 1 ? m.rank_device(0) : m.layers[(size_t) l0].device;
+            inp.hidden = new_input_3d(GGML_TYPE_F32, hp.n_embd, hcm, nt, "inp_hidden", dev_first);
+            inpL = ggml_reshape_4d(ctx, inp.hidden, hp.n_embd, hcm, nt, 1);
         }
-        ggml_tensor * inpL = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt),
-                                            hp.n_embd, hcm, nt, 1);
+        else
+        {
+            char nb[64];
+            snprintf(nb, sizeof(nb), "inp_tokens.%d", dev_embd);
+            inp.tokens[dev_embd] = new_input(GGML_TYPE_I32, nt, 0, nb, dev_embd);
+            // hc_mult exact copies of the embedding: no scaling, no one-hot.
+            ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[dev_embd]);
+            if (res.n_ovr > 0)
+            {
+                // Vision rows: the projected image embeddings replace the token
+                // embeddings of the placeholder positions before the stream fans
+                // out. get_rows leaves `emb` contiguous, so set_rows may write
+                // straight through it.
+                inp.embd_rows = new_input(GGML_TYPE_F32, hp.n_embd, res.n_ovr, "embd_rows", dev_embd);
+                inp.embd_idx = new_input(GGML_TYPE_I64, res.n_ovr, 0, "embd_idx", dev_embd);
+                emb = ggml_set_rows(ctx, emb, inp.embd_rows, inp.embd_idx);
+            }
+            inpL = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt),
+                                  hp.n_embd, hcm, nt, 1);
+        }
 
         ggml_tensor * part[MAX_GPUS] = {};
         ggml_tensor * shexp[MAX_GPUS] = {};
         const int n_attn = m.tp > 1 && m.tp_heads() ? m.tp : 1;
         const int n_moe = m.tp > 1 && m.tp_experts() ? m.tp : 1;
 
-        for (int il = 0; il < hp.n_layer; il++)
+        for (int il = l0; il < l1; il++)
         {
             const glm_layer & L = m.layers[il];
             const glm_layer_weights & LW = L.w[0];
             const int dev = device_of(il, 0);
 
-            if (m.tp == 1 && il > 0 && dev != m.layers[il - 1].device)
+            if (m.tp == 1 && il > l0 && dev != m.layers[il - 1].device)
                 pin(inpL, dev);
 
             // ---- attention crossing ----
@@ -5365,6 +5386,18 @@ struct graph_builder
 
             inpL = build_hc_post(ffn, residual, post, comb);
             trace("l_out", il, 0, inpL);
+        }
+
+        if (l1 < hp.n_layer)
+        {
+            // A layer range that stops short of the head hands its residual
+            // stream to the next range. Contiguous so the host copy is exact.
+            ggml_tensor * out = ggml_cont(ctx, inpL);
+            ggml_set_output(out);
+            ggml_set_name(out, "hidden_out");
+            res.hidden_out = out;
+            ggml_build_forward_expand(gf, out);
+            return;
         }
 
         if (!res.want_logits && !res.want_h)
@@ -6465,8 +6498,11 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
 
 static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_t nt, int64_t p0,
                                           int64_t n_out, bool want_logits, bool * out_reused,
-                                          bool want_h = false, int kind = 0, int64_t n_ovr = 0)
+                                          bool want_h = false, int kind = 0, int64_t n_ovr = 0,
+                                          int layer_begin = 0, int layer_end = 0)
 {
+    // 0/0 and 0/n_layer both mean the whole trunk; normalize for the cache key.
+    if (layer_end == m.hp.n_layer && layer_begin == 0) layer_end = 0;
     const int64_t n_kv = plan_n_kv(m, p0 + nt);
     std::vector<int64_t> decode_row_kv;
     if (m.hp.g5n && nt > 1 && nt <= TSG_PRECISION_DECODE_COLUMNS)
@@ -6485,7 +6521,8 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         graph_build_result * e = it->get();
         if (e->nt == nt && e->n_kv == n_kv && e->n_out == n_out && e->want_logits == want_logits &&
             e->sparse == sparse && e->slot_id == slot.id && e->want_h == want_h && e->kind == kind &&
-            e->n_ovr == n_ovr && e->decode_row_kv == decode_row_kv)
+            e->n_ovr == n_ovr && e->decode_row_kv == decode_row_kv &&
+            e->layer_begin == layer_begin && e->layer_end == layer_end)
         {
             auto entry = std::move(*it);
             m.graph_cache.erase(it);
@@ -6509,6 +6546,8 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         p->kind = kind;
         p->slot_id = slot.id;
         p->n_ovr = n_ovr;
+        p->layer_begin = layer_begin;
+        p->layer_end = layer_end;
         return p;
     };
     auto entry = make_entry();
@@ -6523,11 +6562,12 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     if (const char * e = getenv("TS_GLM_NODES_PER_LAYER")) { int v = atoi(e); if (v > 0) nodes_per_layer = (size_t) v; }
     // The draft block is one layer; give it the same per-layer budget plus the
     // fixed 1024 so its (much smaller) graph never has to share the trunk's.
-    const size_t graph_layers = kind == 0 ? (size_t) m.hp.n_layer : 1;
+    const size_t graph_layers = kind != 0 ? 1
+        : layer_end > 0 ? (size_t) (layer_end - layer_begin) : (size_t) m.hp.n_layer;
 
     // The fast path is intentionally narrow. Other graph kinds/configurations
     // continue below through the mature multi-backend scheduler implementation.
-    const bool use_fused_tp = m.tp_fused && kind == 0 && !want_h;
+    const bool use_fused_tp = m.tp_fused && kind == 0 && !want_h && layer_end == 0;
     if (use_fused_tp)
     {
         const size_t rank_nodes = graph_layers * nodes_per_layer + 1024;
@@ -6792,12 +6832,19 @@ static bool execute_fused_tp(glm_model & m, graph_build_result & root)
 /// the NextN draft head consumes. `all_logits_rows` runs the LM head on every
 /// row instead of only the last, which is what makes one verify pass over a
 /// speculative window cost one trunk forward instead of K+1 of them.
+/// Layer-major prefill (`layers` non-null) runs trunk layers [begin, end) for
+/// tokens at `p0` instead of the slot head: `hidden` carries the residual stream
+/// in from the previous range and out to the next one, and the slot head only
+/// advances once the caller has run every layer.
+struct glm_layer_range { int begin = 0; int end = 0; int64_t p0 = 0; float * hidden = nullptr; };
+
 static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bool want_logits, float * logits_out,
                            float * h_out = nullptr, bool all_logits_rows = false,
-                           const float * ovr_rows = nullptr, const int64_t * ovr_idx = nullptr, int64_t n_ovr = 0)
+                           const float * ovr_rows = nullptr, const int64_t * ovr_idx = nullptr, int64_t n_ovr = 0,
+                           const glm_layer_range * layers = nullptr)
 {
     glm_slot & slot = *m.active_slot;
-    const int64_t p0 = slot.n_past;
+    const int64_t p0 = layers ? layers->p0 : slot.n_past;
     if (p0 + nt > m.n_ctx)
     {
         fprintf(stderr, "[glm] context overflow: %" PRId64 " + %" PRId64 " > %d\n", p0, nt, m.n_ctx);
@@ -6807,8 +6854,15 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     const bool want_h = h_out != nullptr;
     const int64_t n_out = (want_logits && all_logits_rows) ? nt : 1;
     bool reused = false;
-    graph_build_result * gr = acquire_graph(m, slot, nt, p0, n_out, want_logits, &reused, want_h, /*kind=*/0, n_ovr);
+    graph_build_result * gr = acquire_graph(m, slot, nt, p0, n_out, want_logits, &reused, want_h, /*kind=*/0, n_ovr,
+                                            layers ? layers->begin : 0, layers ? layers->end : 0);
     if (!gr) return false;
+    if (layers && ((layers->begin > 0) != (gr->inp.hidden != nullptr)
+        || (layers->end > 0 && layers->end < m.hp.n_layer) != (gr->hidden_out != nullptr)))
+    {
+        fprintf(stderr, "[glm] layer range [%d, %d) graph has the wrong residual inputs/outputs\n", layers->begin, layers->end);
+        return false;
+    }
     glm_begin_selected_expert_graph(*gr);
 
     const int64_t n_kv = gr->n_kv;
@@ -6875,6 +6929,8 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     }
     for (graph_build_result * xgr : exec_graphs)
         set_input_i32(xgr->inp.out_ids, m.h_out_ids.data(), (size_t) n_out);
+    if (layers && gr->inp.hidden && live(gr->inp.hidden))
+        ggml_backend_tensor_set(gr->inp.hidden, layers->hidden, 0, ggml_nbytes(gr->inp.hidden));
 
     if (n_ovr > 0)
     {
@@ -6983,7 +7039,9 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
         ggml_backend_tensor_get(gr->logits, logits_out, 0, (size_t) n_out * m.hp.n_vocab * sizeof(float));
     if (h_out && gr->h_nextn)
         ggml_backend_tensor_get(gr->h_nextn, h_out, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
-    slot.n_past += nt;
+    if (layers && gr->hidden_out)
+        ggml_backend_tensor_get(gr->hidden_out, layers->hidden, 0, ggml_nbytes(gr->hidden_out));
+    if (!layers) slot.n_past += nt;
     selected_guard.complete = true;
     return true;
 }
@@ -7326,6 +7384,63 @@ TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_to
     }
     m->embd_ovr.clear();
     return 1;
+}
+
+/// Layer-major prefill: evaluate `n_tokens` in chunks of at most `chunk_rows`,
+/// one trunk layer at a time over every chunk, so a layer's routed experts are
+/// staged once per forward instead of once per chunk. Each chunk keeps its own
+/// residual stream on the host between layers; a layer sees its chunks in
+/// order, so KV rows, KDA state and indexer pools advance exactly as in chunk
+/// order. Returns 0 on failure, -1 when this configuration needs the ordinary
+/// TSGgml_GlmForward (vision rows, TP, several devices, traces).
+TSG_EXPORT int TSGgml_GlmForwardLayerMajor(void * handle, const int32_t * tokens, int n_tokens, float * logits_out,
+                                           int chunk_rows)
+{
+    glm_model * m = (glm_model *) handle;
+    if (m) m->batched_execution.begin_attempt();
+    if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0 || chunk_rows <= 0 || !tokens) return 0;
+    if (!m->hp.g5n || m->tp != 1 || m->n_gpu > 1 || !m->embd_ovr.empty() || m->trace_dump != nullptr
+        || (m->n_ubatch > 0 && chunk_rows > m->n_ubatch))
+        return -1;
+    glm_slot & slot = *m->active_slot;
+    const int64_t start = slot.n_past;
+    if (start + n_tokens > m->n_ctx)
+    {
+        fprintf(stderr, "[glm] context overflow: %" PRId64 " + %d > %d\n", start, n_tokens, m->n_ctx);
+        return 0;
+    }
+    try
+    {
+        const int chunks = (n_tokens + chunk_rows - 1) / chunk_rows;
+        const size_t row = (size_t) m->hp.n_embd * (size_t) m->hp.hc_mult;
+        std::vector<std::vector<float>> hidden((size_t) chunks);
+        for (int c = 0; c < chunks; ++c)
+            hidden[(size_t) c].resize(row * (size_t) std::min(chunk_rows, n_tokens - c * chunk_rows));
+        for (int il = 0; il < m->hp.n_layer; ++il)
+        {
+            for (int c = 0; c < chunks; ++c)
+            {
+                const int first = c * chunk_rows;
+                const int nt = std::min(chunk_rows, n_tokens - first);
+                glm_layer_range range{ il, il + 1, start + first, hidden[(size_t) c].data() };
+                const bool last = il == m->hp.n_layer - 1 && c == chunks - 1;
+                if (!forward_ubatch(*m, tokens + first, nt, last && logits_out != nullptr, last ? logits_out : nullptr,
+                                    nullptr, false, nullptr, nullptr, 0, &range))
+                {
+                    // Earlier ranges already advanced KV and KDA state.
+                    slot.kda_restore_failed = true;
+                    return 0;
+                }
+            }
+        }
+        slot.n_past = start + n_tokens;
+        return 1;
+    }
+    catch (...)
+    {
+        slot.kda_restore_failed = true;
+        return 0;
+    }
 }
 
 /// Queue projected vision-embedding rows to override the token embeddings of

@@ -174,16 +174,44 @@ namespace TensorSharp.Models
             {
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
-                PrepareUnifiedGraph(checked(_exec.NPast + tokens.Length), Math.Min(tokens.Length, _nativeUbatch), false);
+                int chunk = LayerMajorPrefillChunkTokens;
+                bool layerMajor = chunk > 0 && tokens.Length > chunk && _exec is NativeGlmExecutor;
+                if (ForwardLog && tokens.Length > 1)
+                    Console.Error.WriteLine($"[glm-forward] pos={_exec.NPast} tokens={tokens.Length} " +
+                        (layerMajor ? $"layer-major chunk={chunk}" : $"ubatch={_nativeUbatch}"));
+                PrepareUnifiedGraph(checked(_exec.NPast + tokens.Length),
+                    Math.Min(tokens.Length, layerMajor ? chunk : _nativeUbatch), false);
                 BeforeGraphCall();
                 bool ok;
-                try { ok = _exec.Forward(tokens, _logitsBuffer); }
+                try { ok = layerMajor ? ForwardNativeLayerMajor((NativeGlmExecutor)_exec, tokens, chunk) : _exec.Forward(tokens, _logitsBuffer); }
                 finally { AfterGraphCall(); }
                 if (!ok)
                     throw new InvalidOperationException("glm-dsa native forward failed (see stderr).");
                 _cacheSeqLen = _exec.NPast;
                 return _logitsBuffer;
             }
+        }
+
+        /// <summary>Admitted per-chunk width for layer-major prefill, or 0 for the
+        /// ordinary chunk order. Set by the unified-memory session inside a
+        /// request's own allocation scope.</summary>
+        internal int LayerMajorPrefillChunkTokens { get; set; }
+
+        // TS_GLM_FORWARD_LOG=1: one line per multi-token forward (position,
+        // width and order), to compare chunk boundaries between runs.
+        private static readonly bool ForwardLog =
+            string.Equals(Environment.GetEnvironmentVariable("TS_GLM_FORWARD_LOG"), "1", StringComparison.Ordinal);
+
+        private bool ForwardNativeLayerMajor(NativeGlmExecutor exec, int[] tokens, int chunk)
+        {
+            int result = exec.ForwardLayerMajor(tokens, _logitsBuffer, chunk);
+            if (result >= 0) return result == 1;
+            // This configuration keeps chunk order; still never exceed the
+            // admitted width the forward was granted for.
+            bool ok = true;
+            for (int offset = 0; ok && offset < tokens.Length; offset += chunk)
+                ok = exec.Forward(tokens.AsSpan(offset, Math.Min(chunk, tokens.Length - offset)).ToArray(), _logitsBuffer);
+            return ok;
         }
 
         private void ResetNative()

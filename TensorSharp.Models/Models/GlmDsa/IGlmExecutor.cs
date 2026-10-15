@@ -90,6 +90,8 @@ namespace TensorSharp.Models
         public bool HasDraftHead => GgmlGlmNative.HasDraftHead(_handle);
 
         public bool Forward(int[] tokens, float[] logitsOut) => GgmlGlmNative.Forward(_handle, tokens, logitsOut);
+        internal int ForwardLayerMajor(int[] tokens, float[] logitsOut, int chunkRows)
+            => GgmlGlmNative.ForwardLayerMajor(_handle, tokens, logitsOut, chunkRows);
         public bool ResetChecked() => GgmlGlmNative.ResetChecked(_handle);
         public bool Rewind(int nPast) => GgmlGlmNative.Rewind(_handle, nPast);
         public int SlotAlloc() => GgmlGlmNative.SlotAlloc(_handle);

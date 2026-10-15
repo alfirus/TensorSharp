@@ -28,6 +28,8 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
     private readonly GlmUnifiedVisionMemoryGeometry? _vision;
     private readonly long _hostCeiling, _deviceCeiling, _hostHeadroom, _deviceHeadroom;
     private readonly int _context, _prefill;
+    // Prompt tokens per Forward; above _prefill only with layer-major prefill.
+    private readonly int _forwardTokens;
     private readonly int _prefixCopies;
     private int _effectivePrefixCopies;
     private GgmlCacheBudgetScope? _native;
@@ -86,6 +88,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         }
         _prefixCopies = prefix.RetainedCopies;
         _prefill = plan.PrefillRows;
+        _forwardTokens = Math.Max(_prefill, Math.Min(options.LayerMajorPrefillTokens, context));
         _cpuLayers = plan.CpuExpertLayers;
         _expertCacheBytes = plan.CacheCapacityBytes;
         _expertMinimumForecastBytes = plan.CacheMinimumForecastBytes;
@@ -207,8 +210,8 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         {
             BlockSize = block, NumBlocks = checked((_context + block - 1) / block *
                 (_options.MaximumRunningRequests + _options.RetainedConversationCount + _effectivePrefixCopies + 1)),
-            MaxNumRunningSequences = _options.MaximumRunningRequests, MaxNumBatchedTokens = _prefill,
-            MaxPrefillChunkSize = _prefill, SoloPrefillChunkSize = _prefill, PrefillChunkTokenLimit = _prefill,
+            MaxNumRunningSequences = _options.MaximumRunningRequests, MaxNumBatchedTokens = _forwardTokens,
+            MaxPrefillChunkSize = _forwardTokens, SoloPrefillChunkSize = _forwardTokens, PrefillChunkTokenLimit = _forwardTokens,
             EnablePrefixCaching = requested.EnablePrefixCaching, StopRepetition = requested.StopRepetition,
             DecodeQuantumTokens = requested.DecodeQuantumTokens, Speculation = SpeculationOptions.Disabled,
             ExecutionOptionsOverride = new ExecutionOptions
@@ -223,7 +226,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
                 EstimateMaterializationPeak = EstimateMaterialization,
                 BeforeAdmissionWithRunning = PrepareAdmission,
                 AfterPrefixMaterialization = CompletePrefix, AfterPrefill = CompletePrefill,
-                PrefillTokenLimit = AdmittedPrefillLimit,
+                PrefillTokenLimit = ForwardPrefillLimit,
                 AfterSequenceMemoryRelease = RecoverReleasedCapacity,
                 EnterSerialExecution = EnterSerial,
                 EnterBatchedExecution = _ => EnterAllocations(_joint
@@ -235,6 +238,19 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         => RequestPeakForRows(seq, AdmittedPrefillLimit(seq), materializing);
     private int AdmittedPrefillLimit(SequenceState seq)
         => _requestPrefill.TryGetValue(seq, out var state) ? state.Cap : _prefill;
+    /// <summary>Tokens one prefill Forward may carry. A layer-major forward runs
+    /// every chunk at the admitted width, one trunk layer at a time, so device
+    /// peaks stay per chunk; only host residual streams widen. Media prompts and
+    /// narrow admissions keep ordinary chunk order.</summary>
+    private int ForwardPrefillLimit(SequenceState seq)
+    {
+        int rows = AdmittedPrefillLimit(seq);
+        return LayerMajor(seq, rows) ? _forwardTokens : rows;
+    }
+    // LayerMajorPrefillTokens = 0 disables it outright: an admission narrower
+    // than the load-time width must then keep that narrower Forward.
+    private bool LayerMajor(SequenceState seq, int rows) => _options.LayerMajorPrefillTokens > 0
+        && seq.MediaSpans.Count == 0 && _forwardTokens > rows && rows >= Qwen4ExpModel.LayerMajorMinimumChunkTokens;
     private InferenceMemoryBytes RequestPeakForRows(SequenceState seq, int maximumRows, bool materializing)
     {
         int tokens = checked(seq.PromptTokens.Count + seq.MaxNewTokens);
@@ -249,7 +265,11 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         // radix tree. Its complete allocation is admitted before adoption.
         bool reusable = _effectivePrefixCopies > 0 ? HasNativeSlot(seq) : CanReuseSlotFor(seq);
         long slot = materializing && reusable ? 0 : _geometry.SlotBytes(_context);
-        return new(staging.Host, slot);
+        // Residual streams of the largest layer-major Forward still to run.
+        int remaining = seq.PromptTokens.Count - seq.NumComputedTokens;
+        long residual = remaining > rows && LayerMajor(seq, maximumRows)
+            ? _geometry.LayerMajorHostBytes(Math.Min(_forwardTokens, remaining)) : 0;
+        return new(checked(staging.Host + residual), slot);
     }
     private bool HasNativeSlot(SequenceState seq) => _model!.CanReuseUnifiedSlot(seq.RequestId, includeIdlePrimary: false);
     private bool CanReuseSlotFor(SequenceState seq) => _primarySlotClaim.CanReuse(seq, HasNativeSlot(seq),
@@ -580,13 +600,23 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
             var execution = new SerialExecution(this, scope);
             _executingRequest = request;
             _executingSequence = seq;
+            int rows = AdmittedPrefillLimit(seq);
+            _model!.LayerMajorPrefillChunkTokens = LayerMajor(seq, rows) ? rows : 0;
             return execution;
         }
         catch { scope.Dispose(); throw; }
     }
     private sealed class SerialExecution(GlmUnifiedMemoryModelSession owner, IDisposable scope) : IDisposable
     {
-        public void Dispose() { try { scope.Dispose(); } finally { owner._executingRequest = null; owner._executingSequence = null; } }
+        public void Dispose()
+        {
+            try { scope.Dispose(); }
+            finally
+            {
+                owner._executingRequest = null; owner._executingSequence = null;
+                if (owner._model != null) owner._model.LayerMajorPrefillChunkTokens = 0;
+            }
+        }
     }
     private bool Fits(IReadOnlyList<MemoryCharge> bytes, IReadOnlyList<MemoryCharge> limits)
     {

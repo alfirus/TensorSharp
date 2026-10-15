@@ -78,6 +78,10 @@ internal sealed record GlmUnifiedMemoryGeometry
         }
     }
 
+    /// <summary>Host residual streams a layer-major forward keeps between layers.</summary>
+    internal long LayerMajorHostBytes(int tokens)
+        => tokens <= 0 ? 0 : checked(4L * Hidden * HyperConnections * tokens);
+
     internal InferenceMemoryBytes GraphPeak(int context, int rows, bool batched, int generations = 2)
     {
         if (generations < 1 || generations > 33) throw new ArgumentOutOfRangeException(nameof(generations));

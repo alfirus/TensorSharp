@@ -2325,6 +2325,12 @@ namespace TensorSharp.Models
             if (_logitsDumped || _inWarmup || logits == null) return logits;
             string path = Environment.GetEnvironmentVariable("TS_DUMP_LOGITS");
             if (string.IsNullOrEmpty(path)) return logits;
+            // TS_DUMP_LOGITS_AT=N dumps the forward that leaves the cache at N
+            // tokens instead - the logits a prompt of N tokens samples from,
+            // whatever its chunking and whatever ran before it (a server warmup).
+            string at = Environment.GetEnvironmentVariable("TS_DUMP_LOGITS_AT");
+            if (!string.IsNullOrEmpty(at) && (!int.TryParse(at, out int position) || _cacheSeqLen != position))
+                return logits;
             _logitsDumped = true;
             using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write))
             using (var bw = new System.IO.BinaryWriter(fs))
