@@ -52,8 +52,11 @@ internal sealed class UnifiedMemorySessionHandle
         // Qwen ignores this architecture-specific option. Public API defaults
         // stay independent of this Host policy.
         var scheduler = SchedulerConfig.FromEnvironment();
+        // Capacity growth lets Qwen's per-layer expert tables regrow, with
+        // their hot slots, after a request boundary trims them for a prefill.
         var options = new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true,
             EnableAdaptiveGlmPrefill = true, AdaptiveGlmPrefillChunkTokens = 1024,
+            EnableExpertCacheCapacityGrowth = true,
             PrefixCheckpointCount = scheduler.EnablePrefixCaching
                 ? (scheduler.ExecutionOptionsOverride ?? ExecutionOptions.FromEnvironment()).PrefixCheckpointBudget : 0 };
         string chunk = Environment.GetEnvironmentVariable(chunkVariable);
@@ -72,6 +75,14 @@ internal sealed class UnifiedMemorySessionHandle
                 || tokens > 65536)
                 throw new ArgumentException("TS_UNIFIED_LAYER_MAJOR_TOKENS must be an integer from 0 through 65536.");
             options = options with { LayerMajorPrefillTokens = tokens };
+        }
+        string growth = Environment.GetEnvironmentVariable("TS_UNIFIED_EXPERT_CACHE_GROWTH");
+        if (growth != null)
+        {
+            // 0 keeps each trimmed table at its smaller size until a later trim.
+            if (growth is not ("0" or "1"))
+                throw new ArgumentException("TS_UNIFIED_EXPERT_CACHE_GROWTH must be 0 or 1.");
+            options = options with { EnableExpertCacheCapacityGrowth = growth == "1" };
         }
         foreach (string variable in new[] { "TS_PER_SEQ_FUSED", "TS_BATCHED_FUSED_DECODE" })
         {

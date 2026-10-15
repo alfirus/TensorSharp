@@ -17,6 +17,7 @@ Example (unified Qwen3.8 Flash Next, no prefix cache, fast startup):
       --output artifacts/perf/qwen-baseline-v1
 """
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -213,7 +214,9 @@ def main():
                     row.update(prompt_tokens=prompt_tokens, cache_hits=hits, prompt_s=round(prompt_ns / 1e9, 3),
                                eval_tokens=eval_tokens, eval_s=round(eval_ns / 1e9, 3),
                                done_reason=response.get("done_reason"),
-                               content_head=(response.get("message") or {}).get("content", "")[:240])
+                               content_head=(response.get("message") or {}).get("content", "")[:240],
+                               content_sha1=hashlib.sha1(((response.get("message") or {}).get("content", ""))
+                                                         .encode("utf-8")).hexdigest())
                     if prompt_ns and hits == 0:
                         row["prefill_tps"] = round(prompt_tokens / (prompt_ns / 1e9), 2)
                     if eval_ns and eval_tokens:

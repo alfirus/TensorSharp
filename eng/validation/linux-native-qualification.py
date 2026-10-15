@@ -50,6 +50,8 @@ def cuda_cases():
             ("capacity-growth-q8", expert, ["--capacity-growth"]),
             ("capacity-growth-iq1", expert, ["--capacity-growth", "--quantization", "iq1_m"]),
             ("capacity-growth-iq2", expert, ["--capacity-growth", "--quantization", "iq2_xxs"]),
+            ("shrink-compaction-q8", expert, ["--shrink-compaction"]),
+            ("shrink-compaction-iq1-lfu", expert, ["--shrink-compaction", "--quantization", "iq1_m", "--lfu"]),
             ("bulk-union-q8", expert, ["--bulk-union"]),
             ("bulk-union-iq1", expert, ["--bulk-union", "--quantization", "iq1_m"]),
             ("bulk-union-iq2", expert, ["--bulk-union", "--quantization", "iq2_xxs"]),

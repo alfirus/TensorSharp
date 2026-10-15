@@ -577,21 +577,62 @@ namespace tsg
         bool g_last_phase_wide = false;
         // Caller holds g_cache_mutex. Erased tables are recreated lazily by the
         // next narrow call of their group, each at min(weighted share, room left).
+        // Only a gross imbalance is rebuilt: one table holding over twice its
+        // decode share while the groups below half of theirs (or absent, with
+        // too little spare budget for half of all their shares) are starved.
+        // Affordable unions near their shares keep their hot slots.
         void rebalance_pooled_tables_locked(std::size_t budget, ggml_backend_t backend)
         {
+            const auto share = [&](const CacheEntry& entry) {
+                return g_phase_plan->quota(group_key(entry), budget, false);
+            };
+            const auto skewed = [&](const CacheEntry& entry) {
+                const auto quota = share(entry);
+                return quota != 0 && (entry.bytes / 2 > quota || entry.bytes < quota / 2);
+            };
+            const auto owned = [&](const CacheEntry& entry) { return entry.pooled && entry.backend == backend; };
+            // Full decode shares of the groups that currently own no table.
+            const auto absent_shares = [&] {
+                std::size_t total = 0;
+                for (const auto& group : g_phase_plan->groups()) {
+                    bool present = false;
+                    for (const auto& entry : g_entries)
+                        present = present || (owned(*entry) && group_key(*entry) == group.key);
+                    if (!present) total += g_phase_plan->quota(group.key, budget, false);
+                }
+                return total;
+            };
+            const auto room = [&] { return budget > g_reserved ? budget - g_reserved : 0; };
+            bool hoarding = false, starved = room() < absent_shares() / 2;
+            for (const auto& entry : g_entries) {
+                if (!owned(*entry) || share(*entry) == 0) continue;
+                hoarding = hoarding || entry->bytes / 2 > share(*entry);
+                starved = starved || entry->bytes < share(*entry) / 2;
+            }
+            if (!hoarding || !starved) return;
             drain_decode_prefetch(false);
-            for (auto it = g_entries.begin(); it != g_entries.end();) {
-                const auto& entry = **it;
-                if (!entry.pooled || entry.backend != backend) { ++it; continue; }
-                const auto quota = g_phase_plan->quota(group_key(entry), budget, false);
-                const auto margin = quota / 8;
-                if (quota == 0 || (entry.bytes + margin >= quota && entry.bytes <= quota + margin)) { ++it; continue; }
-                const auto bytes = entry.bytes;
+            const auto erase = [&](std::list<std::unique_ptr<CacheEntry>>::iterator it) {
+                const auto bytes = (*it)->bytes;
                 if (diagnostics()) std::fprintf(stderr,
                     "[HOSTMOE-REBALANCE] layer=%d slots=%d bytes=%zu decode_quota=%zu\n",
-                    entry.layer, entry.capacity, bytes, quota);
-                it = g_entries.erase(it);
+                    (*it)->layer, (*it)->capacity, bytes, share(**it));
                 g_reserved -= bytes;
+                return g_entries.erase(it);
+            };
+            for (auto it = g_entries.begin(); it != g_entries.end();)
+                it = owned(**it) && skewed(**it) ? erase(it) : std::next(it);
+            // Recreated groups get only the room beside retained tables, and
+            // phase-plan tables never grow. Make room for every absent group's
+            // share, taking the table with the largest excess over its own first.
+            while (room() < absent_shares()) {
+                auto largest = g_entries.end();
+                std::size_t excess = 0;
+                for (auto it = g_entries.begin(); it != g_entries.end(); ++it) {
+                    if (!owned(**it) || (*it)->bytes <= share(**it)) continue;
+                    if ((*it)->bytes - share(**it) > excess) { excess = (*it)->bytes - share(**it); largest = it; }
+                }
+                if (largest == g_entries.end()) break;
+                erase(largest);
             }
         }
 
@@ -883,9 +924,9 @@ namespace tsg
             if (entry.allocator == nullptr) return false;
             std::size_t device_bytes = 0;
             ggml_gallocr_reserve_n_size(entry.allocator, entry.graph, nullptr, nullptr, &device_bytes);
-            if (device_bytes > quota || quota - device_bytes < kWorkspaceAllowance) return false;
+            // Measured even when refused, so a quota miss can refit capacity.
             entry.bytes = device_bytes + kWorkspaceAllowance;
-            return true;
+            return device_bytes <= quota && quota - device_bytes >= kWorkspaceAllowance;
         }
 
         std::unique_ptr<CacheEntry> create_entry(const HostMoeSegment& hm,
@@ -915,6 +956,7 @@ namespace tsg
             // Size-only candidates own CPU graph metadata, never backing device
             // buffers or a shared ticket. Destroy each rejected plan before the
             // next candidate so fitting cannot hide physical admission failures.
+            std::size_t refused_bytes = 0;
             const auto plan = [&](std::size_t slots) {
                 auto entry = std::make_unique<CacheEntry>();
                 entry->backend = backend;
@@ -926,7 +968,10 @@ namespace tsg
                 entry->source[0] = hm.gate_data; entry->source[1] = hm.up_data; entry->source[2] = hm.down_data;
                 entry->type[0] = hm.gate_type; entry->type[1] = hm.up_type; entry->type[2] = hm.down_type;
                 for (int i = 0; i < 3; ++i) entry->stride[i] = stride[i];
-                if (!build_graph(*entry, static_cast<int>(slots), quota, graph_rows, bulk_rows, resource_prefill_rows, exact_phase_width)) entry.reset();
+                if (!build_graph(*entry, static_cast<int>(slots), quota, graph_rows, bulk_rows, resource_prefill_rows, exact_phase_width)) {
+                    refused_bytes = entry->bytes;
+                    entry.reset();
+                }
                 return entry;
             };
             auto largest = plan(capacity);
@@ -947,7 +992,18 @@ namespace tsg
                 }
                 return best ? plan(best) : nullptr;
             }
-            // Preserve the original Qwen capacity policy and admission behavior.
+            // The slot estimate above ignores graph scratch, which barely depends
+            // on slot count, so a quota-bound plan usually misses by a few MiB.
+            // Refit once from the measured overshoot rather than giving up a
+            // quarter of the table; then keep the original 3/4 steps.
+            if (refused_bytes > quota) {
+                const auto fewer = (refused_bytes - quota + per_expert - 1) / per_expert;
+                for (std::size_t extra = 0; extra < 2 && capacity > fewer + extra
+                        && capacity - fewer - extra >= static_cast<std::size_t>(minimum_capacity); ++extra) {
+                    auto entry = plan(capacity - fewer - extra);
+                    if (entry) return entry;
+                }
+            }
             for (;;) {
                 if (capacity <= static_cast<std::size_t>(minimum_capacity)) return nullptr;
                 capacity = std::max<std::size_t>(minimum_capacity, capacity * 3 / 4);
@@ -1277,6 +1333,140 @@ namespace tsg
                     static_cast<unsigned long long>(bytes), g_reserved, budget);
                 return Growth::replaced;
             } catch (...) { ++g_growth_failures; throw; }
+        }
+
+        bool compact_shrink()
+        {
+            static const bool enabled = [] {
+                const char* value = std::getenv("TS_HOST_MOE_EXPERT_CACHE_SHRINK_COPY");
+                return value == nullptr || std::strcmp(value, "1") == 0;
+            }();
+            return enabled;
+        }
+
+        // Caller holds the cache gate. A budget cut used to erase every
+        // per-layer table above the new share, so decode after each wide
+        // prefill restarted cold. Rebuild one ordinary table under `quota`
+        // and keep the slots that misses would evict last. The old table
+        // stays published until the copy completes; refusal leaves it intact
+        // for the caller to erase. Old and new payloads coexist briefly within
+        // the credit the caller has not yet returned. `unchanged` means no smaller
+        // table fits; `refused` means its admission was refused.
+        Growth shrink_entry(std::unique_ptr<CacheEntry>& published, std::size_t quota)
+        {
+            auto& old = *published;
+            if (old.pooled || old.split_weights || old.wide_owner || old.capacity <= old.n_used) return Growth::unchanged;
+            HostMoeSegment hm;
+            hm.layer = old.layer; hm.hidden = old.hidden; hm.n_ff = old.n_ff;
+            hm.n_used = old.n_used; hm.num_experts = old.num_experts; hm.swiglu_clamp = old.swiglu_clamp;
+            hm.gate_data = const_cast<void*>(old.source[0]); hm.gate_type = old.type[0];
+            hm.up_data = const_cast<void*>(old.source[1]); hm.up_type = old.type[1];
+            hm.down_data = const_cast<void*>(old.source[2]); hm.down_type = old.type[2];
+            const std::size_t stride[3] = {old.stride[0], old.stride[1], old.stride[2]};
+            using Clock = std::chrono::steady_clock;
+            const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            const auto t0 = Clock::now();
+            auto candidate = create_entry(hm, stride, old.backend, quota,
+                static_cast<std::size_t>(old.capacity - 1), old.graph_rows, old.n_used, old.bulk_rows);
+            if (!candidate || candidate->capacity >= old.capacity || candidate->bytes > quota) return Growth::unchanged;
+            auto& next = *candidate;
+            const auto t1 = Clock::now();
+            const auto admission = allocate_entry(next);
+            if (admission == Admission::refused) return Growth::refused;
+            if (admission == Admission::failed)
+                throw std::runtime_error("Expert-cache compaction payload allocation or commit failed");
+            const auto t2 = Clock::now();
+            g_reserved += next.bytes;
+            struct Rollback {
+                std::unique_ptr<CacheEntry>& candidate;
+                std::size_t bytes;
+                bool published = false;
+                ~Rollback() { if (!published) { candidate.reset(); g_reserved -= bytes; } }
+            } rollback{candidate, next.bytes};
+            // Rank by the miss path's own victim order; drop the most
+            // preferred victims. Kept slots retain their relative order, so
+            // most survivors form a few long runs of one copy each.
+            std::vector<int> order(static_cast<std::size_t>(old.capacity));
+            for (int s = 0; s < old.capacity; ++s) order[static_cast<std::size_t>(s)] = s;
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                // Empty slots go first even when LRU ages tie at zero.
+                const bool empty_a = old.expert_for_slot[a] < 0, empty_b = old.expert_for_slot[b] < 0;
+                if (empty_a != empty_b) return empty_a;
+                return old.eviction_policy.prefer(old.expert_for_slot[a], old.last_used[a],
+                    old.expert_for_slot[b], old.last_used[b]);
+            });
+            std::vector<std::uint8_t> keep(static_cast<std::size_t>(old.capacity), 0);
+            for (std::size_t i = static_cast<std::size_t>(old.capacity - next.capacity); i < order.size(); ++i)
+                keep[static_cast<std::size_t>(order[i])] = old.expert_for_slot[order[i]] >= 0 ? 1 : 0;
+            struct Run { int from, to, count; };
+            std::vector<Run> runs;
+            int hot = 0;
+            for (int s = 0; s < old.capacity; ++s) {
+                if (!keep[static_cast<std::size_t>(s)]) continue;
+                if (!runs.empty() && runs.back().from + runs.back().count == s) ++runs.back().count;
+                else runs.push_back({s, hot, 1});
+                ++hot;
+            }
+            for (const auto& run : runs)
+                for (int i = 0; i < run.count; ++i) {
+                    const auto from = static_cast<std::size_t>(run.from + i), to = static_cast<std::size_t>(run.to + i);
+                    next.expert_for_slot[to] = old.expert_for_slot[from];
+                    next.source_for_slot[to] = old.source_for_slot[from];
+                    next.last_used[to] = old.last_used[from];
+                }
+            if (!old.prefetched.empty()) {
+                next.prefetched.assign(static_cast<std::size_t>(next.capacity), 0);
+                for (const auto& run : runs)
+                    for (int i = 0; i < run.count; ++i)
+                        next.prefetched[static_cast<std::size_t>(run.to + i)] = old.prefetched[static_cast<std::size_t>(run.from + i)];
+            }
+            next.clock = old.clock;
+            next.eviction_policy = old.eviction_policy;
+            next.eviction_policy.shrink_capacity(next.capacity);
+            next.prefetch_policy = old.prefetch_policy;
+            next.prefetch_observations = old.prefetch_observations;
+            next.prefetch_reads = old.prefetch_reads;
+            next.growth_generation = cache_configuration().growth_generation();
+            const auto epoch = g_ggml_error_count.load(std::memory_order_acquire);
+            sync_backend(old.backend);
+            struct CopyDrain {
+                ggml_backend_t backend;
+                bool pending = false;
+                ~CopyDrain() { if (pending) sync_backend(backend); }
+            } copies{next.backend};
+            std::uint64_t bytes = 0;
+            for (int part = 0; part < 3; ++part) {
+                for (const auto& run : runs) {
+                    ggml_tensor source = *old.weight[part], destination = *next.weight[part];
+                    const auto slot_bytes = source.nb[2];
+                    source.data = static_cast<char*>(source.data) + static_cast<std::size_t>(run.from) * slot_bytes;
+                    destination.data = static_cast<char*>(destination.data) + static_cast<std::size_t>(run.to) * slot_bytes;
+                    source.ne[2] = destination.ne[2] = run.count;
+                    source.nb[3] = destination.nb[3] = static_cast<std::size_t>(run.count) * slot_bytes;
+                    bytes += ggml_nbytes(&source);
+                    copies.pending = true;
+                    ggml_backend_tensor_copy_async(old.backend, next.backend, &source, &destination);
+                }
+            }
+            sync_backend(next.backend);
+            copies.pending = false;
+            if (g_ggml_error_count.load(std::memory_order_acquire) != epoch
+                || g_backend_compute_failed.load(std::memory_order_acquire))
+                throw std::runtime_error("Expert-cache compaction device copy failed");
+            const auto t3 = Clock::now();
+            const auto retired_bytes = old.bytes;
+            const int retired_capacity = old.capacity;
+            auto retired = std::move(published);
+            published = std::move(candidate);
+            rollback.published = true;
+            retired.reset();
+            g_reserved -= retired_bytes;
+            const auto t4 = Clock::now();
+            if (diagnostics()) std::fprintf(stderr,
+                "[HOSTMOE-CACHE-SHRINK] layer=%d slots=%d->%d hot=%d runs=%zu copied=%llu reserved=%zu quota=%zu plan=%.2f alloc=%.2f copy=%.2f retire=%.2f ms\n",
+                published->layer, retired_capacity, published->capacity, hot, runs.size(),
+                static_cast<unsigned long long>(bytes), g_reserved, quota, ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4));
+            return Growth::replaced;
         }
 
         void copy_slot_part(CacheEntry& entry, int slot, int expert, int part,
@@ -1684,6 +1874,7 @@ namespace tsg
             const bool optional_growth = settings.capacity_growth
                 && (*found)->growth_generation != cache_configuration().growth_generation()
                 && static_cast<std::size_t>((*found)->capacity) < pool_capacity;
+            bool grown = false;
             if (!g_phase_plan && settings.capacity_growth && (required || optional_growth)) {
                 (*found)->growth_generation = cache_configuration().growth_generation();
                 ++g_growth_attempts;
@@ -1693,16 +1884,19 @@ namespace tsg
                 const auto peak_quota = g_reserved < budget ? (std::min)(quota, budget - g_reserved) : 0;
                 auto expanded = create_entry(hm, stride, backend, peak_quota,
                     pool_capacity, graph_rows, std::max((*found)->capacity, minimum_capacity), bulk_rows);
-                const auto growth = grow_entry(*found, std::move(expanded), budget);
-                if (required && growth != Growth::replaced)
-                    return decline("required hot-table expansion cannot admit simultaneous old and new payloads");
+                grown = grow_entry(*found, std::move(expanded), budget) == Growth::replaced;
             }
-            else if (required) {
+            if (required && !grown) {
                 // Plan without physical allocation first. Retire the old table
                 // before growing so no duplicate weight generation is resident.
+                // Also the fallback when growth cannot hold old and new payloads
+                // at once: losing hot slots beats declining every call until
+                // the next budget change.
                 planned = create_entry(hm, stride, backend, quota,
                     pool_capacity, graph_rows, minimum_capacity, bulk_rows);
                 if (!planned) return decline("larger route union cannot fit its compact graph quota");
+                // The cold loop below may evict a prefetch target.
+                drain_decode_prefetch(true);
                 const auto retired = (*found)->bytes;
                 g_entries.erase(found); g_reserved -= retired;
                 found = g_entries.end();
@@ -2213,6 +2407,8 @@ namespace tsg
         drain_decode_prefetch(false);
         host_moe_cpu_staging_release();
         const auto before = g_reserved;
+        const auto started = std::chrono::steady_clock::now();
+        int compacted = 0, erased = 0;
         for (auto it = g_entries.begin(); per_layer != (std::numeric_limits<std::size_t>::max)()
             && it != g_entries.end();) {
             // Phase sharing imposes one aggregate ceiling. Large hot entries
@@ -2221,6 +2417,26 @@ namespace tsg
             const auto quota = g_phase_plan ? target
                 : g_group_plan ? entry_quota(**it, target, cache_configuration().settings().layers) : per_layer;
             if ((*it)->bytes <= quota) { ++it; continue; }
+            if (!g_phase_plan && !g_group_plan && compact_shrink()) {
+                // A failed compaction left the old table published and owned;
+                // trimming then erases it exactly as before.
+                const auto compact = [&] {
+                    try { return shrink_entry(*it, quota); }
+                    catch (const std::exception&) { return Growth::unchanged; }
+                };
+                auto outcome = compact();
+                if (outcome == Growth::refused && std::next(it) != g_entries.end()) {
+                    // The first compaction may lack transient credit. One
+                    // least-recent table pays for it; later ones are funded
+                    // by the slots each compaction returns.
+                    const auto lru = g_entries.back()->bytes;
+                    g_entries.pop_back();
+                    g_reserved -= lru;
+                    outcome = compact();
+                }
+                if (outcome == Growth::replaced) { ++compacted; ++it; continue; }
+            }
+            ++erased;
             const auto bytes = (*it)->bytes;
             it = g_entries.erase(it);
             g_reserved -= bytes;
@@ -2234,6 +2450,9 @@ namespace tsg
             g_reserved -= bytes;
         }
         if (g_entries.empty()) g_file_read_buffer.clear();
+        if (diagnostics() && (compacted || erased)) std::fprintf(stderr,
+            "[HOSTMOE-CACHE-TRIM] target=%zu compacted=%d erased=%d reserved=%zu ms=%.1f\n", target, compacted, erased,
+            g_reserved, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
         return before - g_reserved;
     }
 

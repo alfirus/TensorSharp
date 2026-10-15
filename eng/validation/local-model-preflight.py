@@ -39,6 +39,30 @@ def sha256(path):
     return digest.hexdigest()
 
 
+ZERO_BLOCK = bytes(8 << 20)
+
+
+def zero_runs(path, minimum_bytes):
+    """Runs of whole all-zero 8 MiB blocks of at least minimum_bytes.
+
+    Real quantized weights are never zero for tens of MiB, so such a run is
+    the signature of a chunk a resumable download never wrote (a sparse or
+    preallocated file keeps its zero fill and its full length)."""
+    runs, start, offset = [], None, 0
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(8 << 20), b""):
+            if block == ZERO_BLOCK[:len(block)]:
+                start = offset if start is None else start
+            elif start is not None:
+                if offset - start >= minimum_bytes:
+                    runs.append([start, offset - start])
+                start = None
+            offset += len(block)
+    if start is not None and offset - start >= minimum_bytes:
+        runs.append([start, offset - start])
+    return runs
+
+
 def gguf_structure(path):
     # Reuse the repository's header reader, but fetch only local bounded bytes.
     spec = importlib.util.spec_from_file_location("gguf_header", Path(__file__).with_name("inspect-remote-gguf.py"))
@@ -131,7 +155,7 @@ def range_evidence(path):
     return result
 
 
-def inspect_file(path, expected=None, hash_contents=False):
+def inspect_file(path, expected=None, hash_contents=False, zero_minimum=0):
     expected = expected or {}
     report = {"path": str(path), "exists": path.is_file(), "status": "missing"}
     if not report["exists"]:
@@ -161,6 +185,13 @@ def inspect_file(path, expected=None, hash_contents=False):
             report["status"] = "verified" if expected_hash and report["sha256"] == expected_hash.lower() else "identity_only"
             if expected_hash and report["status"] != "verified":
                 raise ValueError("SHA-256 does not match the expected checkpoint")
+        if zero_minimum:
+            started = time.perf_counter()
+            report["zero_runs"] = zero_runs(path, zero_minimum)
+            report["zero_scan_seconds"] = time.perf_counter() - started
+            if report["zero_runs"]:
+                raise ValueError(f"{len(report['zero_runs'])} all-zero run(s) of >= {zero_minimum >> 20} MiB: "
+                                 "likely an unwritten download chunk")
         after = path.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise ValueError("File changed during inspection")
@@ -197,6 +228,8 @@ def main():
     parser.add_argument("--model-root", type=Path, default=Path.cwd())
     parser.add_argument("--hash", action="store_true", help="Read each entire file once, sequentially")
     parser.add_argument("--require-verified", action="store_true", help="Exit nonzero unless every file matches an expected SHA-256")
+    parser.add_argument("--zero-runs-mib", type=int, default=0,
+                        help="Read each file and fail on all-zero runs of at least this many MiB (0 = off)")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     expectations = {}
@@ -213,7 +246,7 @@ def main():
               "scope": "Integrity/structure only; no inference, quality, performance or memory-fit claim."}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for path in paths:
-        item = inspect_file(path, expectations.get(str(path)), args.hash)
+        item = inspect_file(path, expectations.get(str(path)), args.hash, args.zero_runs_mib << 20)
         report["files"].append(item)
         report["split_checks"] = split_checks(report["files"])
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

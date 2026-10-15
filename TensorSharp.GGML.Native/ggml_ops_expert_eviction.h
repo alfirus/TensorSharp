@@ -40,6 +40,15 @@ public:
         if (next < epoch_) throw std::invalid_argument("Eviction capacity expansion shortened its epoch");
         epoch_ = next;
     }
+    // Compaction keeps per-expert popularity. The shorter window resumes from
+    // the current aging position, clamped so the next row can still age it.
+    void shrink_capacity(int capacity) {
+        if (capacity <= 0 || (epoch_ && static_cast<std::size_t>(capacity) > frequency_.size()))
+            throw std::invalid_argument("Invalid compacted eviction capacity");
+        if (!epoch_) return;
+        epoch_ = capacity_epoch(capacity);
+        if (rows_ >= epoch_) rows_ = epoch_ - 1;
+    }
     unsigned epoch() const { return epoch_; }
     void observe(const std::int32_t* ids, int count) {
         if (!epoch_) return;

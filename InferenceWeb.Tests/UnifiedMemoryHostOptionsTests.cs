@@ -14,7 +14,7 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
     public UnifiedMemoryHostOptionsTests()
     {
         foreach (string name in new[] { "TS_SCHED_PREFILL_CHUNK", "TS_PER_SEQ_FUSED", "TS_BATCHED_FUSED_DECODE",
-            "TS_SCHED_PREFIX_CACHE", "TS_PREFIX_CHECKPOINTS_MAX" })
+            "TS_SCHED_PREFIX_CACHE", "TS_PREFIX_CHECKPOINTS_MAX", "TS_UNIFIED_EXPERT_CACHE_GROWTH" })
         {
             _previous.Add(name, Environment.GetEnvironmentVariable(name));
             Environment.SetEnvironmentVariable(name, null);
@@ -29,7 +29,7 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
     public void ExplicitUnifiedHostSelectsThePlannedGlmTierWithoutChangingApiDefaultsOrEnvironment()
     {
         var expected = new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
-            AdaptiveGlmPrefillChunkTokens = 1024 };
+            AdaptiveGlmPrefillChunkTokens = 1024, EnableExpertCacheCapacityGrowth = true };
         Assert.Equal(expected, UnifiedMemorySessionHandle.ResolveHostOptions());
         Assert.Equal(512, expected.PrefillChunkTokens);
         Assert.Equal(1024, expected.ResolveGlmPrefillChunkTokens());
@@ -41,7 +41,8 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
         Assert.True(expected.EnableAdaptiveGlmPrefill);
         Assert.False(new UnifiedMemoryModelOptions().EnableAdaptiveGlmPrefill);
         Assert.False(expected.EnableAsyncExpertPrefill);
-        Assert.False(expected.EnableExpertCacheCapacityGrowth);
+        Assert.True(expected.EnableExpertCacheCapacityGrowth);
+        Assert.False(new UnifiedMemoryModelOptions().EnableExpertCacheCapacityGrowth);
         Assert.All(_previous.Keys, name => Assert.Null(Environment.GetEnvironmentVariable(name)));
     }
 
@@ -56,7 +57,7 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
         var options = UnifiedMemorySessionHandle.ResolveHostOptions();
         Assert.Equal(new UnifiedMemoryModelOptions { PrefillChunkTokens = expected,
             EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
-            AdaptiveGlmPrefillChunkTokens = expected }, options);
+            AdaptiveGlmPrefillChunkTokens = expected, EnableExpertCacheCapacityGrowth = true }, options);
         Assert.Equal(expected, options.ResolveGlmPrefillChunkTokens());
         Assert.Equal(value, Environment.GetEnvironmentVariable("TS_SCHED_PREFILL_CHUNK"));
         // A later load receives a fresh snapshot, rather than mutating a prior
@@ -146,7 +147,7 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
         Environment.SetEnvironmentVariable("TS_PER_SEQ_FUSED", value);
         Environment.SetEnvironmentVariable("TS_BATCHED_FUSED_DECODE", value);
         Assert.Equal(new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
-                AdaptiveGlmPrefillChunkTokens = 1024 },
+                AdaptiveGlmPrefillChunkTokens = 1024, EnableExpertCacheCapacityGrowth = true },
             UnifiedMemorySessionHandle.ResolveHostOptions());
     }
 
@@ -167,5 +168,26 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
         Environment.SetEnvironmentVariable("TS_PREFIX_CHECKPOINTS_MAX", "2");
         Assert.Equal(expected, options.PrefixCheckpointCount); // Immutable load forecast.
         Assert.Equal(enabled, Environment.GetEnvironmentVariable("TS_SCHED_PREFIX_CACHE"));
+    }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData("1", true)]
+    [InlineData("0", false)]
+    public void ExpertCacheGrowthDefaultsOnAndHonorsTheOperatorSwitch(string? value, bool expected)
+    {
+        Environment.SetEnvironmentVariable("TS_UNIFIED_EXPERT_CACHE_GROWTH", value);
+        Assert.Equal(expected, UnifiedMemorySessionHandle.ResolveHostOptions().EnableExpertCacheCapacityGrowth);
+    }
+
+    [Theory]
+    [InlineData("2")]
+    [InlineData("true")]
+    [InlineData(" 1")]
+    public void InvalidExpertCacheGrowthSwitchRefuses(string value)
+    {
+        Environment.SetEnvironmentVariable("TS_UNIFIED_EXPERT_CACHE_GROWTH", value);
+        var error = Assert.Throws<ArgumentException>(UnifiedMemorySessionHandle.ResolveHostOptions);
+        Assert.Contains("TS_UNIFIED_EXPERT_CACHE_GROWTH", error.Message);
     }
 }

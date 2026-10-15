@@ -2182,6 +2182,148 @@ namespace
         std::puts("PASS: scoped hot capacity growth preserves exact CUDA widths1..8 and pooled source keys; peak ledger, physical/shared refusal, commit/queued-copy faults, generation retry and teardown");
     }
 
+    // A budget cut below a per-layer table's size rebuilds it smaller and keeps
+    // the slots misses would evict last, instead of erasing the whole table.
+    // Phase 1 leaves no transient credit, so the least-recent table pays for
+    // the first compaction and only it is erased.
+    void shrink_compaction_checks(const std::array<ggml_type, 3>& types)
+    {
+        auto entries = [] {
+            std::vector<std::int64_t> values(32); int count = 0;
+            require(TSGgml_HostMoeExpertCacheEntryStats(values.data(), 4, &count) == 1 && count <= 4,
+                "Compaction metadata is unavailable");
+            std::vector<std::array<std::int64_t, 8>> rows(static_cast<std::size_t>(count));
+            for (int i = 0; i < count; ++i) std::copy_n(values.data() + i * 8, 8, rows[i].data());
+            return rows;
+        };
+        Weights a, b; a.types = b.types = types;
+        a.fill(.5f, 64); b.fill(1.3f, 64); b.segment.layer = 1;
+        FullResidentGraph reference_a(a), reference_b(b);
+        std::array<float, hidden> x{}, actual{};
+        for (int h = 0; h < hidden; ++h) x[h] = std::sin(h * .031f);
+        const std::array<float, used> routes{.6f, .4f};
+        auto call = [&](Weights& weights, FullResidentGraph& reference, int first) {
+            const std::array<std::int32_t, used> ids{first, first + 1};
+            const auto expected = reference.compute(x, ids, routes);
+            require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(), actual.data(),
+                "qwen4exp fused token span") == 1, "Compaction fixture call declined");
+            require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+                "Compacted expert table changed exact CUDA arithmetic");
+        };
+        for (int phase = 0; phase < 2; ++phase) {
+            tsg::host_moe_expert_cache_release();
+            SharedLedger ledger; ledger.multiple_cache_entries = true;
+            const std::int64_t ceiling = 32LL << 20;
+            ledger.capacity = ceiling;
+            require(ledger.attach(), "Cannot attach compaction ledger");
+            const int layers = phase == 0 ? 1 : 2;
+            std::uint64_t token = 0; std::int64_t released = 0;
+            require(TSGgml_BeginHostMoeExpertCacheScopeWithDecodeRows(ceiling, 32, layers, 1, &token) == 1,
+                "Cannot begin compaction scope");
+            struct ScopeEnd {
+                std::uint64_t& token;
+                ~ScopeEnd() { if (token) { std::int64_t released = 0; TSGgml_EndHostMoeExpertCacheScope(token, &released); } }
+            } scope{token};
+            // Thirty-two distinct experts, then six re-touched hot ones; the
+            // last call leaves layer 0 most recent and layer 1 least recent.
+            for (int first = 0; first < 32; first += 2) {
+                if (phase) call(b, reference_b, first);
+                call(a, reference_a, first);
+            }
+            for (int repeat = 0; repeat < 3; ++repeat)
+                for (int first = 0; first < 6; first += 2) {
+                    if (phase) call(b, reference_b, first);
+                    call(a, reference_a, first);
+                }
+            const auto before = entries();
+            require(before.size() == static_cast<std::size_t>(layers) && before[0][0] == 0
+                    && before[0][1] >= 32 && before[0][2] == 32,
+                "Compaction fixture did not seed a large warm table");
+            const auto per_expert = before[0][7];
+            const auto fixed = before[0][4] - before[0][1] * per_expert;
+            const std::int64_t share = fixed + 12 * per_expert + per_expert / 2;
+            if (phase == 1) ledger.capacity = ledger.committed;
+            const auto reserved = Stats().reserved;
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, share * layers, &released) == 1,
+                "Compaction budget update failed");
+            ledger.capacity = ceiling;
+            const auto after = entries();
+            require(after.size() == 1 && after[0][0] == 0 && after[0][1] < before[0][1]
+                    && after[0][1] >= 6 && after[0][2] == std::min<std::int64_t>(after[0][1], 32)
+                    && after[0][4] <= share && Stats().reserved == after[0][4]
+                    && released == reserved - after[0][4] && ledger.valid,
+                "Budget cut erased the hot table, kept the least-recent one, or misreported credit");
+            // Hot experts must still be resident: no source upload, no miss.
+            const auto misses = Stats().misses;
+            tsg::g_test_copy_failure_countdown = 1;
+            for (int first = 0; first < 6; first += 2) call(a, reference_a, first);
+            require(tsg::g_test_copy_failure_countdown == 1 && Stats().misses == misses,
+                "Compaction dropped a hot expert or remapped its slot");
+            tsg::g_test_copy_failure_countdown = 0;
+            call(a, reference_a, 40);
+            require(Stats().misses == misses + 2, "Compacted table did not serve an ordinary cold miss");
+            require(ledger.peak_owned <= ceiling && ledger.valid, "Compaction exceeded its transient credit");
+            require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1, "Compaction owner teardown failed");
+            token = 0; ledger.check_empty(); require(ledger.detach(), "Compaction ledger retained callbacks");
+        }
+        // A joint step whose routed union outgrows a compacted table must not
+        // decline when growth cannot hold old and new payloads at once: the
+        // table is rebuilt at its full share instead (growth-enabled scope).
+        {
+            tsg::host_moe_expert_cache_release();
+            SharedLedger ledger; ledger.multiple_cache_entries = true;
+            const std::int64_t ceiling = 32LL << 20;
+            ledger.capacity = ceiling;
+            require(ledger.attach(), "Cannot attach required-growth ledger");
+            std::uint64_t token = 0; std::int64_t released = 0;
+            require(TSGgml_BeginHostMoeExpertCacheScopeWithCapacityGrowth(ceiling, 32, 1, 8, 1, &token) == 1,
+                "Cannot begin growth-enabled compaction scope");
+            struct ScopeEnd {
+                std::uint64_t& token;
+                ~ScopeEnd() { if (token) { std::int64_t released = 0; TSGgml_EndHostMoeExpertCacheScope(token, &released); } }
+            } scope{token};
+            for (int first = 0; first < 32; first += 2) call(a, reference_a, first);
+            const auto full = entries();
+            const auto per_expert = full[0][7], fixed = full[0][4] - full[0][1] * per_expert;
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, fixed + 12 * per_expert + per_expert / 2, &released) == 1,
+                "Cannot compact the growth-enabled table");
+            const auto compacted = entries();
+            require(compacted.size() == 1 && compacted[0][1] < 16 && compacted[0][1] >= 6,
+                "Growth-enabled cut did not compact below the joint union");
+            require(TSGgml_UpdateHostMoeExpertCacheScope(token, ceiling, &released) == 1, "Cannot restore the ceiling");
+            // Credit for a full new table, but not beside the compacted one.
+            ledger.capacity = full[0][4] + compacted[0][4] / 2;
+            constexpr int rows = 8;
+            std::vector<float> xs(rows * hidden), probabilities(rows * used), output(rows * hidden, -999.0f), expected(rows * hidden);
+            std::vector<std::int32_t> selected(rows * used);
+            for (int row = 0; row < rows; ++row) {
+                std::array<float, hidden> xr{};
+                for (int h = 0; h < hidden; ++h) xr[h] = xs[row * hidden + h] = std::sin(h * .029f + row * .23f);
+                const std::array<std::int32_t, used> ids{2 * row, 2 * row + 1};
+                const std::array<float, used> p{.55f + row * .01f, .45f - row * .01f};
+                std::copy(ids.begin(), ids.end(), selected.begin() + row * used);
+                std::copy(p.begin(), p.end(), probabilities.begin() + row * used);
+                const auto scalar = reference_a.compute(xr, ids, p);
+                std::copy(scalar.begin(), scalar.end(), expected.begin() + row * hidden);
+            }
+            auto hm = a.segment; hm.seq_len = rows; hm.independent_decode_rows = true;
+            const auto growth_before = Stats();
+            require(tsg::host_moe_cached_experts(hm, xs.data(), selected.data(), probabilities.data(), output.data(),
+                "qwen4exp arena batched decode") == 1,
+                "Required expansion declined instead of rebuilding when old and new could not coexist");
+            require(std::memcmp(output.data(), expected.data(), output.size() * sizeof(float)) == 0,
+                "Rebuilt joint table changed exact CUDA arithmetic");
+            const auto rebuilt = entries();
+            require(rebuilt.size() == 1 && rebuilt[0][1] >= 2 * rows && Stats().calls > growth_before.calls
+                    && ledger.peak_owned <= ceiling && ledger.valid,
+                "Required expansion did not rebuild one full table within credit");
+            require(TSGgml_EndHostMoeExpertCacheScope(token, &released) == 1, "Required-growth teardown failed");
+            token = 0; ledger.capacity = ceiling; ledger.check_empty();
+            require(ledger.detach(), "Required-growth ledger retained callbacks");
+        }
+        std::puts("PASS: budget-cut compaction keeps hot slots with exact CUDA arithmetic, serves cold misses, and pays transient credit with one least-recent table; a required joint expansion that cannot coexist rebuilds instead of declining");
+    }
+
     void cuda_checks(Weights& weights, bool arena = false)
     {
         const char* kernel = arena ? "qwen4exp arena batched decode" : "qwen4exp fused token span";
@@ -2429,13 +2571,14 @@ int main(int argc, char** argv)
         }
         Weights weights;
         bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false, scoped = false, arena = false, growth = false, bulk_union = false;
-        bool pooled_quota = false, scalar_file_window = false, compact_prefill = false, direct_reads = false;
+        bool pooled_quota = false, scalar_file_window = false, compact_prefill = false, direct_reads = false, shrink = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
             else if (std::strcmp(argv[arg], "--scope") == 0) scoped = true;
             else if (std::strcmp(argv[arg], "--arena") == 0) arena = true;
             else if (std::strcmp(argv[arg], "--capacity-growth") == 0) growth = true;
+            else if (std::strcmp(argv[arg], "--shrink-compaction") == 0) shrink = true;
             else if (std::strcmp(argv[arg], "--bulk-union") == 0) bulk_union = true;
             else if (std::strcmp(argv[arg], "--pooled-quota") == 0) pooled_quota = true;
             else if (std::strcmp(argv[arg], "--glm-compact-prefill") == 0) compact_prefill = true;
@@ -2504,6 +2647,11 @@ int main(int argc, char** argv)
             }
             if (growth) {
                 capacity_growth_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (shrink) {
+                shrink_compaction_checks(weights.types);
                 ggml_backend_free(g_backend); g_backend = nullptr;
                 return 0;
             }

@@ -785,6 +785,13 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_test(NAME host-moe-expert-cache-cuda-scope COMMAND GgmlOpsHostMoeExpertCacheTest --scope)
         set_tests_properties(host-moe-expert-cache-cuda-scope PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        add_test(NAME host-moe-expert-cache-cuda-shrink-compaction
+            COMMAND GgmlOpsHostMoeExpertCacheTest --shrink-compaction)
+        add_test(NAME host-moe-expert-cache-cuda-shrink-compaction-iq1-lfu
+            COMMAND GgmlOpsHostMoeExpertCacheTest --shrink-compaction --quantization iq1_m --lfu)
+        set_tests_properties(host-moe-expert-cache-cuda-shrink-compaction
+            host-moe-expert-cache-cuda-shrink-compaction-iq1-lfu
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME host-moe-expert-cache-cuda-wide-prefill COMMAND GgmlOpsHostMoeExpertCacheTest --wide-prefill)
         add_test(NAME host-moe-expert-cache-cuda-wide-prefill-iq1-m
             COMMAND GgmlOpsHostMoeExpertCacheTest --wide-prefill --quantization iq1_m)

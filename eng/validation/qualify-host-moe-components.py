@@ -479,6 +479,8 @@ def cases(stage):
               ('arena-file-iq1', ['--arena', '--file-read', '--quantization', 'iq1_m']),
               ('capacity-growth-q8', ['--capacity-growth']), ('capacity-growth-iq1', ['--capacity-growth', '--quantization', 'iq1_m']),
               ('capacity-growth-iq2', ['--capacity-growth', '--quantization', 'iq2_xxs']),
+              ('shrink-compaction-q8', ['--shrink-compaction']),
+              ('shrink-compaction-iq1-lfu', ['--shrink-compaction', '--quantization', 'iq1_m', '--lfu']),
               ('bulk-union-q8', ['--bulk-union']), ('bulk-union-iq1', ['--bulk-union', '--quantization', 'iq1_m']),
               ('bulk-union-iq2', ['--bulk-union', '--quantization', 'iq2_xxs']),
               ('scalar-large-file-q8', ['--glm-scalar-file-window']),
