@@ -63,6 +63,11 @@ PLANS = {
     "decode": [
         ("decode-a", None, 0, 0, "Write a long, detailed essay about the history of the Roman Empire, from its founding to its fall.", 256),
     ],
+    # Two different topics (different expert mixes); use with --concurrent.
+    "decode-pair": [
+        ("decode-a", None, 0, 0, "Write a long, detailed essay about the history of the Roman Empire, from its founding to its fall.", 384),
+        ("decode-b", None, 0, 0, "Explain in detail how a modern CPU executes instructions, covering pipelining, caches and branch prediction.", 384),
+    ],
     "long": [
         ("prefill-4k", "spec", 0, 18000, "Summarize the document above in five sentences.", 64),
         ("decode-a", None, 0, 0, "Write a long, detailed essay about the history of the Roman Empire, from its founding to its fall.", 256),
@@ -130,6 +135,8 @@ def main():
     parser.add_argument("--unified-memory", action="store_true")
     parser.add_argument("--prefix-cache", action="store_true", help="keep the prefix cache (and its startup warmup) on")
     parser.add_argument("--think", action="store_true")
+    parser.add_argument("--concurrent", action="store_true",
+                        help="send every request of a plan round at once and report aggregate tokens/s")
     parser.add_argument("--repeat", type=int, default=1, help="run the whole plan N times in the same server")
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--server-arg", action="append", default=[], help="extra server argument (repeatable)")
@@ -159,8 +166,11 @@ def main():
 
     report = dict(command=command, environment=settings, plan=args.plan, records=[], started_unix=time.time())
 
+    save_lock = threading.Lock()
+
     def save():
-        (out / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        with save_lock:
+            (out / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     sampler = Sampler()
     server = None
@@ -190,8 +200,7 @@ def main():
             report["vram_after_load_mib"] = board_vram_mib()
             print(f"ready in {report['startup_s']} s", flush=True)
             save()
-            for round_index in range(args.repeat):
-                for name, source, start, length, instruction, max_new in PLANS[args.plan]:
+            def run_one(round_index, name, source, start, length, instruction, max_new):
                     body = dict(model=model_id, stream=False, think=args.think, skills=[], skills_discovery=False, multi_agent=False,
                                 messages=[dict(role="user", content=prompt_text(source, start, length, instruction))],
                                 options=dict(temperature=0, top_k=0, top_p=1, min_p=0, repeat_penalty=1, seed=17,
@@ -226,6 +235,36 @@ def main():
                     save()
                     print(json.dumps({k: row.get(k) for k in ("name", "round", "prompt_tokens", "cache_hits", "prompt_s", "prefill_tps",
                                                               "eval_tokens", "eval_s", "decode_tps", "wall_s", "done_reason")}), flush=True)
+                    return row
+
+            for round_index in range(args.repeat):
+                if not args.concurrent:
+                    for entry in PLANS[args.plan]:
+                        run_one(round_index, *entry)
+                    continue
+                # All entries of a round at once: aggregate throughput is total
+                # generated tokens over the round's wall time.
+                rows, errors = [None] * len(PLANS[args.plan]), []
+                def worker(index, entry):
+                    try:
+                        rows[index] = run_one(round_index, *entry)
+                    except Exception as error:
+                        errors.append(error)
+                threads = [threading.Thread(target=worker, args=(i, e)) for i, e in enumerate(PLANS[args.plan])]
+                t0 = time.monotonic()
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                if errors:
+                    raise errors[0]
+                wall = time.monotonic() - t0
+                tokens = sum(row.get("eval_tokens") or 0 for row in rows)
+                batch = dict(round=round_index, requests=len(rows), wall_s=round(wall, 3), eval_tokens=tokens,
+                             aggregate_tps=round(tokens / wall, 2) if wall > 0 else None)
+                report.setdefault("concurrent_rounds", []).append(batch)
+                save()
+                print(json.dumps(batch), flush=True)
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
         print(report["error"], flush=True)

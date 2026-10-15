@@ -115,6 +115,31 @@ public sealed class StartupWarmupPolicyTests
         Assert.False(StartupWarmupPolicy.UseKernelInitializationOnly(false, active, null, 0));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NonUnifiedStateThatCanNeitherCopyNorRewindWarmsOnlyKernels(bool active)
+    {
+        // GLM-5.3 (KDA) and exact-length recurrent holders: the warmup ends past
+        // the shared prefix, so no later conversation can resume it.
+        var capabilities = CopyCapabilities() with
+        {
+            EndState = EndStateSupport.DonateOnly, CanCaptureCopy = false, Truncation = TruncationKind.None,
+        };
+        Assert.True(StartupWarmupPolicy.UseKernelInitializationOnly(false, active, capabilities, 4));
+    }
+
+    [Theory]
+    [InlineData(true, TruncationKind.None)]
+    [InlineData(false, TruncationKind.Any)]
+    [InlineData(false, TruncationKind.WithinUnwrappedWindow)]
+    [InlineData(false, TruncationKind.ModelDecides)]
+    public void NonUnifiedStateThatCanCopyOrRewindKeepsTheFullPromptWarmup(bool copies, TruncationKind truncation)
+    {
+        var capabilities = CopyCapabilities() with { CanCaptureCopy = copies, Truncation = truncation };
+        Assert.False(StartupWarmupPolicy.UseKernelInitializationOnly(false, true, capabilities, 4));
+    }
+
     [Fact]
     public void SessionOverrideWinsOverTheRequestedPublicCheckpointBudget()
     {

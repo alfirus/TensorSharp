@@ -32,9 +32,13 @@ public static class StartupWarmupPolicy
             && effectivePublicCheckpointBudget == 1;
 
     /// <summary>Unified execution prepares only kernels when it cannot copy a
-    /// public prompt checkpoint. Other execution modes retain their existing
-    /// startup selection. A successful warmup still does not prove that a
-    /// reusable checkpoint was retained.</summary>
+    /// public prompt checkpoint. Other execution modes prepare only kernels when
+    /// the model declares it can neither copy a prompt checkpoint nor rewind a
+    /// retained end state: the warmup ends past the shared prefix, so no later
+    /// conversation could resume it, and replaying the full prompt there only
+    /// delays the port (GLM-5.3 on a 16 GB GPU: two 190 s prefills, then a
+    /// first request that still prefilled everything). A successful warmup
+    /// still does not prove that a reusable checkpoint was retained.</summary>
     /// <param name="prefixCacheActive">Whether the loaded engine actually
     /// attached its prefix cache, rather than whether an operator requested it.</param>
     /// <param name="capabilities">The loaded model's declared prefix contract.</param>
@@ -44,6 +48,7 @@ public static class StartupWarmupPolicy
     public static bool UseKernelInitializationOnly(bool unifiedMemoryEnabled,
         bool prefixCacheActive, PrefixCacheCapabilities? capabilities,
         int effectivePublicCheckpointBudget)
-        => unifiedMemoryEnabled && !(prefixCacheActive
-            && capabilities?.CanCaptureCopy == true && effectivePublicCheckpointBudget > 0);
+        => unifiedMemoryEnabled
+            ? !(prefixCacheActive && capabilities?.CanCaptureCopy == true && effectivePublicCheckpointBudget > 0)
+            : capabilities is { CanCaptureCopy: false, Truncation: TruncationKind.None };
 }
