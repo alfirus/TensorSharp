@@ -80,9 +80,17 @@ internal sealed record GlmUnifiedVisionMemoryGeometry(int Patch, int Merge, int 
             long patches = (long)(height / Patch) * (width / Patch), merged = patches / Merge / Merge;
             if (patches * Hidden > int.MaxValue || merged * Projection > int.MaxValue)
                 throw new NotSupportedException("GLM image exceeds the managed tensor range.");
+            // Budgeted sessions require the native encoder (no managed
+            // full-score fallback). On CUDA/Vulkan it tiles queries so one
+            // [patches, tile, heads] score tensor stays near 256 MiB (tile
+            // >= 256 rows); other backends use flash attention. Charge a
+            // score tile and its softmax, not the patches^2 matrix that
+            // refused every ordinary photo. Every native allocation is still
+            // charged, so an underestimate is refused, never unaccounted.
+            long tile = Math.Clamp((256L << 20) / (patches * Heads * 4L), Math.Min(256L, patches), patches);
             long payload = (64L << 20) + 24L * height * width
                 + 4L * patches * (16L * Hidden + 8L * Intermediate)
-                + 4L * Heads * patches * patches // exact score fallback is supported and must fit
+                + 2L * 4L * Heads * patches * tile
                 + 8L * merged * Projection;
             return new(payload, payload);
         }

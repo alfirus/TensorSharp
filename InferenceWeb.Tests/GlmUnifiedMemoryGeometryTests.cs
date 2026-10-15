@@ -206,6 +206,20 @@ public sealed class GlmUnifiedMemoryGeometryTests : IDisposable
         Assert.Equal(minimum, GlmUnifiedVisionMemoryGeometry.PlacementBytes(streamed, -1));
     }
 
+    [Fact]
+    public void ImageScoresAreChargedPerQueryTileNotAsTheFullPatchSquare()
+    {
+        // GLM-5.3's projector: hidden 1024, ffn 4096, 16 heads, projection 4096.
+        var geometry = new GlmUnifiedVisionMemoryGeometry(14, 2, 1024, 4096, 16, 4096, 1, 1, 1);
+        long Peak(int h, int w) => geometry.ExecutionPeak(h, w).Device;
+        long patches = (1092 / 14) * (1932 / 14);
+        Assert.True(Peak(1092, 1932) < 4L * 16 * patches * patches); // the old full-score term alone
+        Assert.True(Peak(1092, 1932) < 3L << 30);
+        // Above the 256-row tile floor, the score term no longer grows with patches^2.
+        long small = Peak(448, 448), doubled = Peak(896, 448), quadrupled = Peak(896, 896);
+        Assert.True(quadrupled - doubled < 3 * (doubled - small));
+    }
+
     private static byte[] PngHeader(int width, int height)
     {
         byte[] header = new byte[24];
