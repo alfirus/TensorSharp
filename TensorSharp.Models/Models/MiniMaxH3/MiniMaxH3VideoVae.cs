@@ -58,7 +58,7 @@ namespace TensorSharp.Models.MiniMaxH3
         private H3Lin _postQuant, _xEmbedder, _projOut;
         private IntPtr _registerTokens, _normOutW, _normOutB;
         // Non-null on the backends with no ggml graph to call (BackendType.Cpu).
-        private readonly MiniMaxH3DirectVideoVae _direct;
+        private MiniMaxH3DirectVideoVae _direct;
         private MiniMaxH3DirectVideoVaeEncoder3D _directEnc3D;
         private readonly IAllocator _allocator;
         private readonly bool _useDirect;
@@ -114,21 +114,32 @@ namespace TensorSharp.Models.MiniMaxH3
             _allocator = allocator;
             _useDirect = allocator != null && backend is not (BackendType.GgmlCuda
                 or BackendType.GgmlCpu or BackendType.GgmlMetal or BackendType.GgmlVulkan);
-            if (_useDirect)
-            {
-                _direct = new MiniMaxH3DirectVideoVae(
-                    allocator,
-                    ReadF32,
-                    name =>
-                    {
-                        var info = _model.TensorOwners[name].GetInfo(name);
-                        return (info.Shape[0], info.Shape[1]);
-                    },
-                    n, Dim, Heads, HeadDim, FfnInner, RotDim, NumRegisterTokens, Eps);
-            }
-
             LatentsMean = ReadF32("latents_mean");
             LatentsStd = ReadF32("latents_std");
+        }
+
+        // Encode-only requests need the causal encoder, so defer the large direct
+        // decoder projections until the first decode. The mapped native descriptors
+        // above remain cheap and preserve immediate shape/dtype validation.
+        private MiniMaxH3DirectVideoVae EnsureDirectDecoder()
+        {
+            return _direct ??= new MiniMaxH3DirectVideoVae(
+                _allocator,
+                ReadF32,
+                name =>
+                {
+                    var info=_model.TensorOwners[name].GetInfo(name);
+                    return (info.Shape[0],info.Shape[1]);
+                },
+                _blocks.Length,Dim,Heads,HeadDim,FfnInner,RotDim,NumRegisterTokens,Eps,
+                mappedWeight: name =>
+                {
+                    var owner=_model.TensorOwners[name];
+                    var info=owner.GetInfo(name);
+                    if(!owner.TryGetTensorDataPointer(info,out IntPtr pointer))
+                        throw new InvalidOperationException($"could not map '{name}'.");
+                    return (pointer,GgmlTypeOf(info.Dtype),info.ByteCount);
+                });
         }
 
         // ---- weight binding -------------------------------------------------
@@ -259,10 +270,10 @@ namespace TensorSharp.Models.MiniMaxH3
             int suffix = NumRegisterTokens + 1;
             var (cos, sin) = BuildRope(latentT, latentH, latentW, suffix);
 
-            if (_direct != null)
+            if (_useDirect)
             {
                 // Pure-managed path: the identical ViT, with no native call.
-                return _direct.DecodeTokens(latent, tokens, LatentChannels, cos, sin, PatchDim);
+                return EnsureDirectDecoder().DecodeTokens(latent, tokens, LatentChannels, cos, sin, PatchDim);
             }
 
             var output = new float[(long)tokens * PatchDim];
@@ -1139,6 +1150,9 @@ namespace TensorSharp.Models.MiniMaxH3
         public void ReleaseDeviceResidency()
         {
             if (_disposed) return;
+            // Direct linear cache entries use shared-owner leases. Context-owned
+            // tensors and the 3D encoder's raw weight tensors remain until disposal.
+            _direct?.ReleaseDeviceResidency();
             foreach (IntPtr ptr in _bound)
                 if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
         }

@@ -478,6 +478,8 @@ public static partial class WebUiRoutes
             CatalogModel? model = Find(request.RouteValues["id"]);
             if (model is null)
                 return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new { error = Loc.T("host.models.notFound") }, 404));
+            if (!model.IsAvailable)
+                return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new { error = model.UnavailableReason }, 409));
             if (model.SideloadOnly)
             {
                 return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new
@@ -584,6 +586,11 @@ public static partial class WebUiRoutes
         {
             AppSettings updated = JsonSerializer.Deserialize<AppSettings>(
                 (await request.ReadJsonAsync(ct)).GetRawText(), SseFraming.JsonOptions) ?? new AppSettings();
+            // A memory-filtered catalog can omit the unavailable entry, so also
+            // resolve known ids against the full catalog before persisting a choice.
+            if (updated.SelectedModelId is { Length: > 0 } selectedId &&
+                (Find(selectedId) ?? ModelCatalog.Find(selectedId)) is { IsAvailable: false } unavailable)
+                return LoopbackResponse.Json(new { error = unavailable.UnavailableReason }, 409);
             // The LoRA sheet's routes own the plug-in choice (MapLoras), which they check as
             // they save it. The page posts the copy of the settings it read when it loaded, so
             // taking that copy's choice would undo a plug-in turned on since, or bring back one
@@ -823,6 +830,8 @@ public static partial class WebUiRoutes
         modalities = model.Modalities.ToString(),
         kind = model.Kind.ToString(),
         experimental = model.Experimental,
+        available = model.IsAvailable,
+        unavailableReason = model.UnavailableReason,
         sideloadOnly = model.SideloadOnly,
         minDeviceMemoryGB = model.MinDeviceMemoryGB,
         totalBytes = model.TotalBytes,

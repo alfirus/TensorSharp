@@ -21,6 +21,11 @@ namespace TensorSharp.Models.Video
         /// <summary>Short family id for UI and telemetry, e.g. "wan" or "minimax-h3".</summary>
         string VideoModelFamily { get; }
 
+        /// <summary>Recommended frame count for a short interactive preview, on this
+        /// model's temporal grid. Zero leaves the frame count to the model's generation
+        /// default. Hosts must not infer a frame grid from another model's family.</summary>
+        int DefaultPreviewFrames => 0;
+
         /// <summary>True when the model generates an audio track jointly with the video.</summary>
         bool SupportsAudio { get; }
 
@@ -30,10 +35,15 @@ namespace TensorSharp.Models.Video
         /// <summary>True when the model accepts a last-frame conditioning image.</summary>
         bool SupportsEndImageConditioning { get; }
 
+        /// <summary>True when images can guide arbitrary frame positions. This is
+        /// temporal image conditioning, distinct from identity reference adapters.</summary>
+        bool SupportsKeyframeConditioning => false;
+
         /// <summary>True when the model accepts reference images/videos/audio.</summary>
         bool SupportsReferenceConditioning { get; }
 
-        /// <summary>How many reference images the model accepts, or 0 when it takes none.
+        /// <summary>How many reference images or temporal image guides the model accepts,
+        /// or 0 when it takes none. The conditioning capability selects their meaning.
         ///
         /// <para>A client that lets someone attach pictures needs the number BEFORE it sends
         /// anything — the alternative is posting ten images and getting the whole request

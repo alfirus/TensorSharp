@@ -1121,7 +1121,7 @@ internal sealed class ShellExec
         return kept;
     }
 
-    /// <summary>`$x` and `${x}` inside `$(( ))` are expanded before evaluation, as bash does.</summary>
+    /// <summary>Variables and positional parameters inside `$(( ))` expand before evaluation.</summary>
     private string ExpandArithmeticText(string expression)
     {
         if (expression.IndexOf('$') < 0)
@@ -1138,10 +1138,17 @@ internal sealed class ShellExec
                     if (close > 0)
                     {
                         string inner = expression.Substring(i + 2, close - i - 2);
-                        sb.Append(GetVariableForArithmetic(inner).Length == 0 ? "0" : GetVariableForArithmetic(inner));
+                        sb.Append(ArithmeticParameterValue(inner));
                         i = close;
                         continue;
                     }
+                }
+                else if (IsSpecialName(expression[i + 1].ToString()))
+                {
+                    // Unbraced positional parameters consume one digit: $10 is
+                    // ${1} followed by 0, while ${10} names the tenth argument.
+                    sb.Append(ArithmeticParameterValue(expression[++i].ToString()));
+                    continue;
                 }
                 else if (char.IsAsciiLetter(expression[i + 1]) || expression[i + 1] == '_')
                 {
@@ -1176,6 +1183,14 @@ internal sealed class ShellExec
             sb.Append(c);
         }
         return sb.ToString();
+    }
+
+    private string ArithmeticParameterValue(string name)
+    {
+        string value = name.Length > 0 && (IsSpecialName(name) || name.All(char.IsAsciiDigit))
+            ? SpecialOrVariable(name).Value
+            : GetVariableForArithmetic(name);
+        return value.Length == 0 ? "0" : value;
     }
 
     public string CaptureOutput(CommandList body)

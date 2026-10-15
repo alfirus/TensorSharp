@@ -68,5 +68,8 @@
   "host.engine.networkOn": "réseau activé",
   "host.engine.networkOff": "réseau désactivé",
   "host.engine.skills": "{count} compétences",
-  "host.engine.unknown": "inconnu"
+  "host.engine.unknown": "inconnu",
+  "host.video.keyframesUnavailable": "Ce modèle vidéo ne prend pas en charge les images clés à des positions arbitraires.",
+  "host.video.ingredientsUnavailable": "Les références d’identité Ingredients nécessitent un checkpoint IC-LoRA ; utilisez des images clés avec LTX 2.5 Distilled.",
+  "host.video.invalidFrames": "Le nombre d’images LTX doit être positif et suivre la règle 8n+1."
 }

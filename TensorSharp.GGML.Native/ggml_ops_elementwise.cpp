@@ -394,7 +394,8 @@ namespace {
     int unary_f32_impl(
         UnaryOpCode op,
         const TensorView4DDesc& result_desc,
-        const TensorView4DDesc& src_desc)
+        const TensorView4DDesc& src_desc,
+        bool clamp = false, float minimum = 0, float maximum = 0)
     {
         if (!ensure_backend())
         {
@@ -465,7 +466,9 @@ namespace {
             return 0;
         }
 
-        ggml_tensor* value_tensor = make_unary_tensor(context.value, op, contiguous_src);
+        ggml_tensor* value_tensor = clamp
+            ? ggml_clamp(context.value, contiguous_src, minimum, maximum)
+            : make_unary_tensor(context.value, op, contiguous_src);
         if (value_tensor == nullptr)
         {
             if (g_last_error.empty())
@@ -1783,6 +1786,29 @@ TSG_EXPORT int TSGgml_UnaryF32(
     catch (...)
     {
         set_last_error("Unknown ggml unary failure.");
+        return 0;
+    }
+}
+
+TSG_EXPORT int TSGgml_ClampF32(TensorView4DDesc result, TensorView4DDesc src, float minimum, float maximum)
+{
+    try
+    {
+        if (std::isnan(minimum) || std::isnan(maximum) || minimum > maximum)
+        {
+            set_last_error("Invalid ggml clamp bounds.");
+            return 0;
+        }
+        return unary_f32_impl(static_cast<UnaryOpCode>(0), result, src, true, minimum, maximum);
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown ggml clamp failure.");
         return 0;
     }
 }

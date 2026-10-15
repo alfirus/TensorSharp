@@ -20,7 +20,7 @@ namespace TensorSharp.Cuda
     /// by it; do not read throughput off it.</item>
     /// <item>Level 3: each stage end records an event instead, and after the step each stage is
     /// charged the GPU time between consecutive events on one device's stream. Nothing waits
-    /// mid-step, so the stages add up to the time the devices were busy. A device's first span
+    /// mid-step. Intervals include stream idle time while the host issues work. A device's first span
     /// starts at <see cref="SpanStart"/>, so a wait on another device belongs to no stage.</item>
     /// </list>
     /// </summary>
@@ -77,16 +77,26 @@ namespace TensorSharp.Cuda
         {
             // Events belong to a context and are recorded from it; the engine may have another
             // device current here (a boundary), so switch for the record and switch back.
-            CudaDriverApi.cuCtxGetCurrent(out IntPtr previous);
+            CudaDriverApi.cuCtxGetCurrent(out IntPtr previous).ThrowOnError();
             context.MakeCurrent();
-            if (!_pool.TryGetValue(context.Handle, out Stack<IntPtr> free))
-                _pool[context.Handle] = free = new Stack<IntPtr>();
-            if (!free.TryPop(out IntPtr ev))
-                CudaDriverApi.cuEventCreate(out ev, 0).ThrowOnError();
-            CudaDriverApi.cuEventRecord(ev, stream).ThrowOnError();
-            _marks.Add((context.Handle, stage, ev));
-            if (previous != IntPtr.Zero && previous != context.Handle)
-                CudaDriverApi.cuCtxSetCurrent(previous);
+            try
+            {
+                if (!_pool.TryGetValue(context.Handle, out Stack<IntPtr> free))
+                    _pool[context.Handle] = free = new Stack<IntPtr>();
+                if (!free.TryPop(out IntPtr ev))
+                    CudaDriverApi.cuEventCreate(out ev, 0).ThrowOnError();
+                try
+                {
+                    CudaDriverApi.cuEventRecord(ev, stream).ThrowOnError();
+                    _marks.Add((context.Handle, stage, ev));
+                }
+                catch { free.Push(ev); throw; }
+            }
+            finally
+            {
+                if (previous != context.Handle)
+                    CudaDriverApi.cuCtxSetCurrent(previous).ThrowOnError();
+            }
         }
 
         /// <summary>Print the step's stages (the caller has synchronized every device, as the end of
@@ -111,16 +121,38 @@ namespace TensorSharp.Cuda
             Console.Error.WriteLine(sb.ToString());
         }
 
-        private void Collect()
+        /// <summary>Collect structured timings without synchronizing when the
+        /// caller already completed its normal readback. Existing Report calls
+        /// retain their synchronized collection behavior.</summary>
+        internal double[] CollectAndReset(bool synchronize = false)
+        {
+            if (Level >= 3)
+                Collect(synchronize);
+            var result = (double[])_ms.Clone();
+            Array.Clear(_ms, 0, _ms.Length);
+            return result;
+        }
+
+        private void Collect(bool synchronize = true)
         {
             var last = new Dictionary<IntPtr, IntPtr>();
             foreach ((IntPtr ctx, int stage, IntPtr ev) in _marks)
             {
                 if (stage >= 0 && last.TryGetValue(ctx, out IntPtr prev))
                 {
-                    CudaDriverApi.cuEventSynchronize(ev);
-                    if (CudaDriverApi.cuEventElapsedTime(out float ms, prev, ev) == 0)
+                    if (synchronize)
+                    {
+                        CudaDriverApi.cuEventSynchronize(ev);
+                        if (CudaDriverApi.cuEventElapsedTime(out float ms, prev, ev) == 0)
+                            _ms[stage] += ms;
+                    }
+                    else
+                    {
+                        // CUDA_ERROR_NOT_READY is an integration error: normal
+                        // callers must finish their existing readback first.
+                        CudaDriverApi.cuEventElapsedTime(out float ms, prev, ev).ThrowOnError();
                         _ms[stage] += ms;
+                    }
                 }
                 last[ctx] = ev;
             }
@@ -131,6 +163,14 @@ namespace TensorSharp.Cuda
 
         public void Dispose()
         {
+            // Exceptional exits may not have reached Report/Collect. Destroying
+            // an event is safe while its recorded work is pending on the stream.
+            foreach ((IntPtr ctx, _, IntPtr ev) in _marks)
+            {
+                CudaDriverApi.cuCtxSetCurrent(ctx);
+                CudaDriverApi.cuEventDestroy(ev);
+            }
+            _marks.Clear();
             foreach (var kv in _pool)
             {
                 CudaDriverApi.cuCtxSetCurrent(kv.Key);

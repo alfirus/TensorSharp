@@ -2404,6 +2404,8 @@ __device__ __forceinline__ void ts_gqa_prefill_flash_group4_impl(
 // those sync rounds. Phase B folds KC/32 scores per lane so a warp still owns a
 // full row. Numerics are byte-for-byte flash1 (f32 Q, f32 accumulation); only the
 // score-reassociation width changes, which stays within the f16/f32 tolerances.
+#include "tensorsharp_embedding_attention.cuh"
+
 template <int HEAD_DIM, int QROWS, int KC, typename cache_t>
 __device__ __forceinline__ void ts_gqa_prefill_flash2_group4_impl(
     const float* __restrict__ query,
@@ -8152,3 +8154,10 @@ extern "C" __global__ void ts_silu_mul_clamp_quantize_q8_1_f32(
         }
     }
 }
+
+#include "tensorsharp_minimax_h3.cuh"
+#include "tensorsharp_gemma4_audio.cuh"
+#include "tensorsharp_minimax_h3_bf16.cuh"
+#include "tensorsharp_minimax_h3_quant_f32.cuh"
+
+#include "tensorsharp_gemma4_vision.cuh"

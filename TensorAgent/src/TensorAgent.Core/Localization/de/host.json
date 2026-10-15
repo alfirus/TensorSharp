@@ -68,5 +68,8 @@
   "host.engine.networkOn": "Netzwerk an",
   "host.engine.networkOff": "Netzwerk aus",
   "host.engine.skills": "{count} Skills",
-  "host.engine.unknown": "unbekannt"
+  "host.engine.unknown": "unbekannt",
+  "host.video.keyframesUnavailable": "Dieses Videomodell unterstützt keine Bildvorlagen an beliebigen Zeitpunkten.",
+  "host.video.ingredientsUnavailable": "Ingredients-Identitätsreferenzen benötigen einen IC-LoRA-Checkpoint; nutzen Sie Bildvorlagen mit LTX 2.5 Distilled.",
+  "host.video.invalidFrames": "Die LTX-Cliplänge muss positiv sein und dem Bildraster 8n+1 entsprechen."
 }

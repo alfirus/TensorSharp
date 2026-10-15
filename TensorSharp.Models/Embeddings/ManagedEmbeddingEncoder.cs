@@ -3,6 +3,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Numerics.Tensors;
 using System.Threading;
@@ -16,16 +17,25 @@ namespace TensorSharp.Models.Embeddings;
 /// </summary>
 internal sealed class ManagedEmbeddingEncoder : IDisposable
 {
-    private sealed class Matrix
+    internal sealed class Matrix
     {
         public byte[] Data { get; private set; }
         private ManagedEmbeddingQ8Matrix _packed;
+        private ManagedEmbeddingQ8AvxMatrix _packedAvx;
+        private ManagedEmbeddingQ8Q16Avx512Matrix _packedQ16;
         public readonly GgmlTensorType Type;
         public readonly int Input, Output, RowBytes;
         public readonly float[] Bias;
+        internal bool UsePackedFloat { get; init; }
+        internal string ProfileName { get; set; } = "";
+        internal string ProfileSourceFormat { get; set; }
+        private readonly bool _profileEnabled = Environment.GetEnvironmentVariable("TENSORSHARP_EMBEDDING_CPU_PROFILE") == "1";
+        private long _profileTicks, _profileCalls, _profileRows;
+        private long _profileSgemmCalls, _profileF32DotCalls;
         public Matrix(byte[] data, GgmlTensorType type, int input, int output, float[] bias = null)
         {
             Data = data; Type = type; Input = input; Output = output; Bias = bias;
+            ProfileSourceFormat = type.ToString();
             RowBytes = checked((int)ManagedQuantizedOps.RowSize((int)type, input));
         }
         public void Row(int row, float[] output, int offset) =>
@@ -38,9 +48,55 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
             Data = null;
         }
 
+        internal void PrepareAvxProjection()
+        {
+            if (Type != GgmlTensorType.Q8_0 || !ManagedEmbeddingQ8AvxMatrix.IsSupported) return;
+            _packedAvx = new ManagedEmbeddingQ8AvxMatrix(Data, Input, Output, preserveFloat32ActivationScales: true);
+            Data = null;
+        }
+
+        internal void PrepareQ16Projection(OwnedEmbeddingCpuProjection native = null)
+        {
+            if (Type != GgmlTensorType.Q8_0 || !ManagedEmbeddingQ8Q16Avx512Matrix.IsSupported) return;
+            _packedQ16 = new ManagedEmbeddingQ8Q16Avx512Matrix(Data, Input, Output, native);
+            Data = null;
+        }
+
         public unsafe void Multiply(float[] input, int rows, float[] output, CpuWorkerPool pool, CancellationToken cancellationToken)
         {
-            if (_packed != null) _packed.Multiply(input, rows, output, pool, cancellationToken);
+            long start = _profileEnabled ? Stopwatch.GetTimestamp() : 0;
+            MultiplyCore(input, rows, output, pool, cancellationToken);
+            if (_profileEnabled)
+            {
+                _profileTicks += Stopwatch.GetTimestamp() - start;
+                ++_profileCalls; _profileRows += rows;
+                if (_packedQ16 == null && _packedAvx == null && _packed == null && Type == GgmlTensorType.F32)
+                {
+                    if (UsePackedFloat && rows > 4 && System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+                        ++_profileSgemmCalls;
+                    else ++_profileF32DotCalls;
+                }
+            }
+        }
+
+        internal object ProfileSnapshot() => new
+        {
+            name = ProfileName, source_format = ProfileSourceFormat, stored_format = Type.ToString(),
+            math = _packedQ16 != null ? (_packedQ16.UsesNative ? "owned-native-q8-q16-vnni" : "managed-q16-avx512") : _packedAvx != null ? "managed-q8-avx"
+                : _packed != null ? "managed-packed-q8" : "managed-" + Type,
+            input = Input, output = Output, successful_calls = _profileCalls, input_rows = _profileRows,
+            f32_sgemm_successful_calls = _profileSgemmCalls, f32_dot_successful_calls = _profileF32DotCalls,
+            elapsed_ms = _profileTicks * 1000.0 / Stopwatch.Frequency,
+        };
+        internal double ProfileElapsedMs => _profileTicks * 1000.0 / Stopwatch.Frequency;
+        internal long ManagedQ16Calls => _packedQ16?.ManagedCalls ?? 0;
+        internal long Q16Float32FallbackRows => _packedQ16?.Float32FallbackRows ?? 0;
+
+        private unsafe void MultiplyCore(float[] input, int rows, float[] output, CpuWorkerPool pool, CancellationToken cancellationToken)
+        {
+            if (_packedQ16 != null) _packedQ16.Multiply(input, rows, output, pool, cancellationToken);
+            else if (_packedAvx != null) _packedAvx.Multiply(input, rows, output, pool, cancellationToken);
+            else if (_packed != null) _packed.Multiply(input, rows, output, pool, cancellationToken);
             else
             fixed (byte* w = Data)
             fixed (float* x = input)
@@ -48,7 +104,34 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
             {
                 nint weights = (nint)w, inputs = (nint)x, outputs = (nint)y;
                 int blocks = Math.Min(Output, Math.Max(1, pool.ThreadCount * 4));
-                if (ManagedQuantizedOps.TryGetActivationPlan(Type, Input, out int activationRowBytes))
+                if (UsePackedFloat && Type == GgmlTensorType.F32 && rows > 4 &&
+                    System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported)
+                {
+                    // The embedding owner supplies its scheduler; this route
+                    // never reconfigures Core's process-wide parallel runner.
+                    // Wider prefill tiles must exceed the GEMM driver's narrow
+                    // dot crossover. Splitting only into 32-column jobs turns
+                    // large attention/output projections back into dot products.
+                    int alignment = rows >= 64 ? 128 : 32;
+                    int tiles = Math.Min((Output + alignment - 1) / alignment,
+                        Math.Max(1, pool.ThreadCount * (rows >= 64 ? 1 : 2)));
+                    int columns = (Output + tiles - 1) / tiles;
+                    columns = (columns + alignment - 1) / alignment * alignment;
+                    int columnTiles = (Output + columns - 1) / columns;
+                    int rowTiles = rows >= 64 ? Math.Min((rows + 31) / 32,
+                        Math.Max(1, pool.ThreadCount / columnTiles)) : 1;
+                    pool.For(columnTiles * rowTiles, tile =>
+                    {
+                        int first = tile % columnTiles * columns, count = Math.Min(columns, Output - first);
+                        int rowTile = tile / columnTiles, firstRow = rows * rowTile / rowTiles;
+                        int rowCount = rows * (rowTile + 1) / rowTiles - firstRow;
+                        TensorSharp.Cpu.CpuSgemm.Gemm(rowCount, count, Input, 1,
+                            (float*)inputs + (long)firstRow * Input, Input, 1,
+                            (float*)weights + (long)first * Input, 1, Input,
+                            0, (float*)outputs + (long)firstRow * Output + first, Output, allowParallel: false);
+                    }, cancellationToken);
+                }
+                else if (ManagedQuantizedOps.TryGetActivationPlan(Type, Input, out int activationRowBytes))
                 {
                     var quantized = ArrayPool<byte>.Shared.Rent(checked(rows * activationRowBytes));
                     try
@@ -202,7 +285,7 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
         int value = checked((int)file.GetUint32(key));
         return value > 0 ? value : throw new InvalidDataException($"Invalid or missing embedding metadata '{key}'.");
     }
-    private static Matrix ReadMatrix(GgufFile file, string name, int input, int output = -1)
+    internal static Matrix ReadMatrix(GgufFile file, string name, int input, int output = -1)
     {
         if (!file.Tensors.TryGetValue(name, out var info)) throw new InvalidDataException($"Missing embedding tensor '{name}'.");
         if (info.Shape.Length is < 1 or > 2 || info.Shape[0] != (ulong)input ||

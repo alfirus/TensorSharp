@@ -18,12 +18,15 @@ namespace TensorSharp.Cuda
             /// slab (bump-suballocated), so this weight must NOT be individually
             /// cuMemFree'd — the arena owns and frees the whole slab.</summary>
             public bool ArenaBacked;
+            public WeightArena ArenaOwner;
 
             public void Dispose()
             {
                 if (DevicePtr != IntPtr.Zero)
                 {
-                    if (!ArenaBacked)
+                    if (ArenaBacked)
+                        ArenaOwner?.Release(DevicePtr);
+                    else
                         CudaDriverApi.cuMemFree(DevicePtr);
                     DevicePtr = IntPtr.Zero;
                 }
@@ -44,9 +47,15 @@ namespace TensorSharp.Cuda
             // allocate late in the preload when free VRAM is low.
             private const long SlabBytes = 256L << 20;
             private readonly CudaAllocator allocator;
-            private readonly List<IntPtr> slabs = new List<IntPtr>();
-            private IntPtr currentSlab;
-            private long currentSlabSize;
+            private sealed class Slab
+            {
+                public IntPtr Pointer;
+                public long Size;
+                public int LiveAllocations;
+            }
+            private readonly List<Slab> slabs = new List<Slab>();
+            private readonly Dictionary<IntPtr, Slab> allocations = new Dictionary<IntPtr, Slab>();
+            private Slab currentSlab;
             private long currentOffset;
 
             public WeightArena(CudaAllocator allocator) => this.allocator = allocator;
@@ -58,34 +67,55 @@ namespace TensorSharp.Cuda
             public IntPtr Allocate(long rawBytes)
             {
                 const long align = 256;
-                long need = ((rawBytes + 16 + align - 1) / align) * align;
-                if (currentSlab == IntPtr.Zero || currentOffset + need > currentSlabSize)
+                long need = checked((checked(rawBytes + 16 + align - 1) / align) * align);
+                if (currentSlab == null || need > currentSlab.Size - currentOffset)
                 {
                     long slabSize = Math.Max(SlabBytes, need);
                     allocator.Context.MakeCurrent();
                     CudaDriverApi.cuMemAlloc(out IntPtr slab, new UIntPtr((ulong)slabSize)).ThrowOnError();
-                    slabs.Add(slab);
-                    currentSlab = slab;
-                    currentSlabSize = slabSize;
+                    currentSlab = new Slab { Pointer = slab, Size = slabSize };
+                    slabs.Add(currentSlab);
                     currentOffset = 0;
                 }
 
-                IntPtr ptr = new IntPtr(currentSlab.ToInt64() + currentOffset);
+                IntPtr ptr = new IntPtr(currentSlab.Pointer.ToInt64() + currentOffset);
                 currentOffset += need;
+                allocations.Add(ptr, currentSlab);
+                currentSlab.LiveAllocations++;
                 return ptr;
+            }
+
+            /// <summary>Reclaim a slab when its last weight is released. A slab
+            /// shared with another live model remains resident. Individual freed
+            /// slices are not reused, so pending kernels and captured graphs
+            /// cannot observe another weight at the same address.</summary>
+            public void Release(IntPtr pointer)
+            {
+                // Allocate, release and FreeAll are called under the cache Sync.
+                if (!allocations.Remove(pointer, out Slab slab)) return;
+                if (--slab.LiveAllocations != 0) return;
+                allocator.Context.MakeCurrent();
+                // Driver free waits for work using the allocation before returning.
+                CudaDriverApi.cuMemFree(slab.Pointer).ThrowOnError();
+                slabs.Remove(slab);
+                if (ReferenceEquals(currentSlab, slab))
+                {
+                    currentSlab = null;
+                    currentOffset = 0;
+                }
             }
 
             public void FreeAll()
             {
                 allocator.Context.MakeCurrent();
-                foreach (IntPtr slab in slabs)
+                foreach (Slab slab in slabs)
                 {
-                    if (slab != IntPtr.Zero)
-                        CudaDriverApi.cuMemFree(slab);
+                    if (slab.Pointer != IntPtr.Zero)
+                        CudaDriverApi.cuMemFree(slab.Pointer);
                 }
                 slabs.Clear();
-                currentSlab = IntPtr.Zero;
-                currentSlabSize = 0;
+                allocations.Clear();
+                currentSlab = null;
                 currentOffset = 0;
             }
         }
@@ -407,6 +437,16 @@ namespace TensorSharp.Cuda
             if (allocator == null)
                 throw new ArgumentNullException(nameof(allocator));
             EnsureWeight(allocator, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
+        }
+
+        // The LTX file uploader publishes into the same cache only after its
+        // synchronous callback has finished every DMA read of its source buffers.
+        internal static void PreloadQuantizedWeightFromSource(CudaAllocator allocator,
+            IntPtr cacheKey, int ggmlType, long ne0, long ne1, long rawBytes, Action<IntPtr> upload)
+        {
+            ArgumentNullException.ThrowIfNull(allocator);
+            ArgumentNullException.ThrowIfNull(upload);
+            EnsureWeight(allocator, cacheKey, IntPtr.Zero, ggmlType, ne0, ne1, rawBytes, upload);
         }
 
         public static void ReleaseQuantizedWeight(CudaAllocator allocator, IntPtr cacheKey)
@@ -1123,7 +1163,8 @@ namespace TensorSharp.Cuda
             int ggmlType,
             long ne0,
             long ne1,
-            long rawBytes)
+            long rawBytes,
+            Action<IntPtr> upload = null)
         {
             if (cacheKey == IntPtr.Zero)
                 cacheKey = hostData;
@@ -1134,9 +1175,14 @@ namespace TensorSharp.Cuda
             lock (Sync)
             {
                 if (Cache.TryGetValue(key, out DeviceWeight existing))
+                {
+                    if (upload != null && (existing.RawBytes != rawBytes || existing.GgmlType != ggmlType ||
+                        existing.Ne0 != ne0 || existing.Ne1 != ne1))
+                        throw new InvalidOperationException("Source upload dimensions differ from the resident CUDA weight.");
                     return existing;
+                }
 
-                if (hostData == IntPtr.Zero)
+                if (hostData == IntPtr.Zero && upload == null)
                     throw new InvalidOperationException("Quantized weight is not preloaded on this CUDA device and no host data was provided.");
 
                 allocator.Context.MakeCurrent();
@@ -1153,7 +1199,18 @@ namespace TensorSharp.Cuda
                 }
 
                 IntPtr devicePtr = arena.Allocate(rawBytes);
-                CudaDriverApi.cuMemcpyHtoD(devicePtr, hostData, new UIntPtr((ulong)rawBytes)).ThrowOnError();
+                try
+                {
+                    if (upload == null)
+                        CudaDriverApi.cuMemcpyHtoD(devicePtr, hostData, new UIntPtr((ulong)rawBytes)).ThrowOnError();
+                    else
+                        upload(devicePtr);
+                }
+                catch
+                {
+                    arena.Release(devicePtr);
+                    throw;
+                }
                 var entry = new DeviceWeight
                 {
                     DevicePtr = devicePtr,
@@ -1163,6 +1220,7 @@ namespace TensorSharp.Cuda
                     Ne1 = ne1,
                     DeviceId = allocator.DeviceId,
                     ArenaBacked = true,
+                    ArenaOwner = arena,
                 };
                 Cache.Add(key, entry);
                 return entry;

@@ -1418,12 +1418,14 @@ namespace TensorSharp.Cli
             _skillSystemBlock = plan.Instructions;
             if (capabilities.ToolsRendered)
             {
-                _tools = SkillTools.Merge(_clientTools, _skillOptions.AllowScripts, out _);
+                var marketplace = SkillMarketplaceSession.Create(_skillRegistry, plan.Reachable, _skillOptions.AllowNetwork);
+                _tools = SkillTools.Merge(_clientTools, _skillOptions.AllowScripts, out _, marketplace);
                 if (_codeRunner != null)
                     _tools = Program.AppendCodeTool(_tools, _codeRunner, _codeWorkspace);
 
                 _skillToolContext = new SkillToolContext(new List<Skill>(plan.Reachable))
                 {
+                    Marketplace = marketplace,
                     ScriptRunner = _skillOptions.AllowScripts
                         ? new SkillScriptRunner(
                             Program.ToScriptRunnerOptions(_skillOptions, _codeWorkspace, _codeRunner), _log)

@@ -11,6 +11,11 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
+    <!-- The CLI, server, and TensorAgent use one audited source skill bundle. -->
+    <Content Include="..\TensorAgent\skills\**\*"
+             Exclude="..\TensorAgent\skills\verdicts.json;..\TensorAgent\skills\**\__pycache__\**\*;..\TensorAgent\skills\**\node_modules\**\*"
+             Link="skills/%(RecursiveDir)%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <PropertyGroup>
     <GgmlNativeBuildDir>$(MSBuildProjectDirectory)/../TensorSharp.GGML.Native/build</GgmlNativeBuildDir>

@@ -55,7 +55,7 @@ namespace TensorSharp.Cli
                 // mean the same thing on both hosts, instead of being silently dropped.
                 args = CliUsage.NormalizeOptionSpellings(args);
             }
-            catch (Exception ex) when (ex is ArgumentException or FileNotFoundException)
+            catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or NotSupportedException)
             {
                 Console.Error.WriteLine("Configuration error: " + ex.Message);
                 Environment.ExitCode = HostExitCodes.ConfigurationError;
@@ -387,6 +387,8 @@ namespace TensorSharp.Cli
             string videoTextEncoderPath = null;
             string videoDit2Path = null;
             string videoAudioVaePath = null;
+            string videoUpscalerPath = null;
+            string videoDiffusionVaePath = null;
             string endImagePath = null;
             string videoMode = null;
             var refImagePaths = new List<string>();
@@ -444,6 +446,8 @@ namespace TensorSharp.Cli
                         videoTextEncoderPath = args[++i]; break;
                     case "--video-dit2": videoDit2Path = args[++i]; break;
                     case "--audio-vae": videoAudioVaePath = args[++i]; break;
+                    case "--video-upscaler": videoUpscalerPath = args[++i]; break;
+                    case "--video-diffusion-vae": videoDiffusionVaePath = args[++i]; break;
                     case "--end-image": endImagePath = args[++i]; break;
                     case "--video-mode": videoMode = args[++i]; break;
                     case "--ref-image": refImagePaths.Add(args[++i]); break;
@@ -816,6 +820,8 @@ namespace TensorSharp.Cli
             ApplyVideoCompanionOverride("--video-text-encoder", videoTextEncoderPath, "TS_VIDEO_TEXT_ENCODER");
             ApplyVideoCompanionOverride("--video-dit2", videoDit2Path, "TS_VIDEO_DIT2");
             ApplyVideoCompanionOverride("--audio-vae", videoAudioVaePath, "TS_VIDEO_AUDIO_VAE");
+            ApplyVideoCompanionOverride("--video-upscaler", videoUpscalerPath, "TS_VIDEO_UPSCALER");
+            ApplyVideoCompanionOverride("--video-diffusion-vae", videoDiffusionVaePath, "TS_VIDEO_DIFFUSION_VAE");
 
             // --qwen-image-variant declares which Qwen-Image-2.1 checkpoint the GGUF holds
             // (Turbo samples its own 8-step schedule); QwenImageModel reads it at load.
@@ -1434,7 +1440,8 @@ namespace TensorSharp.Cli
 
                     if (skillCaps.ToolsRendered)
                     {
-                        tools = SkillTools.Merge(tools, skillScriptsAllowed, out var shadowedTools);
+                        var marketplace = SkillMarketplaceSession.Create(skillRegistry, skillPlan.Reachable, skillOptions.AllowNetwork);
+                        tools = SkillTools.Merge(tools, skillScriptsAllowed, out var shadowedTools, marketplace);
                         foreach (string shadowed in shadowedTools)
                         {
                             _log.LogWarning(LogEventIds.HostConfiguration,
@@ -1445,6 +1452,7 @@ namespace TensorSharp.Cli
 
                         skillToolContext = new SkillToolContext(new List<Skill>(skillPlan.Reachable))
                         {
+                            Marketplace = marketplace,
                             ScriptRunner = skillScriptsAllowed
                                 ? new SkillScriptRunner(ToScriptRunnerOptions(
                                     skillOptions, codeWorkspace, codeRunner), _log)
@@ -2292,15 +2300,14 @@ namespace TensorSharp.Cli
             }
             else
             {
-                codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outputPath, video.Frames, video.Fps);
+                codec = TensorSharp.Models.WanVideo.VideoIO.SaveMp4(outputPath, video.Frames, video.Fps, video.Audio, out bool audioMuxed);
+                if (audioMuxed) Console.WriteLine("  Generated soundtrack included in the MP4.");
             }
             Console.WriteLine($"Saved {video.Frames[0].Width}x{video.Frames[0].Height} x {video.Frames.Length} frames " +
                 $"({codec}, {video.Fps} fps, seed {video.Seed}) to {outputPath} in {sw.Elapsed.TotalSeconds:F1}s");
 
-            // Models that generate audio jointly return a track alongside the frames. It is
-            // written as a sidecar WAV rather than muxed: muxing needs an encoder we cannot
-            // assume is installed, and a sidecar is trivially muxable later with
-            //   ffmpeg -i out.mp4 -i out.wav -c:v copy -c:a aac out_av.mp4
+            // Keep the original PCM alongside the encoded MP4, including when
+            // the platform's video writer cannot mux the soundtrack.
             if (video.Audio is { ChannelCount: > 0, SampleCount: > 0 })
             {
                 string wavPath = Path.ChangeExtension(outputPath, ".wav");

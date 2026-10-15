@@ -25,6 +25,7 @@ public sealed class SingleDeviceArchitectureGateTests
         "diffusion-gemma",
         "wan",
         "minimax-h3",
+        "ltx-2.5",
     };
 
     private static ModelArchitectureDescriptor Arch(string id)

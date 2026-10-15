@@ -27,12 +27,15 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests
 {
-    public class MiniMaxH3VisionOracleTests
+    public class MiniMaxH3VisionOracleTests : IDisposable
     {
         private const string DirEnv = "TS_MINIMAX_H3_DIR";
         private readonly ITestOutputHelper _output;
+        private readonly MiniMaxH3OracleBackend _backend;
 
-        public MiniMaxH3VisionOracleTests(ITestOutputHelper output) { _output = output; }
+        public MiniMaxH3VisionOracleTests(ITestOutputHelper output)
+        { _output=output; _backend=new MiniMaxH3OracleBackend(); _output.WriteLine($"[h3-oracle] backend={_backend.Backend}"); }
+        public void Dispose() => _backend.Dispose();
 
         private static string Root => Environment.GetEnvironmentVariable(DirEnv);
         private static string FixtureDir => Root == null ? null : Path.Combine(Root, "fixtures");
@@ -94,7 +97,7 @@ namespace InferenceWeb.Tests
             int[] expectedIds = File.ReadAllText(Path.Combine(FixtureDir, "h3_ref_prompt_ids.txt"))
                 .Split(',').Select(x => int.Parse(x.Trim(), CultureInfo.InvariantCulture)).ToArray();
 
-            using var te = new MiniMaxH3TextEncoder(TePath, tokenizerDir: Root);
+            using var te = _backend.Text(TePath,Root);
             var (prompt, images) = MiniMaxH3Pipeline.BuildReferencePrompt(
                 te,
                 new[]
@@ -194,7 +197,7 @@ namespace InferenceWeb.Tests
             RgbImage image = LoadFixtureImage();
             int h = image.Height, w = image.Width;
 
-            using var te = new MiniMaxH3TextEncoder(TePath, tokenizerDir: Root);
+            using var te = _backend.Text(TePath,Root);
             Assert.True(te.HasVision, "the Qwen3-VL checkpoint should carry the vision tower");
             var vision = te.Vision;
             _output.WriteLine($"[h3-vision] blocks={vision.NumBlocks} dim={vision.Dim} " +

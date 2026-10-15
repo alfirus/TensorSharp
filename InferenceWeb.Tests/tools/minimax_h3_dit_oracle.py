@@ -207,7 +207,7 @@ def apply_rope_half(x, cos, sin):
 
 
 def attention(x, W, cfg, cos, sin, eps):
-    """Full bidirectional attention with QK-RMSNorm and partial RoPE."""
+    """Full bidirectional attention with QK-RMSNorm and optional partial RoPE."""
     n, hidden = x.shape
     heads, hd = cfg['heads'], cfg['head_dim']
     qkv = F.linear(x, W['qkv'])
@@ -217,8 +217,9 @@ def attention(x, W, cfg, cos, sin, eps):
     v = v.view(n, heads, hd)
     q = rms_norm(q, W['q_norm'], eps)
     k = rms_norm(k, W['k_norm'], eps)
-    q = apply_rope_half(q, cos, sin)
-    k = apply_rope_half(k, cos, sin)
+    if cos is not None:
+        q = apply_rope_half(q, cos, sin)
+        k = apply_rope_half(k, cos, sin)
     # [heads, n, hd]
     o = F.scaled_dot_product_attention(
         q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
@@ -318,8 +319,6 @@ def main():
     n_ref = 0
     while f'token_refiner.blocks.{n_ref}.norm1.weight' in W:
         n_ref += 1
-    text_pos = torch.from_numpy(pos[:text_len])
-    tcos, tsin = build_rope(inv_freq, text_pos.numpy(), head_dim)
     for i in range(n_ref):
         p = f'token_refiner.blocks.{i}.'
         aw = dict(qkv=W.get(p + 'attn.qkv_proj.weight'),
@@ -327,7 +326,9 @@ def main():
                   q_norm=W.get(p + 'attn.q_norm.weight'),
                   k_norm=W.get(p + 'attn.k_norm.weight'))
         h = rms_norm(ctx, W.get(p + 'norm1.weight'), eps)
-        ctx = ctx + attention(h, aw, cfg, tcos, tsin, eps)
+        # Official TokenRefinerBlock calls attention without a positional table.
+        # Only the later packed trunk applies RoPE.
+        ctx = ctx + attention(h, aw, cfg, None, None, eps)
         h = rms_norm(ctx, W.get(p + 'norm2.weight'), eps)
         ctx = ctx + mlp(h, dict(fc1=W.get(p + 'mlp.fc1.weight'),
                                 fc2=W.get(p + 'mlp.fc2.weight')))

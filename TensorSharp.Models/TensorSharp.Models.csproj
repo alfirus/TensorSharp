@@ -63,4 +63,5 @@
   <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'ios' Or '$(TargetPlatformIdentifier)' == 'maccatalyst'">
     <Compile Remove="Media/Desktop/**" />
   </ItemGroup>
+  <Import Project="../TensorSharp.Cpu.Native/Packaging.targets" />
 </Project>

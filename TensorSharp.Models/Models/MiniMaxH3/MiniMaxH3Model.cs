@@ -20,6 +20,7 @@ using System.IO;
 using System.Linq;
 using TensorSharp.Models.Video;
 using TensorSharp.Models.WanVideo;
+using TensorSharp.MLX;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.MiniMaxH3
@@ -208,7 +209,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
         internal MiniMaxH3AudioVae CreateAudioVae() =>
             _audioVaePath != null
-                ? new MiniMaxH3AudioVae(_audioVaePath, Backend, UsesDirectBackend)
+                ? new MiniMaxH3AudioVae(_audioVaePath, Backend, UsesDirectBackend, _allocator)
                 : null;
         /// <summary>True on the backends with no ggml graph to call, which run the
         /// generator through the managed direct implementations instead.</summary>
@@ -218,16 +219,19 @@ namespace TensorSharp.Models.MiniMaxH3
 
         internal string AudioVaePath => _audioVaePath;
 
-        /// <summary>Generate a clip. MiniMax-H3 is CFG-distilled, so guidance must be
-        /// 1.0 and 4-8 steps is the operating point.</summary>
+        /// <summary>Generate a clip with guidance 1.0. Base MiniMax-H3 defaults to
+        /// 20 steps; reduced-step runs need their own quality validation.</summary>
         public GeneratedVideo GenerateVideo(string prompt, VideoGenerationParams p = null)
         {
+            if (_allocator is MlxAllocator && !MlxWorker.Shared.IsOnWorkerThread)
+                return MlxWorker.Shared.Invoke(() => GenerateVideo(prompt, p));
             _pipeline ??= new MiniMaxH3Pipeline(this);
             return _pipeline.Generate(prompt, p ?? new VideoGenerationParams());
         }
 
         // ---- IVideoGenerationModel ----
         string IVideoGenerationModel.VideoModelFamily => ArchitectureId;
+        int IVideoGenerationModel.DefaultPreviewFrames => 22;
         // The joint audio stream is generated either way; only its decode needs the VAE.
         bool IVideoGenerationModel.SupportsAudio => _audioVaePath != null;
         bool IVideoGenerationModel.SupportsImageConditioning => true;

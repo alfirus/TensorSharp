@@ -43,8 +43,8 @@ using Conv = TensorSharp.Models.MiniMaxH3.MiniMaxH3DirectAudioVae.Conv;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
-    /// <summary>Managed MiniMax-H3 audio VAE encoder (no ggml).</summary>
-    internal sealed class MiniMaxH3DirectAudioVaeEncoder
+    /// <summary>CPU/CUDA/MLX MiniMax-H3 audio VAE encoder (no ggml).</summary>
+    internal sealed class MiniMaxH3DirectAudioVaeEncoder : IDisposable
     {
         /// <summary>One encoder Snake1d activation.</summary>
         internal sealed class Snake
@@ -150,6 +150,7 @@ namespace TensorSharp.Models.MiniMaxH3
             public int Heads;
         }
 
+        private readonly MiniMaxH3AudioTensorOps _device;
         private readonly Conv _convIn, _finalConv, _meanProj;
         private readonly Block[] _blocks;
         private readonly Snake _finalAct;
@@ -174,23 +175,14 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <param name="trunkChannels">2048.</param>
         /// <param name="eps">LayerNorm epsilon; 1e-5f, hardcoded by the driver rather
         /// than read from any config, and NOT the 1e-6 other H3 stages use.</param>
-        /// <param name="allocator">Optional, only to reject a CUDA allocator. The
-        /// audio VAE is constructed without one (MiniMaxH3Model.CreateAudioVae passes
-        /// just the path and the backend), so the guard is a no-op on that route.</param>
+        /// <param name="allocator">CUDA or MLX allocator selects the resident device
+        /// path. A CPU allocator or null retains the managed CPU implementation.</param>
         public MiniMaxH3DirectAudioVaeEncoder(Conv convIn, Block[] blocks, Snake finalAct,
                                               Conv finalConv, AttnBlock pre, Conv meanProj,
                                               int latentChannels, int trunkChannels, float eps,
                                               IAllocator allocator = null)
         {
-            // The same guard the other direct MiniMax-H3 stages carry in their
-            // constructors: everything below is a managed CPU kernel, so a caller
-            // holding a CUDA allocator would silently get CPU math on device data.
-            // The context owns nothing and is dropped once it has answered.
-            var ctx = new DirectContext(allocator);
-            if (ctx.IsCuda)
-                throw new NotSupportedException(
-                    "MiniMaxH3DirectAudioVaeEncoder is the managed CPU path; MiniMax-H3 on " +
-                    "BackendType.Cuda is not implemented (use a GGML backend, or BackendType.Cpu).");
+            if (allocator != null) _device = new MiniMaxH3AudioTensorOps(allocator);
 
             _convIn = convIn ?? throw new ArgumentNullException(nameof(convIn));
             _blocks = blocks ?? throw new ArgumentNullException(nameof(blocks));
@@ -269,6 +261,8 @@ namespace TensorSharp.Models.MiniMaxH3
             if (wave.Length == 0)
                 throw new ArgumentException("the waveform is empty.", nameof(wave));
 
+            if (_device?.IsAccelerated == true) return EncodeDevice(wave, frames);
+
             // ---- conv trunk, in [channel][time] ----
             float[] h = Conv1d(wave, 1, wave.Length, _convIn, out int t);
             int c = _convIn.Oc;
@@ -345,6 +339,54 @@ namespace TensorSharp.Models.MiniMaxH3
                     $"expected {frames}.");
             return outp;
         }
+
+        private float[] EncodeDevice(float[] wave, int frames)
+        {
+            Tensor h=_device.Input(wave,1,wave.Length);
+            try
+            {
+                MiniMaxH3AudioTensorOps.Replace(ref h,_device.Conv(h,_convIn));
+                foreach (Block block in _blocks)
+                {
+                    foreach (ResUnit unit in block.Units)
+                    {
+                        using var activated=_device.Context.NewF32(h.Sizes);
+                        _device.Snake(activated,h,unit.Act1.Alpha,unit.Act1.Inv);
+                        using var convolved=_device.Conv(activated,unit.Conv1);
+                        _device.Snake(convolved,convolved,unit.Act2.Alpha,unit.Act2.Inv);
+                        using var residual=_device.Conv(convolved,unit.Conv2);
+                        if (residual.Sizes[0] != h.Sizes[0] || residual.Sizes[1] != h.Sizes[1])
+                            throw new InvalidOperationException("H3 device audio encoder residual geometry mismatch.");
+                        Ops.Add(h,h,residual);
+                    }
+                    _device.Snake(h,h,block.Act.Alpha,block.Act.Inv);
+                    MiniMaxH3AudioTensorOps.Replace(ref h,_device.Conv(h,block.Down));
+                }
+                _device.Snake(h,h,_finalAct.Alpha,_finalAct.Inv);
+                MiniMaxH3AudioTensorOps.Replace(ref h,_device.Conv(h,_finalConv));
+                if (h.Sizes[0] != frames) throw new InvalidOperationException("H3 device audio encoder latent frame count mismatch.");
+                using var n1=_device.Norm(h,_pre.Norm1W,_pre.Norm1B,_eps);
+                using var qkv=_device.Linear(n1,_pre.Qkv,_pre.QkvBias);
+                using var pooled=_device.AttendAndPool(qkv,_pre.Heads,_headDim,_latentChannels);
+                using var attention=_device.Linear(pooled,_pre.AttnProj,_pre.AttnProj.B);
+                using var n3=_device.Norm(h,_pre.Norm3W,_pre.Norm3B,_eps);
+                using var state=_device.Linear(n3,_pre.Proj,_pre.Proj.B);
+                Ops.Add(state,state,attention);
+                using var n2=_device.Norm(state,_pre.Norm2W,_pre.Norm2B,_eps);
+                using var mlpNorm=_device.Norm(n2,_pre.MlpNormW,_pre.MlpNormB,_eps);
+                using var gate=_device.Linear(mlpNorm,_pre.W0,_pre.W0.B);
+                Ops.GELU(gate,gate);
+                using var value=_device.Linear(mlpNorm,_pre.W1,_pre.W1.B);
+                Ops.Mul(gate,gate,value);
+                using var projected=_device.Linear(gate,_pre.W2,_pre.W2.B);
+                Ops.Add(state,state,projected);
+                using var output=_device.Conv(state,_meanProj);
+                return _device.Output(output);
+            }
+            finally { h.Dispose(); }
+        }
+
+        public void Dispose() => _device?.Dispose();
 
         // ---- conv primitive ---------------------------------------------------
 

@@ -10,9 +10,12 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
+using TensorSharp.Cuda;
 
 namespace TensorSharp.Models
 {
@@ -40,8 +43,38 @@ namespace TensorSharp.Models
 
         private readonly Dictionary<string, Tensor> _weights = new();
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
+        private sealed class CompressedMatrix
+        {
+            private GCHandle _pinned;
+            public readonly int Input, OriginalInput, Output, Bytes;
+            public IntPtr Pointer => _pinned.AddrOfPinnedObject();
+            public CompressedMatrix(byte[] bytes, int input, int output)
+            {
+                OriginalInput = input; Input = input; Output = output;
+                if (input % 64 == 0)
+                {
+                    // A zero Q8_0 block preserves every dot product. The 32
+                    // extra channels select unchanged MLX's F32 SIMD QMM
+                    // instead of its M5 TF32 NAX path (K must be %64 there).
+                    int rowBytes = checked(input / 32 * 34);
+                    if (bytes.Length != checked(rowBytes * output)) throw new ArgumentException("Invalid Q8_0 vision row size.");
+                    var padded = new byte[checked((rowBytes + 34) * output)];
+                    for (int row = 0; row < output; ++row)
+                        Buffer.BlockCopy(bytes, row * rowBytes, padded, row * (rowBytes + 34), rowBytes);
+                    bytes = padded; Input = checked(input + 32);
+                }
+                Bytes = bytes.Length; _pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            }
+            public void Free() { if (_pinned.IsAllocated) _pinned.Free(); }
+        }
+        private readonly Dictionary<string, CompressedMatrix> _compressedMatrices = new();
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
+        private readonly bool _useMlxDeviceOps;
+        private readonly bool _useCudaDeviceOps;
+        private readonly bool _usePreciseMetalVision;
+        private readonly bool _requirePreciseGgmlCudaVision;
+        private readonly bool _recenterPixels;
         // Optional ModelBase reference for cooperative GpuComputeLock yielding.
         // When set, Encode() releases the lock between encoder blocks so the
         // engine worker can run one inference step per block — keeping
@@ -101,6 +134,8 @@ namespace TensorSharp.Models
             public required float[] SinX { get; init; }
             public required float[] CosY { get; init; }
             public required float[] SinY { get; init; }
+            public Tensor DeviceCosine;
+            public Tensor DeviceSine;
         }
 
         public int ProjectionDim => _projectionDim;
@@ -127,9 +162,30 @@ namespace TensorSharp.Models
         /// Gemma4VisionEncoder.Safetensors.cs).
         /// </param>
         public Gemma4VisionEncoder(string projectorPath, IAllocator allocator)
+            : this(projectorPath, allocator, inputPixelsInZeroToOneRange: false) { }
+
+        /// <param name="inputPixelsInZeroToOneRange">For the classic tower,
+        /// recenter raw [0,1] pixels to [-1,1] inside patch embedding. Existing
+        /// callers that already supply SigLIP-normalized pixels leave this false.
+        /// The unified tower always consumes raw pixels.</param>
+        /// <remarks>The verified 768-wide, 16-block EmbeddingGemma 2 Q8 GGUF tower
+        /// defaults to MLX padded F32 device math. Its legacy generic M5 route
+        /// produced raw-row max error 0.01887 against the independent full-tower
+        /// oracle (bound 0.01). CUDA uses its qualified F32 device path and Metal
+        /// uses F32 learned projections. Each backend has a diagnostic opt-out.
+        /// This precision choice is not a claim
+        /// of performance parity with llama.cpp.</remarks>
+        public Gemma4VisionEncoder(string projectorPath, IAllocator allocator, bool inputPixelsInZeroToOneRange)
+            : this(projectorPath, allocator, inputPixelsInZeroToOneRange, requireValidatedFloat32Precision: false) { }
+
+        /// <summary>The embedding constructor requires scoped precise CUDA
+        /// blocks for the independently qualified Q8 tower. Existing chat
+        /// constructors retain their original backend arithmetic.</summary>
+        public Gemma4VisionEncoder(string projectorPath, IAllocator allocator, bool inputPixelsInZeroToOneRange,
+            bool requireValidatedFloat32Precision)
         {
             _allocator = allocator;
-            _useNativeAttention = allocator is GgmlAllocator;
+            _recenterPixels = inputPixelsInZeroToOneRange;
 
             GgufFile gguf = null;
             SafetensorsFile safetensors = null;
@@ -148,6 +204,32 @@ namespace TensorSharp.Models
             _hiddenSize = spec.HiddenSize;
             _intermediateSize = spec.IntermediateSize;
             _numHeads = spec.NumHeads;
+            // The validated EmbeddingGemma 2 Q8 tower defaults to padded F32
+            // projection/attention math. Generic M5 NAX F32 dispatch narrows
+            // products to TF32 and failed the full raw-row quality gate.
+            // DEVICE=0 retains that legacy route for diagnostics; DEVICE=1
+            // keeps the existing explicit experiment on other geometries.
+            string deviceSetting = Environment.GetEnvironmentVariable("TS_GEMMA4_VISION_DEVICE");
+            _useMlxDeviceOps = allocator is MlxAllocator && (deviceSetting == "1" ||
+                deviceSetting != "0" && IsValidatedQ8VisionTower(spec, gguf));
+            string cudaSetting = Environment.GetEnvironmentVariable("TS_GEMMA4_VISION_CUDA_DEVICE");
+            _useCudaDeviceOps = allocator is CudaAllocator && (cudaSetting == "1" ||
+                cudaSetting != "0" && IsValidatedQ8VisionTower(spec, gguf));
+            string metalSetting = Environment.GetEnvironmentVariable("TS_GEMMA4_VISION_METAL_PRECISE");
+            _usePreciseMetalVision = allocator is GgmlAllocator metalAllocator &&
+                metalAllocator.Context.BackendType == GgmlBackendType.Metal &&
+                (metalSetting == "1" || metalSetting != "0" && IsValidatedQ8VisionTower(spec, gguf));
+            _requirePreciseGgmlCudaVision = requireValidatedFloat32Precision && allocator is GgmlAllocator cudaAllocator &&
+                cudaAllocator.Context.BackendType == GgmlBackendType.Cuda;
+            if (_requirePreciseGgmlCudaVision && !IsValidatedQ8VisionTower(spec, gguf))
+            {
+                gguf?.Dispose(); safetensors?.Dispose();
+                throw new NotSupportedException("Validated GGML CUDA vision precision requires the qualified EmbeddingGemma 2 Q8 tower.");
+            }
+            // The EmbeddingGemma 2 tower's 64-channel heads use MLX's F32 tiled
+            // attention. Other geometries retain their existing attention path.
+            _useNativeAttention = allocator is GgmlAllocator ||
+                ((_useMlxDeviceOps || _useCudaDeviceOps) && _hiddenSize / _numHeads == 64);
             _blockCount = spec.BlockCount;
             _eps = spec.Eps;
             _projectionDim = spec.ProjectionDim;
@@ -165,16 +247,42 @@ namespace TensorSharp.Models
                 (_isUnified ? $", unifiedPatch={_patchSize * _nMerge}" : string.Empty) +
                 (safetensors != null ? ", source=safetensors" : string.Empty));
 
-            if (safetensors != null)
+            try
             {
-                LoadWeightsFromSafetensors(safetensors);
-                safetensors.Dispose();
+                InitializeCpuVisionProjection(spec, gguf);
+                if (safetensors != null) LoadWeightsFromSafetensors(safetensors);
+                else LoadWeights(gguf);
             }
-            else
+            catch
             {
-                LoadWeights(gguf);
-                gguf.Dispose();
+                // Failed construction must release pinned compressed weights
+                // and any device cache entries already acquired by this tower.
+                Dispose();
+                throw;
             }
+            finally { safetensors?.Dispose(); gguf?.Dispose(); }
+        }
+
+        private static bool IsValidatedQ8VisionTower(TowerSpec spec, GgufFile gguf)
+        {
+            if (gguf == null || spec.ProjectorType != "gemma4v" || spec.HiddenSize != 768 ||
+                spec.IntermediateSize != 3072 || spec.NumHeads != 12 || spec.BlockCount != 16 ||
+                spec.ProjectionDim != 512 || spec.PatchSize != 16 || spec.NMerge != 3) return false;
+            bool Matrix(string name, int input, int output)
+                => gguf.Tensors.TryGetValue(name, out var tensor) && tensor.Type == GgmlTensorType.Q8_0 &&
+                    tensor.Shape.Length == 2 && tensor.Shape[0] == (ulong)input && tensor.Shape[1] == (ulong)output;
+            if (!Matrix("mm.input_projection.weight", 768, 512)) return false;
+            if (!gguf.Tensors.TryGetValue("v.patch_embd.weight", out var patch) || patch.Type != GgmlTensorType.F32 ||
+                patch.Shape.Length != 4 || patch.Shape[0] != 16 || patch.Shape[1] != 16 || patch.Shape[2] != 3 || patch.Shape[3] != 768) return false;
+            for (int block = 0; block < 16; ++block)
+            {
+                string p = $"v.blk.{block}.";
+                foreach (string name in new[] { "attn_q", "attn_k", "attn_v", "attn_out" })
+                    if (!Matrix(p + name + ".weight", 768, 768)) return false;
+                if (!Matrix(p + "ffn_gate.weight", 768, 3072) || !Matrix(p + "ffn_up.weight", 768, 3072) ||
+                    !Matrix(p + "ffn_down.weight", 3072, 768)) return false;
+            }
+            return true;
         }
 
         private static TowerSpec ReadGgufSpec(GgufFile gguf)
@@ -223,8 +331,10 @@ namespace TensorSharp.Models
 
                 if (info.Type == GgmlTensorType.F32)
                     Buffer.BlockCopy(raw, 0, f32, 0, raw.Length);
-                else
+                else if (_allocator is GgmlAllocator)
                     NativeDequant.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
+                else
+                    ManagedQuantizedOps.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
 
                 long[] ggufShape = new long[info.Shape.Length];
                 for (int i = 0; i < info.Shape.Length; i++)
@@ -237,6 +347,14 @@ namespace TensorSharp.Models
                 var tensor = new Tensor(_allocator, DType.Float32, tsShape);
                 tensor.SetElementsAsFloat(f32);
                 _weights[info.Name] = tensor;
+                RetainCpuVisionProjection(info.Name, raw, info.Type, tsShape);
+                if (_useMlxDeviceOps && info.Type == GgmlTensorType.Q8_0 &&
+                    (info.Shape.Length == 2 || info.Name == "v.patch_embd.weight" && info.Shape.Length == 4))
+                {
+                    int output = checked((int)info.Shape[^1]);
+                    int input = checked((int)(numElements / output));
+                    if (input % 32 == 0) _compressedMatrices.Add(info.Name, new CompressedMatrix(raw, input, output));
+                }
                 count++;
 
                 if (info.Name.Contains("input_min") || info.Name.Contains("input_max") ||
@@ -266,6 +384,31 @@ namespace TensorSharp.Models
 
         public unsafe Tensor Encode(float[] pixelValues, int imgWidth, int imgHeight)
         {
+            // Host-model callers yield their GPU lock and retain the prior owner contract.
+            if (_requirePreciseGgmlCudaVision && _hostModel == null)
+            {
+                lock (_ggmlVisionStackSync)
+                {
+                    ObjectDisposedException.ThrowIf(_ggmlVisionStackDisposed, this);
+                    return EncodeCore(pixelValues, imgWidth, imgHeight);
+                }
+            }
+            if (CpuVisionProjectionRequested)
+            {
+                lock (_cpuVisionProjectionSync)
+                {
+                    ObjectDisposedException.ThrowIf(_cpuVisionDisposed, this);
+                    return EncodeCore(pixelValues, imgWidth, imgHeight);
+                }
+            }
+            return EncodeCore(pixelValues, imgWidth, imgHeight);
+        }
+
+        private unsafe Tensor EncodeCore(float[] pixelValues, int imgWidth, int imgHeight)
+        {
+            if (_allocator is TensorSharp.MLX.MlxAllocator && _hostModel == null &&
+                !TensorSharp.MLX.MlxWorker.Shared.IsOnWorkerThread)
+                return TensorSharp.MLX.MlxWorker.Shared.Invoke(() => Encode(pixelValues, imgWidth, imgHeight));
             if (_isUnified)
                 return EncodeUnified(pixelValues, imgWidth, imgHeight);
 
@@ -287,7 +430,8 @@ namespace TensorSharp.Models
             if (stageSw != null) { tPos = stageSw.Elapsed.TotalMilliseconds; stageSw.Restart(); }
             VisionTrace("pos_embed", hidden);
 
-            for (int i = 0; i < _blockCount; i++)
+            bool stackDone = TryGgmlVisionStack(ref hidden, numPatches, ropeCache);
+            if (!stackDone) for (int i = 0; i < _blockCount; i++)
             {
                 if (!VisionStageEnabled)
                     Console.Write($"\r  Vision encoder block {i + 1}/{_blockCount}...");
@@ -511,7 +655,6 @@ namespace TensorSharp.Models
             // v.patch_embd.weight post-load is [hiddenSize, C, P, P] contiguous in
             // [f][c][ky][kx] order — exactly the im2col row ordering below — so it
             // views directly as a [hiddenSize, patchStride] matmul matrix.
-            Tensor weightT = GetOrCreatePatchEmbedTransposed(patchStride);
 
             var im2col = new Tensor(_allocator, DType.Float32, numPatches, patchStride);
             float* im2colPtr = GetFloatPtr(im2col);
@@ -536,8 +679,12 @@ namespace TensorSharp.Models
                             {
                                 long srcOffset = imgChannelOffset + (long)(yBase + ky) * imgW + xBase;
                                 long dstOffset = outChannelOffset + (long)ky * P;
-                                Buffer.MemoryCopy(pix + srcOffset, outRow + dstOffset,
-                                    P * sizeof(float), P * sizeof(float));
+                                if (_recenterPixels)
+                                    for (int kx = 0; kx < P; ++kx)
+                                        outRow[dstOffset + kx] = 2f * pix[srcOffset + kx] - 1f;
+                                else
+                                    Buffer.MemoryCopy(pix + srcOffset, outRow + dstOffset,
+                                        P * sizeof(float), P * sizeof(float));
                             }
                         }
                     }
@@ -545,7 +692,8 @@ namespace TensorSharp.Models
             }
 
             var result = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
-            Ops.Addmm(result, 0, result, 1.0f, im2col, weightT);
+            if (!TryCompressedProjection(result, im2col, "v.patch_embd.weight"))
+                Ops.Addmm(result, 0, result, 1.0f, im2col, GetOrCreatePatchEmbedTransposed(patchStride));
             im2col.Dispose();
             return result;
         }
@@ -571,6 +719,14 @@ namespace TensorSharp.Models
         private unsafe void AddPositionEmbedding2D(Tensor hidden, Rope2DCache ropeCache, int numPatches)
         {
             var posEmbd = _weights["v.position_embd.weight"];
+            if (_useMlxDeviceOps && Environment.GetEnvironmentVariable("TS_GEMMA4_VISION_SPATIAL_DEVICE") == "1")
+            {
+                int patchesX = ropeCache.PosX.Length > 0 ? ropeCache.PosX[^1] + 1 : 0;
+                int patchesY = ropeCache.PosY.Length > 0 ? ropeCache.PosY[^1] + 1 : 0;
+                if (!MlxGemma4VisionOps.TryAddPosition2D(hidden, posEmbd, patchesX, patchesY))
+                    throw new NotSupportedException("MLX vision position lookup requires matching contiguous F32 patch/tables.");
+                return;
+            }
             int maxPos = (int)posEmbd.Sizes[1];
             float* posPtr = GetFloatPtr(posEmbd);
             float* xTable = posPtr;
@@ -611,7 +767,7 @@ namespace TensorSharp.Models
             // back to the per-op path on any failure (e.g. flash-attn unsupported
             // for this head_dim/backend). No-op unless the encoder runs on a GGML
             // allocator (_useNativeAttention).
-            if (_useNativeAttention
+            if (_allocator is GgmlAllocator
                 && TryFusedEncoderBlock(hidden, prefix, numPatches, headDim, ropeCache))
                 return hidden;
 
@@ -652,7 +808,11 @@ namespace TensorSharp.Models
         {
             // The fused kernel doesn't implement the optional per-channel out_scale.
             if (_weights.ContainsKey($"{prefix}.out_scale.weight"))
+            {
+                if (_requirePreciseGgmlCudaVision)
+                    throw new NotSupportedException("Required precise CUDA vision blocks do not support an optional output scale.");
                 return false;
+            }
 
             if (!_weights.TryGetValue($"{prefix}.ln1.weight", out var ln1)
                 || !_weights.TryGetValue($"{prefix}.attn_q.weight", out var qW)
@@ -667,7 +827,11 @@ namespace TensorSharp.Models
                 || !_weights.TryGetValue($"{prefix}.ffn_up.weight", out var upW)
                 || !_weights.TryGetValue($"{prefix}.ffn_down.weight", out var downW)
                 || !_weights.TryGetValue($"{prefix}.ffn_post_norm.weight", out var fpn))
+            {
+                if (_requirePreciseGgmlCudaVision)
+                    throw new NotSupportedException("Required precise CUDA vision block is missing a learned projection or normalization weight.");
                 return false;
+            }
 
             float[] clamps = BuildClampArray(prefix);
             try
@@ -676,11 +840,14 @@ namespace TensorSharp.Models
                     qW, kW, vW, qNorm, kNorm, apn, outW,
                     ropeCache.PosX, ropeCache.PosY, _ropeTheta,
                     ln2, gateW, upW, downW, fpn,
-                    clamps, numPatches, _numHeads, headDim);
+                    clamps, numPatches, _numHeads, headDim, _usePreciseMetalVision, _requirePreciseGgmlCudaVision);
                 return true;
             }
             catch
             {
+                // A required precision path must not silently fall back to the
+                // generic Metal multiplication that failed the raw quality gate.
+                if (_usePreciseMetalVision || _requirePreciseGgmlCudaVision) throw;
                 return false;
             }
         }
@@ -726,7 +893,13 @@ namespace TensorSharp.Models
                 using var q4 = q.View(1, numPatches, _numHeads, headDim);
                 using var k4 = k.View(1, numPatches, _numHeads, headDim);
                 using var v4 = v.View(1, numPatches, _numHeads, headDim);
-                using var attn4 = Ops.ScaledDotProductAttention(null, q4, k4, v4, null, 1f);
+                using var attn4 = _useMlxDeviceOps || _useCudaDeviceOps
+                    ? new Tensor(_allocator, DType.Float32, 1, numPatches, _numHeads, headDim)
+                    : Ops.ScaledDotProductAttention(null, q4, k4, v4, null, 1f);
+                if (_useMlxDeviceOps && !MlxGemma4VisionOps.TrySelfAttention(attn4, q4, k4, v4))
+                    throw new NotSupportedException("MLX Gemma4 vision attention requires matching F32 64-channel heads.");
+                if (_useCudaDeviceOps && !CudaGemma4VisionOps.TrySelfAttention(attn4, q4, k4, v4))
+                    throw new NotSupportedException("CUDA Gemma4 vision attention requires matching F32 64-channel heads.");
                 using var flat = attn4.View(numPatches, _hiddenSize);
                 q.Dispose();
                 k.Dispose();
@@ -769,6 +942,15 @@ namespace TensorSharp.Models
         // (quarter-dim) rotation pairs.
         private unsafe void Apply2DRoPE(Tensor data, Rope2DCache ropeCache, int numPatches, int headDim)
         {
+            if (_useMlxDeviceOps || _useCudaDeviceOps)
+            {
+                EnsureDeviceRopeTables(ropeCache, numPatches, headDim);
+                bool success = _useMlxDeviceOps
+                    ? MlxGemma4VisionOps.TryRope2D(data, ropeCache.DeviceCosine, ropeCache.DeviceSine, numPatches, _numHeads, headDim)
+                    : CudaGemma4VisionOps.TryRope2D(data, ropeCache.DeviceCosine, ropeCache.DeviceSine, numPatches, _numHeads, headDim);
+                if (!success) throw new NotSupportedException("Gemma4 vision device RoPE requires contiguous F32 head rows.");
+                return;
+            }
             float* ptr = GetFloatPtr(data);
             int halfDim = headDim / 2;
             int quarterDim = halfDim / 2;
@@ -874,7 +1056,8 @@ namespace TensorSharp.Models
                 Clamp(src, cp.InMin, cp.InMax);
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-            Ops.Addmm(result, 0, result, 1f, src, GetOrCreateTransposedWeight(weightName));
+            if (!TryCompressedProjection(result, src, weightName))
+                Ops.Addmm(result, 0, result, 1f, src, GetOrCreateTransposedWeight(weightName));
 
             contiguousInput?.Dispose();
 
@@ -886,6 +1069,18 @@ namespace TensorSharp.Models
 
         private unsafe void Clamp(Tensor t, float min, float max)
         {
+            if (_useCudaDeviceOps)
+            {
+                if (!CudaMiniMaxH3Ops.TryClamp(t, t, min, max))
+                    throw new NotSupportedException("CUDA Gemma4 vision clamp requires contiguous F32 tensors.");
+                return;
+            }
+            if (_useMlxDeviceOps)
+            {
+                if (!MlxMiniMaxH3Ops.TryClamp(t, t, min, max))
+                    throw new NotSupportedException("MLX Gemma4 vision clamp requires contiguous F32 tensors.");
+                return;
+            }
             float* ptr = GetFloatPtr(t);
             int count = (int)t.ElementCount();
             for (int i = 0; i < count; i++)
@@ -902,6 +1097,16 @@ namespace TensorSharp.Models
             int mergedPatches = mergedX * mergedY;
 
             var pooled = new Tensor(_allocator, DType.Float32, mergedPatches, _hiddenSize);
+            if (_useMlxDeviceOps && _nMerge == 3 && Environment.GetEnvironmentVariable("TS_GEMMA4_VISION_SPATIAL_DEVICE") == "1")
+            {
+                if (!MlxGemma4VisionOps.TryPool3x3(pooled, visionOutput, patchesX, patchesY))
+                {
+                    pooled.Dispose();
+                    throw new NotSupportedException("MLX vision pooling requires complete contiguous F32 3x3 boxes.");
+                }
+            }
+            else
+            {
             float* srcPtr = GetFloatPtr(visionOutput);
             float* dstPtr = GetFloatPtr(pooled);
             int hiddenSize = _hiddenSize;
@@ -952,6 +1157,7 @@ namespace TensorSharp.Models
                         outRow[e] *= invCount;
                 }
             });
+            }
 
             VisionTrace("pool.mean", pooled);
 
@@ -989,8 +1195,40 @@ namespace TensorSharp.Models
             int outDim = (int)weight.Sizes[0];
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-            Ops.Addmm(result, 0, result, 1f, input, GetOrCreateTransposedWeight(weightName));
+            if (!TryCompressedProjection(result, input, weightName))
+                Ops.Addmm(result, 0, result, 1f, input, GetOrCreateTransposedWeight(weightName));
             return result;
+        }
+
+        private bool TryCompressedProjection(Tensor result, Tensor input, string weightName)
+        {
+            if (TryCpuVisionProjection(result, input, weightName)) return true;
+            if (_usePreciseMetalVision)
+            {
+                var source = _weights[weightName];
+                using var flattened = source.DimensionCount == 4
+                    ? source.View(source.Sizes[0], input.Sizes[1]) : null;
+                if (!GgmlBasicOps.TryGemma4ProjectionFloat32(result, input, flattened ?? source))
+                    throw new NotSupportedException("Metal precise vision projection requires compatible F32 operands: " + weightName);
+                return true;
+            }
+            if (_useCudaDeviceOps)
+            {
+                Tensor weight = weightName == "v.patch_embd.weight" && _weights[weightName].DimensionCount == 4
+                    ? GetOrCreatePatchEmbedTransposed(checked((int)input.Sizes[1])) : GetOrCreateTransposedWeight(weightName);
+                if (!CudaGemma4VisionOps.TryProjectionFloat32(result, input, weight))
+                    throw new InvalidOperationException("CUDA pedantic F32 vision projection failed: " + weightName);
+                return true;
+            }
+            if (!_compressedMatrices.TryGetValue(weightName, out var compressed)) return false;
+            using Tensor padded = compressed.Input == compressed.OriginalInput ? null :
+                new Tensor(_allocator, DType.Float32, input.Sizes[0], compressed.Input);
+            if (padded != null && !MlxGemma4VisionOps.TryPadProjectionInput(padded, input, compressed.Input - compressed.OriginalInput))
+                throw new InvalidOperationException("MLX vision projection zero padding failed: " + weightName);
+            if (!MlxQuantizedOps.TryAddmmQuantizedToFloat32(result, padded ?? input, compressed.Pointer, compressed.Pointer,
+                (int)GgmlTensorType.Q8_0, compressed.Input, compressed.Output, compressed.Bytes, preserveFloat32: true))
+                throw new InvalidOperationException("MLX F32 vision compressed projection failed: " + weightName);
+            return true;
         }
 
         private Tensor RMSNormOp(Tensor input, string weightName)
@@ -1072,7 +1310,49 @@ namespace TensorSharp.Models
             return cache;
         }
 
+        private void EnsureDeviceRopeTables(Rope2DCache cache, int patches, int headDim)
+        {
+            if (cache.DeviceCosine != null) return;
+            int half = headDim / 2, quarter = headDim / 4;
+            var cosine = new float[patches, half];
+            var sine = new float[patches, half];
+            for (int patch = 0; patch < patches; ++patch)
+            for (int channel = 0; channel < quarter; ++channel)
+            {
+                int index = patch * quarter + channel;
+                cosine[patch, channel] = cache.CosX[index];
+                sine[patch, channel] = cache.SinX[index];
+                cosine[patch, quarter + channel] = cache.CosY[index];
+                sine[patch, quarter + channel] = cache.SinY[index];
+            }
+            Tensor deviceCosine = Tensor.FromArray(_allocator, cosine);
+            try { cache.DeviceSine = Tensor.FromArray(_allocator, sine); cache.DeviceCosine = deviceCosine; }
+            catch { deviceCosine.Dispose(); throw; }
+        }
+
         public void Dispose()
+        {
+            // Host-model callers yield their GPU lock and retain the prior owner contract.
+            if (_requirePreciseGgmlCudaVision && _hostModel == null)
+            {
+                lock (_ggmlVisionStackSync)
+                {
+                    if (_ggmlVisionStackDisposed) return;
+                    _ggmlVisionStackDisposed = true;
+                    DisposeCore();
+                }
+                return;
+            }
+            if (!CpuVisionProjectionRequested) { DisposeCore(); return; }
+            lock (_cpuVisionProjectionSync)
+            {
+                _cpuVisionDisposed = true;
+                try { DisposeCore(); }
+                finally { ReleaseCpuVisionProjection(); }
+            }
+        }
+
+        private void DisposeCore()
         {
             // The fused block binds each weight ZERO-COPY on unified-memory Metal: GGML
             // keeps an MTLBuffer that wraps these exact host pages, cached by host pointer.
@@ -1084,6 +1364,12 @@ namespace TensorSharp.Models
             // first tower stayed correct. Invalidate before freeing, the same contract
             // ModelBase.ReleaseGgmlDeviceResidency keeps for the language model's weights.
             ReleaseDeviceBindings();
+            foreach (var matrix in _compressedMatrices.Values)
+            {
+                try { MlxQuantizedOps.ReleaseQuantizedWeight((MlxAllocator)_allocator, matrix.Pointer); }
+                finally { matrix.Free(); }
+            }
+            _compressedMatrices.Clear();
             _onesForNorm?.Dispose();
             foreach (var w in _transposedWeights.Values)
                 w.Dispose();
@@ -1091,6 +1377,11 @@ namespace TensorSharp.Models
             foreach (var w in _weights.Values)
                 w.Dispose();
             _weights.Clear();
+            foreach (var cache in _ropeCache.Values)
+            {
+                cache.DeviceCosine?.Dispose();
+                cache.DeviceSine?.Dispose();
+            }
             _ropeCache.Clear();
         }
 
@@ -1101,7 +1392,7 @@ namespace TensorSharp.Models
         /// </summary>
         private void ReleaseDeviceBindings()
         {
-            if (!_useNativeAttention)
+            if (_allocator is not GgmlAllocator)
                 return;
             foreach (var w in _weights.Values)
             {

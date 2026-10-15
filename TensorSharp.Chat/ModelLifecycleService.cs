@@ -515,6 +515,8 @@ namespace TensorSharp.Server
             try
             {
                 var fi = new FileInfo(path);
+                if (fi.LinkTarget is not null && fi.ResolveLinkTarget(true) is FileInfo target)
+                    fi = target;
                 return fi.Exists ? fi.Length : 0;
             }
             catch

@@ -1021,7 +1021,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"ltx-2.5"`、`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsKeyframeConditioning`、`defaultPreviewFrames`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -1394,9 +1394,42 @@ curl --fail-with-body http://localhost:5000/api/image-generate \
 三个端点共用同一套参数解析和同一道门禁：`POST /api/video-generate`、
 `POST /api/video-generate/stream`（SSE，Web UI 聊天使用的就是它）以及 OpenAI 形态
 的 `POST /v1/videos/generations`。任何实现了视频生成接口的模型都同时服务这三个端
-点 —— MiniMax-H3 或 Wan 2.1 / 2.2 —— 其他模型一律返回 400，并携带
+点 —— LTX 2.5、MiniMax-H3 或 Wan 2.1 / 2.2 —— 其他模型一律返回 400，并携带
 `The loaded model is not a video-generation model.`。`GET /api/models` 上的
 `video` 块会说明当前承载的检查点到底接受哪些条件输入。
+
+#### LTX 2.5 —— 图像关键帧与原生 48 kHz 立体声音频
+
+Distilled 检查点支持首帧 `imagePath`、尾帧 `endImage`，以及指定时间位置和强度的
+多个图像关键帧 `imageConditions`。图像须先通过 `/api/upload` 上传，也可在每个
+关键帧对象的 `image` 中直接提供 base64 或 data URL。`width` 与 `height` 是输出尺寸，
+须为 64 的倍数；省略时使用服务器的 `--video-width` / `--video-height`（随附预设为
+1024 × 1024）。与发布方的流程一致，模型先以一半尺寸采样 8 步，再把潜变量放大 2 倍，
+最后以完整尺寸精修 3 步；`steps: 8` 指的就是这套已发布的步数安排。例如：
+
+```json
+{
+  "prompt": "请让图中的女人来个飞吻",
+  "width": 1024, "height": 1024, "frames": 17, "fps": 24,
+  "steps": 8, "cfg": 1, "sampler": "euler_ancestral", "videoMode": "keyframes",
+  "imageConditions": [
+    { "imagePath": "portrait.png", "frameIndex": 0, "strength": 1 },
+    { "imagePath": "kiss.png", "frameIndex": -1, "strength": 0.8 }
+  ]
+}
+```
+
+`frameIndex` 从零开始，`-1` 表示最终帧，`strength` 范围为 `[0,1]`。
+同时接受 `image_conditions`、`image_path`、`frame_index` 和上游形式 `frame_idx`。
+仅指定尾帧时，可省略模式或使用 `keyframes`；`fl2v` 要求同时有首帧和尾帧。
+`/api/models.video` 返回 `supportsKeyframeConditioning`、`defaultPreviewFrames`
+和 `maxReferenceImages`。Web UI 与 TensorAgent 默认将一张图作为首帧、两张图作为
+首尾帧，三张及以上等距排列在时间线上；每张图也提供帧位置与强度控件。
+
+这些图像用于引导视频时间线。Ingredients 身份参考、视频转视频、retake 及音频参考
+适配器需要另外的模型权重，Distilled 检查点未启用它们。LTX 的 `referenceImages`
+别名同样表示按顺序排列的时间线图像引导。模型文件及验证限制见
+[LTX 2.5](../docs/models/ltx-2.5.md)。
 
 #### MiniMax-H3 —— 视频**与**原生 32 kHz 立体声音频
 
@@ -1535,6 +1568,7 @@ curl -X POST http://localhost:5000/v1/videos/generations \
 条件输入不止首帧、或者与视频一起生成音轨的模型，还接受下列字段 —— 每个都同时接受
 camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为准），并且每个都指
 向先前通过 `/api/upload` 上传的文件（上传目录之外的路径一律拒绝）：
+`imageConditions`/`image_conditions`（包含图像、`frameIndex` 和可选 `strength` 的关键帧数组），
 `endImage`/`end_image`（尾帧条件），
 `referenceImages`/`reference_images`、`referenceVideos`/`reference_videos`、
 `referenceAudios`/`reference_audios`（数组，在提示词中用
@@ -1547,7 +1581,7 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 
 其余字段只接受 camelCase —— `width`、`height`、`frames`、`steps`、`cfg`、
 `cfg2`、`seed`、`fps`、`flowShift`、`negativePrompt`、`sampler`、
-`cfgCacheStride`、`imagePath`（先前上传的文件）以及 `image`（内联 base64 的替代
+`cfgCacheStride`、`imagePath`/`image_path`（先前上传的文件）以及 `image`（内联 base64 的替代
 写法）。`size`、`negative_prompt` 和 `response_format` 只存在于
 `/v1/videos/generations` 上。
 

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../TensorSharp.Models/Embeddings/ManagedEmbeddingQ8AvxMatrix.cs" Link="ManagedEmbeddingQ8AvxMatrix.cs" />
+    <Compile Include="../../../TensorSharp.Models/Embeddings/ManagedEmbeddingQ8Avx512Matrix.cs" Link="ManagedEmbeddingQ8Avx512Matrix.cs" />
+    <Compile Include="../../../TensorSharp.Models/CpuWorkerPool.cs" Link="CpuWorkerPool.cs" />
+  </ItemGroup>
+</Project>

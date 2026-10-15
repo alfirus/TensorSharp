@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+  </ItemGroup>
+  <Target Name="CopyAudioProbeLibraries" AfterTargets="Build">
+    <ItemGroup>
+      <AudioProbeLibrary Include="../../../TensorSharp.GGML.Native/build/libGgmlOps.dylib" Condition="Exists('../../../TensorSharp.GGML.Native/build/libGgmlOps.dylib')" />
+      <AudioProbeLibrary Include="../../../TensorSharp.GGML.Native/build/libGgmlOps.so" Condition="Exists('../../../TensorSharp.GGML.Native/build/libGgmlOps.so')" />
+      <AudioProbeLibrary Include="../../../TensorSharp.Backends.MLX/bin/*.dylib" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
+      <AudioProbeLibrary Include="../../../TensorSharp.Backends.MLX/bin/*.metallib" Condition="$([MSBuild]::IsOSPlatform('OSX'))" />
+    </ItemGroup>
+    <Copy SourceFiles="@(AudioProbeLibrary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

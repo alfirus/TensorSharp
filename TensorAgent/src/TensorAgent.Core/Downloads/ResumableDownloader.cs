@@ -172,6 +172,7 @@ public sealed class ResumableDownloader
         }
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        TensorSharp.Runtime.HuggingFaceAuth.Apply(request);
         if (offset > 0)
             request.Headers.Range = new RangeHeaderValue(offset, null);
 

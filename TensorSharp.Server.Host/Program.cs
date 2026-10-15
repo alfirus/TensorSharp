@@ -39,7 +39,7 @@ try
 {
     args = ConfigFileArgs.Expand(args);
 }
-catch (Exception ex) when (ex is ArgumentException or FileNotFoundException)
+catch (Exception ex) when (ex is ArgumentException or FileNotFoundException or NotSupportedException)
 {
     Console.Error.WriteLine("Configuration error: " + ex.Message);
     Environment.ExitCode = HostExitCodes.ConfigurationError;

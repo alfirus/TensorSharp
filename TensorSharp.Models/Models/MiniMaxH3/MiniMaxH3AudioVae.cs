@@ -51,7 +51,8 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly H3Conv1d[] _convs;
         private readonly H3Act1d[] _acts;
         private readonly int[] _rates;
-        // Non-null on the backends with no ggml graph to call (BackendType.Cpu).
+        // Non-null on direct CPU, CUDA and MLX backends.
+        private readonly IAllocator _allocator;
         private readonly MiniMaxH3DirectAudioVae _direct;
         private MiniMaxH3DirectAudioVaeEncoder _directEnc;
         private readonly bool _useDirect;
@@ -71,9 +72,10 @@ namespace TensorSharp.Models.MiniMaxH3
 
         public MiniMaxH3AudioVae(string path) : this(path, BackendType.GgmlCuda, false) { }
 
-        public MiniMaxH3AudioVae(string path, BackendType backend, bool useDirect)
+        public MiniMaxH3AudioVae(string path, BackendType backend, bool useDirect, IAllocator allocator = null)
         {
             _useDirect = useDirect;
+            _allocator = allocator;
             _model = SafetensorsModel.Open(path);
             if (!_model.HasTensor("dec_in_proj.weight"))
                 throw new InvalidOperationException(
@@ -233,7 +235,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 ReadConv("encoder.block.7", padding: 1),
                 pre,
                 ReadConv("mean_proj", padding: 0),
-                LatentChannels, TrunkChannels, 1e-5f);
+                LatentChannels, TrunkChannels, 1e-5f, _allocator);
         }
 
         private MiniMaxH3DirectAudioVae BuildDirect()
@@ -285,7 +287,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 ReadConv("dec_in_proj", padding: 0),
                 ReadConv("decoder.conv_pre", padding: 3),
                 ReadConv("decoder.conv_post", padding: 3),
-                convs.ToArray(), acts.ToArray(), (int[])Rates.Clone(), AmpsPerStage);
+                convs.ToArray(), acts.ToArray(), (int[])Rates.Clone(), AmpsPerStage, _allocator);
         }
 
         // ---- weights --------------------------------------------------------
@@ -683,6 +685,7 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             if (_disposed) return;
             _disposed = true;
+            _directEnc?.Dispose(); _direct?.Dispose();
             foreach (IntPtr ptr in _bound)
                 if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
             _bound.Clear();

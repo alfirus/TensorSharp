@@ -1,0 +1,271 @@
+{
+  "source_revision": "976e7a41c6615559f7a2ccb79fd5212c378b2c95",
+  "source_path": "src/transformers/models/gemma4/modeling_gemma4.py",
+  "source_url": "https://raw.githubusercontent.com/huggingface/transformers/976e7a41c6615559f7a2ccb79fd5212c378b2c95/src/transformers/models/gemma4/modeling_gemma4.py",
+  "source_sha256": "299f43aa238020eee25c1c1acf9ffcf717c135320fc8e7b0dc7e9716688385b7",
+  "function": "sliding_window_mask_function",
+  "function_line": 1883,
+  "config_attention_context_left": 13,
+  "left_window_argument": 12,
+  "right_window_argument": 0,
+  "effective_maximum_past_distance": 11,
+  "method": "Truth table executed directly from the inspected pinned HF scalar mask definition; no TensorSharp or NumPy encoder output",
+  "regeneration": "python3 eng/validation/generate-gemma4-audio-mask.py",
+  "cases": [
+    {
+      "query": 0,
+      "key": 0,
+      "expected": true
+    },
+    {
+      "query": 0,
+      "key": 1,
+      "expected": false
+    },
+    {
+      "query": 11,
+      "key": 0,
+      "expected": true
+    },
+    {
+      "query": 11,
+      "key": 11,
+      "expected": true
+    },
+    {
+      "query": 11,
+      "key": 12,
+      "expected": false
+    },
+    {
+      "query": 12,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 12,
+      "key": 1,
+      "expected": true
+    },
+    {
+      "query": 12,
+      "key": 12,
+      "expected": true
+    },
+    {
+      "query": 12,
+      "key": 13,
+      "expected": false
+    },
+    {
+      "query": 23,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 23,
+      "key": 10,
+      "expected": false
+    },
+    {
+      "query": 23,
+      "key": 11,
+      "expected": false
+    },
+    {
+      "query": 23,
+      "key": 12,
+      "expected": true
+    },
+    {
+      "query": 23,
+      "key": 23,
+      "expected": true
+    },
+    {
+      "query": 23,
+      "key": 24,
+      "expected": false
+    },
+    {
+      "query": 24,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 24,
+      "key": 11,
+      "expected": false
+    },
+    {
+      "query": 24,
+      "key": 12,
+      "expected": false
+    },
+    {
+      "query": 24,
+      "key": 13,
+      "expected": true
+    },
+    {
+      "query": 24,
+      "key": 24,
+      "expected": true
+    },
+    {
+      "query": 24,
+      "key": 25,
+      "expected": false
+    },
+    {
+      "query": 25,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 25,
+      "key": 12,
+      "expected": false
+    },
+    {
+      "query": 25,
+      "key": 13,
+      "expected": false
+    },
+    {
+      "query": 25,
+      "key": 14,
+      "expected": true
+    },
+    {
+      "query": 25,
+      "key": 25,
+      "expected": true
+    },
+    {
+      "query": 25,
+      "key": 26,
+      "expected": false
+    },
+    {
+      "query": 95,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 95,
+      "key": 82,
+      "expected": false
+    },
+    {
+      "query": 95,
+      "key": 83,
+      "expected": false
+    },
+    {
+      "query": 95,
+      "key": 84,
+      "expected": true
+    },
+    {
+      "query": 95,
+      "key": 95,
+      "expected": true
+    },
+    {
+      "query": 95,
+      "key": 96,
+      "expected": false
+    },
+    {
+      "query": 96,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 96,
+      "key": 83,
+      "expected": false
+    },
+    {
+      "query": 96,
+      "key": 84,
+      "expected": false
+    },
+    {
+      "query": 96,
+      "key": 85,
+      "expected": true
+    },
+    {
+      "query": 96,
+      "key": 96,
+      "expected": true
+    },
+    {
+      "query": 96,
+      "key": 97,
+      "expected": false
+    },
+    {
+      "query": 127,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 127,
+      "key": 114,
+      "expected": false
+    },
+    {
+      "query": 127,
+      "key": 115,
+      "expected": false
+    },
+    {
+      "query": 127,
+      "key": 116,
+      "expected": true
+    },
+    {
+      "query": 127,
+      "key": 127,
+      "expected": true
+    },
+    {
+      "query": 127,
+      "key": 128,
+      "expected": false
+    },
+    {
+      "query": 128,
+      "key": 0,
+      "expected": false
+    },
+    {
+      "query": 128,
+      "key": 115,
+      "expected": false
+    },
+    {
+      "query": 128,
+      "key": 116,
+      "expected": false
+    },
+    {
+      "query": 128,
+      "key": 117,
+      "expected": true
+    },
+    {
+      "query": 128,
+      "key": 128,
+      "expected": true
+    },
+    {
+      "query": 128,
+      "key": 129,
+      "expected": false
+    }
+  ]
+}

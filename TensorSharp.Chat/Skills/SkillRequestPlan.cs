@@ -398,9 +398,12 @@ namespace TensorSharp.Server.Skills
                 return null;
 
             List<ToolFunction> tools = clientTools;
+            var marketplace = offerTools
+                ? SkillMarketplaceSession.Create(registry, prompt.Reachable, options.SkillsAllowNetwork)
+                : null;
             if (offerTools)
             {
-                tools = SkillTools.Merge(clientTools, options.SkillsAllowScripts, out IReadOnlyList<string> shadowed);
+                tools = SkillTools.Merge(clientTools, options.SkillsAllowScripts, out IReadOnlyList<string> shadowed, marketplace);
 
                 // A caller tool that shadows one of ours changes who answers a name the
                 // model will use, and discarding this list meant nobody could see it had
@@ -423,6 +426,7 @@ namespace TensorSharp.Server.Skills
 
             var context = new SkillToolContext(prompt.Reachable.ToList(), ReadCapFor(contextTokens))
             {
+                Marketplace = marketplace,
                 ScriptRunner = options.SkillsAllowScripts && offerTools
                     ? new SkillScriptRunner(new SkillScriptRunnerOptions
                     {

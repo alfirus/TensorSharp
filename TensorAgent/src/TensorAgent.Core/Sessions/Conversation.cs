@@ -33,6 +33,17 @@ public sealed class StoredMessage
     public StoredTurnStats? Stats { get; set; }
     [JsonPropertyName("imagePaths")] public List<string>? ImagePaths { get; set; }
     [JsonPropertyName("stillImagePaths")] public List<string>? StillImagePaths { get; set; }
+    /// <summary>Temporal image guides, retained so replay preserves frame positions and strengths.</summary>
+    [JsonPropertyName("imageConditions")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<StoredVideoImageCondition>? ImageConditions { get; set; }
+    /// <summary>Preserve temporal versus identity-reference semantics when replayed.</summary>
+    [JsonPropertyName("videoMode")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? VideoMode { get; set; }
+    [JsonPropertyName("videoFrames")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? VideoFrames { get; set; }
     [JsonPropertyName("maskPath")] public string? MaskPath { get; set; }
     [JsonPropertyName("maskMode")] public string? MaskMode { get; set; }
     [JsonPropertyName("maskInvert")] public bool? MaskInvert { get; set; }
@@ -97,6 +108,10 @@ public sealed class StoredMessage
                 if (list is not null)
                     foreach (string p in list)
                         yield return Path.GetFileName(p);
+            if (ImageConditions is not null)
+                foreach (var image in ImageConditions)
+                    if (!string.IsNullOrWhiteSpace(image.ImagePath))
+                        yield return Path.GetFileName(image.ImagePath);
             if (!string.IsNullOrEmpty(MaskPath)) yield return Path.GetFileName(MaskPath);
             if (Attachments is not null)
                 foreach (StoredAttachment a in Attachments)
@@ -181,6 +196,12 @@ public sealed class StoredAttachment
     /// <summary>Browser-decodable original-size image for editing HEIC/HEIF uploads.</summary>
     [JsonPropertyName("editFile")] public string? EditFile { get; set; }
     [JsonPropertyName("editUnavailableReason")] public string? EditUnavailableReason { get; set; }
+    [JsonPropertyName("videoFrameIndex")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? VideoFrameIndex { get; set; }
+    [JsonPropertyName("videoStrength")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? VideoStrength { get; set; }
     [JsonPropertyName("maskPath")] public string? MaskPath { get; set; }
     [JsonPropertyName("maskMode")] public string? MaskMode { get; set; }
     [JsonPropertyName("maskInvert")] public bool? MaskInvert { get; set; }
@@ -191,6 +212,19 @@ public sealed class StoredAttachment
     [JsonPropertyName("pageCount")] public int? PageCount { get; set; }
     [JsonPropertyName("extractedPageCount")] public int? ExtractedPageCount { get; set; }
     [JsonPropertyName("renderedAsImages")] public bool? RenderedAsImages { get; set; }
+}
+
+/// <summary>An uploaded or inline temporal image guide saved with its user turn.</summary>
+public sealed class StoredVideoImageCondition
+{
+    [JsonPropertyName("imagePath")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ImagePath { get; set; }
+    [JsonPropertyName("image")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Image { get; set; }
+    [JsonPropertyName("frameIndex")] public int FrameIndex { get; set; }
+    [JsonPropertyName("strength")] public float Strength { get; set; } = 1;
 }
 
 /// <summary>The selection a masked edit applied, under the names the image service reads.</summary>

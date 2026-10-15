@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "Chats suivants",
   "page.knowledge.noChats": "Aucun chat enregistré ne correspond à cette recherche.",
   "page.knowledge.indexingChats": "Copie et indexation des chats…",
-  "page.knowledge.chatImportComplete": "{added} chats indexés · {failed} problèmes nécessitent votre attention"
+  "page.knowledge.chatImportComplete": "{added} chats indexés · {failed} problèmes nécessitent votre attention",
+  "page.chips.keyframe": "Image clé",
+  "page.chips.framePosition": "Position de l’image",
+  "page.chips.autoFrame": "Auto (image {frame})",
+  "page.chips.firstFrame": "Première image",
+  "page.chips.lastFrame": "Dernière image",
+  "page.chips.frameNumber": "Numéro d’image",
+  "page.chips.frameStrength": "Intensité",
+  "page.composer.videoWithKeyframes": "Décrivez une vidéo… ajoutez des images clés pour guider sa chronologie",
+  "page.chips.guidanceMode": "Guidage par images",
+  "page.chips.temporalGuides": "Images initiale/finale et temporisées",
+  "page.chips.identityGuides": "Références d’identité (Ingredients)",
+  "page.chips.clipLength": "Durée du clip",
+  "page.chips.previewLength": "Aperçu de 0,7 s",
+  "page.composer.videoWithIdentityReferences": "Décrivez la scène et chaque image de référence par sa position ; privilégiez des sujets nets sans texte. Plusieurs références peuvent conserver la disposition en panneaux ; une seule image donne une composition plus prévisible."
 }

@@ -460,7 +460,7 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--video-frames <N>` | 视频帧数，会对齐到模型自己的时间网格（Wan 为 `4k+1`；MiniMax-H3 为 `17k+5` —— 5、22、39、56、73、90…）。默认：33；Wan2.2-TI2V 为 49，MiniMax-H3 为 22。`1` 生成一张静态图（配合 `--output out.png`）。 |
 | `--fps <N>` | 保存的 MP4 的播放帧率（默认：16；Wan2.2-TI2V 为 24）。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。 |
 | `--flow-shift <F>` | FlowMatch 时间步 shift（默认：模型官方配方 —— Wan 2.2 为 5.0，A14B T2V 为 12.0，Wan 2.1 为 8.0/3.0/5.0，MiniMax-H3 为 12.0）。在带联合音频流的模型上，该 shift 只作用于视频流。 |
-| `--sampler <name>` | 采样器：`unipc`（Wan 官方采样器，Wan 默认）或 `euler`。这是 Wan 家族的开关——MiniMax-H3 走自己的 flow-match 调度，不读取它。 |
+| `--sampler <name>` | 采样器：`unipc`（Wan 官方采样器，Wan 默认）或 `euler`。LTX 2.5 默认使用发布方配方 `euler_ancestral`；在 LTX 上 `euler` 仅作为确定性 Euler 诊断选项。MiniMax-H3 走自己的 flow-match 调度，不读取它。 |
 | `--negative-prompt <text>` | 负向提示词（默认：模型官方的负向提示词）。在 `--cfg 1.0` 下不生效，因为不跑无条件分支——所以对只接受 `--cfg 1.0` 的 MiniMax-H3 完全没有作用。 |
 | _（步数蒸馏检查点）_ | 按 DiT 文件名自动识别（`Turbo`、`distill`、`Lightning`、`lightx2v`、`FastWan`、`-dmd`，或显式的 `…-4steps-…` / `…8step…`，N 取 1–16）：管线切换到该步数并关闭引导，把官方 50 步 × CFG 配方的 100 次 DiT 前向变成 4 次。这是整个 TensorSharp 里最大的提速手段——详见下文 **[视频生成（Wan）](#视频生成wan)**。`--diffusion-steps` / `--cfg` 可覆盖它。 |
 | `--cfg-cache-stride <N>` | Wan 引导缓存：每 `N` 步只跑一次无条件 CFG 前向，其余步复用缓存的引导方向（默认关闭——每步都跑两次前向）。`2` 约快 1.30×，`3` 约快 1.43×；属于近似，需要严格对齐参考样本时请关闭。在 `--cfg 1.0` 下不起作用，因此对 MiniMax-H3 无效。 |
@@ -468,6 +468,8 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--video-text-encoder <path>` | 覆盖解析到的文本编码器 GGUF（Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B）。环境变量：`TS_VIDEO_TEXT_ENCODER`。 |
 | `--video-dit2 <path>` | 双专家模型的第二个扩散专家（Wan 2.2 A14B 的 high/low-noise 搭档）。两者同目录时按文件名自动解析。环境变量：`TS_VIDEO_DIT2`。 |
 | `--audio-vae <path>` | 与视频联合生成音轨的模型所用的音频 VAE（`minimax_h3_audio_vae_fp32.safetensors`）。不提供时该类模型仍能出图，只是没有音频。环境变量：`TS_VIDEO_AUDIO_VAE`。 |
+| `--video-upscaler <path>` | 两阶段视频模型所用的 2 倍潜变量放大器：LTX 2.5 先以输出尺寸的一半生成，再用 `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` 放大潜变量，最后以完整尺寸精修。默认：模型同目录的 `latent_upscale_models/`。环境变量：`TS_VIDEO_UPSCALER`。 |
+| `--video-diffusion-vae <path>` | 可选的 LTX 2.5 扩散视频解码器（`ltx-2.5-video-vae-bf16.safetensors`）：颗粒和闪烁更少、画面更干净，但比默认的卷积 `--video-vae` 更柔和。仅支持 MLX 和 CPU；CUDA 会拒绝。默认：关闭。环境变量：`TS_VIDEO_DIFFUSION_VAE`。 |
 | `--video-mode <mode>` | 在有多种条件模式的模型上，指定所传图片的含义。默认：按所传内容自动推断。MiniMax-H3 支持 `t2v`（纯文本）、`i2v`（图片**就是**第一帧，并让它动起来）、`fl2v`（首帧与末帧）、`ref`（图片是用于**全新**场景的身份/外观参考）。`i2v`/`fl2v` 需要 FL2VA 检查点，`ref` 需要 Ref2VA——它们是两个独立文件而不是开关，要错了会直接报错并指出该加载的另一个文件。 |
 | `--end-image <file>` | 末帧条件图，适用于支持该能力的模型（MiniMax-H3 的首尾帧模式）。与 `--image` 一起使用时，片段会被引导为从首帧开始、到末帧结束。 |
 | `--ref-image <file>` | 参考图，用于参考条件模型（MiniMax-H3 Ref2VA）：主体特征保留下来，而机位、背景和构图由提示词决定。最多可重复传入 9 次；在提示词中按 `<Picture 1>`、`<Picture 2>`… 引用。参考图只会被**缩小**并保持自身宽高比，输出尺寸仍由 `--width`/`--height` 决定。 |
@@ -727,6 +729,8 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--video-text-encoder <path>` | 覆盖解析到的文本编码器 GGUF（Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B）。环境变量：`TS_VIDEO_TEXT_ENCODER`。 |
 | `--video-dit2 <path>` | 双专家模型的第二个扩散专家（Wan 2.2 A14B 中与 `--model` 配对的 high/low-noise 搭档）。两者同目录时按文件名自动解析。环境变量：`TS_VIDEO_DIT2`。 |
 | `--audio-vae <path>` | 与视频联合生成音轨的模型所用的音频 VAE（`minimax_h3_audio_vae_fp32.safetensors`）。不提供时该类模型仍能出图，只是没有音频。环境变量：`TS_VIDEO_AUDIO_VAE`。 |
+| `--video-upscaler <path>` | 两阶段视频模型所用的 2 倍潜变量放大器：LTX 2.5 先以输出尺寸的一半生成，再用 `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors` 放大潜变量，最后以完整尺寸精修。默认：模型同目录的 `latent_upscale_models/`。环境变量：`TS_VIDEO_UPSCALER`。 |
+| `--video-diffusion-vae <path>` | 可选的 LTX 2.5 扩散视频解码器（`ltx-2.5-video-vae-bf16.safetensors`）：颗粒和闪烁更少、画面更干净，但比默认的卷积 `--video-vae` 更柔和。仅支持 MLX 和 CPU；CUDA 会拒绝。默认：关闭。环境变量：`TS_VIDEO_DIFFUSION_VAE`。 |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | 覆盖服务端原本在 DiT GGUF 旁找到的 Qwen-Image-2.1 伴随文件：VAE、Qwen3-VL-8B 文本编码器及其视觉投影器（编辑时需要）。启动时检查。环境变量：`TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ`。 |
 | `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点，拼写与含义同 CLI：`turbo` 默认按 Turbo 的 8 步调度、CFG 1 采样（请求的 `steps` 只能是 8），并拒绝步数蒸馏 `--lora` 插件。作用于服务端加载的每个 Qwen-Image 模型；其他模型照常加载、不使用它，服务端会记录一条警告，与 `--lora` 相同。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定。启动时检查。环境变量：`TS_QWEN_IMAGE_VARIANT`。 |
 | `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积；`cpu` 后端上为 1024×1024）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 |
@@ -1259,15 +1263,18 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model minimax_h3_ref2va_pruned-
 
 **在服务端，尺寸是启动参数。** 浏览器发送的是提示词，加上所托管检查点通过
 `/api/models` 声明支持的那些条件输入——首帧、末帧，或最多 `maxReferenceImages` 个
-参考——数值类参数一个都不发，因此每段视频都继承服务端默认值：
+参考——以及对应的 `videoMode`。上传图片会直接用于生成，无需在服务端命令行传入
+`--image` 或本地图片路径。数值类参数一个都不发，因此每段视频都继承服务端默认值：
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22 --port 5001
 ```
 
-`--video-mode` 可以为只提供一种模式的部署固定条件模式；不指定时每个请求按其
-自身携带的输入自动推断。
+`--video-mode` 为没有传入 `videoMode` 的请求设置默认模式；不指定时模型按请求
+自身携带的输入自动推断。Web 聊天和 TensorAgent 根据上传附件与所加载的检查点选择
+模式，附带图片时会覆盖这个启动默认值。Ref2VA 将图片用作新场景的参考；若要将上传
+图片作为首帧进行动画生成，请加载 `config/minimax-h3-fl2va.json`。
 
 不指定 `--video-width`/`--video-height` 时，每个请求会按上传图片的宽高比来，
 避免把 4:3 的照片拉成 16:9。
@@ -1989,7 +1996,7 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | 每步的潜变量 / 速度幅值 | 关闭 | `TS_H3_TRACE=1` | — |
 | 执行路径 | 七张原生整网络 ggml 计算图 | — | `--backend cpu` 改用纯 C# 跑同一条流程（t2v、i2v、fl2v 与参考条件） |
 | 托管路径与 GGML 的对拍诊断 | 关闭 | `TS_H3_DUMP_TE`、`TS_H3_DUMP_VEL_V`、`TS_H3_DUMP_VEL_A`、`TS_H3_DUMP_VIS` 把这些张量写到磁盘，使两条路径可以在**同一次**前向上比较；`TS_H3_DIT_LAYERS=N` 在**两条路径上**同时截断主干，把比较变成误差随深度的曲线；`TS_H3_NO_FLASH=1` 让 GGML 走显式 softmax 注意力而不是它的 flash 内核 | — |
-| 伴随网络与分词器覆盖 | 在去噪器同目录解析 | `TS_VIDEO_TEXT_ENCODER`、`TS_VIDEO_VAE`、`TS_VIDEO_AUDIO_VAE`、`TS_VIDEO_TOKENIZER` | `--video-text-encoder`、`--video-vae`、`--audio-vae` |
+| 伴随网络与分词器覆盖 | 在去噪器同目录解析 | `TS_VIDEO_TEXT_ENCODER`、`TS_VIDEO_VAE`、`TS_VIDEO_AUDIO_VAE`、`TS_VIDEO_TOKENIZER`、`TS_VIDEO_UPSCALER`、`TS_VIDEO_DIFFUSION_VAE` | `--video-text-encoder`、`--video-vae`、`--video-upscaler`、`--video-diffusion-vae`、`--audio-vae` |
 
 #### Qwen-Image-2.1
 

@@ -68,5 +68,8 @@
   "host.engine.networkOn": "网络已开启",
   "host.engine.networkOff": "网络已关闭",
   "host.engine.skills": "{count} 个技能",
-  "host.engine.unknown": "未知"
+  "host.engine.unknown": "未知",
+  "host.video.keyframesUnavailable": "此视频模型不支持在任意帧位置使用图像关键帧。",
+  "host.video.ingredientsUnavailable": "Ingredients 身份参考需要 IC-LoRA 检查点；LTX 2.5 Distilled 请使用图像关键帧。",
+  "host.video.invalidFrames": "LTX视频帧数必须为正数并符合8n+1。"
 }

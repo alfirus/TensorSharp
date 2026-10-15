@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "Next chats",
   "page.knowledge.noChats": "No saved chats match this search.",
   "page.knowledge.indexingChats": "Copying and indexing chats…",
-  "page.knowledge.chatImportComplete": "Indexed chats: {added} · issues to review: {failed}"
+  "page.knowledge.chatImportComplete": "Indexed chats: {added} · issues to review: {failed}",
+  "page.chips.keyframe": "Keyframe",
+  "page.chips.framePosition": "Image frame position",
+  "page.chips.autoFrame": "Auto (frame {frame})",
+  "page.chips.firstFrame": "First frame",
+  "page.chips.lastFrame": "Last frame",
+  "page.chips.frameNumber": "Frame number",
+  "page.chips.frameStrength": "Strength",
+  "page.composer.videoWithKeyframes": "Describe a video… attach image keyframes to guide its timeline",
+  "page.chips.guidanceMode": "Image guidance",
+  "page.chips.temporalGuides": "First/last and timed frames",
+  "page.chips.identityGuides": "Identity references (Ingredients)",
+  "page.chips.clipLength": "Clip length",
+  "page.chips.previewLength": "0.7 s preview",
+  "page.composer.videoWithIdentityReferences": "Describe the target scene and each reference image by its position; clean subject images without text work best. Multiple references may retain the sheet's panel layout; one image gives more predictable composition."
 }

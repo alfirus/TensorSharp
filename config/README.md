@@ -15,7 +15,7 @@ These are the executables in the release archives (`tensorsharp-server-*` and
 `dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll` in their place; the examples
 below use the short names.
 
-**Command-line options always win.** When the command line sets a single-valued
+**Command-line option values always win.** When the command line sets a single-valued
 option itself, that option's entry in the file is dropped before it is resolved:
 it is not emitted, its `${variables}` are not substituted and its download is never
 attempted — so one config file can be reused across machines while you override
@@ -62,10 +62,16 @@ already accepts (listed in `--help`), with or without the leading `--`. Comments
 | array               | a repeated flag                  | `"stop": ["</s>", "<\|eot\|>"]` → `--stop </s> --stop <\|eot\|>` |
 | object              | a downloadable file (see below)  | `{ "path": "...", "urls": ["..."] }` |
 
-`"variables"` (see below), its alias `"vars"`, and `"$schema"` are reserved and
-never become options. A key that names a removed option is refused with a message
+`"variables"` (see below), its alias `"vars"`, `"$schema"`, and `"$unavailable"` are
+reserved and never become options. A key that names a removed option is refused with a message
 saying what to use instead, and `lora-scale` / `lora-config` cannot be arrays,
 because each binds to the one `--lora` before it.
+
+`"$unavailable": "reason"` marks a preset whose required implementation is missing.
+Both hosts stop with that reason before expanding options or downloading any
+files from any supplied config. The reason must be a nonempty string. Command-line
+overrides and later configs cannot bypass this marker; use a supported preset to
+run inference. `"$schema"` remains an informational schema hint.
 
 **The two hosts treat an unknown key differently.** The server refuses to start
 on an option it does not recognise (suggesting a near match when there is one); the CLI
@@ -173,11 +179,13 @@ can be selected independently of the required shards.
 
 ## Examples in this folder
 
-Every example uses **real, public, ungated** Hugging Face URLs, so the files
+The runnable examples use **real, public, ungated** Hugging Face URLs, so the files
 auto-download to their local `path` on the first run and are reused afterward.
-The one exception is the MiniMax-H3 tokenizer (`vocab.json`, `merges.txt` and
-`tokenizer_config.json`), which you place by hand; see [below](#video-generation-with-sound-minimax-h3).
+Place the MiniMax-H3 tokenizer (`vocab.json`, `merges.txt` and
+`tokenizer_config.json`) by hand; see [below](#video-generation-with-sound-minimax-h3).
 If you already have a file at that `path`, it is used as-is (no download).
+The experimental LTX 2.5 preset described below includes gated
+official companions; it does not download or start inference.
 
 | File | Model(s) | Shows |
 |------|----------|-------|
@@ -314,10 +322,50 @@ Notes:
   commit and a SHA-256, not to `main`, so every machine gets the same bytes; a
   test enforces it. That covers the basic examples, the Wan and MiniMax-H3
   configs, and the DiffusionGemma model files and vision shard alike. Each pin is
-  the upstream head as of 2026-09-25; to take a later upload, change the commit in
-  the URL and the `sha256` together. The checksum applies only to a new download: a
+  recorded for those configs on 2026-09-25 (LTX 2.5 on 2026-10-13); to take a
+  later upload, change the commit in the URL and the `sha256` together. The checksum
+  applies only to a new download: a
   file already at `path` is used as-is and never re-checked, so an older local copy
   keeps being used until you delete it.
+
+## Experimental LTX 2.5 preset
+
+[`ltx-2.5-distilled.json`](ltx-2.5-distilled.json) records the verified Q4_K_M
+distilled denoiser, the dedicated Gemma 4 text encoder with LTX projections, the
+convolutional video VAE, the x2 spatial latent upscaler and the audio VAE. All five
+files are pinned by commit and SHA-256, with a combined size of 44.76 GB. Paths use
+`${TENSORSHARP_MODELS:-../models}/ltx25`, including the upstream `text_encoders/`,
+`vae/` and `latent_upscale_models/` subfolders. The preset's output is 1024 × 1024,
+17 frames at 24 fps.
+The native generation model runs the dedicated Gemma 4 encoder and AV connectors,
+then the publisher's two-stage distilled recipe: the complete 48-block denoiser
+samples the published eight sigmas (ancestral Euler, CFG 1) at half the output size,
+the latent upscaler doubles it, and three refinement steps run at full size. The
+convolutional video decoder and the 48 kHz stereo audio decoder/vocoder finish.
+TensorAgent offers **Download** and **Use** for **LTX 2.5 Distilled** (Q4_K_M).
+The experimental catalog tier is 48 GB; this is not a measured minimum for every
+resolution or duration. Width and height must be multiples of 64 (each pass keeps
+the 32-pixel latent grid), and frame counts must be `8k+1`. First, last and
+multiple timed image keyframes are supported; see [LTX 2.5](../docs/models/ltx-2.5.md).
+
+```sh
+dotnet run --project TensorSharp.Cli -- --config config/ltx-2.5-distilled.json \
+  --backend mlx --prompt "A red toy car drives slowly along a quiet road." --output ltx25.mp4
+```
+
+Use `--backend ggml_cuda` on NVIDIA GPUs. On Apple Silicon, launch with
+`MLX_ENABLE_TF32=0` to preserve Float32 denoiser/VAE precision, including when
+switching from another MLX model in an existing process. The LTX model sets that
+default before its own first MLX operation; MLX caches the setting process-wide.
+The desktop CLI/server require FFmpeg on `PATH` (or `TS_FFMPEG`) to include audio
+in the MP4; the CLI also saves the original WAV. The Mac app uses AVFoundation.
+
+The official Lightricks companion files are gated. Accept the publisher's license
+and provide `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or a Hugging Face CLI token cache
+(`HF_TOKEN_PATH`, `HF_HOME/token`, or the standard cache). Both downloaders attach
+credentials only to HTTPS `huggingface.co` requests; credentials are not sent to
+download mirrors or CDN redirects. The ordinary Gemma 4 model is not
+interchangeable with the dedicated LTX text encoder, which embeds its tokenizer.
 
 ## Qwen-Image-2.1 LoRA plug-ins (`lora/`)
 

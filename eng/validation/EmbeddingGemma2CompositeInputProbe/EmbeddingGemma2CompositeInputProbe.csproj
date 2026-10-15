@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="TensorSharpCompositeProbeSnapshot" Value="$(TensorSharpCompositeProbeSnapshot)" />
+    <!-- Observe published code; never rebuild a model/backend dependency. -->
+    <Reference Include="$(TensorSharpCompositeProbeSnapshot)/*.dll"
+               Exclude="$(TensorSharpCompositeProbeSnapshot)/TensorSharp.Server.Host.dll;$(TensorSharpCompositeProbeSnapshot)/GgmlOps.dll" />
+    <Content Include="$(TensorSharpCompositeProbeSnapshot)/runtimes/**/*"
+             Link="runtimes/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(TensorSharpCompositeProbeSnapshot)/*.dylib;$(TensorSharpCompositeProbeSnapshot)/*.so;$(TensorSharpCompositeProbeSnapshot)/*.so.*"
+             Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="RequireFrozenCompositeProbe" BeforeTargets="ResolveReferences">
+    <Error Condition="'$(TensorSharpCompositeProbeSnapshot)' == '' Or !Exists('$(TensorSharpCompositeProbeSnapshot)/TensorSharp.Models.dll') Or !Exists('$(TensorSharpCompositeProbeSnapshot)/TensorSharp.Runtime.dll')"
+           Text="Set TensorSharpCompositeProbeSnapshot to a frozen inference directory containing Models and Runtime assemblies." />
+  </Target>
+</Project>

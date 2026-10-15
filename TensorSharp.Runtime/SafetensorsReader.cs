@@ -11,6 +11,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
+using System.Numerics.Tensors;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Text;
@@ -87,19 +88,23 @@ namespace TensorSharp.Runtime
 
         private long _fileLength;
         private MemoryMappedFile? _mappedFile;
+        private FileStream? _mappedStream;
         private MemoryMappedViewAccessor? _mappedView;
         private unsafe byte* _mappedBase;
         private bool _mappedPointerAcquired;
+        private bool _disposed;
 
         public SafetensorsFile(string path)
         {
             Path = path;
-            ParseHeader();
+            _mappedStream = File.OpenRead(path);
+            try { ParseHeader(); }
+            catch { _mappedStream.Dispose(); _mappedStream = null; throw; }
         }
 
         private void ParseHeader()
         {
-            using var fs = File.OpenRead(Path);
+            var fs = _mappedStream!;
             // FileInfo.Length reports the link size for symlinks (common in model
             // caches); the opened stream's length is the real file's.
             _fileLength = fs.Length;
@@ -206,6 +211,18 @@ namespace TensorSharp.Runtime
             return _mappedBase != null;
         }
 
+        /// <summary>Positional read from the same physical file handle that backs
+        /// this reader's mapping. May return fewer bytes at EOF. The reader owns
+        /// the handle; callers must finish reads before disposing the reader.</summary>
+        public int ReadMappedBytes(long fileOffset, Span<byte> destination)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (fileOffset < 0 || fileOffset > long.MaxValue - destination.Length)
+                throw new ArgumentOutOfRangeException(nameof(fileOffset));
+            EnsureMappedView();
+            return RandomAccess.Read(_mappedStream!.SafeFileHandle, destination, fileOffset);
+        }
+
         // ---- dtype conversion -------------------------------------------------
 
         private static unsafe void ConvertToFloat32(SafetensorDtype dtype, byte* src, float* dst, long n)
@@ -219,7 +236,7 @@ namespace TensorSharp.Runtime
                     SafetensorsKernels.Bf16ToF32((ushort*)src, dst, n);
                     break;
                 case SafetensorDtype.F16:
-                    for (long i = 0; i < n; i++) dst[i] = (float)BitConverter.UInt16BitsToHalf(((ushort*)src)[i]);
+                    SafetensorsKernels.F16ToF32((ushort*)src, dst, n);
                     break;
                 case SafetensorDtype.F64:
                     for (long i = 0; i < n; i++) dst[i] = (float)((double*)src)[i];
@@ -276,8 +293,10 @@ namespace TensorSharp.Runtime
 
         private unsafe void EnsureMappedView()
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_mappedBase != null) return;
-            _mappedFile ??= MemoryMappedFile.CreateFromFile(Path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            _mappedFile ??= MemoryMappedFile.CreateFromFile(_mappedStream, null, 0, MemoryMappedFileAccess.Read,
+                HandleInheritability.None, leaveOpen: true);
             _mappedView ??= _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
             byte* viewPtr = null;
             _mappedView.SafeMemoryMappedViewHandle.AcquirePointer(ref viewPtr);
@@ -288,6 +307,7 @@ namespace TensorSharp.Runtime
 
         public unsafe void Dispose()
         {
+            _disposed = true;
             if (_mappedPointerAcquired && _mappedView != null)
             {
                 _mappedView.SafeMemoryMappedViewHandle.ReleasePointer();
@@ -298,6 +318,8 @@ namespace TensorSharp.Runtime
             _mappedView = null;
             _mappedFile?.Dispose();
             _mappedFile = null;
+            _mappedStream?.Dispose();
+            _mappedStream = null;
         }
     }
 
@@ -427,6 +449,21 @@ namespace TensorSharp.Runtime
     /// reused / benchmarked independently of file I/O).</summary>
     public static class SafetensorsKernels
     {
+        /// <summary>Exact Half-to-F32 widening using the vectorized conversion
+        /// already used by managed GGUF dequantization. Chunked spans retain
+        /// support for mapped tensors whose length exceeds Int32.MaxValue.</summary>
+        public static unsafe void F16ToF32(ushort* src,float* dst,long n)
+        {
+            long offset=0;
+            while(offset<n)
+            {
+                int count=(int)Math.Min(n-offset,1<<20);
+                TensorPrimitives.ConvertToSingle(new ReadOnlySpan<System.Half>(src+offset,count),
+                    new Span<float>(dst+offset,count));
+                offset+=count;
+            }
+        }
+
         /// <summary>
         /// BF16 -&gt; F32 by widening the bf16 bits into the top 16 bits of the f32 (the low 16 mantissa
         /// bits are zero). This is exact (bf16 is a truncated f32) and matches numpy's

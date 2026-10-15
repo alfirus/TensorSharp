@@ -648,6 +648,13 @@ label.skill-toggle { padding: 12px 4px; }
   .knowledge-source-header, .knowledge-source-content { padding: 12px; }
 }
 .knowledge-text { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 14px; line-height: 1.5; }
+.video-keyframe-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip.editable-image .video-keyframe-controls { grid-column: 1 / -1; grid-row: 2; min-width: 0; }
+.video-keyframe-controls select, .video-keyframe-controls input { min-height: 44px; max-width: 100%; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font: inherit; font-size: 12px; }
+.video-keyframe-controls input { width: 58px; }
+.video-keyframe-controls label { color: var(--muted); font-size: 12px; }
+.video-keyframe-controls input[hidden] { display: none; }
+.video-reference-help { flex-basis: 100%; min-width: 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .knowledge-reference { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .knowledge-citations { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
 .knowledge-citations .hint-block { width: 100%; }

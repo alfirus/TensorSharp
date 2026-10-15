@@ -1,6 +1,6 @@
 ---
 name: market-data
-description: Use only for current stock/share prices, ticker quotes, and financial market movers (gainers, losers, most-traded shares). Needs the app's Network switch on; no API key.
+description: Use only for current stock/share prices, ticker quotes, and financial market movers. Network switch must be on; no API key.
 ---
 
 # Market data

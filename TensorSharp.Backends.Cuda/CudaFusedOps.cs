@@ -3,6 +3,21 @@ namespace TensorSharp.Cuda
 {
     public static class CudaFusedOps
     {
+        /// <summary>Whether the allocator's PTX provides both EmbeddingGemma 2
+        /// bidirectional attention specializations, including packed sequences.</summary>
+        public static bool HasEmbeddingAttention(CudaAllocator allocator)
+            => CudaKernelOps.HasEmbeddingAttention(allocator);
+
+        /// <summary>F32 bidirectional grouped-query attention for EmbeddingGemma 2.
+        /// Tensors are [batch, sequence, heads, headDimension]. Radius zero is global;
+        /// a positive radius includes both symmetric boundaries. Optional Int32
+        /// [batch, sequence, 2] bounds isolate packed sequences with [start,end) rows.</summary>
+        public static bool TryEmbeddingAttention(Tensor result, Tensor query, Tensor key, Tensor value,
+            int batch, int queryHeads, int kvHeads, int headDim, int seqLen, int windowRadius, float scale,
+            Tensor sequenceBounds = null)
+            => CudaKernelOps.TryEmbeddingAttention(result, query, key, value,
+                batch, queryHeads, kvHeads, headDim, seqLen, windowRadius, scale, sequenceBounds);
+
         /// <summary>Compute the byte count for a sub-weight that is a concatenated
         /// portion (by ne1 column count) of a larger quantized weight.</summary>
         public static long QuantizedWeightSliceBytes(long totalBytes, long totalNe1, long subNe1)

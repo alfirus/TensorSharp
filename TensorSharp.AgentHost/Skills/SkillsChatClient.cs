@@ -94,6 +94,10 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>Advertise skills the request did not select, so the model can pick one up.</summary>
         public bool Discovery { get; init; } = true;
 
+        /// <summary>Allow local find-skills search/inspection over HTTPS. Off by default.
+        /// Installation additionally requires a writable Registry. Ignored for server delivery.</summary>
+        public bool AllowSkillNetwork { get; init; }
+
         /// <summary>Per-request timeout. Only used when the client owns its <see cref="HttpClient"/>.</summary>
         public TimeSpan Timeout { get; init; } = TimeSpan.FromMinutes(10);
     }
@@ -379,9 +383,10 @@ namespace TensorSharp.AgentHost.Skills
 
             SkillPlan plan = SkillPrompt.Plan(selected, catalog, _options.PromptOptions);
             List<ChatMessage> messages = SkillPrompt.Apply(request.Messages, plan);
-            List<ToolFunction> tools = SkillTools.Merge(request.Tools, allowScripts: false, out _);
+            var marketplace = SkillMarketplaceSession.Create(registry, plan.Reachable, _options.AllowSkillNetwork);
+            List<ToolFunction> tools = SkillTools.Merge(request.Tools, allowScripts: false, out _, marketplace);
 
-            var context = new SkillToolContext(plan.Reachable.ToList());
+            var context = new SkillToolContext(plan.Reachable.ToList()) { Marketplace = marketplace };
             int promptTokens = 0, completionTokens = 0;
             string? finishReason = null;
 

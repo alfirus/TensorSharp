@@ -40,7 +40,7 @@ namespace TensorAgent.Core.Hosting;
 public static class VideoTurns
 {
     /// <summary>
-    /// Frames per clip, on the model's 17k+5 grid: 22 is 0.92 s at 24 fps, the length the
+    /// MiniMax-H3's preview length, on its 17k+5 grid: 22 is 0.92 s at 24 fps, the length the
     /// shipped MiniMax-H3 configs make too. The page offers no length setting, so every
     /// turn gets this. MEASURED on an M5 Pro (ggml_metal, 640x384, 20 steps, CLI): 22 frames
     /// take 148 s, 39 frames 279 s, and 56 frames about 7 minutes, since every step attends
@@ -212,11 +212,96 @@ public static class VideoTurns
         string[] clips = Paths(user, "videoFilePaths");
         string[] sounds = Paths(user, "audioPaths");
 
+        if (!model.SupportsKeyframeConditioning
+            && ((user.TryGetProperty("imageConditions", out JsonElement unsupported) && unsupported.ValueKind != JsonValueKind.Null)
+                || (user.TryGetProperty("image_conditions", out unsupported) && unsupported.ValueKind != JsonValueKind.Null)))
+            return VideoRequest.Refused(Loc.T("host.video.keyframesUnavailable"));
+
         var payload = new Dictionary<string, object>
         {
             ["prompt"] = prompt,
-            ["frames"] = model.VideoModelFamily == "wan" ? DefaultWanFrames : DefaultFrames,
         };
+        // Frame grids belong to the model: new families must not inherit H3's
+        // 17k+5 length merely because they are not Wan. An unspecified preference
+        // leaves the request unset so the model can apply its own valid default.
+        if (model.DefaultPreviewFrames > 0)
+            payload["frames"] = model.DefaultPreviewFrames;
+
+        if (model.VideoModelFamily == "ltx-2.5")
+        {
+            string? requestedMode = Text(user, "videoMode") ?? Text(user, "video_mode")
+                ?? Text(body, "videoMode") ?? Text(body, "video_mode");
+            if (string.Equals(requestedMode, "ref", StringComparison.OrdinalIgnoreCase) && !model.SupportsReferenceConditioning)
+                return VideoRequest.Refused(Loc.T("host.video.ingredientsUnavailable"));
+            // The published distilled recipe must override generic video defaults.
+            payload["steps"] = 8;
+            payload["cfg"] = 1f;
+            payload["sampler"] = "euler_ancestral";
+            payload["flowShift"] = 0f;
+            // Size is left to the model (1024x1024): LTX 2.5 samples its first pass at
+            // half the output size, and a 512x512 output smears hands and faces.
+            payload["fps"] = 24;
+            payload["videoMode"] = "t2va";
+            payload["generateAudio"] = true;
+            if (user.TryGetProperty("videoFrames", out JsonElement clipFrames))
+            {
+                if (clipFrames.ValueKind != JsonValueKind.Number || !clipFrames.TryGetInt32(out int requestedFrames)
+                    || requestedFrames < 1 || (requestedFrames - 1) % 8 != 0)
+                    return VideoRequest.Refused(Loc.T("host.video.invalidFrames"));
+                payload["frames"] = requestedFrames;
+            }
+            if (string.Equals(requestedMode, "ref", StringComparison.OrdinalIgnoreCase))
+            {
+                if (clips.Length > 0 || sounds.Length > 0)
+                    return VideoRequest.Refused(Loc.T("host.video.photosOnly"));
+                if (photos.Length > model.MaxReferenceImages)
+                    return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", model.MaxReferenceImages), ("count", photos.Length)));
+                payload["width"] = 768; payload["height"] = 448; payload["frames"] = 121;
+                payload["videoMode"] = "ref"; payload["referenceImages"] = photos;
+                return VideoRequest.For(payload);
+            }
+        }
+
+        if (model.SupportsKeyframeConditioning)
+        {
+            // LTX images describe moments in the output timeline. They are not
+            // identity references, and a clip/audio adapter needs separate weights.
+            if (clips.Length > 0 || sounds.Length > 0)
+                return VideoRequest.Refused(Loc.T("host.video.photosOnly"));
+            if (user.TryGetProperty("imageConditions", out JsonElement conditions)
+                || user.TryGetProperty("image_conditions", out conditions))
+            {
+                if (conditions.ValueKind == JsonValueKind.Array && model.MaxReferenceImages > 0
+                    && conditions.GetArrayLength() > model.MaxReferenceImages)
+                    return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", model.MaxReferenceImages), ("count", conditions.GetArrayLength())));
+                payload["imageConditions"] = conditions.Clone();
+                payload["videoMode"] = "keyframes";
+                return VideoRequest.For(payload);
+            }
+            int limit = model.MaxReferenceImages;
+            if (limit > 0 && photos.Length > limit)
+                return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", limit), ("count", photos.Length)));
+            if (photos.Length > 2)
+            {
+                int frames = payload.TryGetValue("frames", out object selectedFrames) ? (int)selectedFrames : model.DefaultPreviewFrames;
+                if (frames < photos.Length)
+                    return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", frames), ("count", photos.Length)));
+                payload["imageConditions"] = photos.Select((path, index) => new
+                {
+                    imagePath = path,
+                    frameIndex = (int)Math.Round((double)index * (frames - 1) / (photos.Length - 1), MidpointRounding.AwayFromZero),
+                    strength = 1f,
+                }).ToArray();
+                payload["videoMode"] = "keyframes";
+            }
+            else
+            {
+                if (photos.Length > 0) payload["imagePath"] = photos[0];
+                if (photos.Length > 1) payload["endImage"] = photos[1];
+                if (photos.Length > 0) payload["videoMode"] = photos.Length == 1 ? "i2v" : "fl2v";
+            }
+            return VideoRequest.For(payload);
+        }
 
         if (model.SupportsReferenceConditioning)
         {
@@ -230,6 +315,10 @@ public static class VideoTurns
                 payload["referenceVideos"] = clips;
             if (sounds.Length > 0)
                 payload["referenceAudios"] = sounds;
+            // This turn decides how its attachments are used. An inherited startup
+            // mode (for example i2v) must not reinterpret a reference as a first frame.
+            if (count > 0)
+                payload["videoMode"] = "ref";
             return VideoRequest.For(payload);
         }
 
@@ -254,6 +343,8 @@ public static class VideoTurns
             payload["imagePath"] = photos[0];
         if (photos.Length > 1)
             payload["endImage"] = photos[1];
+        if (photos.Length > 0)
+            payload["videoMode"] = photos.Length > 1 ? "fl2v" : "i2v";
         return VideoRequest.For(payload);
     }
 

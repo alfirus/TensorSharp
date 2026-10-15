@@ -20,15 +20,21 @@ public sealed class GgufKnowledgeEmbeddingProvider : IKnowledgeEmbeddingProvider
     public string ModelId { get; }
     public int Dimensions => _model.Dimensions;
 
-    public GgufKnowledgeEmbeddingProvider(string path, string backend = "CPU", string queryPrefix = "", string documentPrefix = "")
+    public GgufKnowledgeEmbeddingProvider(string path, string backend = "CPU", string queryPrefix = null, string documentPrefix = null)
     {
         using var stream = File.OpenRead(path);
         string hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
         _model = EmbeddingModel.Load(path, new EmbeddingModelOptions { Backend = backend });
-        _queryPrefix = queryPrefix;
-        _documentPrefix = documentPrefix;
-        ModelId = $"gguf:sha256:{hash}:mean-parts-v1:{Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(queryPrefix + "\0" + documentPrefix)))}";
+        (_queryPrefix, _documentPrefix) = ResolvePrefixes(_model.Architecture, queryPrefix, documentPrefix);
+        ModelId = $"gguf:sha256:{hash}:mean-parts-v1:{Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(_queryPrefix + "\0" + _documentPrefix)))}";
     }
+
+    // An explicit empty prefix disables task prompting. Missing settings use
+    // the model's retrieval prompts and enter the vector-space identity.
+    internal static (string Query, string Document) ResolvePrefixes(string architecture, string queryPrefix, string documentPrefix)
+        => architecture == "gemma-embedding2"
+            ? (queryPrefix ?? "task: search result | query: ", documentPrefix ?? "title: none | text: ")
+            : (queryPrefix ?? "", documentPrefix ?? "");
 
     public async Task<float[][]> EmbedAsync(IReadOnlyList<string> texts, bool isQuery, CancellationToken cancellationToken = default)
     {

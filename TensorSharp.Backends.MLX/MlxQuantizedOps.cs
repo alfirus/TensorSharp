@@ -57,6 +57,8 @@ namespace TensorSharp.MLX
             public MlxNative.MlxArray Weight;
             public MlxNative.MlxArray Scales;
             public MlxNative.MlxArray Biases;
+            public MlxNative.MlxArray FloatScales;
+            public MlxNative.MlxArray FloatBiases;
             public int DeviceId;
             public int GgmlType;
             public long Ne0;
@@ -81,9 +83,13 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(Weight);
                 MlxNative.FreeArray(Scales);
                 MlxNative.FreeArray(Biases);
+                MlxNative.FreeArray(FloatScales);
+                MlxNative.FreeArray(FloatBiases);
                 Weight = default;
                 Scales = default;
                 Biases = default;
+                FloatScales = default;
+                FloatBiases = default;
             }
         }
 
@@ -505,6 +511,12 @@ namespace TensorSharp.MLX
             long ne0,
             long ne1,
             long rawBytes)
+            => TryAddmmQuantizedToFloat32(result, input, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes, preserveFloat32: false);
+
+        /// <summary>Compressed weight matmul with an explicit F32 activation path for models whose hidden states exceed F16 range.</summary>
+        public static bool TryAddmmQuantizedToFloat32(
+            Tensor result, Tensor input, IntPtr cacheKey, IntPtr hostData,
+            int ggmlType, long ne0, long ne1, long rawBytes, bool preserveFloat32)
         {
             if (!CanPreloadQuantizedType(ggmlType))
                 return false;
@@ -513,12 +525,12 @@ namespace TensorSharp.MLX
 
             DeviceWeight weight = EnsureWeight(resultStorage.DeviceId, cacheKey, hostData, ggmlType, ne0, ne1, rawBytes);
             return MlxWorker.Shared.Invoke(() => RunAddmmQuantizedToFloat32(
-                result, input, weight, ggmlType, ne0, ne1, inputStorage, rows));
+                result, input, weight, ggmlType, ne0, ne1, inputStorage, rows, preserveFloat32));
         }
 
         private static bool RunAddmmQuantizedToFloat32(
             Tensor result, Tensor input, DeviceWeight weight, int ggmlType,
-            long ne0, long ne1, MlxStorage inputStorage, int rows)
+            long ne0, long ne1, MlxStorage inputStorage, int rows, bool preserveFloat32)
         {
             MlxNative.MlxArray inputView = default;
             MlxNative.MlxArray output = default;
@@ -574,7 +586,9 @@ namespace TensorSharp.MLX
                 }
                 else if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 {
-                    output = MlxNative.Q6KMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1);
+                    output = preserveFloat32
+                        ? MlxNative.DirectQ6KFloatMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1)
+                        : MlxNative.Q6KMatmul(inputView, weight.Weight, rows, (int)ne0, (int)ne1);
                     SetDeviceResult(result, output);
                     output = default;
                 }
@@ -608,7 +622,7 @@ namespace TensorSharp.MLX
                         }
                     }
 
-                    output = AffineQuantizedMatmul(inputView, weight, rows);
+                    output = AffineQuantizedMatmul(inputView, weight, rows, preserveFloat32);
                     // mlx_quantized_matmul returns a row-major contiguous
                     // [rows, outDim] array for the standard 2D matmul case
                     // used by Forward/Decode. Skip the explicit
@@ -1246,8 +1260,19 @@ namespace TensorSharp.MLX
             return 1;
         }
 
-        private static MlxNative.MlxArray AffineQuantizedMatmul(MlxNative.MlxArray input, DeviceWeight weight, int rows)
+        private static MlxNative.MlxArray AffineQuantizedMatmul(MlxNative.MlxArray input, DeviceWeight weight, int rows, bool preserveFloat32 = false)
         {
+            if (preserveFloat32)
+            {
+                // Cache widened affine parameters once. No activation or result
+                // is narrowed to F16, including the unnormalized PLE projections.
+                if (!weight.FloatScales.IsValid && weight.GgmlType is (int)GgmlTensorType.Q4_K or (int)GgmlTensorType.Q5_K)
+                    CreateExactFloatKParameters(weight);
+                if (!weight.FloatScales.IsValid) weight.FloatScales = MlxNative.Astype(weight.Scales, DType.Float32);
+                if (weight.Biases.IsValid && !weight.FloatBiases.IsValid) weight.FloatBiases = MlxNative.Astype(weight.Biases, DType.Float32);
+                return MlxNative.QuantizedMatmul(input, weight.Weight, weight.FloatScales, weight.FloatBiases,
+                    transpose: true, weight.GroupSize, weight.Bits, weight.Mode);
+            }
             if (rows < HalfMatmulMinRows || !weight.HalfAffine)
             {
                 return MlxNative.QuantizedMatmul(
@@ -1270,6 +1295,42 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(half);
                 MlxNative.FreeArray(product);
             }
+        }
+
+        private static unsafe void CreateExactFloatKParameters(DeviceWeight weight)
+        {
+            int rows = checked((int)weight.Ne1), blocks = checked((int)(weight.Ne0 / QK_K));
+            int groups = checked(blocks * 8), count = checked(rows * groups);
+            int blockBytes = weight.GgmlType == (int)GgmlTensorType.Q4_K ? Q4_KBlockBytes : Q5_KBlockBytes;
+            var scales = new float[count];
+            var biases = new float[count];
+            byte* raw = (byte*)weight.HostData.ToPointer();
+            if (raw == null) throw new InvalidOperationException("Exact F32 K-quant parameters require the original GGUF weight bytes.");
+            for (int row = 0; row < rows; ++row)
+                for (int block = 0; block < blocks; ++block)
+                {
+                    byte* source = raw + ((long)row * blocks + block) * blockBytes;
+                    float d = (float)BitConverter.UInt16BitsToHalf((ushort)(source[0] | source[1] << 8));
+                    float min = (float)BitConverter.UInt16BitsToHalf((ushort)(source[2] | source[3] << 8));
+                    for (int group = 0; group < 8; ++group)
+                    {
+                        GetScaleMinK4(group, source + 4, out byte scaleByte, out byte minByte);
+                        int index = row * groups + block * 8 + group;
+                        scales[index] = d * scaleByte;
+                        biases[index] = -min * minByte;
+                    }
+                }
+            MlxNative.MlxArray floatScales = default, floatBiases = default;
+            try
+            {
+                fixed (float* pointer = scales)
+                    floatScales = MlxNative.NewArrayFromHost((IntPtr)pointer, [rows, groups], DType.Float32);
+                fixed (float* pointer = biases)
+                    floatBiases = MlxNative.NewArrayFromHost((IntPtr)pointer, [rows, groups], DType.Float32);
+                weight.FloatScales = floatScales; floatScales = default;
+                weight.FloatBiases = floatBiases; floatBiases = default;
+            }
+            finally { MlxNative.FreeArray(floatScales); MlxNative.FreeArray(floatBiases); }
         }
 
         private static bool TryValidateGetRows(
@@ -1538,39 +1599,11 @@ namespace TensorSharp.MLX
                 throw new ArgumentException($"Q4_K raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
 
             int groupsPerRow = superBlocksPerRow * 8;
-            using var staging = new AffineStaging(checked(outDim * (inDim / 2)), checked(outDim * groupsPerRow));
+            using var staging = new AffineStaging(checked(outDim * (inDim / 2)), checked(outDim * groupsPerRow),zeroPacked:false);
             byte* packedWeights = staging.Packed;
             System.Half* scales = staging.Scales;
             System.Half* biases = staging.Biases;
-            byte[] values = new byte[32];
-
-            byte* src = (byte*)hostData.ToPointer();
-            for (int row = 0; row < outDim; row++)
-            {
-                for (int sb = 0; sb < superBlocksPerRow; sb++)
-                {
-                    byte* block = src + ((long)row * superBlocksPerRow + sb) * Q4_KBlockBytes;
-                    float d = (float)BitConverter.UInt16BitsToHalf((ushort)(block[0] | (block[1] << 8)));
-                    float min = (float)BitConverter.UInt16BitsToHalf((ushort)(block[2] | (block[3] << 8)));
-                    byte* packedScales = block + 4;
-                    byte* q = block + 4 + KScaleSize;
-                    for (int group = 0; group < 8; group++)
-                    {
-                        GetScaleMinK4(group, packedScales, out byte scaleByte, out byte minByte);
-                        int pairIndex = group / 2;
-                        bool highNibble = (group & 1) != 0;
-                        byte* qGroup = q + pairIndex * 32;
-                        for (int i = 0; i < 32; i++)
-                            values[i] = highNibble ? (byte)(qGroup[i] >> 4) : (byte)(qGroup[i] & 0x0F);
-
-                        int scaleIndex = row * groupsPerRow + sb * 8 + group;
-                        scales[scaleIndex] = (System.Half)(d * scaleByte);
-                        biases[scaleIndex] = (System.Half)(-min * minByte);
-                        long dstOffset = (long)row * (inDim / 2) + sb * (QK_K / 2) + group * 16;
-                        PackUnsignedBits(values, MlxAffineQ4Bits, packedWeights, dstOffset);
-                    }
-                }
-            }
+            MlxQ4KRepack.Pack(hostData,(IntPtr)packedWeights,(IntPtr)scales,(IntPtr)biases,inDim,outDim);
 
             return CreateDeviceWeight(
                 deviceId,
@@ -2748,8 +2781,8 @@ namespace TensorSharp.MLX
         /// <summary>
         /// Native staging for an affine repack: the packed weights, scales and biases the repack
         /// writes and MLX copies into its own buffers, freed as soon as the copy is made. They
-        /// were managed arrays the GC kept committed long after the upload. Zeroed, because the
-        /// bit packers OR into the destination.
+        /// were managed arrays the GC kept committed long after the upload. Generic bit packers
+        /// require a zeroed destination; Q4_K's direct writer overwrites every byte.
         /// </summary>
         private sealed unsafe class AffineStaging : IDisposable
         {
@@ -2757,7 +2790,7 @@ namespace TensorSharp.MLX
             public readonly System.Half* Scales;
             public readonly System.Half* Biases;
 
-            public AffineStaging(long packedBytes, long scaleCount)
+            public AffineStaging(long packedBytes, long scaleCount, bool zeroPacked=true)
             {
                 try
                 {
@@ -2770,7 +2803,7 @@ namespace TensorSharp.MLX
                     Dispose();
                     throw;
                 }
-                NativeMemory.Clear(Packed, (nuint)packedBytes);
+                if(zeroPacked) NativeMemory.Clear(Packed, (nuint)packedBytes);
             }
 
             public void Dispose()

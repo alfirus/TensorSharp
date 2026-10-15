@@ -860,6 +860,7 @@ public sealed partial class OpenAIChatAdapter
             responseMessage = OpenAIResponseFactory.PlainAssistantMessage(knowledge.Normalize(rawOutput));
         }
 
+        ctx.Response.ContentType = "application/json; charset=utf-8";
         await ctx.Response.WriteAsync(JsonSerializer.Serialize(
             knowledge.WithSources(OpenAIResponseFactory.Completion(requestId, _svc.LoadedModelName, responseMessage,
                 FinishReasonMapper.ToOpenAIChat(pipelineFinishReason, sawToolCalls),

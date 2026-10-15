@@ -239,6 +239,7 @@ public sealed class ModelStore
         IReadOnlyCollection<CatalogFileRole>? optionalRoles = null)
     {
         ArgumentNullException.ThrowIfNull(model);
+        if (!model.IsAvailable) throw new NotSupportedException(model.UnavailableReason);
         if (model.SideloadOnly)
         {
             throw new InvalidOperationException(
@@ -319,6 +320,7 @@ public sealed class ModelStore
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(source);
+        if (!model.IsAvailable) throw new NotSupportedException(model.UnavailableReason);
         if (!model.SideloadOnly)
             throw new InvalidOperationException(Loc.T("host.models.notImported", ("model", model.DisplayName)));
         if (!source.CanRead)
@@ -606,8 +608,16 @@ public sealed class ModelStore
         return null;
     }
 
-    private static bool IsComplete(string path, CatalogFile file) =>
-        File.Exists(path) && new FileInfo(path).Length == file.Bytes;
+    private static bool IsComplete(string path, CatalogFile file)
+    {
+        if (!File.Exists(path)) return false;
+        var info = new FileInfo(path);
+        // An isolated cache may link an already verified companion. On macOS
+        // FileInfo.Length describes the link itself, rather than the model bytes.
+        if (info.LinkTarget is not null && info.ResolveLinkTarget(true) is FileInfo target)
+            info = target;
+        return info.Length == file.Bytes;
+    }
 
     private void Notify(string path)
     {

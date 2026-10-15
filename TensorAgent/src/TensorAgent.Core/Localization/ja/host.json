@@ -68,5 +68,8 @@
   "host.engine.networkOn": "ネットワークオン",
   "host.engine.networkOff": "ネットワークオフ",
   "host.engine.skills": "スキル {count} 件",
-  "host.engine.unknown": "不明"
+  "host.engine.unknown": "不明",
+  "host.video.keyframesUnavailable": "この動画モデルは任意のフレーム位置への画像キーフレーム指定に対応していません。",
+  "host.video.ingredientsUnavailable": "Ingredientsの人物・物体参照にはIC-LoRAチェックポイントが必要です。LTX 2.5 Distilledでは画像キーフレームを使用してください。",
+  "host.video.invalidFrames": "LTXのフレーム数は正の8n+1にしてください。"
 }

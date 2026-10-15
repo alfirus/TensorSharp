@@ -145,6 +145,13 @@ After editing a `.cu` kernel, refresh the committed PTX baseline explicitly and 
 dotnet build TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj -p:TensorSharpUpdateCommittedPtx=true
 ```
 
+The committed baseline targets `compute_61` so it can load on older supported
+GPUs when `nvcc` is unavailable. The refresh command resolves `CudaArch=auto`
+and `native` to this portable target; it rejects an explicit newer target.
+Use a CUDA toolkit that supports `compute_61` to refresh the baseline. Ordinary
+builds retain automatic GPU detection, and GPU-specific local builds should omit
+`TensorSharpUpdateCommittedPtx`.
+
 #### Metal 4 tensor API on Apple silicon
 
 On M5 and newer GPUs ggml can route matmuls through the Metal 4 tensor API, which measured **2.6× prefill throughput** on an M5 Pro (807 → 2107 tok/s, Gemma 4 E4B Q8_0, 2048-token prefill). Decode is unchanged, as expected — single-sequence decode is memory-bandwidth bound.

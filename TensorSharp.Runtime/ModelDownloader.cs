@@ -133,6 +133,7 @@ namespace TensorSharp.Runtime
             string url, string tempPath, string? sha256, string label, TextWriter log, bool interactiveProgress)
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            HuggingFaceAuth.Apply(request);
             using HttpResponseMessage response = Http.Send(request, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 

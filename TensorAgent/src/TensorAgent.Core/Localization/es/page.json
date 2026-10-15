@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "Chats siguientes",
   "page.knowledge.noChats": "No hay chats guardados que coincidan con esta búsqueda.",
   "page.knowledge.indexingChats": "Copiando e indexando chats…",
-  "page.knowledge.chatImportComplete": "{added} chats indexados · {failed} problemas requieren atención"
+  "page.knowledge.chatImportComplete": "{added} chats indexados · {failed} problemas requieren atención",
+  "page.chips.keyframe": "Fotograma clave",
+  "page.chips.framePosition": "Posición del fotograma",
+  "page.chips.autoFrame": "Auto (fotograma {frame})",
+  "page.chips.firstFrame": "Primer fotograma",
+  "page.chips.lastFrame": "Último fotograma",
+  "page.chips.frameNumber": "Número de fotograma",
+  "page.chips.frameStrength": "Intensidad",
+  "page.composer.videoWithKeyframes": "Describe un vídeo… añade imágenes clave para guiar su secuencia",
+  "page.chips.guidanceMode": "Guía de imágenes",
+  "page.chips.temporalGuides": "Fotogramas inicial/final y temporizados",
+  "page.chips.identityGuides": "Referencias de identidad (Ingredients)",
+  "page.chips.clipLength": "Duración del clip",
+  "page.chips.previewLength": "Vista previa de 0,7 s",
+  "page.composer.videoWithIdentityReferences": "Describe la escena y cada imagen de referencia según su posición; funcionan mejor los sujetos claros sin texto. Varias referencias pueden conservar la disposición en paneles; una sola imagen ofrece una composición más predecible."
 }

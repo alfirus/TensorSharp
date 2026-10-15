@@ -358,7 +358,7 @@ public sealed class ModelsPage : ContentPage
         int deviceGB = _app.Paths.DeviceMemoryGB;
         _rows.Clear();
         foreach (CatalogModel model in ModelCatalog.BuiltIn
-                     .OrderByDescending(m => m.MinDeviceMemoryGB <= deviceGB)
+                     .OrderByDescending(m => m.IsAvailable && m.MinDeviceMemoryGB <= deviceGB)
                      .ThenBy(m => m.MinDeviceMemoryGB)
                      .ThenBy(m => m.TotalBytes))
         {
@@ -906,10 +906,10 @@ public sealed class ModelRow : BindableObject
         bool loadedVisionReady = false, bool loadedDraftReady = false)
     {
         Model = model;
-        Runnable = model.MinDeviceMemoryGB <= deviceMemoryGB;
+        Runnable = model.IsAvailable && model.MinDeviceMemoryGB <= deviceMemoryGB;
         DeviceMemoryGB = deviceMemoryGB;
         RefreshInstallState(store);
-        IsSelected = string.Equals(model.Id, selectedId, StringComparison.Ordinal);
+        IsSelected = model.IsAvailable && string.Equals(model.Id, selectedId, StringComparison.Ordinal);
         VisionActivationRequired = IsSelected
             && IsInstalled
             && model.Modalities.HasFlag(CatalogModalities.Image)
@@ -922,13 +922,15 @@ public sealed class ModelRow : BindableObject
             && string.Equals(model.Weights.FileName, loadedModelName, StringComparison.OrdinalIgnoreCase)
             && !loadedDraftReady;
         _status = DescribeState(store);
-        _actionLabel = !Runnable ? Loc.T("models.action.tooBig")
+        _actionLabel = !model.IsAvailable ? Loc.T("models.action.unavailable")
+            : !Runnable ? Loc.T("models.action.tooBig")
             : VisionActivationRequired ? Loc.T("models.action.enableVision")
             : DraftActivationRequired ? Loc.T("models.action.loadDraft")
             : IsInstalled ? (IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use"))
             : model.SideloadOnly ? Loc.T("models.action.import")
             : Loc.T("models.action.download");
 
+        if (!model.IsAvailable) return;
         if (download is { IsRunning: true } running)
         {
             BeginDownload();
@@ -969,7 +971,7 @@ public sealed class ModelRow : BindableObject
         private set { _downloading = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanAct)); }
     }
 
-    /// <summary>Whether this device has the memory the entry asks for.</summary>
+    /// <summary>Whether the runtime implements the entry and this device has its memory tier.</summary>
     public bool Runnable { get; }
 
     public int DeviceMemoryGB { get; }
@@ -1148,12 +1150,14 @@ public sealed class ModelRow : BindableObject
         OnPropertyChanged(nameof(CanAddDraft));
     }
 
-    private string InstalledActionLabel => VisionActivationRequired ? Loc.T("models.action.enableVision")
+    private string InstalledActionLabel => !Model.IsAvailable ? Loc.T("models.action.unavailable")
+        : VisionActivationRequired ? Loc.T("models.action.enableVision")
         : DraftActivationRequired ? Loc.T("models.action.loadDraft")
         : IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use");
 
     private string DescribeState(ModelStore store)
     {
+        if (!Model.IsAvailable) return Model.UnavailableReason!;
         if (!Runnable)
         {
             // Said as a fact about the hardware rather than as a refusal, and it names

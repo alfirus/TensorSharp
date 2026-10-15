@@ -396,7 +396,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--ref-audio &lt;file&gt;</code></td><td>独立的参考音轨，可重复；提示词中以 <code>&lt;Audio 1&gt;</code>、<code>&lt;Audio 2&gt;</code>…… 引用。会被重采样到音频 VAE 的 32 kHz 立体声，并截断到所生成片段的时长。</td></tr>
       <tr><td><code>--no-audio</code></td><td>在与视频联合生成音轨的模型（MiniMax-H3）上跳过音频解码，只要画面时可省下音频 VAE 的时间与显存。纯视频模型会忽略它。</td></tr>
       <tr><td><code>--flow-shift &lt;F&gt;</code></td><td>FlowMatch timestep shift（默认 <code>0</code> = 模型官方配方：Wan 2.2 为 5.0，A14B T2V 为 12.0；Wan 2.1 中 1.3B 模型的视频运行为 8.0，其余 ≤ 480p 为 3.0、更高为 5.0；MiniMax-H3 为 12.0）。在带联合音频流的模型上，该 shift 只作用于视频流。</td></tr>
-      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。默认取模型自身的值 —— Wan 为 <code>unipc</code>。它是 Wan 家族的旋钮：MiniMax-H3 走自己的 flow-match 调度，会忽略它。</td></tr>
+      <tr><td><code>--sampler &lt;name&gt;</code></td><td><code>unipc</code>（Wan 官方采样器；多步预测-校正，在相同步数下质量更好）或 <code>euler</code>。默认取模型自身的值 —— Wan 为 <code>unipc</code>，LTX 2.5 为发布方配方 <code>euler_ancestral</code>（在 LTX 上 <code>euler</code> 仅作为确定性 Euler 诊断选项）。MiniMax-H3 走自己的 flow-match 调度，会忽略它。</td></tr>
       <tr><td><code>--negative-prompt &lt;text&gt;</code></td><td>无分类器引导使用的负向提示词（默认为模型官方的负向提示词）。在 <code>--cfg 1.0</code> 下不会被用到，因为根本不跑负向分支 —— 所以它对步数蒸馏的 Wan 权重、以及 CFG 蒸馏的 MiniMax-H3 都没有作用。</td></tr>
       <tr><td><code>--cfg-cache-stride &lt;N&gt;</code></td><td>引导缓存：每 N 步才跑一次无条件 CFG 分支，其余步复用缓存的引导方向（前三步与最后一步始终重算）。50 步时，<code>2</code> 只跑 100 次前向中的 77 次（快 1.30×），<code>3</code> 跑 70 次（1.43×）。默认 <code>0</code> = 关闭。它是一种近似 —— 需要对齐参考样本时请保持关闭；另外在 <code>--cfg 1.0</code> 下它没有意义，因为根本没有无条件分支可缓存。</td></tr>
       <tr><td><code>--diffusion-steps &lt;N&gt;</code> / <code>--cfg &lt;F&gt;</code></td><td>覆盖配方或自动识别到的蒸馏取值。在基础 Wan 权重上用 30 步替代 50 步，观感非常接近而开销少 1.7×。MiniMax-H3 经过 <strong>CFG 蒸馏</strong>：默认 20 步，任何高于 <code>1.0</code> 的 <code>--cfg</code> 都会被拒绝，而 4–8 步是它的快速工作点。</td></tr>
@@ -404,6 +404,8 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>文本编码器 GGUF —— Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B。默认在同目录扫描；环境变量 <code>TS_VIDEO_TEXT_ENCODER</code>。H3 的编码器<strong>不附带分词器</strong> —— 请把 <code>vocab.json</code> 与 <code>merges.txt</code> 放在它旁边，或用 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</td></tr>
       <tr><td><code>--video-dit2 &lt;path&gt;</code></td><td>双专家模型的第二个扩散专家（Wan 2.2 A14B 的 high/low noise 一对）。默认按文件名在第一个专家旁边自动解析。环境变量：<code>TS_VIDEO_DIT2</code>。</td></tr>
       <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>与视频联合生成音轨的模型所用的音频 VAE（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它这类模型照样能跑并产出视频，只是没有声音。环境变量：<code>TS_VIDEO_AUDIO_VAE</code>。</td></tr>
+      <tr><td><code>--video-upscaler &lt;path&gt;</code></td><td>两阶段视频模型所用的 2 倍潜变量放大器：LTX 2.5 先以输出尺寸的一半生成，再用 <code>ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors</code> 放大潜变量，最后以完整尺寸精修。默认：模型同目录的 <code>latent_upscale_models/</code>。环境变量：<code>TS_VIDEO_UPSCALER</code>。</td></tr>
+      <tr><td><code>--video-diffusion-vae &lt;path&gt;</code></td><td>可选的 LTX 2.5 扩散视频解码器（<code>ltx-2.5-video-vae-bf16.safetensors</code>）：颗粒和闪烁更少、画面更干净，但比默认的卷积 <code>--video-vae</code> 更柔和。仅支持 MLX 和 CPU；CUDA 会拒绝。默认：关闭。环境变量：<code>TS_VIDEO_DIFFUSION_VAE</code>。</td></tr>
     </tbody>
   </table>
   </div>

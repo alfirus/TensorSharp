@@ -35,6 +35,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         private readonly DirectContext _ctx;
+        private readonly MiniMaxH3TensorOps _tensorOps;
         private readonly BlockW[] _blocks;
         private readonly DirectLinear _postQuant, _xEmbedder, _projOut;
         private readonly Tensor _registerTokens, _normOutW, _normOutB;
@@ -50,13 +51,11 @@ namespace TensorSharp.Models.MiniMaxH3
             Func<string, float[]> read,
             Func<string, (long OutFeatures, long InFeatures)> shape,
             int numBlocks, int dim, int heads, int headDim, int inner, int rotDim,
-            int numRegister, float eps)
+            int numRegister, float eps,
+            Func<string, (IntPtr Pointer, int Type, long Bytes)> mappedWeight = null)
         {
             _ctx = new DirectContext(allocator);
-            if (_ctx.IsCuda)
-                throw new NotSupportedException(
-                    "MiniMaxH3DirectVideoVae is the managed CPU path; MiniMax-H3 on " +
-                    "BackendType.Cuda is not implemented (use a GGML backend, or BackendType.Cpu).");
+            _tensorOps = new MiniMaxH3TensorOps(_ctx);
 
             _dim = dim; _heads = heads; _headDim = headDim; _inner = inner;
             _rotDim = rotDim; _numRegister = numRegister; _eps = eps;
@@ -64,7 +63,16 @@ namespace TensorSharp.Models.MiniMaxH3
             DirectLinear Lin(string w, string b)
             {
                 var (outF, inF) = shape(w);
-                var l = DirectLinear.FromFloats(_ctx, read(w), inF, outF, read(b));
+                DirectLinear l;
+                if (_ctx.IsCuda && mappedWeight != null &&
+                    Environment.GetEnvironmentVariable("TS_H3_CUDA_MAPPED_VAE_WEIGHTS") == "1")
+                {
+                    var mapped = mappedWeight(w);
+                    l = mapped.Type is 0 or 1
+                        ? DirectLinear.FromMappedH3Dense(_ctx,mapped.Pointer,mapped.Type,inF,outF,mapped.Bytes,read(b))
+                        : DirectLinear.FromFloats(_ctx,read(w),inF,outF,read(b));
+                }
+                else l = DirectLinear.FromFloats(_ctx, read(w), inF, outF, read(b));
                 _owned.Add(l);
                 return l;
             }
@@ -110,6 +118,8 @@ namespace TensorSharp.Models.MiniMaxH3
         private unsafe Tensor SplitInterleaved(Tensor qkv, int seq, int which)
         {
             int heads = _heads, hd = _headDim;
+            if (_tensorOps.IsAccelerated)
+                return MiniMaxH3TensorOps.SplitInterleaved(qkv, seq, heads, hd, which);
             Tensor outT = _ctx.NewF32(seq, (long)heads * hd);
             float* src = (float*)CpuNativeHelpers.GetBufferStart(qkv);
             float* dst = (float*)CpuNativeHelpers.GetBufferStart(outT);
@@ -137,10 +147,15 @@ namespace TensorSharp.Models.MiniMaxH3
                 return n.View(seq, (long)_heads * _headDim);
         }
 
-        private static unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
+        private unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
                                             int seq, int heads, int hd, int rot)
         {
             if (rot <= 0) return;
+            if (_tensorOps.IsAccelerated)
+            {
+                _tensorOps.RopeHalf(x, cos, sin, seq, heads, hd, rot);
+                return;
+            }
             int half = rot / 2;
             float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
             fixed (float* pcos = cos, psin = sin)
@@ -255,12 +270,18 @@ namespace TensorSharp.Models.MiniMaxH3
             return Ops.NewContiguous(view);
         }
 
+        internal void ReleaseDeviceResidency()
+        {
+            if (!_disposed) _ctx.ReleaseDeviceResidency();
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
             foreach (var l in _owned) l.Dispose();
             _owned.Clear();
+            _tensorOps.Dispose();
             _ctx.Dispose();
         }
     }

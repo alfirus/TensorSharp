@@ -95,7 +95,10 @@ namespace TensorSharp.Server.Host.Hosting
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
                     "Embedding server configuration: hostedModel={HostedModel} backend={Backend} execution={Execution} threads={Threads} contextLimit={ContextLimit} listen={ListenAddress}",
-                    options.StartupModelPath, options.DefaultBackend, options.UsesManagedEmbeddingBackend ? "pure-csharp" : "native-ggml",
+                    options.StartupModelPath, options.DefaultBackend, options.DefaultBackend switch
+                    {
+                        "cpu" => "pure-csharp", "cuda" => "direct-cuda", "mlx" => "mlx", _ => "native-ggml",
+                    },
                     options.EmbeddingThreads > 0 ? options.EmbeddingThreads.ToString(CultureInfo.InvariantCulture) : "backend-default",
                     options.EmbeddingContextSize > 0 ? options.EmbeddingContextSize.ToString(CultureInfo.InvariantCulture) : "model-default",
                     listenAddress);

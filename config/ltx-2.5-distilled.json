@@ -1,0 +1,66 @@
+{
+  // LTX 2.5 Distilled Q4_K_M — experimental video and audio preset.
+  // Native text and image conditioning, eight-step AV sampling and video/audio decoding.
+  // Accepts first/last images and multiple timed image guides (imageConditions).
+  // Ordered referenceImages are temporal guides, evenly spaced first to last.
+  // videoMode=ref instead uses identity/appearance references when the optional
+  // Ingredients adapter is installed beside the model in loras/, or selected
+  // through TS_LTX25_INGREDIENTS_LORA. Its trained preview is 768x448x121.
+
+  // Five verified assets, 44,764,412,884 bytes in total, pinned by commit and
+  // SHA-256. The official Lightricks companions are gated: accept their license
+  // and configure HF_TOKEN or the Hugging Face CLI token cache for downloading.
+  // The stock Gemma 4 checkpoint is not a substitute for the LTX projection file.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "ltxRoot": "${modelRoot}/ltx25",
+    "hf": "https://huggingface.co"
+  },
+
+  "backend": "ggml_cuda",
+
+  // The model supplies the publisher's two-stage distilled recipe: 8 ancestral Euler steps at
+  // half the output size, the x2 latent upscaler, then 3 refinement steps at full size; CFG 1
+  // and no flow-shift override. Width and height are the output size, multiples of 64.
+  // 1024x1024 samples its first pass at 512x512; a 512x512 output would plan motion on a
+  // 256x256 grid, which smears hands and faces. CUDA is the default here; override
+  // --backend mlx on Apple Silicon. Start with a 17-frame preview on a 48 GB device.
+  "width": 1024,
+  "height": 1024,
+  "video-frames": 17,
+  "fps": 24,
+
+  "model": {
+    "path": "${ltxRoot}/LTX-2.5-Distilled-Q4_K_M.gguf",
+    "urls": [ "${hf}/Abiray/LTX-2.5-Distilled-GGUF/resolve/7b0c2025441f1bf12c18eac375ad21f5e3d3c9e0/LTX-2.5-Distilled-Q4_K_M.gguf" ],
+    "sha256": "0f51eb0d82b19bddbfb3b0371a65217844ea03750f27dd733528f22152e0e0d0"
+  },
+
+  "video-text-encoder": {
+    "path": "${ltxRoot}/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors" ],
+    "sha256": "ef7243612fdae7a75cb4d5cee9433e81380675fb6c213bd98ae74a9cd16561d1"
+  },
+
+  "video-vae": {
+    "path": "${ltxRoot}/vae/ltx-2.5-video-vae-conv-bf16.safetensors",
+    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/vae/ltx-2.5-video-vae-conv-bf16.safetensors" ],
+    "sha256": "685b06ee3d9b2039647698fc4ea33175112462fc374e2777312c907897dfce8d"
+  },
+
+  // The publisher's diffusion video decoder (ltx-2.5-video-vae-bf16.safetensors) is
+  // opt-in through --video-diffusion-vae: cleaner, with less grain and flicker, but
+  // softer than this convolutional decoder on the preset's 1024x1024 output.
+
+  "video-upscaler": {
+    "path": "${ltxRoot}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" ],
+    "sha256": "eb5a71fe4068ee87ccdb1c3aa635e547ca76bd2d30ae20ae889f2c325c0677e8"
+  },
+
+  "audio-vae": {
+    "path": "${ltxRoot}/vae/ltx-2.5-audio-vae-bf16.safetensors",
+    "urls": [ "${hf}/Lightricks/LTX-2.5/resolve/49b093a39c19169a8a81721dcc541e07e945232f/vae/ltx-2.5-audio-vae-bf16.safetensors" ],
+    "sha256": "c52733d37f6a7fb7949c3dc0fb468c6cb2169e4d836983a73babb9f0d54837a5"
+  }
+}

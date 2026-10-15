@@ -64,5 +64,7 @@
   "catalog.extended.30b3b.parameters": "300 億（有効 30 億）",
   "catalog.extended.744b40b.parameters": "7440 億（有効 400 億）",
   "catalog.extended.384experts.parameters": "MoE、384 のルーティング対象エキスパート",
-  "catalog.extended.14bExpert.parameters": "エキスパートあたり 140 億"
+  "catalog.extended.14bExpert.parameters": "エキスパートあたり 140 億",
+  "catalog.model.ltx25.notes": "48kHzステレオ音声付きの実験的なテキスト・画像動画生成。LTX2.5 DistilledはCFG1で、半分のサイズでAncestral Eulerを8ステップ、潜在空間の2倍アップスケール、仕上げ3ステップを実行し、最初・最後のフレームと、位置・強度を指定した複数の画像キーフレームに対応します。画像は出力の時間軸を指定します。人物の参照や動画・音声アダプターには別のチェックポイントが必要です。固定ダウンロードは合計44.76GBで、Hugging Faceの承認済みアクセスが必要です。端末の目安は48GBで、短い1024×1024動画で検証済みです。",
+  "catalog.license.ltx25": "LTX-2.5 と Gemma の利用条件"
 }

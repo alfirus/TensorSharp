@@ -1,0 +1,16 @@
+<Project>
+  <!-- Build the stateless library separately with CMake. Explicit packaging
+       avoids adding a native compiler dependency to portable managed builds. -->
+  <ItemGroup Condition="'$(TensorSharpCpuNativeLibrary)' != '' And '$(TargetPlatformIdentifier)' != 'ios' And '$(TargetPlatformIdentifier)' != 'maccatalyst'">
+    <None Include="$(TensorSharpCpuNativeLibrary)" Link="$([System.IO.Path]::GetFileName('$(TensorSharpCpuNativeLibrary)'))"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest"
+          Pack="true" PackagePath="runtimes/$(TensorSharpCpuNativeRuntimeIdentifier)/native/" />
+  </ItemGroup>
+  <Target Name="ValidateOwnedCpuNativePackage" BeforeTargets="AssignTargetPaths"
+          Condition="'$(TensorSharpCpuNativeLibrary)' != '' And '$(TargetPlatformIdentifier)' != 'ios' And '$(TargetPlatformIdentifier)' != 'maccatalyst'">
+    <Error Condition="'$(TensorSharpCpuNativeRuntimeIdentifier)' == ''"
+           Text="Set TensorSharpCpuNativeRuntimeIdentifier when packaging an owned CPU library." />
+    <Error Condition="!Exists('$(TensorSharpCpuNativeLibrary)')"
+           Text="TensorSharpCpuNativeLibrary must name an existing separately built library." />
+  </Target>
+</Project>

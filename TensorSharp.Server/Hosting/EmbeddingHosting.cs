@@ -22,9 +22,18 @@ public static class EmbeddingHosting
             throw new ArgumentException(error, nameof(requestedBackend));
         string backend = resolvedBackend;
         services.TryAddSingleton(options);
-        services.AddSingleton<IEmbeddingModel>(_ => EmbeddingModel.Load(options.StartupModelPath,
-            new EmbeddingModelOptions { Backend = backend, Threads = options.EmbeddingThreads,
-                MaxTokens = options.EmbeddingContextSize }));
+        var modelOptions = new EmbeddingModelOptions { Backend = backend, Threads = options.EmbeddingThreads,
+            MaxTokens = options.EmbeddingContextSize };
+        if (!string.IsNullOrWhiteSpace(options.StartupMmProjPath))
+        {
+            services.AddSingleton(_ => EmbeddingGemma2MultimodalEncoder.Load(options.StartupModelPath,
+                options.StartupMmProjPath, modelOptions));
+            // The wrapper owns the text allocator and the media tensors. Register
+            // the same owner so DI never frees that allocator before its towers.
+            services.AddSingleton<IEmbeddingModel>(provider => provider.GetRequiredService<EmbeddingGemma2MultimodalEncoder>());
+        }
+        else
+            services.AddSingleton<IEmbeddingModel>(_ => EmbeddingModel.Load(options.StartupModelPath, modelOptions));
         services.AddSingleton<EmbeddingAdapter>();
         return services;
     }
@@ -66,7 +75,9 @@ public static class EmbeddingHosting
         "ggml_cpu" => "GGML_CPU",
         "ggml_metal" => "GGML_METAL",
         "ggml_cuda" => "GGML_CUDA",
-        _ => throw new ArgumentException($"Embedding hosting requires cpu (pure C#), ggml_cpu, ggml_metal, or ggml_cuda; got '{backend}'."),
+        "cuda" => "CUDA",
+        "mlx" => "MLX",
+        _ => throw new ArgumentException($"Embedding hosting requires cpu (pure C#), ggml_cpu, ggml_metal, ggml_cuda, cuda, or mlx; got '{backend}'."),
     };
 
     /// <summary>Rejects generation requests before any adapter attempts to load an encoder as a chat model.</summary>

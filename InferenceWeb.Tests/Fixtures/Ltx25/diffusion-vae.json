@@ -1,0 +1,70 @@
+{
+ "source_revision": "be6d6d0a69d11a0a399c462ed92606692e5f8697",
+ "checkpoint_sha256": "0e0d66aef1d89e5cef67ae27db500ee75f8d7822a6235b5e947d877a4bd36fea",
+ "seed": 4242,
+ "bin_sha256": "ae8efb7d50b18ebc1a2e05b1b6c380880177003a67b1437c85d3c4c27adf8dc4",
+ "arrays": {
+  "latent": {
+   "offset": 0,
+   "shape": [
+    8,
+    2,
+    1,
+    2
+   ]
+  },
+  "noise": {
+   "offset": 128,
+   "shape": [
+    3,
+    17,
+    32,
+    96
+   ]
+  },
+  "feat_stage4_input": {
+   "offset": 626816,
+   "shape": [
+    17,
+    4,
+    12,
+    16
+   ]
+  },
+  "context": {
+   "offset": 679040,
+   "shape": [
+    9,
+    4,
+    12,
+    16
+   ]
+  },
+  "prediction": {
+   "offset": 706688,
+   "shape": [
+    3,
+    17,
+    32,
+    96
+   ]
+  },
+  "output": {
+   "offset": 1333376,
+   "shape": [
+    3,
+    9,
+    32,
+    64
+   ]
+  }
+ },
+ "layouts": {
+  "latent": "[C,T,H,W] normalized",
+  "noise": "[3,F,H,W] stage-5 canvas pixels",
+  "feat_stage4_input": "[T,H,W,C] channels-last, with ghost frames",
+  "context": "[T,H,W,C] stage-4 output before upsamples[3], after the ghost crop",
+  "prediction": "[3,F,H,W] x0 before the content crop",
+  "output": "[3,F,H,W] in [-1,1]"
+ }
+}

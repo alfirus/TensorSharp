@@ -14,7 +14,7 @@ using TensorSharp.Server.Hosting;
 namespace TensorSharp.Server.ProtocolAdapters;
 
 /// <summary>OpenAI and Ollama embedding protocols over one resident encoder.</summary>
-public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
+public sealed partial class EmbeddingAdapter : IDisposable, IAsyncDisposable
 {
     public const int MaxBatchInputs = 2048;
     public const int MaxBatchTokens = 262144;
@@ -23,12 +23,14 @@ public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
     private readonly IEmbeddingModel _model;
     private readonly ServerHostingOptions _options;
     private readonly EmbeddingRequestDispatcher _dispatcher;
+    private readonly EmbeddingGemma2MultimodalEncoder? _multimodal;
 
-    public EmbeddingAdapter(IEmbeddingModel model, ServerHostingOptions options)
+    public EmbeddingAdapter(IEmbeddingModel model, ServerHostingOptions options, EmbeddingGemma2MultimodalEncoder? multimodal = null)
     {
         _model = model;
         _options = options;
         _dispatcher = new EmbeddingRequestDispatcher(model);
+        _multimodal = multimodal;
     }
 
     public void Dispose() => _dispatcher.Dispose();
@@ -36,6 +38,8 @@ public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
 
     public Task OpenAIAsync(HttpContext context) => EmbedAsync(context, openAI: true);
     public Task OllamaAsync(HttpContext context) => EmbedAsync(context, openAI: false);
+
+    private EmbeddingModel? ConcreteModel => _multimodal?.TextModel ?? _model as EmbeddingModel;
 
     public IResult ListModels() => Results.Json(new
     {
@@ -60,10 +64,10 @@ public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
     public IResult GetWebModels() => Results.Json(new
     {
         models = new[] { Path.GetFileName(_options.StartupModelPath) },
-        mmProjModels = Array.Empty<string>(),
+        mmProjModels = _multimodal == null ? Array.Empty<string>() : new[] { Path.GetFileName(_options.StartupMmProjPath) },
         loaded = Path.GetFileName(_options.StartupModelPath),
-        loadedMmProj = (string?)null,
-        loadedBackend = _model is EmbeddingModel embeddingModel
+        loadedMmProj = _multimodal == null ? null : Path.GetFileName(_options.StartupMmProjPath),
+        loadedBackend = ConcreteModel is { } embeddingModel
             ? BackendCatalog.Canonicalize(embeddingModel.Backend) : _options.DefaultBackend,
         defaultBackend = _options.DefaultBackend,
         supportedBackends = _options.SupportedBackends,
@@ -72,8 +76,8 @@ public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
         modelContextTokens = _model.MaxTokens,
         embeddingDimensions = _model.Dimensions,
         capabilities = new[] { "embedding" },
-        visionReady = false,
-        acceptsVisionProjector = false,
+        visionReady = _multimodal?.SupportsImages == true,
+        acceptsVisionProjector = _model.Architecture == "gemma-embedding2",
         defaultMaxTokens = _options.DefaultMaxTokens,
     });
 
@@ -86,9 +90,11 @@ public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
             var metadata = new Dictionary<string, object>
             {
                 ["general.architecture"] = _model.Architecture,
-                [_model.Architecture + ".embedding_length"] = _model.Dimensions,
+                [_model.Architecture + ".embedding_length"] = ConcreteModel?.HiddenSize ?? _model.Dimensions,
                 [_model.Architecture + ".context_length"] = _model.MaxTokens,
             };
+            if (_model.Architecture == "gemma-embedding2")
+                metadata["gemma-embedding2.embedding_length_out"] = _model.Dimensions;
             await context.Response.WriteAsJsonAsync(new { details = new { format = "gguf", family = _model.Architecture },
                 model_info = metadata, capabilities = new[] { "embedding" }, parameters = "", template = "" },
                 context.RequestAborted).ConfigureAwait(false);
@@ -136,11 +142,22 @@ public sealed class EmbeddingAdapter : IDisposable, IAsyncDisposable
                     throw Invalid("truncate must be a boolean.", "truncate");
                 truncate = truncateProperty.GetBoolean();
             }
-            var inputs = ParseInputs(input, openAI, truncate, context);
-            EmbeddingBatchResult result = inputs.Count == 0
-                ? new EmbeddingBatchResult(Array.Empty<float[]>(), 0)
-                : await _dispatcher.EmbedAsync(inputs, context.RequestAborted).ConfigureAwait(false);
-            if (result.Embeddings.Length != inputs.Count)
+            int inputCount;
+            EmbeddingBatchResult result;
+            if (input.ValueKind == JsonValueKind.Object || (input.ValueKind == JsonValueKind.Array &&
+                input.GetArrayLength() > 0 && input[0].ValueKind == JsonValueKind.Object))
+            {
+                inputCount = input.ValueKind == JsonValueKind.Object ? 1 : input.GetArrayLength();
+                result = await EmbedMediaAsync(input, context.RequestAborted).ConfigureAwait(false);
+            }
+            else
+            {
+                var inputs = ParseInputs(input, openAI, truncate, context);
+                inputCount = inputs.Count;
+                result = inputs.Count == 0 ? new EmbeddingBatchResult(Array.Empty<float[]>(), 0)
+                    : await _dispatcher.EmbedAsync(inputs, context.RequestAborted).ConfigureAwait(false);
+            }
+            if (result.Embeddings.Length != inputCount)
                 throw new InvalidOperationException("Embedding result count does not match input count.");
             float[][] embeddings = result.Embeddings.Select(vector => ResizeAndNormalize(vector, dimensions)).ToArray();
             if (openAI)

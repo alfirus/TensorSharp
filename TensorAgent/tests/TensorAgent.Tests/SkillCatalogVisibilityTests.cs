@@ -83,7 +83,7 @@ public sealed class SkillCatalogVisibilityTests
         // The two the app's own router depends on, named rather than merely counted:
         // they are the ones the alphabet dropped, and a count could pass while they are
         // the pair still missing.
-        foreach (string required in new[] { "documents", "research" })
+        foreach (string required in new[] { "documents", "find-skills", "research" })
         {
             Assert.Contains(plan.Catalog, skill =>
                 string.Equals(skill.Id, required, StringComparison.OrdinalIgnoreCase));
@@ -260,6 +260,25 @@ public sealed class SkillCatalogVisibilityTests
 
         Assert.True(result.Ok, result.Content);
         Assert.Contains("scripts/market_movers.py --quote", result.Content, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(8_192)]
+    [InlineData(32_768)]
+    public void FindSkillsRemainsDiscoverableWithoutInliningItsInstructions(int contextTokens)
+    {
+        SkillRegistry registry = BundledSkills();
+        SkillRequestPlan plan = DiscoveryPlan(registry, contextTokens);
+        Skill skill = Assert.Single(registry.Skills, skill => skill.Id == "find-skills");
+        string line = Assert.Single(plan.Prompt.Instructions.Split('\n'),
+            entry => entry.StartsWith("- find-skills:", StringComparison.Ordinal));
+
+        Assert.Equal("- find-skills: " + skill.Description, line);
+        Assert.Contains("Find, inspect and install skills", line, StringComparison.Ordinal);
+        Assert.Contains("Network switch", line, StringComparison.Ordinal);
+        Assert.Empty(plan.Prompt.Inlined);
+        Assert.DoesNotContain(skill.Manifest.Body, plan.Prompt.Instructions, StringComparison.Ordinal);
+        Assert.Contains(plan.ToolContext.Reachable, item => item.Id == skill.Id);
     }
 
     private static SkillRequestPlan DiscoveryPlan(SkillRegistry registry, int contextTokens)

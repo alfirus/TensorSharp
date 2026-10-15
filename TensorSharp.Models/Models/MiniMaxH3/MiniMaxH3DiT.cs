@@ -474,6 +474,7 @@ namespace TensorSharp.Models.MiniMaxH3
         public void ReleaseDeviceResidency()
         {
             if (_disposed) return;
+            _direct?.ReleaseDeviceResidency();
             foreach (IntPtr ptr in _bound)
                 if (ptr != IntPtr.Zero) GgmlBasicOps.InvalidateHostBuffer(ptr);
             // _bound is deliberately NOT cleared: the pointers stay valid, Dispose still

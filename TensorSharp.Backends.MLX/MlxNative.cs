@@ -18,7 +18,10 @@ namespace TensorSharp.MLX
         private const int MlxGpu = 1;
         private static readonly object initSync = new();
         private static readonly object errorSync = new();
-        private static readonly MlxErrorHandler ErrorHandler = CaptureError;
+        // Static reverse-P/Invoke entry points require no runtime-generated
+        // delegate trampolines, which are unavailable in Apple AOT builds.
+        private static readonly unsafe IntPtr ErrorHandlerPtr =
+            (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, void>)&CaptureError;
         private static readonly object fastKernelSync = new();
         private static bool resolverInstalled;
         private static bool errorHandlerInstalled;
@@ -3049,7 +3052,7 @@ if (simd_id == 0) {
 
         public static bool IsAvailable()
         {
-            if (!OperatingSystem.IsMacOS())
+            if (!OperatingSystem.IsMacOS() && !OperatingSystem.IsMacCatalyst())
                 return false;
 
             try
@@ -3185,15 +3188,13 @@ if (simd_id == 0) {
             return MlxWorker.Shared.Invoke(() => mlx_array_new_data(data, shape, shape.Length, mlxDtype));
         }
 
-        // Empty deleter for zero-copy MLX arrays whose buffer lifetime is
-        // owned by the caller (typically a long-lived GGUF mmap region or
-        // a pinned native buffer). Must remain a static field so the GC
-        // never collects the delegate (Metal holds the function pointer
-        // until the MLX array is freed).
-        private static readonly NoCopyDeleter NoOpDeleter = static (IntPtr _) => { };
+        // The caller owns zero-copy buffers (usually a mapped checkpoint).
+        // This AOT-safe native callback never frees the caller's allocation.
+        private static readonly unsafe IntPtr NoOpDeleterPtr =
+            (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, void>)&NoOpDeleter;
 
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void NoCopyDeleter(IntPtr ptr);
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void NoOpDeleter(IntPtr ptr) { }
 
         /// <summary>
         /// Wraps an existing host buffer as an MLX array WITHOUT copying.
@@ -3216,7 +3217,7 @@ if (simd_id == 0) {
                 throw new ArgumentException("MLX array shape must be non-empty.", nameof(shape));
 
             int mlxDtype = ToMlxDtype(dtype);
-            IntPtr dtorPtr = Marshal.GetFunctionPointerForDelegate<NoCopyDeleter>(NoOpDeleter);
+            IntPtr dtorPtr = NoOpDeleterPtr;
             return MlxWorker.Shared.Invoke(() =>
                 mlx_array_new_data_managed(data, shape, shape.Length, mlxDtype, dtorPtr));
         }
@@ -3321,21 +3322,16 @@ if (simd_id == 0) {
         // mlx_closure_apply, which we always invoke from the worker thread.
         // The worker is re-entrant, so the C# `trace` delegate is free to
         // call any MlxNative.* helper.
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private unsafe delegate int MlxClosureCallback(MlxVectorArray* result, MlxVectorArray input, IntPtr payload);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void MlxClosureDestructor(IntPtr payload);
-
-        private static readonly unsafe MlxClosureCallback ClosureCallbackDelegate = ClosureCallback;
-        private static readonly MlxClosureDestructor ClosureDestructorDelegate = ClosureDestructor;
-        private static readonly unsafe IntPtr ClosureCallbackPtr = Marshal.GetFunctionPointerForDelegate(ClosureCallbackDelegate);
-        private static readonly IntPtr ClosureDestructorPtr = Marshal.GetFunctionPointerForDelegate(ClosureDestructorDelegate);
+        private static readonly unsafe IntPtr ClosureCallbackPtr =
+            (IntPtr)(delegate* unmanaged[Cdecl]<MlxVectorArray*, MlxVectorArray, IntPtr, int>)&ClosureCallback;
+        private static readonly unsafe IntPtr ClosureDestructorPtr =
+            (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, void>)&ClosureDestructor;
 
         internal sealed class CompiledClosure
         {
             internal MlxClosure Compiled;
             internal GCHandle TraceHandle;
+            internal TraceFunc Trace;
             internal bool Disposed;
         }
 
@@ -3353,19 +3349,24 @@ if (simd_id == 0) {
             {
                 var holder = new CompiledClosure
                 {
-                    TraceHandle = GCHandle.Alloc(trace),
+                    Trace = trace,
                 };
+                holder.TraceHandle = GCHandle.Alloc(holder);
 
                 MlxClosure src = mlx_closure_new_func_payload(
                     ClosureCallbackPtr,
                     GCHandle.ToIntPtr(holder.TraceHandle),
                     ClosureDestructorPtr);
 
+                if (!src.IsValid)
+                {
+                    holder.TraceHandle.Free();
+                    holder.Trace = null;
+                    throw new InvalidOperationException("mlx_closure_new_func_payload returned null.");
+                }
+
                 try
                 {
-                    if (!src.IsValid)
-                        throw new InvalidOperationException("mlx_closure_new_func_payload returned null.");
-
                     Check(mlx_compile(out holder.Compiled, src, shapeless), "compiling MLX closure");
                 }
                 finally
@@ -3446,10 +3447,10 @@ if (simd_id == 0) {
             {
                 if (holder.Compiled.IsValid)
                     _ = mlx_closure_free(holder.Compiled);
-                // Destructor handles GCHandle.Free(); guard against MLX not
-                // firing it (e.g. if compile failed) by checking handle.
-                if (holder.TraceHandle.IsAllocated)
-                    holder.TraceHandle.Free();
+                // The native payload destructor owns the GCHandle. MLX may
+                // retain closure copies; freeing it here would invalidate their
+                // callback payload or double-free a handle already released by
+                // the destructor.
             });
         }
 
@@ -3467,6 +3468,7 @@ if (simd_id == 0) {
         //   stores them in `result`; we then release our reference so that
         //   when `result` is later freed (by the apply caller) the final
         //   ref drops as expected.
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static unsafe int ClosureCallback(MlxVectorArray* result, MlxVectorArray input, IntPtr payload)
         {
             MlxArray[] inputs = null;
@@ -3475,7 +3477,7 @@ if (simd_id == 0) {
             {
                 if (result == null || payload == IntPtr.Zero) return 1;
                 var handle = GCHandle.FromIntPtr(payload);
-                var trace = handle.Target as TraceFunc;
+                var trace = (handle.Target as CompiledClosure)?.Trace;
                 if (trace == null) return 1;
 
                 int n = (int)mlx_vector_array_size(input);
@@ -3536,23 +3538,25 @@ if (simd_id == 0) {
             }
         }
 
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static void ClosureDestructor(IntPtr payload)
         {
-            // MLX guarantees the destructor runs exactly once when the
-            // compiled closure is freed. We free the GCHandle here; the
-            // matching CompiledClosure.Disposed=true is set by our
-            // FreeCompiledClosure caller (or it will be set after this fires
-            // — either way GCHandle is freed exactly once because we guard
-            // with IsAllocated on the manual path).
+            // Native shared ownership calls this once, after the final closure
+            // copy is released. Update the holder's handle rather than freeing
+            // a stale GCHandle copy a second time in FreeCompiledClosure.
             try
             {
                 if (payload == IntPtr.Zero) return;
-                var handle = GCHandle.FromIntPtr(payload);
-                if (handle.IsAllocated)
-                    handle.Free();
+                if (GCHandle.FromIntPtr(payload).Target is CompiledClosure holder)
+                {
+                    holder.Trace = null;
+                    if (holder.TraceHandle.IsAllocated)
+                        holder.TraceHandle.Free();
+                }
             }
             catch
             {
+                // Managed exceptions must never escape a native callback.
             }
         }
 
@@ -8378,7 +8382,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         {
             try
             {
-                if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
+                if (OperatingSystem.IsMacOS() || OperatingSystem.IsMacCatalyst() || OperatingSystem.IsLinux())
                 {
                     return TensorSharp.Memory.HostMemoryInfo.Capture().Total;
                 }
@@ -8448,16 +8452,25 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 if (errorHandlerInstalled)
                     return;
 
-                mlx_set_error_handler(ErrorHandler, IntPtr.Zero, IntPtr.Zero);
+                mlx_set_error_handler(ErrorHandlerPtr, IntPtr.Zero, IntPtr.Zero);
                 errorHandlerInstalled = true;
             }
         }
 
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static void CaptureError(IntPtr message, IntPtr data)
         {
-            string text = Marshal.PtrToStringAnsi(message) ?? string.Empty;
-            lock (errorSync)
-                lastError = text;
+            try
+            {
+                string text = Marshal.PtrToStringAnsi(message) ?? string.Empty;
+                lock (errorSync)
+                    lastError = text;
+            }
+            catch
+            {
+                // Preserve the native return-code failure even if capturing its
+                // optional diagnostic fails; never unwind into native code.
+            }
         }
 
         private static void ClearCapturedError()
@@ -8582,9 +8595,6 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             foreach (string part in value.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
                 yield return part;
         }
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void MlxErrorHandler(IntPtr message, IntPtr data);
 
         private static int ToMlxDtype(DType dtype)
         {
@@ -8733,7 +8743,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_set_error_handler")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial void mlx_set_error_handler(MlxErrorHandler handler, IntPtr data, IntPtr destructor);
+        private static partial void mlx_set_error_handler(IntPtr handler, IntPtr data, IntPtr destructor);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_device_new_type")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

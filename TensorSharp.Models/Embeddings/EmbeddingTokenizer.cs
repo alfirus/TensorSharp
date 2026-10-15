@@ -35,7 +35,23 @@ internal sealed class EmbeddingTokenizer : ITokenizer, ISpecialTokenVocabulary
     public int VocabSize => Vocab.Length;
     public IReadOnlyCollection<int> SpecialTokenIds { get; }
 
-    public static ITokenizer Create(GgufFile file) => new EmbeddingTokenizer(file);
+    public static ITokenizer Create(GgufFile file)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        if (file.GetString("tokenizer.ggml.model", "") != "gemma4") return new EmbeddingTokenizer(file);
+        var vocabulary = file.GetStringArray("tokenizer.ggml.tokens")
+            ?? throw new InvalidDataException("Embedding GGUF has no tokenizer vocabulary.");
+        var types = file.GetInt32Array("tokenizer.ggml.token_type");
+        var merges = file.GetStringArray("tokenizer.ggml.merges")
+            ?? throw new InvalidDataException("Gemma embedding tokenizer requires BPE merge ranks.");
+        int bos = ReadId(file, "bos_token_id", -1), eos = ReadId(file, "eos_token_id", -1);
+        if (vocabulary.Length == 0 || (types != null && types.Length != vocabulary.Length) ||
+            (uint)bos >= (uint)vocabulary.Length || (uint)eos >= (uint)vocabulary.Length)
+            throw new InvalidDataException("Gemma embedding tokenizer has invalid vocabulary or special token IDs.");
+        return new BpeTokenizer(vocabulary, types, merges, bos, [eos],
+            file.GetBool("tokenizer.ggml.add_bos_token", true),
+            file.GetBool("tokenizer.ggml.add_eos_token", true), "gemma4");
+    }
 
     private EmbeddingTokenizer(GgufFile file)
     {

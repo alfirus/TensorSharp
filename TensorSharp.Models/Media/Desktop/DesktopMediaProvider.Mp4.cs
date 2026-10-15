@@ -19,6 +19,7 @@ using System.Diagnostics;
 using System.IO;
 using OpenCvSharp;
 using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.Video;
 
 namespace TensorSharp.Models.Media.Desktop
 {
@@ -52,7 +53,31 @@ namespace TensorSharp.Models.Media.Desktop
                 "Install ffmpeg (https://ffmpeg.org) to enable video export.");
         }
 
-        private static bool TrySaveWithFfmpeg(string path, RgbImage[] frames, int fps)
+        /// <summary>Encode the generated soundtrack into the MP4 using FFmpeg.
+        /// OS-only video writers retain their video-only fallback behavior.</summary>
+        public string SaveMp4(string path, RgbImage[] frames, int fps, GeneratedVideoAudio audio, out bool audioMuxed)
+        {
+            audioMuxed = false;
+            if (audio is not { ChannelCount: > 0, SampleCount: > 0, SampleRate: > 0 })
+                return SaveMp4(path, frames, fps);
+            if (frames == null || frames.Length == 0) throw new ArgumentException("no frames to save", nameof(frames));
+            foreach (float[] channel in audio.Channels)
+            {
+                if (channel == null || channel.Length != audio.SampleCount)
+                    throw new ArgumentException("audio channels must have equal sample counts", nameof(audio));
+                foreach (float value in channel)
+                    if (!float.IsFinite(value)) throw new ArgumentException("audio samples must be finite", nameof(audio));
+            }
+            if (TrySaveWithFfmpeg(path, frames, fps > 0 ? fps : 16, audio))
+            {
+                audioMuxed = true;
+                return "h264";
+            }
+            Console.WriteLine("  [video] the MP4 soundtrack requires FFmpeg; exporting video only.");
+            return SaveMp4(path, frames, fps);
+        }
+
+        private static bool TrySaveWithFfmpeg(string path, RgbImage[] frames, int fps, GeneratedVideoAudio audio = null)
         {
             string ffmpeg = FindFfmpeg();
             if (ffmpeg == null) return false;
@@ -64,15 +89,30 @@ namespace TensorSharp.Models.Media.Desktop
                 for (int i = 0; i < frames.Length; i++)
                     ImageIO.SavePng(Path.Combine(tmpDir, $"f{i:D5}.png"), frames[i]);
 
+                string audioPath = Path.Combine(tmpDir, "audio.f32");
+                if (audio != null)
+                {
+                    using var writer = new BinaryWriter(File.Create(audioPath));
+                    for (int sample = 0; sample < audio.SampleCount; ++sample)
+                        for (int channel = 0; channel < audio.ChannelCount; ++channel)
+                            writer.Write(audio.Channels[channel][sample]);
+                }
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = ffmpeg,
-                    Arguments = $"-y -loglevel error -framerate {fps} -i \"{Path.Combine(tmpDir, "f%05d.png")}\" " +
-                                $"-c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart \"{path}\"",
                     UseShellExecute = false,
                     RedirectStandardError = true,
                     CreateNoWindow = true,
                 };
+                foreach (string value in new[] { "-y", "-loglevel", "error", "-framerate", fps.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    "-i", Path.Combine(tmpDir, "f%05d.png") }) psi.ArgumentList.Add(value);
+                if (audio != null)
+                    foreach (string value in new[] { "-f", "f32le", "-ar", audio.SampleRate.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        "-ac", audio.ChannelCount.ToString(System.Globalization.CultureInfo.InvariantCulture), "-i", audioPath,
+                        "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k" }) psi.ArgumentList.Add(value);
+                foreach (string value in new[] { "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart", path }) psi.ArgumentList.Add(value);
                 using var proc = Process.Start(psi);
                 string err = proc.StandardError.ReadToEnd();
                 proc.WaitForExit();

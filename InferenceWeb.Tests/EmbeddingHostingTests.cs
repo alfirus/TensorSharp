@@ -51,7 +51,6 @@ public class EmbeddingHostingTests : IDisposable
     [InlineData("--embeddings")]
     [InlineData("--embedding-threads", "4")]
     [InlineData("--embedding-context-size", "4096")]
-    [InlineData("--embeddings", "--model", "model.gguf", "--mmproj", "projector.gguf")]
     [InlineData("--embeddings", "--model", "model.gguf", "--embedding-threads", "-1")]
     [InlineData("--embeddings", "--model", "model.gguf", "--embedding-context-size", "zero")]
     public void InvalidEmbeddingOptions_FailAtStartup(params string[] args)
@@ -144,21 +143,38 @@ public class EmbeddingHostingTests : IDisposable
     [InlineData("ggml_cpu", "GGML_CPU")]
     [InlineData("ggml_metal", "GGML_METAL")]
     [InlineData("ggml_cuda", "GGML_CUDA")]
+    [InlineData("cuda", "CUDA")]
+    [InlineData("direct-cuda", "CUDA")]
+    [InlineData("mlx", "MLX")]
     public void EmbeddingBackendVocabulary_KeepsManagedAndNativeChoicesDistinct(string hosted, string model)
     {
         Assert.Equal(model, EmbeddingHosting.ResolveModelBackend(hosted));
     }
 
     [Theory]
-    [InlineData("cuda")]
-    [InlineData("direct-cuda")]
-    [InlineData("mlx")]
     [InlineData("ggml_vulkan")]
     public void UnsupportedEmbeddingBackend_IsRejectedBeforeAvailabilityFallback(string backend)
     {
         var error = Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(
             ["--model", "encoder.gguf", "--embeddings", "--backend", backend, "--no-skills"], _directory));
         Assert.Contains("cpu (pure C#)", error.Message);
+    }
+
+    [Theory]
+    [InlineData("cpu")]
+    [InlineData("ggml_metal")]
+    [InlineData("cuda")]
+    [InlineData("direct-cuda")]
+    [InlineData("mlx")]
+    public void EmbeddingConfigurationAcceptsTextAndProjectorPathsWithEachBackendVocabulary(string backend)
+    {
+        string[] args = ["--model", "embeddinggemma-2.gguf", "--mmproj", "embeddinggemma-2-mmproj.gguf",
+            "--embeddings", "--backend", backend, "--no-skills"];
+        ServerHostingOptions options = ServerOptionsBuilder.Build(args, _directory);
+        Assert.True(options.EmbeddingsEnabled);
+        Assert.EndsWith("embeddinggemma-2.gguf", options.StartupModelPath);
+        Assert.EndsWith("embeddinggemma-2-mmproj.gguf", options.StartupMmProjPath);
+        Assert.Equal(backend, ServerOptionsBuilder.ReadConfiguredBackendInput(args));
     }
 
     [Theory]

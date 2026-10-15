@@ -54,28 +54,46 @@
     </Content>
   </ItemGroup>
 
-  <Target Name="ResolveCudaPtxBuildSettings">
+  <Target Name="DetectCudaPtxBuildSettings">
     <Exec Command="nvcc --version" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_NvccExitCode" />
     </Exec>
-    <Exec Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
+    <Exec Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' == 'true'"
           Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(CudaArchResolverPs1)&quot; -FallbackArch &quot;$(CudaArchFallback)&quot;"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
       <Output TaskParameter="ExitCode" PropertyName="_DetectCudaArchExitCode" />
     </Exec>
-    <Exec Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
+    <Exec Condition="'$(_NvccExitCode)' == '0' And '$(TensorSharpUpdateCommittedPtx)' != 'true' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$([MSBuild]::IsOSPlatform(Windows))' != 'true'"
           Command="sh &quot;$(CudaArchResolverSh)&quot; &quot;$(CudaArchFallback)&quot;"
           ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_DetectedCudaArch" />
       <Output TaskParameter="ExitCode" PropertyName="_DetectCudaArchExitCode" />
     </Exec>
-    <PropertyGroup Condition="'$(_NvccExitCode)' == '0'">
-      <_ResolvedCudaArch Condition="'$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native'">$(CudaArch)</_ResolvedCudaArch>
+  </Target>
+
+  <!-- Keep architecture resolution independent of the installed toolchain so
+       the portable-baseline policy can also be checked without nvcc or a GPU. -->
+  <Target Name="ResolveCudaPtxArchitecture">
+    <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native' And '$(CudaArch)' != 'compute_61' And '$(CudaArch)' != 'sm_61'"
+           Text="The committed CUDA PTX baseline must target compute_61 for machines without nvcc. Use -p:CudaArch=compute_61 (with a toolkit that supports it), or omit TensorSharpUpdateCommittedPtx for a GPU-specific local build. Requested target: $(CudaArch)." />
+    <PropertyGroup>
+      <_ResolvedCudaArch Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true'">compute_61</_ResolvedCudaArch>
+      <_ResolvedCudaArch Condition="'$(TensorSharpUpdateCommittedPtx)' != 'true' And '$(CudaArch)' != 'auto' And '$(CudaArch)' != 'native'">$(CudaArch)</_ResolvedCudaArch>
       <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == '' And '$(_DetectCudaArchExitCode)' == '0' And '$(_DetectedCudaArch)' != ''">$(_DetectedCudaArch.Trim())</_ResolvedCudaArch>
       <_ResolvedCudaArch Condition="'$(_ResolvedCudaArch)' == ''">$(CudaArchFallback)</_ResolvedCudaArch>
       <_CudaBuildSettingsKey>$(_ResolvedCudaArch.Replace('compute_', 'compute_').Replace('sm_', 'sm_'))_$(CudaNvccOptimizationFlags.Replace(' ', '_').Replace('-', ''))$(CudaFastMathFlag.Replace(' ', '_').Replace('-', ''))</_CudaBuildSettingsKey>
     </PropertyGroup>
+  </Target>
+
+  <Target Name="ResolveCudaPtxBuildSettings" DependsOnTargets="DetectCudaPtxBuildSettings;ResolveCudaPtxArchitecture">
+    <Error Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' != '0'"
+           Text="Refreshing the committed CUDA PTX baseline requires nvcc on PATH and a toolkit that supports compute_61. Omit TensorSharpUpdateCommittedPtx to build with the existing committed kernels." />
+    <!-- PTX files share one output directory across architecture settings.
+         A prior compute_61 stamp cannot prove that later GPU-specific output
+         is portable. Invalidate it for explicit baseline refreshes only. -->
+    <Delete Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true'"
+            Files="$(CudaPtxStampDir)/tensorsharp_cuda_$(_CudaBuildSettingsKey).stamp" />
     <Message Condition="'$(_NvccExitCode)' == '0' And ('$(CudaArch)' == 'auto' Or '$(CudaArch)' == 'native') And '$(_DetectCudaArchExitCode)' != '' And '$(_DetectCudaArchExitCode)' != '0'"
              Importance="high"
              Text="WARNING: TensorSharp CUDA architecture detection failed; using $(CudaArchFallback)." />
@@ -98,6 +116,14 @@
       <Content Remove="$(CudaCommittedPtxDir)/*.ptx" />
       <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')">
         <Link>cuda_kernels\%(Filename).ptx</Link>
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      </Content>
+    </ItemGroup>
+    <ItemGroup Condition="'$(_NvccExitCode)' != '0'">
+      <!-- A previous GPU-specific build can be newer than the portable
+           baseline. Replace it even when timestamps would preserve it. -->
+      <Content Update="$(CudaCommittedPtxDir)/*.ptx">
         <CopyToOutputDirectory>Always</CopyToOutputDirectory>
         <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </Content>
@@ -157,7 +183,7 @@
                       Overwrite="true" />
   </Target>
 
-  <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx">
+  <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx" Condition="'$(_NvccExitCode)' == '0'">
     <ItemGroup>
       <!-- Match SelectCudaPtxContent and SDK publish: without nvcc, a stale
            local obj file is not an authorized replacement for the baseline. -->
@@ -177,12 +203,14 @@
          dotnet build TensorSharp.Backends.Cuda -p:TensorSharpUpdateCommittedPtx=true
        Run this after editing a .cu kernel and commit the resulting diff -
        machines without nvcc run the committed PTX, so a kernel change that is
-       not regenerated here ships silently-stale kernels to them. Keep the
-       committed baseline's architecture stable (see DEVELOPMENT.md) so diffs
-       reflect real kernel changes. -->
+       not regenerated here ships silently-stale kernels to them. The
+       committed baseline targets compute_61 even on newer GPUs; auto/native
+       resolve to that portable target only for this opt-in operation. -->
   <Target Name="UpdateCommittedCudaPtx"
           AfterTargets="CompileCudaPtx"
           Condition="'$(TensorSharpUpdateCommittedPtx)' == 'true' And '$(_NvccExitCode)' == '0'">
+    <Error Condition="'$(_ResolvedCudaArch)' != 'compute_61'"
+           Text="Refusing to overwrite the portable committed CUDA PTX baseline with target $(_ResolvedCudaArch). Rebuild with -p:CudaArch=compute_61." />
     <Copy SourceFiles="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')"
           DestinationFolder="$(CudaCommittedPtxDir)"
           SkipUnchangedFiles="true" />

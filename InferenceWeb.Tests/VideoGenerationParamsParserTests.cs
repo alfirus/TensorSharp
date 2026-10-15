@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System.Text.Json;
+using TensorSharp.Models.MiniMaxH3;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.RequestParsers;
 
@@ -113,8 +114,74 @@ public class VideoGenerationParamsParserTests : IDisposable
         Assert.Null(parsed.ImageBytes);
     }
 
+    [Theory]
+    [InlineData(0L)]
+    [InlineData(42L)]
+    [InlineData(-1L)]
+    public void Parse_ExplicitSeedIncludesZeroForReproducibleGeneration(long seed)
+    {
+        using var doc = JsonDocument.Parse($$"""{"seed":{{seed}}}""");
+        var parsed = VideoGenerationParamsParser.Parse(doc.RootElement, BuildOptions(17, 24), out string error);
+        Assert.Null(error);
+        Assert.Equal(seed, parsed.Seed);
+    }
+
     // ---- model-agnostic fields added alongside the second video model ----------
     // Every one is accepted in camelCase (web UI) and snake_case (OpenAI-shaped route).
+
+    [Theory]
+    [InlineData("imageConditions", "imagePath", "frameIndex")]
+    [InlineData("image_conditions", "image_path", "frame_index")]
+    [InlineData("image_conditions", "image_path", "frame_idx")]
+    public void Parse_ImageKeyframesResolveUploadsAndRetainExactPositionsAndStrength(
+        string list, string image, string frame)
+    {
+        var options = BuildOptions(17, 24);
+        WriteUpload(options, "first.png");
+        WriteUpload(options, "last.png");
+        using var doc = JsonDocument.Parse($$"""{"{{list}}":[{"{{image}}":"first.png","{{frame}}":5,"strength":0.65},{"{{image}}":"last.png","{{frame}}":-1}]}""");
+        var parsed = VideoGenerationParamsParser.Parse(doc.RootElement, options, out string error);
+        Assert.Null(error);
+        Assert.Equal(new[] { 5, -1 }, parsed.ImageConditions.Select(c => c.FrameIndex));
+        Assert.Equal(.65f, parsed.ImageConditions[0].Strength);
+        Assert.Equal(1f, parsed.ImageConditions[1].Strength);
+        Assert.All(parsed.ImageConditions, c => Assert.True(File.Exists(c.ImagePath)));
+        Assert.Null(parsed.ImageBytes);
+    }
+
+    [Fact]
+    public void Parse_ImageKeyframesAcceptInlineDataUrls()
+    {
+        var options = BuildOptions(17, 24);
+        using var doc = JsonDocument.Parse("""{"imageConditions":[{"image":"data:image/png;base64,AQID","frameIndex":0,"strength":0}]}""");
+        var parsed = VideoGenerationParamsParser.Parse(doc.RootElement, options, out string error);
+        Assert.Null(error);
+        var condition = Assert.Single(parsed.ImageConditions);
+        Assert.Equal(new byte[] { 1, 2, 3 }, condition.ImageBytes);
+        Assert.Equal(0f, condition.Strength);
+    }
+
+    [Theory]
+    [InlineData("""{"imageConditions":{}}""")]
+    [InlineData("""{"imageConditions":[42]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID"}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID","frameIndex":-2}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID","frameIndex":0.5}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID","frameIndex":0,"strength":1.01}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID","frameIndex":0,"strength":-0.01}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID","frameIndex":0,"strength":1e99}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"invalid","frameIndex":0}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"","frameIndex":0}]}""")]
+    [InlineData("""{"imageConditions":[{"imagePath":"../../../etc/passwd","frameIndex":0}]}""")]
+    [InlineData("""{"imageConditions":[{"imagePath":"never-uploaded.png","frameIndex":0}]}""")]
+    [InlineData("""{"imageConditions":[{"image":"AQID","frameIndex":0},{"image":"AQID","frameIndex":0}]}""")]
+    public void Parse_InvalidImageKeyframesAreRejectedBeforeInference(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        var parsed = VideoGenerationParamsParser.Parse(doc.RootElement, BuildOptions(17, 24), out string error);
+        Assert.NotNull(error);
+        Assert.Null(parsed.ImageConditions);
+    }
 
     [Fact]
     public void Parse_GenerateAudio_DefaultsToTrueAndAcceptsBothSpellings()
@@ -260,6 +327,63 @@ public class VideoGenerationParamsParserTests : IDisposable
         // Unset means "infer it from what the request supplies", which is what every
         // deployment offering more than one mode wants.
         Assert.Null(VideoGenerationParamsParser.Parse(doc.RootElement, options, out _).Mode);
+    }
+
+    [Theory]
+    [InlineData("i2v", "fl2v", MiniMaxH3Partition.FirstLastFrame, MiniMaxH3Mode.ImageToVideo)]
+    [InlineData("fl2v", "i2v", MiniMaxH3Partition.FirstLastFrame, MiniMaxH3Mode.FirstLastFrame)]
+    [InlineData("ref", "i2v", MiniMaxH3Partition.Reference, MiniMaxH3Mode.Reference)]
+    public void Parse_UploadedChatImages_UseRequestModeAndRetainNumericStartupDefaults(
+        string requestMode, string startupMode, MiniMaxH3Partition partition, MiniMaxH3Mode expectedMode)
+    {
+        var options = ServerOptionsBuilder.Build(
+            ["--video-mode", startupMode, "--video-frames", "144", "--fps", "24"], _baseDir);
+        string first = WriteUpload(options, "banner_1.png");
+        string last = WriteUpload(options, "last.png");
+        var payload = new Dictionary<string, object> { ["videoMode"] = requestMode };
+        if (requestMode == "ref")
+            payload["referenceImages"] = new[] { first };
+        else
+            payload["imagePath"] = first;
+        if (requestMode == "fl2v")
+            payload["endImage"] = last;
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(payload));
+
+        var parsed = VideoGenerationParamsParser.Parse(doc.RootElement, options, out string error);
+
+        Assert.Null(error);
+        Assert.Equal(requestMode, parsed.Mode);
+        Assert.Equal(144, parsed.Frames);
+        Assert.Equal(24, parsed.Fps);
+        Assert.Equal(expectedMode, MiniMaxH3ModeResolver.Resolve(parsed, partition));
+        if (requestMode == "ref")
+        {
+            Assert.Equal(Path.Combine(options.UploadDirectory, first), Assert.Single(parsed.ReferenceImagePaths));
+            Assert.Null(parsed.ImageBytes);
+        }
+        else
+        {
+            Assert.Equal(File.ReadAllBytes(Path.Combine(options.UploadDirectory, first)), parsed.ImageBytes);
+            Assert.Null(parsed.ImagePath); // The uploaded image is handed to the model as bytes.
+        }
+        if (requestMode == "fl2v")
+            Assert.Equal(Path.Combine(options.UploadDirectory, last), parsed.EndImagePath);
+    }
+
+    [Fact]
+    public void Parse_ExplicitApiMode_IsNotChangedToAccommodateAnIncompatibleCheckpoint()
+    {
+        var options = ServerOptionsBuilder.Build(["--video-mode", "ref"], _baseDir);
+        string first = WriteUpload(options, "banner_1.png");
+        using var doc = JsonDocument.Parse($$"""{"videoMode":"i2v","imagePath":"{{first}}"}""");
+
+        var parsed = VideoGenerationParamsParser.Parse(doc.RootElement, options, out string error);
+
+        Assert.Null(error);
+        Assert.Equal("i2v", parsed.Mode);
+        var rejection = Assert.Throws<InvalidOperationException>(
+            () => MiniMaxH3ModeResolver.Resolve(parsed, MiniMaxH3Partition.Reference));
+        Assert.Contains("FL2VA checkpoint", rejection.Message);
     }
 
     // Drop a file into the server's upload directory and return the bare name a

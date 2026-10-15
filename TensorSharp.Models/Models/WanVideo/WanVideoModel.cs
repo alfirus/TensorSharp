@@ -301,6 +301,7 @@ namespace TensorSharp.Models.WanVideo
         // Wan is video-only and takes at most a first-frame image; the reference-conditioning
         // and joint-audio paths belong to other families (MiniMax-H3).
         string IVideoGenerationModel.VideoModelFamily => "wan";
+        int IVideoGenerationModel.DefaultPreviewFrames => 21;
         bool IVideoGenerationModel.SupportsAudio => false;
         bool IVideoGenerationModel.SupportsImageConditioning => true;
         bool IVideoGenerationModel.SupportsEndImageConditioning => false;

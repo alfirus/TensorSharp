@@ -16,6 +16,10 @@ using NVorbis;
 
 namespace TensorSharp.Models
 {
+    /// <summary>Audio logarithm policy. HuggingFaceAddFloor is the model default;
+    /// LlamaClampFloor is available for explicit reference comparisons.</summary>
+    public enum Gemma4AudioLogPolicy { HuggingFaceAddFloor, LlamaClampFloor }
+
     public class Gemma4AudioPreprocessor
     {
         private const int SampleRate = 16000;
@@ -30,26 +34,34 @@ namespace TensorSharp.Models
         private static readonly int HopLength = (int)Math.Round(SampleRate * HopLengthMs / 1000.0); // 160
         private static readonly int FftLength = ComputeFftLength();
         private static readonly int NumFreqBins = FftLength / 2 + 1;
+        private static readonly Complex[][] FftTwiddles = BuildFftTwiddles();
         private static readonly double[] HannWindow = BuildWindow();
-        private static readonly float[] MelFilters = BuildMelFilterBank(NumFreqBins, MelBins, MinFrequency, MaxFrequency, SampleRate);
+        private static readonly MelFilter[] MelFilters = BuildMelFilterBank(NumFreqBins, MelBins, MinFrequency, MaxFrequency, SampleRate);
+
+        // Each triangular mel filter has only a few nonzero FFT bins. Store its
+        // contiguous support in ascending-bin order rather than rereading a
+        // mostly zero, strided 257-by-128 matrix for every analysis frame.
+        private readonly record struct MelFilter(int FirstBin, double[] Weights);
 
         public static float[] DecodeAudioFile(string path)
         {
             string ext = Path.GetExtension(path).ToLowerInvariant();
-            return ext switch
+            float[] samples = ext switch
             {
                 ".wav" => DecodeWAV(File.ReadAllBytes(path)),
                 ".mp3" => DecodeMp3(path),
                 ".ogg" => DecodeOgg(path),
                 _ => DecodeViaPlatform(path),
             };
+            ValidateSamples(samples);
+            return samples;
         }
 
         /// <summary>
         /// Every extension the managed decoders above do not handle (.m4a / .aac / .caf from
         /// Voice Memos, .flac, ...) goes to the platform audio decoder on
         /// <see cref="TensorSharp.Models.Media.MediaCodecs.Audio"/>, which returns native-rate
-        /// planar PCM. The fold to mono (float average, as the MP3/OGG paths do) and the
+        /// planar PCM. The fold to mono and the
         /// resampler are this file's own, so the mel pipeline sees exactly what it always has.
         /// With no platform decoder registered this throws the provider's
         /// <see cref="NotSupportedException"/>, which names what to register.
@@ -57,22 +69,28 @@ namespace TensorSharp.Models
         private static float[] DecodeViaPlatform(string path)
         {
             TensorSharp.Models.Video.DecodedAudio raw = TensorSharp.Models.Media.MediaCodecs.Audio.Decode(path);
-            if (raw is not { ChannelCount: > 0, SampleCount: > 0 })
+            if (raw?.Channels is not { Length: > 0 } || raw.Channels[0] is not { Length: > 0 } || raw.SampleRate <= 0)
                 throw new InvalidDataException($"The platform audio decoder returned no samples for '{path}'.");
 
             int channels = raw.ChannelCount;
             int totalFrames = raw.SampleCount;
+            foreach (float[] channel in raw.Channels)
+            {
+                if (channel == null || channel.Length != totalFrames)
+                    throw new InvalidDataException("The platform audio decoder returned inconsistent channel lengths.");
+                ValidateSamples(channel);
+            }
             float[] mono = new float[totalFrames];
             for (int i = 0; i < totalFrames; i++)
             {
-                float sum = 0;
+                double sum = 0;
                 for (int ch = 0; ch < channels; ch++)
                     sum += raw.Channels[ch][i];
-                mono[i] = sum / channels;
+                mono[i] = (float)(sum / channels);
             }
 
             if (raw.SampleRate != SampleRate)
-                mono = ResampleLinear(mono, raw.SampleRate, SampleRate);
+                mono = Gemma4AudioResampler.Resample(mono, raw.SampleRate, SampleRate);
             return mono;
         }
 
@@ -93,6 +111,7 @@ namespace TensorSharp.Models
             }
 
             float[] interleaved = allSamples.ToArray();
+            ValidateSamples(interleaved);
             int totalFrames = interleaved.Length / channels;
             float[] mono = new float[totalFrames];
             for (int i = 0; i < totalFrames; i++)
@@ -104,7 +123,7 @@ namespace TensorSharp.Models
             }
 
             if (mpegSampleRate != SampleRate)
-                mono = ResampleLinear(mono, mpegSampleRate, SampleRate);
+                mono = Gemma4AudioResampler.Resample(mono, mpegSampleRate, SampleRate);
             return mono;
         }
 
@@ -124,6 +143,7 @@ namespace TensorSharp.Models
             }
 
             float[] interleaved = allSamples.ToArray();
+            ValidateSamples(interleaved);
             int totalFrames = interleaved.Length / channels;
             float[] mono = new float[totalFrames];
             for (int i = 0; i < totalFrames; i++)
@@ -135,36 +155,55 @@ namespace TensorSharp.Models
             }
 
             if (oggSampleRate != SampleRate)
-                mono = ResampleLinear(mono, oggSampleRate, SampleRate);
+                mono = Gemma4AudioResampler.Resample(mono, oggSampleRate, SampleRate);
             return mono;
         }
 
         public static float[] DecodeWAV(byte[] data)
         {
+            ArgumentNullException.ThrowIfNull(data);
             if (data.Length < 12 || System.Text.Encoding.ASCII.GetString(data, 0, 4) != "RIFF" ||
                 System.Text.Encoding.ASCII.GetString(data, 8, 4) != "WAVE")
-                throw new Exception("Not a WAV file");
+                throw new InvalidDataException("Not a WAV file.");
+            uint riffLength = BitConverter.ToUInt32(data, 4);
+            if (riffLength < 4 || riffLength > data.Length - 8)
+                throw new InvalidDataException("WAV RIFF length exceeds the available data.");
+            int riffEnd = checked((int)riffLength + 8);
 
             ushort audioFormat = 0;
-            int numChannels = 0, sampleRate = 0, bitsPerSample = 0;
+            int numChannels = 0, sampleRate = 0, bitsPerSample = 0, blockAlign = 0;
             byte[] audioData = null;
             bool foundFmt = false;
 
             int offset = 12;
-            while (offset + 8 <= data.Length)
+            while (offset < riffEnd)
             {
+                if (riffEnd - offset < 8) throw new InvalidDataException("WAV chunk header is truncated.");
                 string chunkId = System.Text.Encoding.ASCII.GetString(data, offset, 4);
-                int chunkSize = BitConverter.ToInt32(data, offset + 4);
-                int chunkEnd = Math.Min(offset + 8 + chunkSize, data.Length);
+                uint declaredSize = BitConverter.ToUInt32(data, offset + 4);
+                if (declaredSize > (uint)(riffEnd - offset - 8))
+                    throw new InvalidDataException("WAV chunk length exceeds the available data.");
+                int chunkSize = checked((int)declaredSize);
+                int chunkEnd = offset + 8 + chunkSize;
 
-                if (chunkId == "fmt " && chunkEnd - offset - 8 >= 16)
+                if (chunkId == "fmt ")
                 {
+                    if (chunkSize < 16) throw new InvalidDataException("WAV format chunk is truncated.");
                     audioFormat = BitConverter.ToUInt16(data, offset + 8);
                     numChannels = BitConverter.ToUInt16(data, offset + 10);
                     sampleRate = BitConverter.ToInt32(data, offset + 12);
+                    blockAlign = BitConverter.ToUInt16(data, offset + 20);
                     bitsPerSample = BitConverter.ToUInt16(data, offset + 22);
-                    if (audioFormat == 0xFFFE && chunkEnd - offset - 8 >= 26)
+                    if (audioFormat == 0xFFFE)
+                    {
+                        if (chunkSize < 40 || BitConverter.ToUInt16(data, offset + 24) < 22)
+                            throw new InvalidDataException("WAV extensible format chunk is truncated.");
+                        var subtype = new Guid(data.AsSpan(offset + 32, 16));
+                        if (subtype != new Guid("00000001-0000-0010-8000-00aa00389b71") &&
+                            subtype != new Guid("00000003-0000-0010-8000-00aa00389b71"))
+                            throw new NotSupportedException($"Unsupported WAV extensible subtype: {subtype}.");
                         audioFormat = BitConverter.ToUInt16(data, offset + 32);
+                    }
                     foundFmt = true;
                 }
                 else if (chunkId == "data")
@@ -173,18 +212,25 @@ namespace TensorSharp.Models
                     Array.Copy(data, offset + 8, audioData, 0, audioData.Length);
                 }
 
-                offset += 8 + chunkSize;
-                if (chunkSize % 2 != 0) offset++;
+                if ((chunkSize & 1) != 0 && chunkEnd == riffEnd)
+                    throw new InvalidDataException("WAV odd-length chunk is missing its padding byte.");
+                offset = chunkEnd + (chunkSize & 1);
             }
 
-            if (!foundFmt) throw new Exception("No fmt chunk in WAV");
+            if (!foundFmt) throw new InvalidDataException("No format chunk in WAV.");
             if (audioFormat != 1 && audioFormat != 3)
-                throw new Exception($"Unsupported WAV format: {audioFormat}");
-            if (audioData == null) throw new Exception("No data chunk in WAV");
+                throw new NotSupportedException($"Unsupported WAV format: {audioFormat}.");
+            if (sampleRate <= 0 || numChannels <= 0 ||
+                (audioFormat == 1 && bitsPerSample is not (8 or 16 or 24 or 32)) ||
+                (audioFormat == 3 && bitsPerSample != 32) || blockAlign != numChannels * (bitsPerSample / 8))
+                throw new InvalidDataException("WAV sample rate, channels, bit depth or block alignment is invalid.");
+            if (audioData == null || audioData.Length == 0 || audioData.Length % blockAlign != 0)
+                throw new InvalidDataException("WAV data chunk is missing, empty or truncated.");
 
             float[] samples = DecodeSamples(audioData, audioFormat, bitsPerSample, numChannels);
+            ValidateSamples(samples);
             if (sampleRate != SampleRate)
-                samples = ResampleLinear(samples, sampleRate, SampleRate);
+                samples = Gemma4AudioResampler.Resample(samples, sampleRate, SampleRate);
 
             return samples;
         }
@@ -223,26 +269,15 @@ namespace TensorSharp.Models
             return mono;
         }
 
-        private static float[] ResampleLinear(float[] samples, int fromRate, int toRate)
-        {
-            int n = (int)((double)samples.Length / fromRate * toRate);
-            float[] output = new float[n];
-            for (int i = 0; i < n; i++)
-            {
-                double pos = (double)i * (samples.Length - 1) / (n - 1);
-                int idx = (int)pos;
-                float frac = (float)(pos - idx);
-                output[i] = idx + 1 < samples.Length
-                    ? samples[idx] * (1 - frac) + samples[idx + 1] * frac
-                    : samples[idx];
-            }
-            return output;
-        }
-
         public static (float[] melData, int numFrames) ComputeMelSpectrogram(float[] samples)
+            => ComputeMelSpectrogram(samples, Gemma4AudioLogPolicy.HuggingFaceAddFloor);
+
+        public static (float[] melData, int numFrames) ComputeMelSpectrogram(float[] samples, Gemma4AudioLogPolicy policy)
         {
-            int frameSizeForUnfold = FrameLength + 1;
-            int numFrames = (samples.Length - frameSizeForUnfold) / HopLength;
+            ArgumentNullException.ThrowIfNull(samples);
+            if (!Enum.IsDefined(policy)) throw new ArgumentOutOfRangeException(nameof(policy));
+            ValidateSamples(samples);
+            int numFrames = ComputeMelFrameCount(samples.Length);
             if (numFrames <= 0) return (null, 0);
 
             float[] result = new float[numFrames * MelBins];
@@ -250,7 +285,7 @@ namespace TensorSharp.Models
             {
                 var fftInput = new Complex[FftLength];
                 for (int f = 0; f < numFrames; f++)
-                    ComputeMelFrame(samples, f, fftInput, result);
+                    ComputeMelFrame(samples, f, fftInput, result, policy);
             }
             else
             {
@@ -258,7 +293,7 @@ namespace TensorSharp.Models
                     () => new Complex[FftLength],
                     (f, _, fftInput) =>
                     {
-                        ComputeMelFrame(samples, f, fftInput, result);
+                        ComputeMelFrame(samples, f, fftInput, result, policy);
                         return fftInput;
                     },
                     _ => { });
@@ -267,7 +302,13 @@ namespace TensorSharp.Models
             return (result, numFrames);
         }
 
-        private static float[] BuildMelFilterBank(int numFreqBins, int numMels, double fMin, double fMax, int sr)
+        private static void ValidateSamples(float[] samples)
+        {
+            foreach (float sample in samples)
+                if (!float.IsFinite(sample)) throw new InvalidDataException("Audio contains a non-finite sample.");
+        }
+
+        private static MelFilter[] BuildMelFilterBank(int numFreqBins, int numMels, double fMin, double fMax, int sr)
         {
             double HzToMel(double f) => 2595.0 * Math.Log10(1.0 + f / 700.0);
             double MelToHz(double m) => 700.0 * (Math.Pow(10.0, m / 2595.0) - 1.0);
@@ -286,12 +327,14 @@ namespace TensorSharp.Models
             for (int i = 0; i < numFreqBins; i++)
                 fftFreqs[i] = (double)i * sr / (2.0 * (numFreqBins - 1));
 
-            float[] filters = new float[numFreqBins * numMels];
+            var filters = new MelFilter[numMels];
             for (int m = 0; m < numMels; m++)
             {
                 double fLeft = filterFreqs[m];
                 double fCenter = filterFreqs[m + 1];
                 double fRight = filterFreqs[m + 2];
+                var weights = new double[numFreqBins];
+                int first = numFreqBins, last = -1;
                 for (int k = 0; k < numFreqBins; k++)
                 {
                     double f = fftFreqs[k];
@@ -301,8 +344,13 @@ namespace TensorSharp.Models
                     else if (f > fCenter && f <= fRight && fRight > fCenter)
                         v = (fRight - f) / (fRight - fCenter);
                     if (v > 0)
-                        filters[k * numMels + m] = (float)v;
+                    {
+                        weights[k] = v;
+                        first = Math.Min(first, k);
+                        last = k;
+                    }
                 }
+                filters[m] = last < 0 ? new MelFilter(0, Array.Empty<double>()) : new MelFilter(first, weights[first..(last + 1)]);
             }
             return filters;
         }
@@ -321,33 +369,46 @@ namespace TensorSharp.Models
                 if (i < j) { var tmp = x[i]; x[i] = x[j]; x[j] = tmp; }
             }
 
-            for (int size = 2; size <= n; size <<= 1)
+            int stage = 0;
+            for (int size = 2; size <= n; size <<= 1, ++stage)
             {
                 int halfSize = size / 2;
-                Complex w = new Complex(Math.Cos(2 * Math.PI / size), -Math.Sin(2 * Math.PI / size));
+                Complex[] twiddles = FftTwiddles[stage];
                 for (int start = 0; start < n; start += size)
                 {
-                    Complex wn = Complex.One;
                     for (int k = 0; k < halfSize; k++)
                     {
-                        Complex t = wn * x[start + k + halfSize];
+                        Complex t = twiddles[k] * x[start + k + halfSize];
                         x[start + k + halfSize] = x[start + k] - t;
                         x[start + k] = x[start + k] + t;
-                        wn *= w;
                     }
                 }
             }
         }
 
-        public static int ComputeAudioTokenCount(float[] samples)
+        private static Complex[][] BuildFftTwiddles()
         {
-            if (samples.Length % 128 != 0)
+            var stages = new System.Collections.Generic.List<Complex[]>();
+            for (int size = 2; size <= FftLength; size <<= 1)
             {
-                int padded = samples.Length + (128 - samples.Length % 128);
-                samples = new float[padded];
+                var values = new Complex[size / 2];
+                Complex step = new Complex(Math.Cos(2 * Math.PI / size), -Math.Sin(2 * Math.PI / size));
+                Complex value = Complex.One;
+                for (int k = 0; k < values.Length; ++k)
+                {
+                    values[k] = value;
+                    value *= step;
+                }
+                stages.Add(values);
             }
-            int frameSizeForUnfold = FrameLength + 1;
-            int numFrames = (samples.Length - frameSizeForUnfold) / HopLength;
+            return stages.ToArray();
+        }
+
+        public static int ComputeAudioTokenCount(float[] samples, bool padToMultiple = true)
+        {
+            ArgumentNullException.ThrowIfNull(samples);
+            int paddedLength = padToMultiple ? checked((samples.Length + 127) / 128 * 128) : samples.Length;
+            int numFrames = ComputeMelFrameCount(paddedLength);
             if (numFrames <= 0) return 0;
 
             int tConv0 = (numFrames + 2 - 3) / 2 + 1;
@@ -355,24 +416,42 @@ namespace TensorSharp.Models
             return tConv1;
         }
 
-        private static void ComputeMelFrame(float[] samples, int frameIndex, Complex[] fftInput, float[] result)
+        private static int ComputeMelFrameCount(int samples)
         {
-            int start = frameIndex * HopLength;
+            // HF unfolds frame_length+1 samples after prepending half a frame
+            // of zeros, then drops the last sample before the FFT.
+            int minimum = FrameLength + 1 - FrameLength / 2;
+            return samples < minimum ? 0 : (samples - minimum) / HopLength + 1;
+        }
+
+        private static void ComputeMelFrame(float[] samples, int frameIndex, Complex[] fftInput, float[] result, Gemma4AudioLogPolicy policy)
+        {
+            int start = frameIndex * HopLength - FrameLength / 2;
             for (int i = 0; i < FrameLength; i++)
-                fftInput[i] = new Complex(samples[start + i] * HannWindow[i], 0);
+            {
+                int sample = start + i;
+                float value = sample < 0 || sample >= samples.Length ? 0 : samples[sample];
+                fftInput[i] = new Complex(value * (float)HannWindow[i], 0);
+            }
             for (int i = FrameLength; i < FftLength; i++)
                 fftInput[i] = Complex.Zero;
 
             FFT(fftInput);
 
+            // Every mel filter reads the same FFT magnitudes. Compute each
+            // double-precision magnitude once without changing the filter
+            // summation order or the HF logarithm policy.
+            Span<double> magnitudes = stackalloc double[NumFreqBins];
+            for (int k = 0; k < NumFreqBins; ++k) magnitudes[k] = fftInput[k].Magnitude;
             int dstOffset = frameIndex * MelBins;
             for (int m = 0; m < MelBins; m++)
             {
                 double melVal = 0;
-                for (int k = 0; k < NumFreqBins; k++)
-                    melVal += fftInput[k].Magnitude * MelFilters[k * MelBins + m];
-                if (melVal < MelFloor) melVal = MelFloor;
-                result[dstOffset + m] = (float)Math.Log(melVal);
+                var filter = MelFilters[m];
+                for (int k = 0; k < filter.Weights.Length; k++)
+                    melVal += magnitudes[filter.FirstBin + k] * filter.Weights[k];
+                result[dstOffset + m] = (float)Math.Log(policy == Gemma4AudioLogPolicy.LlamaClampFloor
+                    ? Math.Max(melVal, MelFloor) : melVal + MelFloor);
             }
         }
 
@@ -380,7 +459,7 @@ namespace TensorSharp.Models
         {
             int fftLen = 1;
             while (fftLen < FrameLength) fftLen <<= 1;
-            return fftLen * 2;
+            return fftLen;
         }
 
         private static double[] BuildWindow()
@@ -388,7 +467,7 @@ namespace TensorSharp.Models
             double[] window = new double[FrameLength];
             double arg = Math.PI * 2.0 / FrameLength;
             for (int i = 0; i < FrameLength; i++)
-                window[i] = 0.5 - 0.5 * Math.Cos(arg * (i + 0.5));
+                window[i] = (float)(0.5 - 0.5 * Math.Cos(arg * i));
             return window;
         }
     }

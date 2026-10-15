@@ -30,28 +30,36 @@ public sealed class EmbeddingModelOptions
     public string Backend { get; init; } = "CPU";
     public int Device { get; init; }
     public int Threads { get; init; }
-    /// <summary>Zero uses the GGUF context length. A positive value may reduce it.</summary>
+    /// <summary>Zero uses the supported model window (8192 for EmbeddingGemma 2).
+    /// A positive value may reduce it.</summary>
     public int MaxTokens { get; init; }
     public string ModelName { get; init; }
 }
 
-/// <summary>GGUF BERT and XLM-RoBERTa sentence encoders on managed CPU and native ggml backends.</summary>
+/// <summary>GGUF sentence encoders on managed CPU, direct CUDA/MLX, and native ggml backends.</summary>
 public sealed class EmbeddingModel : IEmbeddingModel
 {
     private readonly ITokenizer _tokenizer;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly ManagedEmbeddingEncoder _managed;
+    private readonly ManagedEmbeddingGemma2Encoder _managedGemma;
+    private readonly TensorEmbeddingGemma2Encoder _tensor;
+    private readonly IAllocator _inputAllocator;
     private IntPtr _handle;
     private bool _disposed;
 
     public string ModelName { get; }
     public string Architecture { get; }
     public int Dimensions { get; }
+    /// <summary>Width of token and media inputs before the final output projection.</summary>
+    public int HiddenSize { get; }
     public int MaxTokens { get; }
     public int VocabularySize => _tokenizer.VocabSize;
-    /// <summary>CPU is entirely managed; GGML_CPU, GGML_METAL and GGML_CUDA use native ggml.</summary>
+    /// <summary>CPU is managed; CUDA and MLX use their own tensor executors;
+    /// GGML_CPU, GGML_METAL and GGML_CUDA use native ggml.</summary>
     public string Backend { get; }
-    public bool IsManaged => _managed != null;
+    public bool IsManaged => _managed != null || _managedGemma != null;
+    internal IAllocator InputAllocator => _inputAllocator;
 
     private EmbeddingModel(string path, EmbeddingModelOptions options)
     {
@@ -63,7 +71,9 @@ public sealed class EmbeddingModel : IEmbeddingModel
             "CPU" => "CPU",
             "GGML_CPU" => "GGML_CPU",
             "METAL" or "GGML_METAL" => "GGML_METAL",
-            "CUDA" or "GGML_CUDA" => "GGML_CUDA",
+            "GGML_CUDA" => "GGML_CUDA",
+            "CUDA" => "CUDA",
+            "MLX" => "MLX",
             _ => throw new NotSupportedException($"Unsupported embedding backend '{options.Backend}'."),
         };
         if (Backend == "CPU" && options.Device != 0)
@@ -71,26 +81,52 @@ public sealed class EmbeddingModel : IEmbeddingModel
         using var file = new GgufFile(path);
         Architecture = file.GetString("general.architecture") ?? string.Empty;
         bool isNomicBert = Architecture == "nomic-bert";
-        if (Architecture != "bert" && !isNomicBert)
-            throw new NotSupportedException($"Embedding architecture '{Architecture}' is not supported. Expected a BERT, XLM-RoBERTa, or Nomic BERT GGUF with architecture 'bert' or 'nomic-bert'.");
-        string prefix = isNomicBert ? "nomic-bert." : "bert.";
+        bool isGemma2 = Architecture == "gemma-embedding2";
+        if (Architecture != "bert" && !isNomicBert && !isGemma2)
+            throw new NotSupportedException($"Embedding architecture '{Architecture}' is not supported. Expected bert, nomic-bert, or gemma-embedding2.");
+        if (!isGemma2 && Backend is "CUDA" or "MLX")
+            throw new NotSupportedException($"The {Backend} tensor embedding executor currently requires EmbeddingGemma 2; select a GGML backend for {Architecture}.");
+        string prefix = Architecture + ".";
         uint pooling = file.GetUint32(prefix + "pooling_type", 0);
-        if (pooling is < 1 or > 3)
+        if (pooling is < 1 or > 3 || (isGemma2 && pooling != 1))
             throw new NotSupportedException($"Embedding GGUF must specify mean, CLS, or last-token pooling in {prefix}pooling_type.");
-        Dimensions = checked((int)file.GetUint32(prefix + "embedding_length"));
+        int hiddenSize = checked((int)file.GetUint32(prefix + "embedding_length"));
+        HiddenSize = hiddenSize;
+        Dimensions = isGemma2 ? checked((int)file.GetUint32(prefix + "embedding_length_out")) : hiddenSize;
         int modelContext = checked((int)file.GetUint32(prefix + "context_length"));
-        if (Dimensions <= 0 || modelContext <= 0) throw new InvalidDataException("Embedding GGUF is missing valid dimensions or context length.");
+        if (hiddenSize <= 0 || Dimensions <= 0 || modelContext <= 0) throw new InvalidDataException("Embedding GGUF is missing valid dimensions or context length.");
+        // This GGUF records the backbone's rotary range (262144), whereas the
+        // published embedding model supports an 8192-token shared input window.
+        if (isGemma2) modelContext = Math.Min(modelContext, 8192);
         if (options.MaxTokens > modelContext)
             throw new ArgumentOutOfRangeException(nameof(options.MaxTokens), $"The context limit must not exceed the model's {modelContext} tokens.");
         MaxTokens = options.MaxTokens == 0 ? modelContext : options.MaxTokens;
         ModelName = string.IsNullOrWhiteSpace(options.ModelName) ? Path.GetFileNameWithoutExtension(path) : options.ModelName;
         _tokenizer = EmbeddingTokenizer.Create(file);
         if (!file.Tensors.TryGetValue("token_embd.weight", out var tokenEmbedding) ||
-            tokenEmbedding.Shape.Length != 2 || tokenEmbedding.Shape[0] != (ulong)Dimensions ||
+            tokenEmbedding.Shape.Length != 2 || tokenEmbedding.Shape[0] != (ulong)hiddenSize ||
             tokenEmbedding.Shape[1] != (ulong)_tokenizer.VocabSize)
             throw new InvalidDataException("Embedding tensor dimensions do not match the model dimension and tokenizer vocabulary.");
-        if (Backend == "CPU")
+        if (isGemma2 && (!file.Tensors.TryGetValue("output.weight", out var projection) ||
+            projection.Shape.Length != 2 || projection.Shape[0] != (ulong)hiddenSize || projection.Shape[1] != (ulong)Dimensions))
+            throw new InvalidDataException("EmbeddingGemma 2 output projection does not match the hidden and output dimensions.");
+        if (Backend == "CPU" && isGemma2)
+            _managedGemma = new ManagedEmbeddingGemma2Encoder(file, options.Threads);
+        else if (Backend == "CPU")
             _managed = new ManagedEmbeddingEncoder(file, options.Threads);
+        else if (Backend is "CUDA" or "MLX")
+        {
+            IAllocator allocator;
+            if (Backend == "MLX")
+            {
+                TensorSharp.MLX.MlxBackend.Register();
+                allocator = new TensorSharp.MLX.MlxAllocator(options.Device);
+            }
+            else allocator = new TensorSharp.Cuda.CudaAllocator(options.Device);
+            _inputAllocator = allocator;
+            try { _tensor = new TensorEmbeddingGemma2Encoder(file, allocator); }
+            catch { (allocator as IDisposable)?.Dispose(); throw; }
+        }
         else
             _handle = LoadNative(path, Backend, options.Device, options.Threads);
     }
@@ -166,7 +202,9 @@ public sealed class EmbeddingModel : IEmbeddingModel
                     int offset = 0;
                     for (int i = 0; i < count; ++i) { owned[order[start + i]].CopyTo(flat, offset); offset += lengths[i]; }
                     var output = new float[checked(count * Dimensions)];
-                    if (_managed != null) _managed.Encode(flat, lengths, output, cancellationToken);
+                    if (_managedGemma != null) _managedGemma.Encode(flat, lengths, output, cancellationToken);
+                    else if (_tensor != null) _tensor.Encode(flat, lengths, output, cancellationToken);
+                    else if (_managed != null) _managed.Encode(flat, lengths, output, cancellationToken);
                     else GgmlEmbeddingNative.Encode(_handle, flat, lengths, output);
                     for (int i = 0; i < count; ++i)
                     {
@@ -189,6 +227,65 @@ public sealed class EmbeddingModel : IEmbeddingModel
         return EmbedTokensAsync(inputs.Select(text => Tokenize(text, truncate)).ToArray(), cancellationToken);
     }
 
+    /// <summary>Returns EmbeddingGemma 2 token rows with the model's sqrt(hidden) scale.
+    /// Media encoder rows already use the input scale and must not be scaled again.</summary>
+    public float[] GetTokenEmbeddings(int[] tokens)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        RequireGemmaInputs();
+        if (tokens.Length == 0) return Array.Empty<float>();
+        if (tokens.Length > MaxTokens) throw new ArgumentException("Token rows exceed the context limit.", nameof(tokens));
+        var owned = (int[])tokens.Clone();
+        foreach (int token in owned)
+            if ((uint)token >= (uint)VocabularySize) throw new ArgumentException("Token is outside the model vocabulary.", nameof(tokens));
+        _gate.Wait();
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var output = new float[checked(owned.Length * HiddenSize)];
+            if (_managedGemma != null) _managedGemma.TokenRows(owned, output);
+            else if (_tensor != null) _tensor.TokenRows(owned, output);
+            else GgmlEmbeddingNative.TokenRows(_handle, owned, output);
+            return output;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Encodes one complete EmbeddingGemma 2 sequence of row-major F32
+    /// token and media inputs. Text rows are sqrt(hidden)-scaled; media rows are raw.</summary>
+    public async Task<EmbeddingBatchResult> EmbedInputsAsync(float[] inputs, int tokens, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(inputs);
+        RequireGemmaInputs();
+        if (tokens < 1 || tokens > MaxTokens || inputs.Length != checked(tokens * HiddenSize))
+            throw new ArgumentException($"Input must contain 1 to {MaxTokens} rows of {HiddenSize} values.", nameof(inputs));
+        var owned = (float[])inputs.Clone();
+        if (owned.Any(value => !float.IsFinite(value))) throw new ArgumentException("Input rows must be finite.", nameof(inputs));
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var output = new float[Dimensions];
+                if (_managedGemma != null) _managedGemma.EncodeInputs(owned, [tokens], output, cancellationToken);
+                else if (_tensor != null) _tensor.EncodeInputs(owned, [tokens], output, cancellationToken);
+                else GgmlEmbeddingNative.EncodeInputs(_handle, owned, [tokens], output);
+                cancellationToken.ThrowIfCancellationRequested();
+                return new EmbeddingBatchResult([output], tokens);
+            }, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally { _gate.Release(); }
+    }
+
+    private void RequireGemmaInputs()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (Architecture != "gemma-embedding2")
+            throw new NotSupportedException("Input embeddings require an EmbeddingGemma 2 model.");
+    }
+
     public void Dispose()
     {
         _gate.Wait();
@@ -197,6 +294,9 @@ public sealed class EmbeddingModel : IEmbeddingModel
             if (_disposed) return;
             _disposed = true;
             _managed?.Dispose();
+            _managedGemma?.Dispose();
+            _tensor?.Dispose();
+            (_inputAllocator as IDisposable)?.Dispose();
             if (_handle != IntPtr.Zero) { GgmlEmbeddingNative.TSGgml_EmbeddingFree(_handle); _handle = IntPtr.Zero; }
         }
         finally { _gate.Release(); }

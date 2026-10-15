@@ -106,7 +106,9 @@ namespace TensorSharp.Models.MiniMaxH3
                     "(minimax_h3_ref2va_pruned-*.gguf); the loaded model is FL2VA. The two are " +
                     "separate checkpoints, not settings — load the other file, or drop the " +
                     "reference inputs to animate the image as a first frame instead (--video-mode i2v).");
-            if (!wantsReference && haveReference && (hasFirst || hasLast))
+            if (!wantsReference && haveReference
+                && (mode is MiniMaxH3Mode.ImageToVideo or MiniMaxH3Mode.FirstLastFrame
+                    || hasFirst || hasLast))
                 throw new InvalidOperationException(
                     "keyframe conditioning needs the FL2VA checkpoint " +
                     "(minimax_h3_fl2va_pruned-*.gguf); the loaded model is Ref2VA, which treats " +
@@ -115,10 +117,11 @@ namespace TensorSharp.Models.MiniMaxH3
 
             if (mode == MiniMaxH3Mode.ImageToVideo && !hasFirst)
                 throw new InvalidOperationException(
-                    "--video-mode i2v needs a conditioning image (--image).");
+                    "--video-mode i2v needs a conditioning image. Upload an image or pass --image.");
             if (mode == MiniMaxH3Mode.FirstLastFrame && !(hasFirst || hasLast))
                 throw new InvalidOperationException(
-                    "--video-mode fl2v needs --image and/or --end-image.");
+                    "--video-mode fl2v needs a first and/or last conditioning image. " +
+                    "Upload an image or pass --image and/or --end-image.");
             if (mode == MiniMaxH3Mode.Reference && !hasRefs)
                 throw new InvalidOperationException(
                     "--video-mode ref needs at least one --ref-image / --ref-video / --ref-audio.");

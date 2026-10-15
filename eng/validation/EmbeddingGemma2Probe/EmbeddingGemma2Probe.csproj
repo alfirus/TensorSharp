@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(TensorSharpEmbeddingProbeSnapshot)' == ''">
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TensorSharpEmbeddingProbeSnapshot)' != ''">
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Reference Include="$(TensorSharpEmbeddingProbeSnapshot)/*.dll"
+               Exclude="$(TensorSharpEmbeddingProbeSnapshot)/TensorSharp.Server.Host.dll;$(TensorSharpEmbeddingProbeSnapshot)/GgmlOps.dll" />
+    <Content Include="$(TensorSharpEmbeddingProbeSnapshot)/runtimes/**/*"
+             Link="runtimes/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(TensorSharpEmbeddingProbeSnapshot)/*.so;$(TensorSharpEmbeddingProbeSnapshot)/*.so.*;$(TensorSharpEmbeddingProbeSnapshot)/*.dylib;$(TensorSharpEmbeddingProbeSnapshot)/*.metallib"
+             Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(TensorSharpEmbeddingProbeSnapshot)/GgmlOps.dll"
+             Condition="Exists('$(TensorSharpEmbeddingProbeSnapshot)/GgmlOps.dll')"
+             Link="GgmlOps.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="RequireEmbeddingProbeSnapshot" BeforeTargets="ResolveReferences"
+          Condition="'$(TensorSharpEmbeddingProbeSnapshot)' != ''">
+    <Error Condition="!Exists('$(TensorSharpEmbeddingProbeSnapshot)/TensorSharp.Models.dll') Or !Exists('$(TensorSharpEmbeddingProbeSnapshot)/TensorSharp.Runtime.dll') Or !Exists('$(TensorSharpEmbeddingProbeSnapshot)/TensorSharp.Backends.GGML.dll')"
+           Text="TensorSharpEmbeddingProbeSnapshot must contain a complete frozen TensorSharp runtime." />
+  </Target>
+  <Target Name="CopyGgmlProbeLibrary" AfterTargets="Build" Condition="'$(TensorSharpEmbeddingProbeSnapshot)' == ''">
+    <ItemGroup>
+      <GgmlProbeLibrary Include="../../../TensorSharp.GGML.Native/build/libGgmlOps.dylib"
+                        Condition="Exists('../../../TensorSharp.GGML.Native/build/libGgmlOps.dylib')" />
+      <GgmlProbeLibrary Include="../../../TensorSharp.GGML.Native/build/libGgmlOps.so"
+                        Condition="Exists('../../../TensorSharp.GGML.Native/build/libGgmlOps.so')" />
+      <GgmlProbeLibrary Include="../../../TensorSharp.GGML.Native/build-windows/Release/GgmlOps.dll"
+                        Condition="Exists('../../../TensorSharp.GGML.Native/build-windows/Release/GgmlOps.dll')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GgmlProbeLibrary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyMlxProbeLibraries" AfterTargets="Build" Condition="'$(TensorSharpEmbeddingProbeSnapshot)' == '' And $([MSBuild]::IsOSPlatform('OSX'))">
+    <ItemGroup>
+      <MlxProbeLibrary Include="../../../TensorSharp.Backends.MLX/Native/dist/libmlxc.dylib"
+                       Condition="Exists('../../../TensorSharp.Backends.MLX/Native/dist/libmlxc.dylib')" />
+      <MlxProbeLibrary Include="../../../TensorSharp.Backends.MLX/Native/dist/libmlx.dylib"
+                       Condition="Exists('../../../TensorSharp.Backends.MLX/Native/dist/libmlx.dylib')" />
+      <MlxProbeLibrary Include="../../../TensorSharp.Backends.MLX/Native/dist/libjaccl.dylib"
+                       Condition="Exists('../../../TensorSharp.Backends.MLX/Native/dist/libjaccl.dylib')" />
+      <MlxProbeLibrary Include="../../../TensorSharp.Backends.MLX/Native/dist/mlx.metallib"
+                       Condition="Exists('../../../TensorSharp.Backends.MLX/Native/dist/mlx.metallib')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MlxProbeLibrary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

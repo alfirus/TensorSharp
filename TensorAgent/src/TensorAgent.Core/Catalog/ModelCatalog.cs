@@ -479,6 +479,7 @@ public static partial class ModelCatalog
             // Photos, clips and recordings are references for a new scene, up to nine.
             modalities: CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
             notes: "catalog.model.minimaxH3Ref2va.notes"),
+        Ltx25Distilled(),
     }.Concat(ExtendedModels()).ToArray();
 
     // Qwen-Image-2.1's companions, shared by its base and Turbo entries: one set of bytes, so a

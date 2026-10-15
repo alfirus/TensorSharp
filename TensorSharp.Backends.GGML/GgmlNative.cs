@@ -1643,6 +1643,12 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_AddmmF32PreciseMetal(
+            GgmlTensorView2D result, GgmlTensorView2D src, GgmlTensorView2D m1,
+            GgmlTensorView2D m2, float beta, float alpha);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_AddmmQuantF32(
             GgmlTensorView2D result,
             GgmlTensorView2D m1,
@@ -1902,6 +1908,46 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_FusedGemma4VisionBlockF32(
+            GgmlTensorView2D hidden, float eps,
+            IntPtr ln1W,
+            IntPtr qW, int qNe0, int qNe1, long qBytes,
+            IntPtr kW, int kNe0, int kNe1, long kBytes,
+            IntPtr vW, int vNe0, int vNe1, long vBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr attnPostNormW,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr posX, IntPtr posY, float ropeTheta,
+            IntPtr ln2W,
+            IntPtr gateW, int gateNe0, int gateNe1, long gateBytes,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr ffnPostNormW,
+            IntPtr clamps,
+            int numPatches, int numHeads, int headDim);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_FusedGemma4VisionBlockF32PreciseMetal(
+            GgmlTensorView2D hidden, float eps,
+            IntPtr ln1W,
+            IntPtr qW, int qNe0, int qNe1, long qBytes,
+            IntPtr kW, int kNe0, int kNe1, long kBytes,
+            IntPtr vW, int vNe0, int vNe1, long vBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr attnPostNormW,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr posX, IntPtr posY, float ropeTheta,
+            IntPtr ln2W,
+            IntPtr gateW, int gateNe0, int gateNe1, long gateBytes,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr ffnPostNormW,
+            IntPtr clamps,
+            int numPatches, int numHeads, int headDim);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_FusedGemma4VisionBlockF32PreciseCuda(
             GgmlTensorView2D hidden, float eps,
             IntPtr ln1W,
             IntPtr qW, int qNe0, int qNe1, long qBytes,
@@ -4435,6 +4481,11 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_ClampF32(GgmlTensorView4D result, GgmlTensorView4D src,
+            float minimum, float maximum);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_BinaryTensorF32(
             int op,
             GgmlTensorView4D result,
@@ -4705,6 +4756,9 @@ internal enum GgmlIndexReductionOp
         {
             CheckResult(TSGgml_AddmmF32(result, src, m1, m2, beta, alpha), "addmm");
         }
+
+        internal static void AddmmPreciseMetal(GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight)
+            => CheckResult(TSGgml_AddmmF32PreciseMetal(result, default, input, weight, 0, 1), "gemma4_projection_float32_metal");
 
         public static void AddmmQuant(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
         {
@@ -4990,7 +5044,90 @@ internal enum GgmlIndexReductionOp
             IntPtr clamps,
             int numPatches, int numHeads, int headDim)
         {
-            CheckResult(TSGgml_FusedGemma4VisionBlockF32(hidden, eps, ln1W,
+            FusedGemma4VisionBlock(hidden, eps, ln1W,
+                qW, qNe0, qNe1, qBytes, kW, kNe0, kNe1, kBytes, vW, vNe0, vNe1, vBytes,
+                qNormW, kNormW, attnPostNormW, outW, outNe0, outNe1, outBytes,
+                posX, posY, ropeTheta, ln2W, gateW, gateNe0, gateNe1, gateBytes,
+                upW, upNe0, upNe1, upBytes, downW, downNe0, downNe1, downBytes,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim, false);
+        }
+
+        public static void FusedGemma4VisionBlock(
+            GgmlTensorView2D hidden, float eps,
+            IntPtr ln1W,
+            IntPtr qW, int qNe0, int qNe1, long qBytes,
+            IntPtr kW, int kNe0, int kNe1, long kBytes,
+            IntPtr vW, int vNe0, int vNe1, long vBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr attnPostNormW,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr posX, IntPtr posY, float ropeTheta,
+            IntPtr ln2W,
+            IntPtr gateW, int gateNe0, int gateNe1, long gateBytes,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr ffnPostNormW,
+            IntPtr clamps,
+            int numPatches, int numHeads, int headDim, bool requireFloat32MetalPrecision)
+        {
+            FusedGemma4VisionBlock(hidden, eps, ln1W,
+                qW, qNe0, qNe1, qBytes,
+                kW, kNe0, kNe1, kBytes,
+                vW, vNe0, vNe1, vBytes,
+                qNormW, kNormW, attnPostNormW,
+                outW, outNe0, outNe1, outBytes,
+                posX, posY, ropeTheta, ln2W,
+                gateW, gateNe0, gateNe1, gateBytes,
+                upW, upNe0, upNe1, upBytes,
+                downW, downNe0, downNe1, downBytes,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim, requireFloat32MetalPrecision, false);
+        }
+
+        public static void FusedGemma4VisionBlock(
+            GgmlTensorView2D hidden, float eps,
+            IntPtr ln1W,
+            IntPtr qW, int qNe0, int qNe1, long qBytes,
+            IntPtr kW, int kNe0, int kNe1, long kBytes,
+            IntPtr vW, int vNe0, int vNe1, long vBytes,
+            IntPtr qNormW, IntPtr kNormW,
+            IntPtr attnPostNormW,
+            IntPtr outW, int outNe0, int outNe1, long outBytes,
+            IntPtr posX, IntPtr posY, float ropeTheta,
+            IntPtr ln2W,
+            IntPtr gateW, int gateNe0, int gateNe1, long gateBytes,
+            IntPtr upW, int upNe0, int upNe1, long upBytes,
+            IntPtr downW, int downNe0, int downNe1, long downBytes,
+            IntPtr ffnPostNormW,
+            IntPtr clamps,
+            int numPatches, int numHeads, int headDim, bool requireFloat32MetalPrecision, bool requireFloat32CudaPrecision)
+        {
+            if (requireFloat32MetalPrecision && requireFloat32CudaPrecision)
+                throw new ArgumentException("Select one backend precision requirement.");
+            CheckResult(requireFloat32CudaPrecision
+                ? TSGgml_FusedGemma4VisionBlockF32PreciseCuda(hidden, eps, ln1W,
+                qW, qNe0, qNe1, qBytes,
+                kW, kNe0, kNe1, kBytes,
+                vW, vNe0, vNe1, vBytes,
+                qNormW, kNormW, attnPostNormW,
+                outW, outNe0, outNe1, outBytes,
+                posX, posY, ropeTheta, ln2W,
+                gateW, gateNe0, gateNe1, gateBytes,
+                upW, upNe0, upNe1, upBytes,
+                downW, downNe0, downNe1, downBytes,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim)
+                : requireFloat32MetalPrecision
+                ? TSGgml_FusedGemma4VisionBlockF32PreciseMetal(hidden, eps, ln1W,
+                qW, qNe0, qNe1, qBytes,
+                kW, kNe0, kNe1, kBytes,
+                vW, vNe0, vNe1, vBytes,
+                qNormW, kNormW, attnPostNormW,
+                outW, outNe0, outNe1, outBytes,
+                posX, posY, ropeTheta, ln2W,
+                gateW, gateNe0, gateNe1, gateBytes,
+                upW, upNe0, upNe1, upBytes,
+                downW, downNe0, downNe1, downBytes,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim)
+                : TSGgml_FusedGemma4VisionBlockF32(hidden, eps, ln1W,
                 qW, qNe0, qNe1, qBytes,
                 kW, kNe0, kNe1, kBytes,
                 vW, vNe0, vNe1, vBytes,
@@ -5222,6 +5359,9 @@ internal enum GgmlIndexReductionOp
         {
             CheckResult(TSGgml_UnaryF32((int)op, result, src), op.ToString());
         }
+
+        public static void Clamp(GgmlTensorView4D result, GgmlTensorView4D src, float minimum, float maximum)
+            => CheckResult(TSGgml_ClampF32(result, src, minimum, maximum), "clamp");
 
         public static void BinaryTensor(GgmlBinaryTensorOp op, GgmlTensorView4D result, GgmlTensorView4D lhs, GgmlTensorView4D rhs)
         {

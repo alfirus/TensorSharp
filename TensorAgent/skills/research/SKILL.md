@@ -1,6 +1,6 @@
 ---
 name: research
-description: Use for web searches and current information lookups, finding sources, fact-checking, researching questions, comparing sources, or summarising web pages. Searches the web without being given any URLs and reads relevant pages with citations. Needs the app's Network switch on; no API key.
+description: Use for web searches and current information lookups, finding sources, and fact-checking without being given any URLs. Network switch must be on; no API key.
 ---
 
 # Research

@@ -17,12 +17,14 @@
 //   * the audio stream is conditioned on the timestep a shift-3 schedule would
 //     have had at the same underlying uniform time -- MapSigma() below unshifts
 //     by 12 and reshifts by 3; and
-//   * the audio velocity the model emits is pre-multiplied by dSigmaAudio/dSigmaVideo
-//     (ShiftSlope) so that the shared Euler update x += v * dSigmaVideo integrates
-//     the audio along its own trajectory.
+//   * the sampler carries c_a = (sigma_video / sigma_audio) * x_a. Before calling
+//     the model it restores x_a, then converts the model's audio velocity to the
+//     derivative of this carrier. The conversion includes a drift term; a
+//     chain-rule scale alone leaves noise in the decoded audio.
 //
-// Both schedules start at sigma = 1 and end at sigma = 0, so the endpoints agree
-// exactly and one sampler lands both streams on the data manifold together.
+// At sigma = 1 the carrier equals the physical audio. At sigma = 0 its limit is
+// (videoShift / audioShift) * cleanAudio, so the final carrier must be scaled by
+// audioShift / videoShift before the audio VAE, matching process_latent_out.
 using System;
 
 namespace TensorSharp.Models.MiniMaxH3
@@ -42,8 +44,9 @@ namespace TensorSharp.Models.MiniMaxH3
         /// essentially clean, but not exactly, matching the tiny noise blend applied to them.</summary>
         public const float VisualConditionTimestep = 0.999f;
 
-        /// <summary>Default denoising steps. H3 is step-distilled and CFG-free; 4-8 steps
-        /// are the usual operating point, and the reference CLI default is 20.</summary>
+        /// <summary>Default denoising steps, matching stable-diffusion.cpp's CLI.
+        /// Guidance distillation does not guarantee quality at fewer steps; dedicated
+        /// FastH3 checkpoints use their own trained schedules.</summary>
         public const int DefaultSteps = 20;
 
         /// <summary>The flow-matching SNR shift: sigma' = a*t / (1 + (a-1)*t).</summary>
@@ -59,6 +62,7 @@ namespace TensorSharp.Models.MiniMaxH3
         public static float[] BuildSigmas(int steps, float shift = VideoShift)
         {
             if (steps <= 0) throw new ArgumentOutOfRangeException(nameof(steps));
+            if (!float.IsFinite(shift) || shift <= 0) throw new ArgumentOutOfRangeException(nameof(shift));
             var sigmas = new float[steps + 1];
             for (int i = 0; i < steps; i++)
             {
@@ -103,9 +107,53 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>Clamp a video sigma into the domain the timestep mapping is defined on.</summary>
         public static float ClampSigma(float sigma) => Math.Clamp(sigma, 1e-6f, 1f);
 
+        /// <summary>Restore the network's audio input from the sampler carrier,
+        /// matching the H3 reference runner's sigma_audio / sigma_video scale.</summary>
+        public static float[] AudioInputFromCarrier(float[] carrier, float sigma,
+            float videoShift = VideoShift, float audioShift = AudioShift)
+        {
+            if (carrier is null) throw new ArgumentNullException(nameof(carrier));
+            float videoSigma = ClampSigma(sigma);
+            float scale = MapSigma(videoSigma, videoShift, audioShift) / videoSigma;
+            var audio = new float[carrier.Length];
+            for (int i = 0; i < audio.Length; ++i) audio[i] = carrier[i] * scale;
+            return audio;
+        }
+
+        /// <summary>Convert DiT's chain-rule-scaled audio velocity in place to
+        /// d(carrier)/d(sigma_video). DiT's standalone component contract uses
+        /// ShiftSlope; the generation sampler additionally needs the carrier drift.</summary>
+        public static void ConvertAudioVelocityToCarrier(float[] audioInput, float[] velocity,
+            float sigma, float videoShift = VideoShift, float audioShift = AudioShift)
+        {
+            if (audioInput is null) throw new ArgumentNullException(nameof(audioInput));
+            if (velocity is null) throw new ArgumentNullException(nameof(velocity));
+            if (audioInput.Length != velocity.Length)
+                throw new ArgumentException("velocity length must match the audio input length", nameof(velocity));
+            float videoSigma = ClampSigma(sigma);
+            float audioSigma = MapSigma(videoSigma, videoShift, audioShift);
+            float ratio = videoShift / audioShift;
+            float predictionScale = (1f + (ratio - 1f) * audioSigma)
+                / ShiftSlope(videoSigma, videoShift, audioShift);
+            for (int i = 0; i < velocity.Length; ++i)
+                velocity[i] = (1f - ratio) * audioInput[i] + predictionScale * velocity[i];
+        }
+
+        /// <summary>Restore the clean physical audio at the sampler endpoint,
+        /// matching H3AVFlowDenoiser.process_latent_out. Unlike the network-input
+        /// conversion, this uses the sigma-zero limit and performs no clamping.</summary>
+        public static void AudioOutputFromCarrierInPlace(float[] carrier,
+            float videoShift = VideoShift, float audioShift = AudioShift)
+        {
+            if (carrier is null) throw new ArgumentNullException(nameof(carrier));
+            if (!float.IsFinite(videoShift) || videoShift <= 0) throw new ArgumentOutOfRangeException(nameof(videoShift));
+            if (!float.IsFinite(audioShift) || audioShift <= 0) throw new ArgumentOutOfRangeException(nameof(audioShift));
+            float scale = audioShift / videoShift;
+            for (int i = 0; i < carrier.Length; ++i) carrier[i] *= scale;
+        }
+
         /// <summary>One Euler update: <c>x += velocity * (sigmaNext - sigma)</c>.
-        /// The model already emits the correctly-signed and correctly-scaled velocity for
-        /// both streams, so the sampler itself stays completely stream-agnostic.</summary>
+        /// Audio velocities must first be converted to the sampler carrier derivative.</summary>
         public static void EulerStep(float[] x, float[] velocity, float sigma, float sigmaNext)
         {
             if (x is null) throw new ArgumentNullException(nameof(x));

@@ -87,5 +87,6 @@
   "models.alert.delete.title": "删除模型",
   "models.alert.delete.message": "要从此设备移除 {model} 吗？以后可以重新下载。",
   "models.alert.delete.messageLocal": "要从此设备移除 {model} 吗？恢复时需要再次选择原始本地 GGUF 文件。",
-  "models.alert.delete.confirm": "删除"
+  "models.alert.delete.confirm": "删除",
+  "models.action.unavailable": "暂不可用"
 }

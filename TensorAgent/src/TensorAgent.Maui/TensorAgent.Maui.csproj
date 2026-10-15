@@ -334,6 +334,16 @@
              RemoveProperties="TargetFramework;RuntimeIdentifier;SelfContained;TensorSharpAppleTargets" />
   </Target>
 
+  <!-- LTX uses the owned direct MLX executor on the Mac. Build a missing runtime
+       and bundle its libraries and Metal kernels together for portable installs. -->
+  <Target Name="TensorAgentBuildMlxDesktopEngine" BeforeTargets="BeforeBuild"
+          Condition="'$(TensorAgentPlatform)' == 'maccatalyst'">
+    <MSBuild Projects="../../../TensorSharp.Backends.MLX/TensorSharp.Backends.MLX.csproj"
+             Targets="BuildMlxNative"
+             Properties="TensorSharpSkipMlxNative=false;TENSORSHARP_MLX_NATIVE_SKIP=false"
+             RemoveProperties="TargetFramework;RuntimeIdentifier;SelfContained;TensorSharpAppleTargets" />
+  </Target>
+
   <ItemGroup Condition="'$(TensorAgentPlatform)' == 'maccatalyst'">
     <!-- Binary distributions retain the engine's license and third-party notices
          inside the app, including the ZIP/PKG variants without a readme beside it. -->
@@ -346,6 +356,12 @@
          managed assemblies, rewrites its install name for that location and signs it
          with the app. -->
     <NativeReference Include="$(TensorAgentGgmlNativeDir)/libGgmlOps.dylib" Kind="Dynamic" />
+    <NativeReference Include="../../../TensorSharp.Backends.MLX/Native/dist/libmlxc.dylib" Kind="Dynamic" />
+    <NativeReference Include="../../../TensorSharp.Backends.MLX/Native/dist/libmlx.dylib" Kind="Dynamic" />
+    <NativeReference Include="../../../TensorSharp.Backends.MLX/Native/dist/libjaccl.dylib" Kind="Dynamic" />
+    <Content Include="$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../../../TensorSharp.Backends.MLX/Native/dist/lib/mlx.metallib'))"
+             Link="mlx.metallib" CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" PublishFolderType="Assembly" />
   </ItemGroup>
 
   <Target Name="TensorAgentShipWindowsEngine" AfterTargets="TensorAgentBuildDesktopEngine"

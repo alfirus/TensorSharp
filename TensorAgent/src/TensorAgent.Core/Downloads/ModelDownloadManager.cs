@@ -188,6 +188,7 @@ public sealed class ModelDownloadManager : IDisposable
     public ModelDownloadStatus Start(CatalogModel model, IReadOnlyCollection<CatalogFileRole>? optionalRoles = null)
     {
         ArgumentNullException.ThrowIfNull(model);
+        if (!model.IsAvailable) throw new NotSupportedException(model.UnavailableReason);
         return StartJob(model.Id, optionalRoles,
             (progress, ct, roles) => _store.DownloadAsync(model, progress, ct, roles));
     }
@@ -273,6 +274,8 @@ public sealed class ModelDownloadManager : IDisposable
                 if (job.Status.State != DownloadState.Failed)
                     continue;
                 if (find(job.Status.ModelId) is not { } model)
+                    continue;
+                if (!model.IsAvailable)
                     continue;
                 _log.LogInformation("resuming the interrupted download of {Model}", model.Id);
                 // Preserve the transfer the user actually requested. In particular, an

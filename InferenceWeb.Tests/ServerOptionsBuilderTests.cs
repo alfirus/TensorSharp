@@ -444,7 +444,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--continuous-batching", "--prefill-chunk-size",
             "--spec", "--spec-type", "--spec-draft", "--spec-pmin", "--draft-model",
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-variant",
-            "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae",
+            "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae", "--video-upscaler", "--video-diffusion-vae",
             "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
             "--skill", "--list-skills",
             "--code-exec", "--code-exec-allow-install", "--code-exec-install-domains",
@@ -518,6 +518,8 @@ public class ServerOptionsBuilderTests : IDisposable
     [InlineData("--video-vae", "TS_VIDEO_VAE")]
     [InlineData("--video-text-encoder", "TS_VIDEO_TEXT_ENCODER")]
     [InlineData("--video-dit2", "TS_VIDEO_DIT2")]
+    [InlineData("--video-upscaler", "TS_VIDEO_UPSCALER")]
+    [InlineData("--video-diffusion-vae", "TS_VIDEO_DIFFUSION_VAE")]
     public void Build_VideoCompanionFlags_SetTheirEnv(string flag, string env)
     {
         string path = Path.Combine(_baseDir, "companion.bin");

@@ -38,6 +38,14 @@ namespace TensorSharp.AgentHost.Skills
     /// </summary>
     public sealed class SkillRegistryOptions
     {
+        /// <summary>Optional marketplace transport, for hosts with their own HTTP policy or tests.
+        /// Network access is still gated separately by the request's host options.</summary>
+        public SkillMarketplace? Marketplace { get; init; }
+
+        /// <summary>Optional host network policy, evaluated for each marketplace operation.
+        /// Hosts can use this to apply their current domain allow-list and network switch.</summary>
+        public Func<string, bool>? MarketplaceHostAllowed { get; init; }
+
         /// <summary>
         /// Directories to scan, in precedence order. A root may be a single skill
         /// (it contains <c>SKILL.md</c> directly) or a directory of them.
@@ -154,6 +162,11 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>True when this registry can accept new skills.</summary>
         public bool CanInstall => !string.IsNullOrWhiteSpace(_options.InstallDirectory);
+
+        /// <summary>The shared discovery client. Merely accessing it performs no network I/O.</summary>
+        public SkillMarketplace Marketplace => _options.Marketplace ?? SkillMarketplace.Shared;
+
+        internal bool MarketplaceHostAllowed(string host) => _options.MarketplaceHostAllowed?.Invoke(host) ?? true;
 
         /// <summary>Look up a skill by id, case-insensitively.</summary>
         public bool TryGet(string? id, out Skill skill)

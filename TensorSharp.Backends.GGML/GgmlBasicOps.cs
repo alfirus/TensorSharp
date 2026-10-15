@@ -546,6 +546,26 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Multiply expanded Gemma F32 weights without Metal's internal Half
+        /// matrix narrowing. Weight shape is [output,input].
+        /// </summary>
+        public static bool TryGemma4ProjectionFloat32(Tensor result, Tensor input, Tensor weight)
+        {
+            if (result?.Allocator is not GgmlAllocator allocator || allocator.Context.BackendType != GgmlBackendType.Metal ||
+                input?.Allocator != allocator || weight?.Allocator != allocator ||
+                result.ElementType != DType.Float32 || input.ElementType != DType.Float32 || weight.ElementType != DType.Float32 ||
+                result.DimensionCount != 2 || input.DimensionCount != 2 || weight.DimensionCount != 2 ||
+                ReferenceEquals(result.Storage, input.Storage) || ReferenceEquals(result.Storage, weight.Storage) ||
+                result.Sizes[0] != input.Sizes[0] || result.Sizes[1] != weight.Sizes[0] || input.Sizes[1] != weight.Sizes[1] ||
+                !TryCreateStandardView(result, out GgmlTensorView2D resultView) ||
+                !TryCreateRawView(input, out GgmlTensorView2D inputView)) return false;
+            using var transpose = weight.Transpose();
+            if (!TryCreateRawView(transpose, out GgmlTensorView2D weightView)) return false;
+            GgmlNative.AddmmPreciseMetal(resultView, inputView, weightView);
+            return true;
+        }
+
+        /// <summary>
         /// Quantized linear forward: result = m1 * quantizedWeight^T.
         /// The quantized weight data is stored in native GGUF format with GGML type.
         /// ne0 = inDim (shared dimension), ne1 = outDim.
@@ -1306,6 +1326,44 @@ namespace TensorSharp.GGML
             float[] clamps,
             int numPatches, int numHeads, int headDim)
         {
+            FusedGemma4VisionBlock(hidden, eps, ln1W, qW, kW, vW, qNormW, kNormW,
+                attnPostNormW, outW, posX, posY, ropeTheta, ln2W, gateW, upW, downW,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim, false);
+        }
+
+        public static unsafe void FusedGemma4VisionBlock(
+            Tensor hidden, float eps,
+            Tensor ln1W,
+            Tensor qW, Tensor kW, Tensor vW,
+            Tensor qNormW, Tensor kNormW, Tensor attnPostNormW,
+            Tensor outW,
+            int[] posX, int[] posY, float ropeTheta,
+            Tensor ln2W,
+            Tensor gateW, Tensor upW, Tensor downW,
+            Tensor ffnPostNormW,
+            float[] clamps,
+            int numPatches, int numHeads, int headDim, bool requireFloat32MetalPrecision)
+        {
+            FusedGemma4VisionBlock(hidden, eps, ln1W, qW, kW, vW, qNormW, kNormW,
+                attnPostNormW, outW, posX, posY, ropeTheta, ln2W, gateW, upW, downW,
+                ffnPostNormW, clamps, numPatches, numHeads, headDim, requireFloat32MetalPrecision, false);
+        }
+
+        public static unsafe void FusedGemma4VisionBlock(
+            Tensor hidden, float eps,
+            Tensor ln1W,
+            Tensor qW, Tensor kW, Tensor vW,
+            Tensor qNormW, Tensor kNormW, Tensor attnPostNormW,
+            Tensor outW,
+            int[] posX, int[] posY, float ropeTheta,
+            Tensor ln2W,
+            Tensor gateW, Tensor upW, Tensor downW,
+            Tensor ffnPostNormW,
+            float[] clamps,
+            int numPatches, int numHeads, int headDim, bool requireFloat32MetalPrecision, bool requireFloat32CudaPrecision)
+        {
+            if (requireFloat32MetalPrecision && requireFloat32CudaPrecision)
+                throw new ArgumentException("Select one backend precision requirement.");
             if (!HasNativeBufferStorage(hidden))
                 throw new ArgumentException("FusedGemma4VisionBlock requires native-backed hidden tensor.");
             if (!TryCreateStandardView(hidden, out GgmlTensorView2D hiddenView))
@@ -1349,7 +1407,7 @@ namespace TensorSharp.GGML
                     uPtr, uNe0, uNe1, uBytes,
                     dPtr, dNe0, dNe1, dBytes,
                     fpnPtr, (IntPtr)clPtr,
-                    numPatches, numHeads, headDim);
+                    numPatches, numHeads, headDim, requireFloat32MetalPrecision, requireFloat32CudaPrecision);
             }
         }
 
@@ -4244,6 +4302,20 @@ namespace TensorSharp.GGML
 
         /// <summary>GELU with erf, as trained by Qwen3-VL's vision tower.</summary>
         public static Tensor GELUErf(Tensor result, Tensor src) => ExecuteUnary(result, src, GgmlUnaryOp.GELUErf, "GELU(erf)");
+
+        [RegisterOpStorageType("clamp", typeof(GgmlStorage))]
+        public static Tensor Clamp(Tensor result, Tensor src, float minimum, float maximum)
+        {
+            ValidateUnaryArguments(result, src, "clamp");
+            if (float.IsNaN(minimum) || float.IsNaN(maximum) || minimum > maximum)
+                throw new ArgumentOutOfRangeException(nameof(minimum), "Clamp bounds must be ordered and cannot be NaN.");
+            Tensor target = TensorResultBuilder.GetWriteTarget(result, src, false, src.Sizes);
+            if (!TryCreateStandardView(target, out GgmlTensorView4D targetView) ||
+                !TryCreateStandardView(src, out GgmlTensorView4D sourceView))
+                throw new NotSupportedException("GGML clamp requires Float32 tensors with 1 to 4 dimensions and a row-contiguous layout.");
+            GgmlNative.Clamp(targetView, sourceView, minimum, maximum);
+            return target;
+        }
 
         [RegisterOpStorageType("SiLUMul", typeof(GgmlStorage))]
         public static Tensor SiLUMul(Tensor result, Tensor gate, Tensor up) => ExecuteFusedActMul(result, gate, up, GgmlFusedActMulOp.SiLUMul, "SiLUMul");

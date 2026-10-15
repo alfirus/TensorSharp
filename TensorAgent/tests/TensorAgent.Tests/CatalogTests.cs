@@ -23,6 +23,7 @@ public sealed class CatalogTests
             "qwen-image-2.1-turbo-q8",
             "minimax-h3-fl2va-q4k",
             "minimax-h3-ref2va-q4k",
+            "ltx-2.5-distilled-q4km",
             "gemma-4-26b-a4b-qat-q4kxl",
             "gemma-4-31b-q4-0",
             "qwen3.5-35b-a3b-q4km",
@@ -616,6 +617,7 @@ public sealed class CatalogTests
     /// </summary>
     private static readonly string[] Shipped =
     {
+        "ltx-2.5-distilled-q4km",
         "gemma-4-e2b-q8",
         "gemma-4-e4b-q8",
         "gemma-4-e4b-q4kxl",

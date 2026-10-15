@@ -28,11 +28,43 @@
     "reasons": []
   },
   {
+    "name": "find-skills",
+    "ok": true,
+    "kind": "instructions only",
+    "scripts": 0,
+    "reasons": [],
+    "validation": "Uses native managed discovery tools on desktop and in-process hosts; downloaded workflows have separate runtime requirements."
+  },
+  {
     "name": "frontend-design",
     "ok": true,
     "kind": "instructions only",
     "scripts": 0,
     "reasons": []
+  },
+  {
+    "name": "grill-me",
+    "ok": true,
+    "kind": "instructions only",
+    "scripts": 0,
+    "reasons": [],
+    "validation": "portable instructions and bundled references; live model quality is recorded separately"
+  },
+  {
+    "name": "grill-with-docs",
+    "ok": true,
+    "kind": "instructions only",
+    "scripts": 0,
+    "reasons": [],
+    "validation": "portable instructions and bundled references; live model quality is recorded separately"
+  },
+  {
+    "name": "handoff",
+    "ok": true,
+    "kind": "instructions only",
+    "scripts": 0,
+    "reasons": [],
+    "validation": "portable instructions and bundled references; live model quality is recorded separately"
   },
   {
     "name": "internal-comms",
@@ -70,6 +102,14 @@
     "kind": "scripts",
     "scripts": 4,
     "reasons": []
+  },
+  {
+    "name": "tdd",
+    "ok": true,
+    "kind": "instructions only",
+    "scripts": 0,
+    "reasons": [],
+    "validation": "portable instructions and bundled references; live model quality is recorded separately"
   },
   {
     "name": "theme-factory",

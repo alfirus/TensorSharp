@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "다음 채팅",
   "page.knowledge.noChats": "검색과 일치하는 저장된 채팅이 없습니다.",
   "page.knowledge.indexingChats": "채팅 복사 및 색인 생성 중…",
-  "page.knowledge.chatImportComplete": "채팅 {added}개 색인 생성 완료 · 문제 {failed}개 확인 필요"
+  "page.knowledge.chatImportComplete": "채팅 {added}개 색인 생성 완료 · 문제 {failed}개 확인 필요",
+  "page.chips.keyframe": "키프레임",
+  "page.chips.framePosition": "이미지 프레임 위치",
+  "page.chips.autoFrame": "자동 (프레임 {frame})",
+  "page.chips.firstFrame": "첫 프레임",
+  "page.chips.lastFrame": "마지막 프레임",
+  "page.chips.frameNumber": "프레임 번호",
+  "page.chips.frameStrength": "강도",
+  "page.composer.videoWithKeyframes": "동영상 설명…이미지 키프레임으로 타임라인 지정",
+  "page.chips.guidanceMode": "이미지 안내",
+  "page.chips.temporalGuides": "첫/마지막 및 지정 프레임",
+  "page.chips.identityGuides": "인물·사물 참조(Ingredients)",
+  "page.chips.clipLength": "동영상 길이",
+  "page.chips.previewLength": "0.7초 미리보기",
+  "page.composer.videoWithIdentityReferences": "생성할 장면과 각 참조 이미지의 내용을 위치와 함께 설명하세요. 피사체가 명확하고 글자가 없는 이미지가 좋습니다. 참조 이미지가 여러 장이면 시트의 패널 배치가 영상에 남을 수 있습니다. 한 장만 사용하면 구도를 더 예측하기 쉽습니다."
 }

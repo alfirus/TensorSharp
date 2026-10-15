@@ -720,9 +720,54 @@ static void benchmark(ggml_backend_t allocator, ggml_backend_t backend,
 #endif
 #include "vision_attention_test.h"
 
+// Explicit qualification mode: --require-cuda is fail-closed and must name the
+// visible device, so a CPU callback or a skipped CUDA device cannot pass it.
+static int vision_head64_gate(int argc, char ** argv)
+{
+    bool require_cuda = false;
+    int device = -1;
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--require-cuda") == 0) require_cuda = true;
+        else if (std::strcmp(argv[i], "--cuda-device") == 0 && i + 1 < argc) {
+            char * end = nullptr;
+            const long value = std::strtol(argv[++i], &end, 10);
+            require(end && *end == '\0' && end != argv[i] && value >= 0 &&
+                value <= std::numeric_limits<int>::max(), "Invalid visible CUDA device index");
+            device = int(value);
+        } else require(false, "Usage: --vision-head64-only [--require-cuda --cuda-device INDEX]");
+    }
+    require(require_cuda == (device >= 0), "CUDA qualification requires both --require-cuda and --cuda-device INDEX");
+#ifdef TSG_GGML_USE_CUDA
+    const int devices = ggml_backend_cuda_get_device_count();
+    if (!devices && !require_cuda) return 77;
+    if (device < 0) device = 0;
+    require(devices > device, "Required visible CUDA device is unavailable");
+    auto * cuda = ggml_backend_cuda_init(device);
+    require(cuda != nullptr, "Cannot initialize required CUDA device");
+    auto * backend = tsg_dsv4_fused_backend_init(cuda);
+    require(backend != nullptr, "Cannot initialize owned vision attention CUDA backend");
+    std::printf("VISION_HEAD64_GATE backend=CUDA device=%d cuda_required=%d description=%s\n", device,
+        require_cuda, ggml_backend_dev_description(ggml_backend_get_device(cuda)));
+    run_vision_head64(cuda, backend);
+    ggml_backend_free(backend);
+    ggml_backend_free(cuda);
+#else
+    require(!require_cuda, "CUDA qualification requested from a CPU-only executable");
+    auto * backend = ggml_backend_cpu_init();
+    require(backend != nullptr, "Cannot initialize CPU vision attention backend");
+    ggml_backend_cpu_set_n_threads(backend, 4);
+    std::printf("VISION_HEAD64_GATE backend=CPU cuda_executed=0\n");
+    run_vision_head64(backend, backend);
+    ggml_backend_free(backend);
+#endif
+    return 0;
+}
+
 int main(int argc, char ** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    if (argc >= 2 && std::strcmp(argv[1], "--vision-head64-only") == 0)
+        return vision_head64_gate(argc, argv);
 #ifdef TSG_GGML_USE_CUDA
     const int devices = ggml_backend_cuda_get_device_count();
     if (devices == 0) return 77;

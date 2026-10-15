@@ -4,17 +4,21 @@
 
 // A double-precision, two-pass softmax reference checks the streaming kernel's
 // geometry and arithmetic independently, including long bidirectional rows.
+enum class vision_data { random, large_values, exact_large, source_bits };
+
 static void check_vision(ggml_backend_t allocator, ggml_backend_t backend,
-                         int queries, int keys, int heads, int batches, bool padded,
-                         bool interleaved, bool large_values = false) {
-    constexpr int width = 72;
+                         int width, int queries, int keys, int heads, int batches, bool padded,
+                         bool interleaved, vision_data data = vision_data::random) {
     auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     require(ctx != nullptr, "Cannot initialize vision attention test context");
     input_tensor q(ctx, GGML_TYPE_F32, {width, queries, heads, batches}, padded, interleaved);
     input_tensor k(ctx, GGML_TYPE_F32, {width, keys, heads, batches}, padded, interleaved);
     input_tensor v(ctx, GGML_TYPE_F32, {width, keys, heads, batches}, padded, interleaved);
-    const float scale = 1.0f / std::sqrt(float(width));
+    const float scale = data == vision_data::source_bits ? 1.0f : 1.0f / std::sqrt(float(width));
     auto * output = tsg_vision_attention_f32(ctx, q.tensor, k.tensor, v.tensor, scale);
+    require(output && output->op == GGML_OP_CUSTOM && output->type == GGML_TYPE_F32 &&
+        output->ne[0] == width && output->ne[1] == heads && output->ne[2] == queries && output->ne[3] == batches,
+        "Vision attention must retain its owned F32 operator and flattened token layout");
     auto * graph = ggml_new_graph(ctx);
     // An ordinary downstream node exercises the paired backend's stream order.
     auto * result_tensor = ggml_scale(ctx, output, 0.5f);
@@ -25,7 +29,26 @@ static void check_vision(ggml_backend_t allocator, ggml_backend_t backend,
     std::uniform_real_distribution<float> uniform(-1.5f, 1.5f);
     for (auto & value : q.values) value = uniform(random);
     for (auto & value : k.values) value = uniform(random);
-    for (auto & value : v.values) value = large_values ? 70000.125f + uniform(random) : uniform(random);
+    for (auto & value : v.values) value = data == vision_data::large_values ? 80000.125f + uniform(random) : uniform(random);
+    if (data == vision_data::exact_large || data == vision_data::source_bits) {
+        std::fill(q.values.begin(), q.values.end(), 0.0f);
+        std::fill(k.values.begin(), k.values.end(), 0.0f);
+        std::fill(v.values.begin(), v.values.end(), 80000.125f);
+        if (data == vision_data::source_bits) {
+            require(keys == 2, "Source-bit vision test requires two keys");
+            for (int batch = 0; batch < batches; ++batch)
+            for (int head = 0; head < heads; ++head) {
+                for (int query = 0; query < queries; ++query)
+                    q.values[q.logical(0, query, head, batch)] = 1.0f + 0x1p-12f;
+                k.values[k.logical(0, 0, head, batch)] = 1.0f;
+                k.values[k.logical(0, 1, head, batch)] = -1.0f;
+                for (int x = 0; x < width; ++x) {
+                    v.values[v.logical(x, 0, head, batch)] = 1.0f;
+                    v.values[v.logical(x, 1, head, batch)] = -1.0f;
+                }
+            }
+        }
+    }
     q.upload(); k.upload(); v.upload();
     timed_compute(backend, graph, 1);
     std::vector<float> result(ggml_nelements(result_tensor));
@@ -51,28 +74,43 @@ static void check_vision(ggml_backend_t allocator, ggml_backend_t backend,
             expected *= 0.5 / sum;
             const size_t index = x + width * (head + heads * (query + queries * batch));
             const double error = std::abs(double(result[index]) - expected);
-            require(std::isfinite(result[index]) && error <= 8e-5 + 2e-5 * std::abs(expected),
+            const double bound = data == vision_data::source_bits ? 2e-6 : 8e-5 + 2e-5 * std::abs(expected);
+            require(std::isfinite(result[index]) && error <= bound,
                 "F32 vision attention differs from independent double-precision reference");
+            if (data == vision_data::exact_large)
+                require(result[index] == 40000.0625f, "Vision attention rounded or narrowed an exact 80000.125 F32 value");
             maximum_error = std::max(maximum_error, error);
             squared_error += error * error;
             squared_reference += expected * expected;
         }
     }
     q.check_unchanged(); k.check_unchanged(); v.check_unchanged();
-    std::printf("VISION_F32_TEST queries=%d keys=%d heads=%d batches=%d padded=%d interleaved=%d large_values=%d max_abs=%.9g rel_l2=%.9g\n",
-        queries, keys, heads, batches, padded, interleaved, large_values, maximum_error,
+    std::printf("VISION_F32_TEST width=%d queries=%d keys=%d heads=%d batches=%d padded=%d interleaved=%d data=%d max_abs=%.9g rel_l2=%.9g\n",
+        width, queries, keys, heads, batches, padded, interleaved, int(data), maximum_error,
         std::sqrt(squared_error / std::max(1e-30, squared_reference)));
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
 }
 
+static void run_vision_head64(ggml_backend_t allocator, ggml_backend_t backend) {
+    check_vision(allocator, backend, 64, 1, 1, 1, 1, false, false);
+    check_vision(allocator, backend, 64, 37, 37, 3, 2, true, false);
+    check_vision(allocator, backend, 64, 65, 129, 2, 1, true, true);
+    check_vision(allocator, backend, 64, 129, 521, 4, 1, false, false);
+    check_vision(allocator, backend, 64, 3, 8193, 2, 1, true, false);
+    check_vision(allocator, backend, 64, 65, 257, 2, 1, false, false, vision_data::large_values);
+    check_vision(allocator, backend, 64, 129, 17, 2, 2, true, true, vision_data::exact_large);
+    check_vision(allocator, backend, 64, 129, 2, 2, 2, true, true, vision_data::source_bits);
+}
+
 static void run_vision(ggml_backend_t allocator, ggml_backend_t backend) {
-    check_vision(allocator, backend, 1, 1, 1, 1, false, false);
-    check_vision(allocator, backend, 37, 37, 3, 2, true, false);
-    check_vision(allocator, backend, 65, 129, 2, 1, true, true);
-    check_vision(allocator, backend, 129, 521, 4, 1, false, false);
-    check_vision(allocator, backend, 3, 8193, 2, 1, true, false);
-    check_vision(allocator, backend, 65, 257, 2, 1, false, false, true);
+    check_vision(allocator, backend, 72, 1, 1, 1, 1, false, false);
+    check_vision(allocator, backend, 72, 37, 37, 3, 2, true, false);
+    check_vision(allocator, backend, 72, 65, 129, 2, 1, true, true);
+    check_vision(allocator, backend, 72, 129, 521, 4, 1, false, false);
+    check_vision(allocator, backend, 72, 3, 8193, 2, 1, true, false);
+    check_vision(allocator, backend, 72, 65, 257, 2, 1, false, false, vision_data::large_values);
+    run_vision_head64(allocator, backend);
 }
 
 #ifdef TSG_GGML_USE_CUDA

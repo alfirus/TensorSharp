@@ -18,6 +18,7 @@ import signal
 import statistics
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -169,7 +170,16 @@ def benchmark(url, model, warmup, repeats, minimum_seconds=0, cases=None):
     return results
 
 
-def correctness(url, model, is_tensorsharp, reference_min_batch_cosine=.9999):
+def numerical_gate(checks, name, passed, metrics, failure, is_tensorsharp,
+                   measure_reference_after_quality_failure=False):
+    """Record strict numerical failures; only an explicit reference run continues."""
+    checks[name] = dict(passed=bool(passed), **metrics)
+    assert passed or (measure_reference_after_quality_failure and not is_tensorsharp), failure
+
+
+def correctness(url, model, is_tensorsharp, reference_min_batch_cosine=.9999, reference_min_duplicate_cosine=.99999,
+                measure_reference_after_quality_failure=False):
+    checks = {}
     vectors, usage = embedding(url, model, TEXTS)
     assert len(vectors) == len(TEXTS)
     dim = len(vectors[0])
@@ -177,18 +187,26 @@ def correctness(url, model, is_tensorsharp, reference_min_batch_cosine=.9999):
     singles = [embedding(url, model, s)[0][0] for s in TEXTS]
     batch_cosines = [cosine(a,b) for a,b in zip(vectors,singles)]
     consistency_gate = .9999 if is_tensorsharp else reference_min_batch_cosine
-    assert min(batch_cosines) > consistency_gate, batch_cosines
+    numerical_gate(checks, "batch", min(batch_cosines) > consistency_gate,
+                   dict(cosines=batch_cosines, threshold=consistency_gate), batch_cosines,
+                   is_tensorsharp, measure_reference_after_quality_failure)
     reversed_rows, _ = embedding(url, model, list(reversed(TEXTS)))
-    assert min(cosine(a,b) for a,b in zip(vectors,reversed(reversed_rows))) > .9999
+    reverse_cosines = [cosine(a,b) for a,b in zip(vectors,reversed(reversed_rows))]
+    numerical_gate(checks, "reversed", min(reverse_cosines) > .9999,
+                   dict(cosines=reverse_cosines, threshold=.9999), ("reversed input order", reverse_cosines, .9999),
+                   is_tensorsharp, measure_reference_after_quality_failure)
     repeated, _ = embedding(url, model, [TEXTS[0], TEXTS[0], TEXTS[1]])
-    assert cosine(repeated[0], repeated[1]) > .99999
-    rankings = {
-        "add_function": cosine(vectors[0],vectors[1]) > cosine(vectors[0],vectors[2]),
-        "read_file": cosine(vectors[3],vectors[2]) > cosine(vectors[3],vectors[1]),
-        "cat_paraphrase": cosine(vectors[4],vectors[5]) > cosine(vectors[4],vectors[6]),
-        "snowflake": cosine(vectors[10],vectors[11]) > cosine(vectors[10],vectors[12]),
-    }
-    assert all(rankings.values()), rankings
+    duplicate_cosine = cosine(repeated[0], repeated[1])
+    duplicate_gate = .99999 if is_tensorsharp else reference_min_duplicate_cosine
+    numerical_gate(checks, "duplicate", duplicate_cosine > duplicate_gate,
+                   dict(cosine=duplicate_cosine, threshold=duplicate_gate), ("duplicate inputs", duplicate_cosine, duplicate_gate),
+                   is_tensorsharp, measure_reference_after_quality_failure)
+    retrieval_cosines = {name: dict(positive=cosine(vectors[q],vectors[p]), negative=cosine(vectors[q],vectors[n]))
+                         for name, q, p, n in (("add_function",0,1,2), ("read_file",3,2,1),
+                                                ("cat_paraphrase",4,5,6), ("snowflake",10,11,12))}
+    rankings = {name: values["positive"] > values["negative"] for name, values in retrieval_cosines.items()}
+    numerical_gate(checks, "retrieval", all(rankings.values()), dict(rankings=rankings, cosines=retrieval_cosines), rankings,
+                   is_tensorsharp, measure_reference_after_quality_failure)
     extra = {}
     if is_tensorsharp:
         status, models = request(url, "/v1/models")
@@ -226,10 +244,46 @@ def correctness(url, model, is_tensorsharp, reference_min_batch_cosine=.9999):
                      dimensions_tested=min(256,dim))
     return dict(dimensions=dim,vectors=vectors,single_vectors=singles,
                 usage=usage,batch_min_cosine=min(batch_cosines),batch_consistency_gate=consistency_gate,
-                rankings=rankings,**extra)
+                reversed_min_cosine=min(reverse_cosines),reversed_consistency_gate=.9999,
+                duplicate_cosine=duplicate_cosine,duplicate_consistency_gate=duplicate_gate,
+                rankings=rankings,retrieval_cosines=retrieval_cosines,numerical_checks=checks,
+                quality_pass=all(check["passed"] for check in checks.values()),**extra)
+
+
+def process_memory(pid):
+    """Read Linux main-server memory outside timing; child/GPU memory is excluded."""
+    if platform.system() != "Linux":
+        return dict(available=False, scope="main-server process", reason="Linux /proc is unavailable")
+    try:
+        status = (Path("/proc") / str(pid) / "status").read_text()
+        fields = {}
+        for line in status.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key in ("VmRSS", "VmHWM", "VmSize", "VmSwap"):
+                pieces = value.split()
+                if len(pieces) == 2 and pieces[1] == "kB":
+                    fields[key] = int(pieces[0]) * 1024
+        if "VmRSS" not in fields or "VmHWM" not in fields:
+            return dict(available=False, scope="main-server process", reason="RSS/high-water fields are unavailable")
+        return dict(available=True, scope="main-server process", pid=pid,
+                    resident_bytes=fields["VmRSS"], high_water_resident_bytes=fields["VmHWM"],
+                    virtual_bytes=fields.get("VmSize"), swap_bytes=fields.get("VmSwap"),
+                    source="Linux /proc/<pid>/status; kB fields converted with 1024 bytes",
+                    limitations="Excludes child-process RSS and GPU device memory; high-water includes startup.")
+    except (OSError, ValueError) as error:
+        return dict(available=False, scope="main-server process", reason=type(error).__name__)
 
 
 def run_engine(name, command, url, args, output):
+    record = dict(command=command, url=url, memory_snapshots=[])
+    capture = None
+    if getattr(args, "capture_boundary_telemetry", False):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "eng/validation"))
+        from embeddinggemma2_boundary_telemetry import capture_boundary
+        from embeddinggemma2_http_environment import audit_child_environment
+        capture = capture_boundary
+        record["environment_audit"] = audit_child_environment(command, os.environ).metadata()
+        record["boundary_telemetry_before"] = capture()
     log = open(output / (name + ".log"),"w")
     process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
     start = time.monotonic()
@@ -246,8 +300,10 @@ def run_engine(name, command, url, args, output):
             time.sleep(.25)
         else:
             raise TimeoutError(name+" startup")
+        record["memory_snapshots"].append(dict(phase="ready", **process_memory(process.pid)))
         print(name,"ready",flush=True)
-        checks = correctness(url,args.model,name=="tensorsharp",args.reference_min_batch_cosine)
+        checks = correctness(url,args.model,name=="tensorsharp",args.reference_min_batch_cosine,args.reference_min_duplicate_cosine,
+                             args.measure_reference_after_quality_failure)
         # Small encoders can finish the correctness corpus before a managed
         # runtime promotes hot methods. Give both engines the same timed
         # prewarm, in addition to the per-shape warmups below.
@@ -257,8 +313,11 @@ def run_engine(name, command, url, args, output):
             embedding(url,args.model,scenarios()["single_short"])
             prewarm_calls += 1
         prewarm = dict(calls=prewarm_calls,elapsed_seconds=time.perf_counter()-prewarm_start)
+        record["memory_snapshots"].append(dict(phase="after-correctness-and-prewarm", **process_memory(process.pid)))
         timings = benchmark(url,args.model,args.warmup,args.repeats,args.minimum_measure_seconds,args.cases)
-        return dict(command=command,url=url,correctness=checks,prewarm=prewarm,benchmarks=timings)
+        record["memory_snapshots"].append(dict(phase="after-all-measurements", **process_memory(process.pid)))
+        record.update(correctness=checks, prewarm=prewarm, benchmarks=timings)
+        return record
     finally:
         for connection in getattr(CONNECTIONS,"connections",{}).values():
             connection.close()
@@ -271,6 +330,11 @@ def run_engine(name, command, url, args, output):
                 os.killpg(process.pid,signal.SIGKILL)
                 process.wait()
         log.close()
+        record["server_exit_code"] = process.returncode
+        if capture:
+            record["boundary_telemetry_after"] = capture()
+        if process.returncode != 0:
+            raise RuntimeError(name+" failed graceful shutdown: "+str(process.returncode))
 
 
 def main():
@@ -296,11 +360,17 @@ def main():
     parser.add_argument("--min-cosine",type=float,default=.999)
     parser.add_argument("--reference-min-batch-cosine",type=float,default=.9999,
                         help="Explicit llama batch/individual tolerance; TensorSharp always requires .9999")
+    parser.add_argument("--reference-min-duplicate-cosine",type=float,default=.99999,
+                        help="Explicit llama duplicate-input tolerance; TensorSharp and the default reference always require .99999")
+    parser.add_argument("--measure-reference-after-quality-failure",action="store_true",
+                        help="Collect llama numerical failures and timings without relaxing gates; candidate failures still stop, and the overall run fails")
     parser.add_argument("--max-slowdown",type=float,default=1.05)
     parser.add_argument("--require-performance",action="store_true")
     parser.add_argument("--tensorsharp-first",action="store_true",help="Reverse engine order for a repeat run")
     parser.add_argument("--keep-alive",action="store_true",
                         help="Reuse one HTTP connection per client thread, as embedding SDKs normally do")
+    parser.add_argument("--capture-boundary-telemetry",action="store_true",
+                        help="Read-only GPU/cgroup snapshots before launch and after shutdown, outside timing")
     args=parser.parse_args()
     if args.scenario_file:
         EXTRA_SCENARIOS = json.loads(args.scenario_file.read_text())
@@ -321,15 +391,25 @@ def main():
         parser.error("repeats must be positive; warmup and finite prewarm-seconds must be nonnegative")
     if not math.isfinite(args.minimum_measure_seconds) or args.minimum_measure_seconds < 0:
         parser.error("minimum-measure-seconds must be finite and nonnegative")
+    if any(not math.isfinite(value) or not -1 <= value <= 1 for value in
+           (args.reference_min_batch_cosine, args.reference_min_duplicate_cosine)):
+        parser.error("reference cosine gates must be finite and between -1 and 1")
     args.output.mkdir(parents=True,exist_ok=True)
     digest=hashlib.sha256()
     with args.model_file.open("rb") as model_file:
         for block in iter(lambda:model_file.read(1024*1024),b""):
             digest.update(block)
-    result=dict(platform=platform.platform(),machine=platform.machine(),
+    result=dict(platform=platform.platform(),machine=platform.machine(),strict_pass=False,
                 timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
                 model_file=str(args.model_file),model_sha256=digest.hexdigest(),
+                runner_arguments=list(os.sys.argv[1:]),
+                thresholds=dict(cross_engine_min_cosine=args.min_cosine,maximum_latency_ratio=args.max_slowdown,
+                                reference_batch_min_cosine=args.reference_min_batch_cosine,
+                                reference_duplicate_min_cosine=args.reference_min_duplicate_cosine,
+                                candidate_batch_min_cosine=.9999,candidate_duplicate_min_cosine=.99999,
+                                reversed_order_min_cosine=.9999,performance_required=args.require_performance),
                 warmup=args.warmup,repeats=args.repeats,prewarm_seconds=args.prewarm_seconds,
+                measure_reference_after_quality_failure=args.measure_reference_after_quality_failure,
                 minimum_measure_seconds=args.minimum_measure_seconds,
                 connection_mode="persistent-per-thread" if KEEP_ALIVE else "new-per-request",inputs=TEXTS,
                 benchmark_inputs={key:value for key,value in scenarios().items() if args.cases is None or key in args.cases},engines={},
@@ -350,6 +430,7 @@ def main():
         error=max(abs(x-y) for a,b in zip(ts["correctness"]["vectors"],llama["correctness"]["vectors"]) for x,y in zip(a,b))
         ratios={name:ts["benchmarks"][name]["median_ms"]/v["median_ms"] for name,v in llama["benchmarks"].items()}
         result["comparison"]=dict(cosines=cosines,min_cosine=min(cosines),max_absolute_error=error,
+                                  cross_engine_quality_pass=min(cosines)>=args.min_cosine,
                                   latency_ratio_tensorsharp_over_llama=ratios,
                                   performance_pass=all(v <= args.max_slowdown for v in ratios.values()))
         extra_checks = {}
@@ -360,17 +441,34 @@ def main():
             assert a["prompt_tokens"] == b["prompt_tokens"], (name, "token accounting differs")
             assert len(a["vectors"]) == len(b["vectors"]), (name, "row count differs")
             similarities = [cosine(x,y) for x,y in zip(a["vectors"],b["vectors"])]
-            extra_checks[name] = dict(min_cosine=min(similarities), prompt_tokens=a["prompt_tokens"])
-            assert min(similarities) >= args.min_cosine, (name, extra_checks[name])
+            extra_checks[name] = dict(cosines=similarities, min_cosine=min(similarities), prompt_tokens=a["prompt_tokens"],
+                                     threshold=args.min_cosine, passed=min(similarities)>=args.min_cosine)
         if extra_checks:
             result["comparison"]["extra_scenarios"] = extra_checks
         assert ts["correctness"]["usage"] == llama["correctness"]["usage"], "token accounting differs"
+        result["comparison"]["quality_pass"] = (ts["correctness"]["quality_pass"] and llama["correctness"]["quality_pass"] and
+                                                 min(cosines)>=args.min_cosine and all(item["passed"] for item in extra_checks.values()))
+        # All raw-input comparison metrics are now attached before any numeric
+        # failure aborts; a failing 8192-token case must not hide later cases.
+        for name, check in extra_checks.items():
+            assert check["passed"], (name, check)
         assert min(cosines)>=args.min_cosine, result["comparison"]
+        assert ts["correctness"]["quality_pass"] and llama["correctness"]["quality_pass"], "Strict engine numerical checks failed; timings are diagnostic only"
         if args.require_performance:
             assert result["comparison"]["performance_pass"], ratios
+        result["strict_pass"] = True
         print(json.dumps(result["comparison"],indent=2),flush=True)
     finally:
+        result["binary_artifacts_after"] = {
+            "tensorsharp": command_artifacts(args.tensorsharp_command),
+            "llama": command_artifacts(args.llama_command),
+        }
+        result["binary_artifacts_unchanged"] = result["binary_artifacts"] == result["binary_artifacts_after"]
+        if not result["binary_artifacts_unchanged"]:
+            result["strict_pass"] = False
         destination.write_text(json.dumps(result,indent=2,ensure_ascii=False)+"\n")
+        if not result["binary_artifacts_unchanged"]:
+            raise RuntimeError("Runtime binaries changed during validation; repeat using a frozen build directory")
 
 
 if __name__=="__main__":

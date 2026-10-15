@@ -31,6 +31,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         private readonly DirectContext _ctx;
+        private readonly MiniMaxH3TensorOps _tensorOps;
         private readonly MiniMaxH3TextEncoderConfig _cfg;
         private readonly LayerW[] _layers;
         private readonly System.Collections.Generic.List<DirectLinear> _owned = new();
@@ -41,14 +42,12 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             _cfg = config;
             _ctx = new DirectContext(allocator);
-            if (_ctx.IsCuda)
-                throw new NotSupportedException(
-                    "MiniMaxH3DirectTextEncoder is the managed CPU path; MiniMax-H3 on " +
-                    "BackendType.Cuda is not implemented (use a GGML backend, or BackendType.Cpu).");
+            _tensorOps = new MiniMaxH3TensorOps(_ctx);
 
             DirectLinear Lin(string w, string b)
             {
-                var l = DirectLinear.FromGguf(_ctx, gguf, w, gguf.Tensors.ContainsKey(b ?? "") ? b : null);
+                var l = DirectLinear.FromGguf(_ctx, gguf, w, gguf.Tensors.ContainsKey(b ?? "") ? b : null,
+                    prescale: true, h3PreserveFloat32: true);
                 _owned.Add(l);
                 return l;
             }
@@ -92,9 +91,14 @@ namespace TensorSharp.Models.MiniMaxH3
         /// prefix of each head, so the two are kept separate rather than merged
         /// behind a flag.
         /// </summary>
-        private static unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
+        private unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
                                             int seq, int nHeads, int hd)
         {
+            if (_tensorOps.IsAccelerated)
+            {
+                _tensorOps.RopeHalf(x, cos, sin, seq, nHeads, hd, hd);
+                return;
+            }
             int half = hd / 2;
             float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
             fixed (float* pcos = cos, psin = sin)
@@ -128,6 +132,8 @@ namespace TensorSharp.Models.MiniMaxH3
         private unsafe Tensor CausalGqaAttention(Tensor q, Tensor k, Tensor v,
                                                  int seq, int heads, int kvHeads, int hd)
         {
+            if (_tensorOps.IsAccelerated)
+                return _tensorOps.CausalGqaAttention(q, k, v, seq, heads, kvHeads, hd);
             float scale = 1.0f / MathF.Sqrt(hd);
             int group = heads / kvHeads;
             Tensor outT = _ctx.NewF32(seq, (long)heads * hd);
@@ -253,6 +259,7 @@ namespace TensorSharp.Models.MiniMaxH3
             _disposed = true;
             foreach (var l in _owned) l.Dispose();
             _owned.Clear();
+            _tensorOps.Dispose();
             _ctx.Dispose();
         }
     }

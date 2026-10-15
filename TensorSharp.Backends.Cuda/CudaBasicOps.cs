@@ -23,9 +23,19 @@ namespace TensorSharp.Cuda
         {
             if (CudaKernelOps.TryCopy(result, src))
                 return;
+            if (CudaMiniMaxH3Ops.TryCopyStrided(result, src))
+                return;
 
             CudaCpuFallback.WarnFallback("copy");
             CudaCpuFallback.CopyLogical(result, src);
+        }
+
+        [RegisterOpStorageType("clamp", typeof(CudaStorage))]
+        public static Tensor Clamp(Tensor result,Tensor src,float min,float max)
+        {
+            Tensor writeTarget=TensorResultBuilder.GetWriteTarget(result,src,true,src.Sizes);
+            if(CudaMiniMaxH3Ops.TryClamp(writeTarget,src,min,max))return writeTarget;
+            throw new NotSupportedException("CUDA F32 clamp requires contiguous matching tensors and current TensorSharp kernels.");
         }
 
         [RegisterOpStorageType("dot", typeof(CudaStorage))]

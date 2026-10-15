@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <AssemblyMetadata Include="TensorSharpBatchQualitySnapshot" Value="$(TensorSharpBatchQualitySnapshot)" />
+    <Reference Include="$(TensorSharpBatchQualitySnapshot)/*.dll" Exclude="$(TensorSharpBatchQualitySnapshot)/TensorSharp.Server.Host.dll;$(TensorSharpBatchQualitySnapshot)/GgmlOps.dll" />
+    <Content Include="$(TensorSharpBatchQualitySnapshot)/runtimes/**/*" Link="runtimes/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(TensorSharpBatchQualitySnapshot)/*.so;$(TensorSharpBatchQualitySnapshot)/*.so.*;$(TensorSharpBatchQualitySnapshot)/*.dylib" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Include="../EmbeddingGemma2CompositeInputProbe/DefaultHttpSource.cs" Link="DefaultHttpSource.cs" />
+  </ItemGroup>
+  <Target Name="RequireFrozenBatchQuality" BeforeTargets="ResolveReferences">
+    <Error Condition="'$(TensorSharpBatchQualitySnapshot)' == '' Or !Exists('$(TensorSharpBatchQualitySnapshot)/TensorSharp.Models.dll') Or !Exists('$(TensorSharpBatchQualitySnapshot)/TensorSharp.Runtime.dll') Or !Exists('$(TensorSharpBatchQualitySnapshot)/TensorSharp.Server.dll')" Text="Set TensorSharpBatchQualitySnapshot to an immutable complete runtime; no production dependencies are rebuilt." />
+  </Target>
+</Project>

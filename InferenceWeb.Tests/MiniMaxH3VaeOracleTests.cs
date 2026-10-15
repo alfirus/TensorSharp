@@ -27,12 +27,15 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests
 {
-    public class MiniMaxH3VaeOracleTests
+    public class MiniMaxH3VaeOracleTests : IDisposable
     {
         private const string DirEnv = "TS_MINIMAX_H3_DIR";
         private readonly ITestOutputHelper _output;
+        private readonly MiniMaxH3OracleBackend _backend;
 
-        public MiniMaxH3VaeOracleTests(ITestOutputHelper output) { _output = output; }
+        public MiniMaxH3VaeOracleTests(ITestOutputHelper output)
+        { _output=output; _backend=new MiniMaxH3OracleBackend(); _output.WriteLine($"[h3-oracle] backend={_backend.Backend}"); }
+        public void Dispose() => _backend.Dispose();
 
         private static string Root => Environment.GetEnvironmentVariable(DirEnv);
         private static string FixtureDir =>
@@ -116,7 +119,7 @@ namespace InferenceWeb.Tests
                             latent[(((long)ti * h + hi) * w + wi) * c + ci] =
                                 zchw[(((long)ci * t + ti) * h + hi) * w + wi];
 
-            using var vae = new MiniMaxH3VideoVae(VaePath);
+            using var vae = _backend.Video(VaePath);
             Assert.Equal(36, vae.NumBlocks);
             Assert.Equal(3072, vae.PatchDim);
 
@@ -160,7 +163,7 @@ namespace InferenceWeb.Tests
             if (!Have("h3_video_latents_mean.bin", "h3_video_latents_std.bin")
                 || !File.Exists(VaePath)) return;
 
-            using var vae = new MiniMaxH3VideoVae(VaePath);
+            using var vae = _backend.Video(VaePath);
             float[] mean = ReadF32("h3_video_latents_mean.bin");
             float[] std = ReadF32("h3_video_latents_std.bin");
 
@@ -191,7 +194,7 @@ namespace InferenceWeb.Tests
             int[] ids = File.ReadAllText(idsPath).Split(',')
                 .Select(x => int.Parse(x.Trim(), CultureInfo.InvariantCulture)).ToArray();
 
-            using var te = new MiniMaxH3TextEncoder(TePath, tokenizerDir: Root);
+            using var te = _backend.Text(TePath,Root);
             _output.WriteLine("[h3-te] " + te.Config);
 
             // The published H3 encoder: 50 layers, no final norm, GQA 64/8.
@@ -229,7 +232,7 @@ namespace InferenceWeb.Tests
         public void TextEncoderTokenizesWithoutAChatTemplate()
         {
             if (!File.Exists(TePath) || !File.Exists(Path.Combine(Root, "vocab.json"))) return;
-            using var te = new MiniMaxH3TextEncoder(TePath, tokenizerDir: Root);
+            using var te = _backend.Text(TePath,Root);
 
             // H3 adds no BOS and no EOS, and wraps the prompt in nothing at all.
             // Round-tripping the prompt is the cheapest proof of both.
@@ -269,7 +272,7 @@ namespace InferenceWeb.Tests
             float[] audioLatent = ReadF32("h3_dit_audio_latent.bin");   // [2][T][32]
             float[] textHidden = ReadF32("h3_dit_text_hidden.bin");     // [5][5120]
 
-            using var dit = new MiniMaxH3DiT(DitPath);
+            using var dit = _backend.Dit(DitPath);
             _output.WriteLine("[h3-dit] " + dit.Config);
 
             var shape = new MiniMaxH3Shape
@@ -319,7 +322,7 @@ namespace InferenceWeb.Tests
             const string prompt = "a red fox trotting through falling snow, cinematic";
             float[] textHidden;
             int textLen;
-            using (var te = new MiniMaxH3TextEncoder(TePath, tokenizerDir: Root))
+            using (var te = _backend.Text(TePath,Root))
             {
                 var ids = te.Tokenize(prompt);
                 textLen = ids.Count;
@@ -328,22 +331,20 @@ namespace InferenceWeb.Tests
                                   $"absmax={AbsMax(textHidden):F3}");
             }
 
-            using var dit = new MiniMaxH3DiT(DitPath);
+            using var dit = _backend.Dit(DitPath);
             var shape = MiniMaxH3Geometry.Resolve(256, 256, 22);
             int videoCount = shape.VideoTokenCount, audioCount = shape.AudioTokenCount;
-            var rng = new Random(1234);
-            var video = new float[(long)videoCount * dit.Config.VideoPatchDim];
-            var audio = new float[(long)audioCount * dit.Config.AudioLatentChannels];
-            for (int i = 0; i < video.Length; i++) video[i] = Gauss(rng);
-            for (int i = 0; i < audio.Length; i++) audio[i] = Gauss(rng);
+            var (video, audio) = MiniMaxH3Noise.Initial(shape, 1234);
 
             float[] sigmas = MiniMaxH3Scheduler.BuildSigmas(8);
             for (int step = 0; step < 8; step++)
             {
                 float sigma = sigmas[step];
                 var layout = MiniMaxH3Layout.Build(textLen, shape, sigma);
-                var (v, a) = dit.Forward(video, videoCount, audio, audioCount,
+                float[] audioInput = MiniMaxH3Scheduler.AudioInputFromCarrier(audio, sigma);
+                var (v, a) = dit.Forward(video, videoCount, audioInput, audioCount,
                                          textHidden, textLen, layout, sigma);
+                MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(audioInput, a, sigma);
                 _output.WriteLine(
                     $"[probe] step {step} sigma={sigma:F4} dt={sigmas[step + 1] - sigma:+0.0000} " +
                     $"| latent rms={Rms(video):F3} | v rms={Rms(v):F3} absmax={AbsMax(v):F2} " +
@@ -355,9 +356,10 @@ namespace InferenceWeb.Tests
             _output.WriteLine($"[probe] final AUDIO latent rms={Rms(audio):F4} absmax={AbsMax(audio):F3}");
             if (File.Exists(AudioVaePath))
             {
-                using var av = new MiniMaxH3AudioVae(AudioVaePath);
+                using var av = _backend.Audio(AudioVaePath);
                 _output.WriteLine($"[probe] audio latents_std mean=" +
                     $"{(av.LatentsStd is null ? double.NaN : av.LatentsStd.Average()):F3}");
+                MiniMaxH3Scheduler.AudioOutputFromCarrierInPlace(audio);
                 var track = av.DecodeStereo(audio, shape.AudioLatentFrames);
                 _output.WriteLine($"[probe] decoded waveform rms={Rms(track.Channels[0]):F5} " +
                                   $"peak={AbsMax(track.Channels[0]):F5}");
@@ -416,7 +418,7 @@ namespace InferenceWeb.Tests
                             latent[(((long)ti * h + hi) * w + wi) * c + ci] =
                                 flat[(((long)ci * t + ti) * h + hi) * w + wi];
 
-            using var vae = new MiniMaxH3VideoVae(VaePath);
+            using var vae = _backend.Video(VaePath);
             vae.DenormalizeLatent(latent);
             float[] pixels = vae.Decode(latent, t, h, w);
             int frames = t * 4, height = h * 16, width = w * 16;
@@ -500,7 +502,7 @@ namespace InferenceWeb.Tests
                               $"absmax={AbsMax(expected):F1}");
 
             const string prompt = "a red fox trotting through falling snow, cinematic";
-            using var te = new MiniMaxH3TextEncoder(TePath, tokenizerDir: Root);
+            using var te = _backend.Text(TePath,Root);
             var ids = te.Tokenize(prompt);
             _output.WriteLine($"[h3-cond] tokenized to {ids.Count} tokens " +
                               $"(reference used {tokens})");
@@ -549,7 +551,7 @@ namespace InferenceWeb.Tests
             var textHidden = new float[(condRaw.Length - 8) / 4];
             Buffer.BlockCopy(condRaw, 8, textHidden, 0, condRaw.Length - 8);
 
-            using var dit = new MiniMaxH3DiT(DitPath);
+            using var dit = _backend.Dit(DitPath);
             var shape = new MiniMaxH3Shape
             {
                 Width = w * 16, Height = h * 16,
@@ -561,10 +563,12 @@ namespace InferenceWeb.Tests
 
             float[] videoPatches = PackedToVideoPatches(packedIn, w, h, t);
             float[] audioLatent = PackedToAudioLatent(packedIn, w, h, t, audioLen);
+            float[] audioInput = MiniMaxH3Scheduler.AudioInputFromCarrier(audioLatent, sigma);
 
             var (vVel, aVel) = dit.Forward(videoPatches, shape.VideoTokenCount,
-                                           audioLatent, shape.AudioTokenCount,
+                                           audioInput, shape.AudioTokenCount,
                                            textHidden, textLen, layout, sigma);
+            MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(audioInput, aVel, sigma);
 
             float[] expectedVideo = PackedToVideoLatent(packedOut, w, h, t);
             float[] actualVideo = MiniMaxH3DiT.UnpatchifyVideo(vVel, t, h, w, 24);
@@ -647,7 +651,7 @@ namespace InferenceWeb.Tests
                     px[q * 3 + c] = planar[c * hw + q];
             var image = new TensorSharp.Models.QwenImage.RgbImage(w, h, px);
 
-            using var vae = new MiniMaxH3VideoVae(VaePath);
+            using var vae = _backend.Video(VaePath);
             Assert.True(vae.HasEncoder, "this VAE checkpoint should carry encoder weights");
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -688,7 +692,7 @@ namespace InferenceWeb.Tests
             int stereo = zs[0], ch = zs[1], t = zs[2];
             float[] z = ReadF32("h3_audio_latent_in.bin");
 
-            using var vae = new MiniMaxH3AudioVae(AudioVaePath);
+            using var vae = _backend.Audio(AudioVaePath);
             Assert.Equal(7, vae.NumStages);
             Assert.Equal(t * 800, MiniMaxH3AudioVae.SamplesFor(t));
 
@@ -749,7 +753,7 @@ namespace InferenceWeb.Tests
                 clip.Add(new TensorSharp.Models.QwenImage.RgbImage(w, h, rgb));
             }
 
-            using var vae = new MiniMaxH3VideoVae(VaePath);
+            using var vae = _backend.Video(VaePath);
             Assert.Equal(latentFrames, MiniMaxH3VideoVae.ChunkLatentFrames(frames));
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -793,7 +797,7 @@ namespace InferenceWeb.Tests
                     rgb[i * 3 + c] = pixels[((long)c * t + 0) * plane + i];
             var frame = new TensorSharp.Models.QwenImage.RgbImage(w, h, rgb);
 
-            using var vae = new MiniMaxH3VideoVae(VaePath);
+            using var vae = _backend.Video(VaePath);
             float[] flat = vae.EncodeFrame(frame);
             float[] cubic = vae.EncodeChunk(new[] { frame });
 
@@ -825,7 +829,7 @@ namespace InferenceWeb.Tests
             float[] expected = ReadF32("h3_audio_enc_mean.bin");
             int frames = meanShape[2];
 
-            using var vae = new MiniMaxH3AudioVae(AudioVaePath);
+            using var vae = _backend.Audio(AudioVaePath);
             Assert.True(vae.HasEncoder, "the audio VAE checkpoint should carry the DAC encoder");
             Assert.Equal(frames, MiniMaxH3AudioVae.FramesFor(samples));
 
@@ -863,7 +867,7 @@ namespace InferenceWeb.Tests
             var plane = new float[samples];
             Array.Copy(wave, plane, samples);
 
-            using var vae = new MiniMaxH3AudioVae(AudioVaePath);
+            using var vae = _backend.Audio(AudioVaePath);
             if (!vae.HasEncoder) return;
             int frames = MiniMaxH3AudioVae.FramesFor(samples);
 
@@ -921,7 +925,7 @@ namespace InferenceWeb.Tests
             float[] expected = ReadF32("h3_audio_pipeline_wave.bin");
             int samples = waveShape[0];
 
-            using var vae = new MiniMaxH3AudioVae(AudioVaePath);
+            using var vae = _backend.Audio(AudioVaePath);
             var track = vae.DecodeStereo(tokens, t);
             Assert.Equal(samples, track.SampleCount);
 

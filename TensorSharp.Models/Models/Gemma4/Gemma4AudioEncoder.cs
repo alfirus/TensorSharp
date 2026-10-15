@@ -9,6 +9,8 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
 using System.Collections.Generic;
+using System.Numerics;
+using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.GGML;
 
@@ -20,9 +22,53 @@ namespace TensorSharp.Models
         // yielding between conformer blocks. See Gemma4VisionEncoder.
         private ModelBase _hostModel;
         public void SetHostModel(ModelBase model) => _hostModel = model;
+        // Independent validation can inspect stage outputs without changing
+        // the public model API. The absent observer adds no device readbacks.
+        internal Action<string, float[], int, int> ValidationTrace { get; set; }
+
+        private void TraceTensor(string name, Tensor tensor)
+        {
+            var observer = ValidationTrace;
+            if (observer == null) return;
+            int rows = checked((int)tensor.Sizes[0]), columns = checked((int)tensor.Sizes[1]);
+            observer(name, tensor.GetElementsAsFloat(checked(rows * columns)), rows, columns);
+        }
+
+        private void TracePlanar(string name, float[] values, int frequency, int time, int channels)
+        {
+            var observer = ValidationTrace;
+            if (observer == null) return;
+            int spatial = checked(frequency * time);
+            var flattened = new float[checked(spatial * channels)];
+            for (int position = 0; position < spatial; ++position)
+                for (int channel = 0; channel < channels; ++channel)
+                    flattened[position * channels + channel] = values[channel * spatial + position];
+            observer(name, flattened, time, checked(frequency * channels));
+        }
 
         private readonly Dictionary<string, Tensor> _weights = new();
         private readonly Dictionary<string, Tensor> _transposedWeights = new();
+        private sealed class CompressedMatrix
+        {
+            private GCHandle _pinned;
+            public readonly int Input, Output, Bytes;
+            public IntPtr Pointer => _pinned.AddrOfPinnedObject();
+            public CompressedMatrix(byte[] bytes, int input, int output)
+            {
+                Input = input; Output = output; Bytes = bytes.Length;
+                _pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            }
+            public void Free() { if (_pinned.IsAllocated) _pinned.Free(); }
+        }
+        private readonly Dictionary<string, CompressedMatrix> _compressedMatrices = new();
+        private readonly Dictionary<int, GgmlGemma4AudioBlock> _conformerBlocks = new();
+        private readonly bool _useConformerBlockGraph;
+        private readonly bool _useSscpGraph;
+        private readonly bool _requireGgmlFloat32Precision;
+        private readonly bool _usePreciseCudaSscp;
+        private readonly bool _usePreciseCudaLinears;
+        private GgmlGemma4AudioConvolution[] _sscpConvolutions;
+        private GgmlGemma4AudioLinear _sscpProjection;
         private readonly IAllocator _allocator;
 
         private readonly int _hiddenSize;
@@ -49,6 +95,7 @@ namespace TensorSharp.Models
         }
         private readonly Dictionary<string, ClampParams> _clampParams = new();
         private readonly Dictionary<string, float[]> _positionEmbeddingCache = new();
+        private readonly Dictionary<string, Tensor> _devicePositionEmbeddingCache = new();
 
         private bool _useOllamaNames;
         private Tensor _onesForNorm;
@@ -67,9 +114,37 @@ namespace TensorSharp.Models
         public bool IsEncoderFree => _isEncoderFree;
 
         public Gemma4AudioEncoder(string mmProjPath, IAllocator allocator)
+            : this(mmProjPath, allocator, requireValidatedFloat32Precision: false) { }
+
+        /// <summary>Loads the audio tower. The precision requirement selects
+        /// model-qualified learned projection and SSCP F32 paths without changing process-wide
+        /// backend math modes. EmbeddingGemma 2 uses this requirement; existing
+        /// Gemma chat callers retain their constructor behavior.</summary>
+        public Gemma4AudioEncoder(string mmProjPath, IAllocator allocator, bool requireValidatedFloat32Precision)
         {
+            ArgumentNullException.ThrowIfNull(allocator);
             _allocator = allocator;
-            var gguf = new GgufFile(mmProjPath);
+            static bool Enabled(string name, bool defaultEnabled = false)
+            {
+                string value = Environment.GetEnvironmentVariable(name);
+                return value == "1" || defaultEnabled && value != "0";
+            }
+            bool metal = allocator is GgmlAllocator ga && ga.Context.BackendType == GgmlBackendType.Metal;
+            bool ggmlCuda = allocator is GgmlAllocator gc && gc.Context.BackendType == GgmlBackendType.Cuda;
+            bool ggmlCpu = allocator is GgmlAllocator cp && cp.Context.BackendType == GgmlBackendType.Cpu;
+            bool qualifiedGgml = metal || ggmlCuda || ggmlCpu;
+            _requireGgmlFloat32Precision = metal && Enabled("TS_GEMMA4_AUDIO_METAL_MPS_MM", requireValidatedFloat32Precision) ||
+                ggmlCuda && Enabled("TS_GEMMA4_AUDIO_GGML_CUDA_PEDANTIC", requireValidatedFloat32Precision) ||
+                ggmlCpu && requireValidatedFloat32Precision;
+            _useConformerBlockGraph = allocator is GgmlAllocator &&
+                Enabled("TS_GEMMA4_AUDIO_BLOCK_GRAPH", qualifiedGgml && requireValidatedFloat32Precision);
+            _useSscpGraph = allocator is GgmlAllocator &&
+                Enabled("TS_GEMMA4_AUDIO_SSCP_GRAPH", qualifiedGgml && requireValidatedFloat32Precision);
+            _usePreciseCudaSscp = allocator is TensorSharp.Cuda.CudaAllocator &&
+                Enabled("TS_GEMMA4_AUDIO_CUDA_PRECISE_SSCP", requireValidatedFloat32Precision);
+            _usePreciseCudaLinears = allocator is TensorSharp.Cuda.CudaAllocator &&
+                Enabled("TS_GEMMA4_AUDIO_CUDA_PRECISE_LINEAR", requireValidatedFloat32Precision);
+            using var gguf = new GgufFile(mmProjPath);
 
             _projectorType = gguf.GetString("clip.audio.projector_type", "gemma4a") ?? "gemma4a";
             _isEncoderFree = string.Equals(_projectorType, "gemma4ua", StringComparison.Ordinal);
@@ -100,14 +175,33 @@ namespace TensorSharp.Models
             Console.WriteLine($"  chunk={_chunkSize}, maxPast={_maxPast}, maxFuture={_maxFuture}, context={_contextSize}");
             Console.WriteLine($"  projDim={_projectionDim}");
 
-            LoadWeights(gguf);
-            gguf.Dispose();
+            try { LoadWeights(gguf); }
+            catch { Dispose(); throw; }
 
             _useOllamaNames = _weights.ContainsKey("a.blk.0.ln1.weight");
             _causalMask = BuildCausalValidMask();
             Console.WriteLine($"  GGUF naming: {(_useOllamaNames ? "Ollama" : "mmproj/Unsloth")}");
             Console.WriteLine($"  projector_type: {_projectorType}" +
                 (_isEncoderFree ? " (encoder-free / raw-waveform)" : " (conformer)"));
+        }
+
+        private bool ShouldRetainCompressedMatrix(string name)
+        {
+            if (_allocator is TensorSharp.MLX.MlxAllocator) return true;
+            if (_allocator is not GgmlAllocator ga || ga.Context.BackendType != GgmlBackendType.Metal) return false;
+            // MPS consumes the already retained exact F32 weights. Avoid pinning
+            // an additional copy of Q8 matrices that only these graphs consume.
+            // Relative-position and final projector weights retain their Q8 path.
+            if (_requireGgmlFloat32Precision && _useSscpGraph &&
+                (name == "a.input_projection.weight" || name == "a.pre_encode.out.weight")) return false;
+            if (_requireGgmlFloat32Precision && _useConformerBlockGraph && name.StartsWith("a.blk.", StringComparison.Ordinal))
+            {
+                string[] suffixes = [".ffn_up.weight", ".ffn_down.weight", ".attn_q.weight", ".attn_k.weight",
+                    ".attn_v.weight", ".attn_out.weight", ".conv_pw1.weight", ".conv_pw2.weight",
+                    ".ffn_up_1.weight", ".ffn_down_1.weight"];
+                foreach (string suffix in suffixes) if (name.EndsWith(suffix, StringComparison.Ordinal)) return false;
+            }
+            return true;
         }
 
         private void LoadWeights(GgufFile gguf)
@@ -126,8 +220,10 @@ namespace TensorSharp.Models
 
                 if (info.Type == GgmlTensorType.F32)
                     Buffer.BlockCopy(raw, 0, f32, 0, raw.Length);
-                else
+                else if (_allocator is GgmlAllocator)
                     NativeDequant.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
+                else
+                    ManagedQuantizedOps.DequantizeToFloat32((int)info.Type, raw, 0, f32, 0, numElements);
 
                 long[] ggufShape = new long[info.Shape.Length];
                 for (int i = 0; i < info.Shape.Length; i++)
@@ -140,6 +236,14 @@ namespace TensorSharp.Models
                 var tensor = new Tensor(_allocator, DType.Float32, tsShape);
                 tensor.SetElementsAsFloat(f32);
                 _weights[info.Name] = tensor;
+                // Keep the exact GGUF blocks alongside the scalar-oracle
+                // weights. Weight-only kernels consume F32 activations and
+                // produce F32 outputs; no conformer hidden state is narrowed.
+                // CPU and unvalidated CUDA paths retain the dense F32 math.
+                if (info.Type == GgmlTensorType.Q8_0 && info.Shape.Length == 2 &&
+                    ShouldRetainCompressedMatrix(info.Name))
+                    _compressedMatrices.Add(info.Name, new CompressedMatrix(raw,
+                        checked((int)info.Shape[0]), checked((int)info.Shape[1])));
                 count++;
 
                 if (info.Name.Contains("input_min") || info.Name.Contains("input_max") ||
@@ -169,7 +273,20 @@ namespace TensorSharp.Models
 
         public unsafe Tensor Encode(float[] melData, int numFrames)
         {
+            if (_allocator is TensorSharp.MLX.MlxAllocator && !TensorSharp.MLX.MlxWorker.Shared.IsOnWorkerThread)
+                return TensorSharp.MLX.MlxWorker.Shared.Invoke(() => Encode(melData, numFrames));
             Console.Write("Audio encoder SSCP...");
+
+            Tensor hiddenTensor;
+            int hidDim, seqLen;
+            if (_useSscpGraph)
+            {
+                hiddenTensor = EncodeSscpGraph(melData, numFrames);
+                seqLen = checked((int)hiddenTensor.Sizes[0]);
+                hidDim = checked((int)hiddenTensor.Sizes[1]);
+            }
+            else
+            {
 
             // melData is [numFrames, melBins] row-major. We need [numFrames, melBins] as TensorSharp tensor.
             // In GGML: mel features is [melBins, numFrames] (ne0=melBins, ne1=numFrames).
@@ -182,12 +299,14 @@ namespace TensorSharp.Models
             int f0Out = (_melBins + 2 - 3) / 2 + 1;
             int t0Out = (numFrames + 2 - 3) / 2 + 1;
             int c0Out = GetConvOutChannels("a.conv1d.0");
+            TracePlanar("sscp0", conv0Out, f0Out, t0Out, c0Out);
 
             // Conv1
             var conv1Out = Conv2DBlock(conv0Out, f0Out, t0Out, c0Out, "a.conv1d.1");
             int f1Out = (f0Out + 2 - 3) / 2 + 1;
             int t1Out = (t0Out + 2 - 3) / 2 + 1;
             int c1Out = GetConvOutChannels("a.conv1d.1");
+            TracePlanar("sscp1", conv1Out, f1Out, t1Out, c1Out);
 
             Console.Write($" conv=[{f1Out},{t1Out},{c1Out}]");
 
@@ -220,14 +339,12 @@ namespace TensorSharp.Models
                 ? "a.input_projection.weight"
                 : "a.pre_encode.out.weight";
 
-            Tensor hiddenTensor;
-            int hidDim;
             if (_weights.TryGetValue(sscpWeightName, out var sscpWeight))
             {
                 int outDim = (int)sscpWeight.Sizes[0];
                 hidDim = outDim;
                 hiddenTensor = new Tensor(_allocator, DType.Float32, t1Out, hidDim);
-                Ops.Addmm(hiddenTensor, 0, hiddenTensor, 1f, projTensor, GetOrCreateTransposedWeight(sscpWeightName));
+                Project(hiddenTensor, projTensor, sscpWeightName);
                 projTensor.Dispose();
 
                 string biasName = sscpWeightName.Replace(".weight", ".bias");
@@ -240,12 +357,27 @@ namespace TensorSharp.Models
                 hiddenTensor = projTensor;
             }
 
-            int seqLen = t1Out;
+            seqLen = t1Out;
+            }
             Console.Write($" proj=[{seqLen},{hidDim}]");
+            TraceTensor("input_projection", hiddenTensor);
 
             // Build causal-valid mask
             // Conformer blocks
-            for (int i = 0; i < _numLayers; i++)
+            if (_useConformerBlockGraph && _hostModel == null && _numLayers > 0)
+            {
+                var stackResult = new Tensor(_allocator, DType.Float32, seqLen, hidDim);
+                try
+                {
+                    var blocks = new GgmlGemma4AudioBlock[_numLayers];
+                    for (int index = 0; index < blocks.Length; ++index) blocks[index] = GetConformerBlockDescriptor(index);
+                    if (!GgmlGemma4AudioOps.TryConformerStack(stackResult, hiddenTensor, blocks, seqLen, _numHeads, _headDim))
+                        throw new InvalidOperationException("The selected backend rejected the Gemma4 F32 conformer stack descriptors.");
+                    hiddenTensor.Dispose(); hiddenTensor = stackResult;
+                }
+                catch { stackResult.Dispose(); hiddenTensor.Dispose(); throw; }
+            }
+            else for (int i = 0; i < _numLayers; i++)
             {
                 Console.Write($"\r  Audio conformer block {i + 1}/{_numLayers}...                    ");
                 hiddenTensor = ConformerBlock(hiddenTensor, i, seqLen, hidDim, _causalMask);
@@ -262,7 +394,7 @@ namespace TensorSharp.Models
             {
                 int outDim = (int)outProjWeight.Sizes[0];
                 var outProj = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                Ops.Addmm(outProj, 0, outProj, 1f, hiddenTensor, GetOrCreateTransposedWeight("a.output_proj.weight"));
+                Project(outProj, hiddenTensor, "a.output_proj.weight");
                 if (_weights.TryGetValue("a.output_proj.bias", out var outProjBias))
                     AddBias(outProj, outProjBias, seqLen, outDim);
                 hiddenTensor.Dispose();
@@ -283,7 +415,7 @@ namespace TensorSharp.Models
             {
                 int fcOutDim = (int)fcWeight.Sizes[0];
                 var fcOut = new Tensor(_allocator, DType.Float32, seqLen, fcOutDim);
-                Ops.Addmm(fcOut, 0, fcOut, 1f, hiddenTensor, GetOrCreateTransposedWeight(fcWeightName));
+                Project(fcOut, hiddenTensor, fcWeightName);
 
                 string fcBiasName = fcWeightName.Replace(".weight", ".bias");
                 if (_weights.TryGetValue(fcBiasName, out var fcBias))
@@ -294,7 +426,9 @@ namespace TensorSharp.Models
             }
 
             // Unweighted RMSNorm
+            TraceTensor("encoder_output_projection", hiddenTensor);
             ApplyUnweightedRMSNorm(hiddenTensor, seqLen, hidDim);
+            TraceTensor("embedding_norm", hiddenTensor);
 
             // Embedding projection to text hidden size
             if (_weights.ContainsKey("mm.a.input_projection.weight"))
@@ -306,6 +440,7 @@ namespace TensorSharp.Models
             }
 
             Console.WriteLine($"Audio encoder: [{seqLen}, {hidDim}] done");
+            TraceTensor("soft_rows", hiddenTensor);
             return hiddenTensor;
         }
 
@@ -348,7 +483,7 @@ namespace TensorSharp.Models
             ApplyUnweightedRMSNorm(input, nTokens, frameSize);
 
             var output = new Tensor(_allocator, DType.Float32, nTokens, outDim);
-            Ops.Addmm(output, 0, output, 1f, input, GetOrCreateTransposedWeight(projName));
+            Project(output, input, projName);
             input.Dispose();
 
             Console.WriteLine(" done");
@@ -359,6 +494,100 @@ namespace TensorSharp.Models
         {
             var w = _weights[$"{prefix}.weight"];
             return (int)w.Sizes[0]; // TensorSharp reversed: GGUF [kW, kH, C_in, C_out] -> TS [C_out, C_in, kH, kW]
+        }
+
+        // SSCP's two small strided convolutions can use the same backend GEMM
+        // as the conformer projections. Packing is linear in the input size;
+        // convolution, channel normalization, and ReLU execute on the allocator.
+        internal static Tensor SscpConvolution(IAllocator allocator, float[] planarInput,
+            int inW, int inH, int inChannels, int kernelW, int kernelH,
+            Tensor projection, Tensor normWeight, Tensor normBias, float epsilon, bool preferFloat32 = false)
+        {
+            ArgumentNullException.ThrowIfNull(allocator);
+            ArgumentNullException.ThrowIfNull(planarInput);
+            ArgumentNullException.ThrowIfNull(projection);
+            if (inW <= 0 || inH <= 0 || inChannels <= 0 || kernelW <= 0 || kernelH <= 0 ||
+                planarInput.Length != checked(inW * inH * inChannels) ||
+                projection.DimensionCount != 2 || projection.Sizes[0] != checked(inChannels * kernelW * kernelH) ||
+                projection.Sizes[1] <= 0 || projection.ElementType != DType.Float32 ||
+                !float.IsFinite(epsilon) || epsilon <= 0)
+                throw new ArgumentException("SSCP convolution dimensions or normalization epsilon are invalid.");
+            int outW = (inW + 2 - kernelW) / 2 + 1, outH = (inH + 2 - kernelH) / 2 + 1;
+            if (outW <= 0 || outH <= 0) throw new ArgumentException("SSCP convolution has no output positions.");
+            int kernelColumns = checked(inChannels * kernelH * kernelW), outChannels = checked((int)projection.Sizes[1]);
+            int positions = checked(outW * outH), inSpatial = checked(inW * inH);
+            var columns = new float[checked(positions * kernelColumns)];
+            for (int oh = 0; oh < outH; ++oh)
+                for (int ow = 0; ow < outW; ++ow)
+                    for (int channel = 0; channel < inChannels; ++channel)
+                        for (int ky = 0; ky < kernelH; ++ky)
+                            for (int kx = 0; kx < kernelW; ++kx)
+                            {
+                                int y = oh * 2 - 1 + ky, x = ow * 2 - 1 + kx;
+                                if ((uint)y < (uint)inH && (uint)x < (uint)inW)
+                                    columns[(oh * outW + ow) * kernelColumns + (channel * kernelH + ky) * kernelW + kx]
+                                        = planarInput[channel * inSpatial + y * inW + x];
+                            }
+            using var input = new Tensor(allocator, DType.Float32, positions, kernelColumns);
+            input.SetElementsAsFloat(columns);
+            var output = new Tensor(allocator, DType.Float32, positions, outChannels);
+            try
+            {
+                if (allocator is TensorSharp.MLX.MlxAllocator)
+                {
+                    if (!TensorSharp.MLX.MlxExactOps.TryMatmul(output, input, projection))
+                        throw new NotSupportedException("MLX requires the exact F32 SSCP projection kernel.");
+                }
+                else if (allocator is TensorSharp.Cuda.CudaAllocator &&
+                    (preferFloat32 || Environment.GetEnvironmentVariable("TS_GEMMA4_AUDIO_CUDA_PRECISE_SSCP") == "1"))
+                {
+                    if (!TensorSharp.Cuda.CudaGemma4AudioOps.TryProjectionFloat32(output, input, projection))
+                        throw new NotSupportedException("CUDA precise SSCP requires contiguous F32 operands on one allocator.");
+                }
+                else Ops.Addmm(output, 0, output, 1, input, projection);
+                if (normWeight != null || normBias != null) Ops.LayerNorm(output, output, normWeight, normBias, epsilon);
+                Ops.Relu(output, output);
+                return output;
+            }
+            catch { output.Dispose(); throw; }
+        }
+
+        private Tensor EncodeSscpGraph(float[] melData, int numFrames)
+        {
+            if (_sscpConvolutions == null)
+            {
+                _sscpConvolutions = new GgmlGemma4AudioConvolution[2];
+                for (int layer = 0; layer < 2; ++layer)
+                {
+                    string prefix = $"a.conv1d.{layer}";
+                    var weight = _weights[prefix + ".weight"];
+                    _weights.TryGetValue(prefix + ".norm.weight", out var norm);
+                    _weights.TryGetValue(prefix + ".norm.bias", out var bias);
+                    _sscpConvolutions[layer] = new(weight, checked((int)weight.Sizes[1]), checked((int)weight.Sizes[0]),
+                        checked((int)weight.Sizes[3]), checked((int)weight.Sizes[2]), norm, bias);
+                }
+                string name = _weights.ContainsKey("a.input_projection.weight") ? "a.input_projection.weight" : "a.pre_encode.out.weight";
+                _weights.TryGetValue(name.Replace(".weight", ".bias"), out var projectionBias);
+                _sscpProjection = new(_weights[name], projectionBias);
+                if (_compressedMatrices.TryGetValue(name, out var compressed))
+                    _sscpProjection = _sscpProjection with
+                    {
+                        CompressedWeight = compressed.Pointer, CompressedWeightType = (int)GgmlTensorType.Q8_0,
+                        CompressedWeightBytes = compressed.Bytes,
+                    };
+            }
+            int time = numFrames;
+            foreach (var convolution in _sscpConvolutions) time = (time + 2 - convolution.KernelTime) / 2 + 1;
+            using var input = new Tensor(_allocator, DType.Float32, numFrames, _melBins);
+            input.SetElementsAsFloat(melData);
+            var result = new Tensor(_allocator, DType.Float32, time, _sscpProjection.Weight.Sizes[0]);
+            try
+            {
+                if (!GgmlGemma4AudioOps.TrySscp(result, input, _sscpConvolutions, _sscpProjection, _melBins, numFrames, 1, _eps, _requireGgmlFloat32Precision))
+                    throw new InvalidOperationException("The selected backend rejected the Gemma4 SSCP descriptors.");
+                return result;
+            }
+            catch { result.Dispose(); throw; }
         }
 
         private unsafe float[] Conv2DBlock(float[] input, int inW, int inH, int inC, string prefix)
@@ -380,88 +609,52 @@ namespace TensorSharp.Models
             int outW = (inW + 2 * pad - kW) / stride + 1;
             int outH = (inH + 2 * pad - kH) / stride + 1;
 
-            float* kPtr = GetFloatPtr(kernelTensor);
-            int inSpatial = inW * inH;
-            int outSpatial = outW * outH;
-            float[] output = new float[outSpatial * cOut];
-
-            for (int oc = 0; oc < cOut; oc++)
+            string projectionKey = prefix + ".sscp_projection";
+            if (!_transposedWeights.TryGetValue(projectionKey, out var projection))
             {
-                for (int oh = 0; oh < outH; oh++)
-                {
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        float sum = 0;
-                        for (int ic = 0; ic < cIn; ic++)
-                        {
-                            for (int ky = 0; ky < kH; ky++)
-                            {
-                                for (int kx = 0; kx < kW; kx++)
-                                {
-                                    int ih = oh * stride - pad + ky;
-                                    int iw = ow * stride - pad + kx;
-                                    if (ih >= 0 && ih < inH && iw >= 0 && iw < inW)
-                                    {
-                                        float pixel = input[iw + ih * inW + ic * inSpatial];
-                                        int kIdx = ((oc * cIn + ic) * kH + ky) * kW + kx;
-                                        sum += pixel * kPtr[kIdx];
-                                    }
-                                }
-                            }
-                        }
-                        output[ow + oh * outW + oc * outSpatial] = sum;
-                    }
-                }
+                using var flattened = kernelTensor.View(cOut, checked(cIn * kH * kW));
+                using var transposed = flattened.Transpose();
+                projection = Ops.NewContiguous(transposed);
+                _transposedWeights.Add(projectionKey, projection);
             }
-
-            // LayerNorm over channels for each spatial position.
-            // Output layout: element(f', t', c) = output[f' + t' * outW + c * outSpatial]
-            if (_weights.TryGetValue($"{prefix}.norm.weight", out var normWeight))
-            {
-                float* nw = GetFloatPtr(normWeight);
-                float* nb = _weights.TryGetValue($"{prefix}.norm.bias", out var normBias)
-                    ? GetFloatPtr(normBias) : null;
-
-                for (int s = 0; s < outSpatial; s++)
-                {
-                    float mean = 0;
-                    for (int c = 0; c < cOut; c++)
-                        mean += output[s + c * outSpatial];
-                    mean /= cOut;
-
-                    float var_ = 0;
-                    for (int c = 0; c < cOut; c++)
-                    {
-                        float d = output[s + c * outSpatial] - mean;
-                        var_ += d * d;
-                    }
-                    var_ /= cOut;
-                    float invStd = 1f / MathF.Sqrt(var_ + _eps);
-
-                    for (int c = 0; c < cOut; c++)
-                    {
-                        float val = (output[s + c * outSpatial] - mean) * invStd;
-                        val *= nw[c];
-                        if (nb != null) val += nb[c];
-                        output[s + c * outSpatial] = val;
-                    }
-                }
-            }
-
-            // ReLU
-            for (int i = 0; i < output.Length; i++)
-                if (output[i] < 0) output[i] = 0;
-
-            return output;
+            _weights.TryGetValue(prefix + ".norm.weight", out var channelNorm);
+            _weights.TryGetValue(prefix + ".norm.bias", out var channelBias);
+            using var result = SscpConvolution(_allocator, input, inW, inH, inC, kW, kH,
+                projection, channelNorm, channelBias, _eps, _usePreciseCudaSscp);
+            var rowMajor = result.GetElementsAsFloat(checked(outW * outH * cOut));
+            int spatial = checked(outW * outH);
+            var planar = new float[rowMajor.Length];
+            for (int position = 0; position < spatial; ++position)
+                for (int channel = 0; channel < cOut; ++channel)
+                    planar[position + channel * spatial] = rowMajor[position * cOut + channel];
+            return planar;
         }
 
         private Tensor ConformerBlock(Tensor x, int blockIdx, int seqLen, int hidDim, float[] causalMask)
         {
             string prefix = $"a.blk.{blockIdx}";
+            if (_useConformerBlockGraph)
+            {
+                var result = new Tensor(_allocator, DType.Float32, seqLen, hidDim);
+                try
+                {
+                    var block = GetConformerBlockDescriptor(blockIdx);
+                    if (!GgmlGemma4AudioOps.TryConformerBlock(result, x, block.Relative, block.Norms, block.Linears,
+                        seqLen, _numHeads, _headDim, block.MaximumPast, block.MaximumFuture, block.Kernel,
+                        block.Epsilon, block.Cap, block.GradientClip, block.ResidualWeight, block.RequireFloat32Precision))
+                        throw new InvalidOperationException("The selected backend rejected the Gemma4 F32 conformer block descriptors.");
+                    x.Dispose();
+                    return result;
+                }
+                catch { result.Dispose(); x.Dispose(); throw; }
+            }
 
             x = ForwardFFW(x, prefix, "ffn_norm", "ffn_up", "ffn_down", "ffn_post_norm", seqLen, hidDim);
+            TraceTensor($"layer{blockIdx}_ffn0", x);
             x = ForwardAttention(x, prefix, seqLen, hidDim, causalMask);
+            TraceTensor($"layer{blockIdx}_attention", x);
             x = ForwardLightConv(x, prefix, seqLen, hidDim);
+            TraceTensor($"layer{blockIdx}_convolution", x);
             x = ForwardFFW(x, prefix, "ffn_norm_1", "ffn_up_1", "ffn_down_1", "ffn_post_norm_1", seqLen, hidDim);
 
             Clamp(x, -_gradClip, _gradClip);
@@ -469,8 +662,39 @@ namespace TensorSharp.Models
             var old = x;
             x = ApplyRMSNorm(x, blockNormName, seqLen, hidDim);
             old.Dispose();
+            TraceTensor($"layer{blockIdx}", x);
 
             return x;
+        }
+
+        private GgmlGemma4AudioBlock GetConformerBlockDescriptor(int blockIdx)
+        {
+            if (_conformerBlocks.TryGetValue(blockIdx, out var block)) return block;
+            string prefix = $"a.blk.{blockIdx}";
+            Tensor Weight(string name) => _weights.GetValueOrDefault(name + ".weight");
+            Tensor[] norms = [Weight(prefix + ".ffn_norm"), Weight(prefix + ".ffn_post_norm"),
+                Weight(ResolveName(prefix, "attn_pre_norm")), Weight(ResolveName(prefix, "attn_post_norm")),
+                Weight(prefix + ".conv_norm"), Weight(prefix + ".norm_conv"),
+                Weight(prefix + ".ffn_norm_1"), Weight(prefix + ".ffn_post_norm_1"),
+                Weight(ResolveName(prefix, "block_norm")), Weight(prefix + ".per_dim_scale"), Weight(prefix + ".conv_dw")];
+            string[] names = ["ffn_up", "ffn_down", "attn_q", "attn_k", "attn_v", "attn_out", "conv_pw1", "conv_pw2", "ffn_up_1", "ffn_down_1"];
+            var linears = new GgmlGemma4AudioLinear[names.Length];
+            for (int index = 0; index < names.Length; ++index)
+            {
+                string name = prefix + "." + names[index];
+                bool clamp = _clampParams.TryGetValue(name, out var cp) && cp.HasClamp;
+                linears[index] = new(Weight(name), _weights.GetValueOrDefault(name + ".bias"), clamp,
+                    cp.InMin, cp.InMax, cp.OutMin, cp.OutMax);
+                if (_compressedMatrices.TryGetValue(name + ".weight", out var compressed))
+                    linears[index] = linears[index] with { CompressedWeight = compressed.Pointer,
+                        CompressedWeightType = (int)GgmlTensorType.Q8_0, CompressedWeightBytes = compressed.Bytes };
+            }
+            int pastInclusive = _maxPast - 1;
+            var relative = GetDevicePositionEmbeddings(prefix, pastInclusive + _maxFuture + 1);
+            int kernel = norms[10] == null ? 1 : checked((int)norms[10].Sizes[1]);
+            block = new(relative, norms, linears, pastInclusive, _maxFuture, kernel, _eps, _logitCap, _gradClip, _residualWeight, _requireGgmlFloat32Precision);
+            _conformerBlocks.Add(blockIdx, block);
+            return block;
         }
 
         private Tensor ForwardFFW(Tensor x, string prefix, string normName,
@@ -478,8 +702,7 @@ namespace TensorSharp.Models
         {
             var residual = x;
 
-            var clamped = CloneTensor(x, seqLen, hidDim);
-            Clamp(clamped, -_gradClip, _gradClip);
+            var clamped = ClampedCopy(x, seqLen, hidDim, -_gradClip, _gradClip);
 
             var normed = ApplyRMSNorm(clamped, $"{prefix}.{normName}.weight", seqLen, hidDim);
             clamped.Dispose();
@@ -499,7 +722,14 @@ namespace TensorSharp.Models
             downOut.Dispose();
 
             // result = residual + postNormed * residualWeight
-            Ops.AddMulV(postNormed, residual, postNormed, _residualWeight);
+            if (_allocator is TensorSharp.MLX.MlxAllocator or GgmlAllocator)
+            {
+                // MLX/GGML's generic addmulv registrations execute on CPU. The
+                // exact binary factor 0.5 permits the same residual on-device.
+                Ops.Mul(postNormed, postNormed, _residualWeight);
+                Ops.Add(postNormed, postNormed, residual);
+            }
+            else Ops.AddMulV(postNormed, residual, postNormed, _residualWeight);
             residual.Dispose();
 
             return postNormed;
@@ -509,8 +739,7 @@ namespace TensorSharp.Models
         {
             var residual = x;
 
-            var clamped = CloneTensor(x, seqLen, hidDim);
-            Clamp(clamped, -_gradClip, _gradClip);
+            var clamped = ClampedCopy(x, seqLen, hidDim, -_gradClip, _gradClip);
 
             string preNormName = ResolveName(prefix, "attn_pre_norm") + ".weight";
             var normed = ApplyRMSNorm(clamped, preNormName, seqLen, hidDim);
@@ -531,9 +760,25 @@ namespace TensorSharp.Models
             // Key scaling
             float kScale = (float)(Math.Log(1 + Math.E) / Math.Log(2));
             Ops.Mul(k, k, kScale);
+            TraceTensor(prefix + "_attention_qkv", q);
 
-            // Build position embeddings
             int maxSpan = _maxPast + _maxFuture + 1;
+            Tensor result;
+            if (Gemma4AudioTensorOps.UsesDevicePath(_allocator))
+            {
+                result = new Tensor(_allocator, DType.Float32, seqLen, hidDim);
+                try
+                {
+                    Tensor relative = GetDevicePositionEmbeddings(prefix, _maxPast + _maxFuture);
+                    if (!Gemma4AudioTensorOps.TryAttention(result, q, k, v, relative, seqLen, _numHeads, _headDim,
+                        _maxPast - 1, _maxFuture, _logitCap))
+                        throw new InvalidOperationException("The selected backend does not provide the required Gemma4 F32 relative audio attention.");
+                }
+                catch { result.Dispose(); throw; }
+                finally { q.Dispose(); k.Dispose(); v.Dispose(); }
+            }
+            else
+            {
             float[] posEmb = BuildPositionEmbeddings(prefix, maxSpan);
 
             // Block-local chunked attention
@@ -563,18 +808,20 @@ namespace TensorSharp.Models
 
             float[] attnOutput = new float[paddedLen * hidDim];
 
-            for (int u = 0; u < numChunks; u++)
+            CpuWorkers.Shared.For(checked(numChunks * _numHeads), job =>
             {
                 ChunkedAttention(qArr, kPadded, vPadded, posEmb, causalMask, attnOutput,
-                    u, seqLen, hidDim, maxSpan, padLeft);
-            }
+                    job / _numHeads, job % _numHeads, seqLen, hidDim, maxSpan, padLeft);
+            });
 
             // Trim to original seqLen
-            var result = new Tensor(_allocator, DType.Float32, seqLen, hidDim);
+            result = new Tensor(_allocator, DType.Float32, seqLen, hidDim);
             float* rPtr = GetFloatPtr(result);
             fixed (float* aPtr = attnOutput)
                 Buffer.MemoryCopy(aPtr, rPtr, seqLen * hidDim * 4, seqLen * hidDim * 4);
+            }
 
+            TraceTensor(prefix + "_attention_core", result);
             // Output projection
             var projected = AudioClippableLinearForward(result, $"{prefix}.attn_out", seqLen);
             result.Dispose();
@@ -592,12 +839,11 @@ namespace TensorSharp.Models
 
         private unsafe void ChunkedAttention(float[] qArr, float[] kPadded, float[] vPadded,
             float[] posEmb, float[] causalMask, float[] attnOutput,
-            int chunkIdx, int seqLen, int hidDim, int maxSpan, int padLeft)
+            int chunkIdx, int h, int seqLen, int hidDim, int maxSpan, int padLeft)
         {
             int cs = _chunkSize;
             int ctx = _contextSize;
 
-            for (int h = 0; h < _numHeads; h++)
             {
                 float[] logitsBuffer = new float[ctx];
                 for (int qi = 0; qi < cs; qi++)
@@ -626,16 +872,14 @@ namespace TensorSharp.Models
                         int kGlobalIdx = chunkIdx * cs + ci;
                         int kOffset = kGlobalIdx * hidDim + h * _headDim;
 
-                        for (int d = 0; d < _headDim; d++)
-                            dotCC += qArr[qOffset + d] * kPadded[kOffset + d];
+                        dotCC = Dot(qArr, qOffset, kPadded, kOffset, _headDim);
 
                         float dotCP = 0;
                         int posIdx = RelativeShiftIndex(qi, ci, maxSpan);
                         if (posIdx >= 0 && posIdx < maxSpan)
                         {
                             int posOffset = (posIdx * _numHeads + h) * _headDim;
-                            for (int d = 0; d < _headDim; d++)
-                                dotCP += qArr[qOffset + d] * posEmb[posOffset + d];
+                            dotCP = Dot(qArr, qOffset, posEmb, posOffset, _headDim);
                         }
 
                         logits[ci] = dotCC + dotCP;
@@ -656,7 +900,18 @@ namespace TensorSharp.Models
                         logits[ci] *= invSum;
 
                     int outOffset = globalQIdx * hidDim + h * _headDim;
-                    for (int d = 0; d < _headDim; d++)
+                    int d = 0;
+                    for (; d + Vector<float>.Count <= _headDim; d += Vector<float>.Count)
+                    {
+                        var sum = Vector<float>.Zero;
+                        for (int ci = 0; ci < ctx; ci++)
+                        {
+                            int vOffset = (chunkIdx * cs + ci) * hidDim + h * _headDim + d;
+                            sum += new Vector<float>(logits[ci]) * new Vector<float>(vPadded, vOffset);
+                        }
+                        sum.CopyTo(attnOutput, outOffset + d);
+                    }
+                    for (; d < _headDim; d++)
                     {
                         float sum = 0;
                         for (int ci = 0; ci < ctx; ci++)
@@ -668,6 +923,17 @@ namespace TensorSharp.Models
                     }
                 }
             }
+        }
+
+        private static float Dot(float[] left, int leftOffset, float[] right, int rightOffset, int count)
+        {
+            var sum = Vector<float>.Zero;
+            int index = 0;
+            for (; index + Vector<float>.Count <= count; index += Vector<float>.Count)
+                sum += new Vector<float>(left, leftOffset + index) * new Vector<float>(right, rightOffset + index);
+            float result = Vector.Sum(sum);
+            for (; index < count; ++index) result += left[leftOffset + index] * right[rightOffset + index];
+            return result;
         }
 
         private int RelativeShiftIndex(int queryInChunk, int contextIdx, int maxSpan)
@@ -716,7 +982,7 @@ namespace TensorSharp.Models
             using var sinSlice = sinTensor.Narrow(1, 0, inDim);
             using var sinContig = Ops.NewContiguous(sinSlice);
             var result = new Tensor(_allocator, DType.Float32, maxSpan, relOutDim);
-            Ops.Addmm(result, 0, result, 1f, sinContig, GetOrCreateTransposedWeight(relKey));
+            Project(result, sinContig, relKey);
 
             float[] projected = new float[maxSpan * relOutDim];
             result.CopyToArray(projected);
@@ -724,6 +990,50 @@ namespace TensorSharp.Models
 
             _positionEmbeddingCache[prefix] = projected;
             return projected;
+        }
+
+        private Tensor GetDevicePositionEmbeddings(string prefix, int maxSpan)
+        {
+            if (_devicePositionEmbeddingCache.TryGetValue(prefix, out var cached)) return cached;
+            int halfDim = _hiddenSize / 2;
+            double logInc = Math.Log(10000.0) / Math.Max(halfDim - 1, 1);
+            var values = new float[checked(maxSpan * _hiddenSize)];
+            for (int p = 0; p < maxSpan; ++p)
+                for (int d = 0; d < halfDim; ++d)
+                {
+                    // HF passes left-window12 and tests distance<12. The
+                    // compact device window therefore projects distances11..0.
+                    double angle = (_maxPast - 1 - p) * Math.Exp(-d * logInc);
+                    values[p * _hiddenSize + d] = (float)Math.Sin(angle);
+                    values[p * _hiddenSize + halfDim + d] = (float)Math.Cos(angle);
+                }
+            var sinusoidal = new Tensor(_allocator, DType.Float32, maxSpan, _hiddenSize);
+            try
+            {
+                sinusoidal.SetElementsAsFloat(values);
+                string name = ResolveName(prefix, "attn_k_rel") + ".weight";
+                if (!_weights.TryGetValue(name, out var weight))
+                {
+                    _devicePositionEmbeddingCache.Add(prefix, sinusoidal);
+                    return sinusoidal;
+                }
+                int input = (int)weight.Sizes[1], output = (int)weight.Sizes[0];
+                using var slice = sinusoidal.Narrow(1, 0, input);
+                using var contiguous = Ops.NewContiguous(slice);
+                var projected = new Tensor(_allocator, DType.Float32, maxSpan, output);
+                try
+                {
+                    Project(projected, contiguous, name);
+                    _devicePositionEmbeddingCache.Add(prefix, projected);
+                    return projected;
+                }
+                catch { projected.Dispose(); throw; }
+            }
+            finally
+            {
+                if (!_devicePositionEmbeddingCache.TryGetValue(prefix, out var stored) || !ReferenceEquals(stored, sinusoidal))
+                    sinusoidal.Dispose();
+            }
         }
 
         private unsafe Tensor ForwardLightConv(Tensor x, string prefix, int seqLen, int hidDim)
@@ -761,10 +1071,20 @@ namespace TensorSharp.Models
             if (_weights.TryGetValue($"{prefix}.conv_dw.weight", out var dwWeight))
             {
                 int kSize = (int)dwWeight.Sizes[1];
+                var convOut = new Tensor(_allocator, DType.Float32, seqLen, halfDim);
+                if (Gemma4AudioTensorOps.UsesDevicePath(_allocator))
+                {
+                    try
+                    {
+                        if (!Gemma4AudioTensorOps.TryDepthwise(convOut, gluOut, dwWeight, seqLen, halfDim, kSize))
+                            throw new InvalidOperationException("The selected backend does not provide the required Gemma4 F32 causal depthwise convolution.");
+                    }
+                    catch { convOut.Dispose(); throw; }
+                }
+                else
+                {
                 float* dwPtr = GetFloatPtr(dwWeight);
                 float* gluPtr = GetFloatPtr(gluOut);
-
-                var convOut = new Tensor(_allocator, DType.Float32, seqLen, halfDim);
                 float* convPtr = GetFloatPtr(convOut);
 
                 for (int t = 0; t < seqLen; t++)
@@ -781,6 +1101,7 @@ namespace TensorSharp.Models
                         }
                         convPtr[t * halfDim + d] = sum;
                     }
+                }
                 }
                 gluOut.Dispose();
                 gluOut = convOut;
@@ -837,12 +1158,11 @@ namespace TensorSharp.Models
             Tensor src = input;
             if (hasClamp)
             {
-                src = CloneTensor(input, seqLen, (int)input.Sizes[1]);
-                Clamp(src, cp.InMin, cp.InMax);
+                src = ClampedCopy(input, seqLen, (int)input.Sizes[1], cp.InMin, cp.InMax);
             }
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-            Ops.Addmm(result, 0, result, 1f, src, GetOrCreateTransposedWeight(weightName));
+            Project(result, src, weightName);
 
             if (hasClamp && src != input) src.Dispose();
 
@@ -891,20 +1211,21 @@ namespace TensorSharp.Models
             Ops.SiLU(t, t);
         }
 
-        private unsafe void Clamp(Tensor t, float min, float max)
-        {
-            float* ptr = GetFloatPtr(t);
-            int count = (int)t.ElementCount();
-            for (int i = 0; i < count; i++)
-            {
-                if (ptr[i] < min) ptr[i] = min;
-                else if (ptr[i] > max) ptr[i] = max;
-            }
-        }
+        private void Clamp(Tensor t, float min, float max) => Ops.Clamp(t, t, min, max);
 
         private Tensor CloneTensor(Tensor src, int rows, int cols)
         {
             return Ops.NewContiguous(src);
+        }
+
+        private Tensor ClampedCopy(Tensor src, int rows, int cols, float minimum, float maximum)
+        {
+            // A GGML contiguous copy uses host memcpy. A distinct clamp output
+            // performs the same copy/clipping on the selected device instead.
+            if (Gemma4AudioTensorOps.UsesDevicePath(_allocator)) return Ops.Clamp(null, src, minimum, maximum);
+            var copy = CloneTensor(src, rows, cols);
+            Clamp(copy, minimum, maximum);
+            return copy;
         }
 
         private unsafe float[] ExtractAndPad(float* ptr, int seqLen, int dim, int paddedLen)
@@ -917,18 +1238,23 @@ namespace TensorSharp.Models
 
         private float[] BuildCausalValidMask()
         {
-            int upperDiag = _maxPast + _maxFuture;
             float[] result = new float[_chunkSize * _contextSize];
             for (int r = 0; r < _chunkSize; r++)
             {
                 for (int c = 0; c < _contextSize; c++)
                 {
-                    bool lower = r <= c;
-                    bool upper = c <= r + upperDiag;
-                    result[r * _contextSize + c] = (lower && upper) ? 1f : 0f;
+                    result[r * _contextSize + c] = IsWithinAudioAttentionHorizon(r, c - _maxPast, _maxPast, _maxFuture) ? 1f : 0f;
                 }
             }
             return result;
+        }
+
+        // Pinned modeling_gemma4.py sliding_window_mask_function uses strict
+        // inequalities; context-left13 is converted to left-window12 first.
+        internal static bool IsWithinAudioAttentionHorizon(int query, int key, int leftWindow, int rightWindow)
+        {
+            long distance = (long)query - key;
+            return (distance >= 0 && distance < leftWindow) || (distance < 0 && -distance < rightWindow);
         }
 
         private static unsafe float* GetFloatPtr(Tensor t) =>
@@ -940,22 +1266,79 @@ namespace TensorSharp.Models
                 return transposed;
 
             using var weightViewT = _weights[weightName].Transpose();
-            transposed = Ops.NewContiguous(weightViewT);
+            // GGML consumes the original [out,in] storage through a logical
+            // [in,out] column-strided view. Materializing that transpose would
+            // force the native GEMM bridge to repack the whole weight each call.
+            transposed = _allocator is GgmlAllocator ? weightViewT.CopyRef() : Ops.NewContiguous(weightViewT);
             _transposedWeights[weightName] = transposed;
             return transposed;
+        }
+
+        private void Project(Tensor result, Tensor input, string weightName)
+        {
+            if (_requireGgmlFloat32Precision && _allocator is GgmlAllocator ga &&
+                ga.Context.BackendType == GgmlBackendType.Metal)
+            {
+                if (!GgmlBasicOps.TryGemma4ProjectionFloat32(result, input, _weights[weightName]))
+                    throw new NotSupportedException("Metal precise audio projection requires compatible F32 operands: " + weightName);
+                return;
+            }
+            if (_compressedMatrices.TryGetValue(weightName, out var compressed))
+            {
+                if (_allocator is GgmlAllocator)
+                    GgmlBasicOps.AddmmQuant(result, input, compressed.Pointer,
+                        (int)GgmlTensorType.Q8_0, compressed.Input, compressed.Output, compressed.Bytes);
+                else if (!TensorSharp.MLX.MlxQuantizedOps.TryAddmmQuantizedToFloat32(result, input,
+                    compressed.Pointer, compressed.Pointer, (int)GgmlTensorType.Q8_0,
+                    compressed.Input, compressed.Output, compressed.Bytes, preserveFloat32: true))
+                    throw new InvalidOperationException("MLX F32 audio compressed projection failed: " + weightName);
+            }
+            else if (_allocator is GgmlAllocator)
+            {
+                // The native descriptor cache accepts F32 as well as GGUF
+                // quantization. Keep immutable [out,in] weights resident across
+                // calls, including CUDA where Metal's host zero-copy is absent.
+                var weight = _weights[weightName];
+                GgmlBasicOps.AddmmQuant(result, input, weight.Storage.PtrAtElement(weight.StorageOffset),
+                    (int)GgmlTensorType.F32, weight.Sizes[1], weight.Sizes[0], checked(weight.ElementCount() * sizeof(float)));
+            }
+            else if (_allocator is TensorSharp.Cuda.CudaAllocator &&
+                _usePreciseCudaLinears)
+            {
+                if (!TensorSharp.Cuda.CudaGemma4AudioOps.TryProjectionFloat32(result, input, GetOrCreateTransposedWeight(weightName)))
+                    throw new NotSupportedException("CUDA precise audio projection requires contiguous F32 operands on one allocator.");
+            }
+            else Ops.Addmm(result, 0, result, 1, input, GetOrCreateTransposedWeight(weightName));
         }
 
         #endregion
 
         public void Dispose()
         {
+            foreach (var matrix in _compressedMatrices.Values)
+            {
+                try
+                {
+                    if (_allocator is TensorSharp.MLX.MlxAllocator ma)
+                        TensorSharp.MLX.MlxQuantizedOps.ReleaseQuantizedWeight(ma, matrix.Pointer);
+                    else GgmlBasicOps.InvalidateHostBuffer(matrix.Pointer);
+                }
+                finally { matrix.Free(); }
+            }
+            _compressedMatrices.Clear();
+            _conformerBlocks.Clear();
             _onesForNorm?.Dispose();
             foreach (var w in _transposedWeights.Values)
                 w.Dispose();
             _transposedWeights.Clear();
             _positionEmbeddingCache.Clear();
+            foreach (var position in _devicePositionEmbeddingCache.Values) position.Dispose();
+            _devicePositionEmbeddingCache.Clear();
             foreach (var w in _weights.Values)
+            {
+                if (_allocator is GgmlAllocator) GgmlBasicOps.InvalidateTensorHostBuffer(w);
                 w.Dispose();
+            }
             _weights.Clear();
         }
     }

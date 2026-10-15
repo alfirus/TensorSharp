@@ -64,5 +64,7 @@
   "catalog.extended.30b3b.parameters": "30 Md (3 Md actifs)",
   "catalog.extended.744b40b.parameters": "744 Md (40 Md actifs)",
   "catalog.extended.384experts.parameters": "MoE, 384 experts routés",
-  "catalog.extended.14bExpert.parameters": "14 Md par expert"
+  "catalog.extended.14bExpert.parameters": "14 Md par expert",
+  "catalog.model.ltx25.notes": "Génération expérimentale de texte/image vers vidéo avec audio stéréo 48 kHz. LTX 2.5 Distilled utilise 8 étapes Euler ancestral à mi-taille, un agrandissement latent x2 et 3 étapes d’affinage avec CFG 1 et accepte première/dernière image et plusieurs images clés avec position et intensité. Les images guident la chronologie ; les références d’identité et les adaptateurs vidéo/audio exigent d’autres checkpoints. Téléchargements figés de 44,76 Go avec accès Hugging Face approuvé. Palier prudent de 48 Go ; validé sur de courts clips 1024×1024.",
+  "catalog.license.ltx25": "Conditions LTX-2.5 et Gemma"
 }

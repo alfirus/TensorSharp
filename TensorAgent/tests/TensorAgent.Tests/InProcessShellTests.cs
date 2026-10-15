@@ -206,6 +206,15 @@ public sealed class InProcessShellTests : IDisposable
         Assert.Equal("nested\n", Out("echo $(echo $(echo nested))"));
     }
 
+    [Theory]
+    [InlineData("set -- 6 7; echo $(( $1 * $2 ))", "42\n")]
+    [InlineData("set -- -3 8; echo $(( ${1} * $2 + $# ))", "-22\n")]
+    [InlineData("set -- 1 2 3 4 5 6 7 8 9 12; echo $(( ${10} + $10 ))", "22\n")]
+    public void ArithmeticUsesScriptPositionalParameters(string command, string expected)
+    {
+        Assert.Equal(expected, Out(command));
+    }
+
     [Fact]
     public void PipelinesConditionalsAndExitCodes()
     {

@@ -1,0 +1,136 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// Licensed under the BSD-3-Clause license in the repository root.
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using TensorSharp.Models.QwenImage;
+using TensorSharp.Models.Video;
+
+namespace TensorSharp.Models.Ltx25;
+
+/// <summary>Ingredients IC-LoRA identity/appearance conditioning. A reference
+/// sheet becomes a real static RGB video, is encoded by the causal video VAE,
+/// and is appended as clean reference tokens on the original causal time grid.
+/// It never replaces output frame zero or marks references as generated frames.</summary>
+public static class Ltx25ReferenceConditioning
+{
+    public const int MinimumFrames = 121;
+    public const int MaxImages = 16;
+
+    /// <summary>Resolve identity sources without interpreting them as timeline
+    /// anchors. Single-image fields and reference-image lists are alternative forms.</summary>
+    public static IReadOnlyList<VideoImageCondition> ResolveSources(VideoGenerationParams parameters)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        if (parameters.Mode != "ref") throw new ArgumentException("Ingredients identity images require mode ref.");
+        if (parameters.EndImage != null || !string.IsNullOrWhiteSpace(parameters.EndImagePath) || parameters.ImageConditions is { Count: > 0 })
+            throw new ArgumentException("Identity references cannot be combined with first/last or timed image guides.");
+        bool single = parameters.Image != null || parameters.ImageBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(parameters.ImagePath);
+        if (single && parameters.ReferenceImagePaths is { Count: > 0 })
+            throw new ArgumentException("Use a single identity image or a reference-image list, rather than combining both.");
+        var sources = new List<VideoImageCondition>();
+        if (single) sources.Add(new() { Image = parameters.Image, ImageBytes = parameters.ImageBytes, ImagePath = parameters.ImagePath });
+        else if (parameters.ReferenceImagePaths != null)
+            foreach (string path in parameters.ReferenceImagePaths)
+            {
+                if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Identity reference paths cannot be empty.");
+                sources.Add(new() { ImagePath = path });
+            }
+        if (sources.Count is < 1 or > MaxImages)
+            throw new ArgumentException($"Ingredients mode requires between 1 and {MaxImages} identity reference images.");
+        return sources;
+    }
+
+    /// <summary>Compose an ordered contact sheet on black, fitting each complete
+    /// source into a grid cell without stretching, cropping or adding text.</summary>
+    public static RgbImage BuildSheet(IReadOnlyList<RgbImage> sources, int width, int height)
+    {
+        ArgumentNullException.ThrowIfNull(sources);
+        if (sources.Count is < 1 or > MaxImages || width < 32 || height < 32 || width % 32 != 0 || height % 32 != 0)
+            throw new ArgumentException("Ingredients requires 1–16 images and positive 32-aligned sheet geometry.");
+        int columns = checked((int)Math.Ceiling(Math.Sqrt(sources.Count)));
+        int rows = (sources.Count + columns - 1) / columns;
+        var pixels = new float[checked(width * height * 3)];
+        for (int index = 0; index < sources.Count; ++index)
+        {
+            var source = sources[index];
+            if (source == null || source.Width <= 0 || source.Height <= 0 || source.Pixels == null ||
+                source.Pixels.Length != checked(source.Width * source.Height * 3) ||
+                source.Pixels.Any(value => !float.IsFinite(value) || value < 0 || value > 1) ||
+                source.Alpha != null && source.Alpha.Any(value => !float.IsFinite(value) || value < 0 || value > 1))
+                throw new ArgumentException("Identity reference images must contain finite RGB01 pixels.");
+            if (source.Alpha != null)
+            {
+                var opaque = new float[source.Pixels.Length];
+                for (int value = 0; value < opaque.Length; ++value) opaque[value] = source.Pixels[value] * source.Alpha[value / 3];
+                source = new RgbImage(source.Width, source.Height, opaque);
+            }
+            int left = index % columns * width / columns, right = (index % columns + 1) * width / columns;
+            int top = index / columns * height / rows, bottom = (index / columns + 1) * height / rows;
+            double scale = Math.Min((right - left) / (double)source.Width, (bottom - top) / (double)source.Height);
+            int fittedWidth = Math.Clamp((int)Math.Round(source.Width * scale), 1, right - left);
+            int fittedHeight = Math.Clamp((int)Math.Round(source.Height * scale), 1, bottom - top);
+            var fitted = TensorSharp.Models.QwenImage.ImageIO.Resize(source, fittedWidth, fittedHeight);
+            int x = left + (right - left - fittedWidth) / 2, y = top + (bottom - top - fittedHeight) / 2;
+            for (int row = 0; row < fittedHeight; ++row)
+                Array.Copy(fitted.Pixels, row * fittedWidth * 3, pixels, ((y + row) * width + x) * 3, fittedWidth * 3);
+        }
+        return new RgbImage(width, height, pixels);
+    }
+
+    /// <summary>Build an explicit frame-major static RGB video for the full
+    /// temporal encoder and independent oracles. Production uses the encoder's
+    /// equivalent static-video specialization to avoid repeated pixel storage.</summary>
+    public static float[] RepeatSheet(RgbImage sheet, int frames, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sheet);
+        if (frames < MinimumFrames || (frames - 1) % 8 != 0)
+            throw new ArgumentException("Ingredients static references require at least 121 RGB frames on the 8n+1 temporal grid.");
+        if (sheet.Width <= 0 || sheet.Height <= 0 || sheet.Pixels == null || sheet.Pixels.Length != checked(sheet.Width * sheet.Height * 3) ||
+            sheet.Pixels.Any(value => !float.IsFinite(value) || value < 0 || value > 1))
+            throw new ArgumentException("The reference sheet must contain finite RGB01 pixels.");
+        var result = new float[checked(sheet.Pixels.Length * frames)];
+        for (int frame = 0; frame < frames; ++frame)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            sheet.Pixels.CopyTo(result, frame * sheet.Pixels.Length);
+        }
+        return result;
+    }
+
+    /// <summary>Append full normalized channel-major reference video latents.
+    /// Initial noise already reserves all reference token slots. The canvas
+    /// keeps its initial noise, references are clean at sigma one, and the
+    /// caller's input and reference arrays remain unchanged.</summary>
+    public static Ltx25DenoiserInput Apply(Ltx25DenoiserInput initial, Ltx25GenerationSettings settings,
+        float[] channelMajorReference, int referenceLatentFrames, int referenceLatentHeight, int referenceLatentWidth)
+    {
+        ArgumentNullException.ThrowIfNull(initial); ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(channelMajorReference);
+        if (referenceLatentFrames < (MinimumFrames - 1) / 8 + 1 || referenceLatentHeight != settings.LatentHeight || referenceLatentWidth != settings.LatentWidth)
+            throw new ArgumentException("Ingredients requires at least 16 reference latent frames matching the canvas spatial geometry (downscale factor one).");
+        int referenceTokens = checked(referenceLatentFrames * referenceLatentHeight * referenceLatentWidth);
+        int tokens = checked(settings.VideoTokens + referenceTokens), canvasValues = checked(settings.VideoTokens * 128);
+        if (channelMajorReference.Length != checked(referenceTokens * 128) || channelMajorReference.Any(value => !float.IsFinite(value)) ||
+            initial.VideoTokens != tokens || initial.Video == null || initial.Video.Length != checked(tokens * 128))
+            throw new ArgumentException("Initial noise and normalized Ingredients reference latents have inconsistent geometry.");
+        var video = (float[])initial.Video.Clone(); var clean = new float[video.Length];
+        var mask = new float[tokens]; Array.Fill(mask, 1f, 0, settings.VideoTokens);
+        var markers = new float[tokens]; Array.Fill(markers, 1f, 0, checked(settings.LatentHeight * settings.LatentWidth));
+        float[] packed = Ltx25Geometry.PackVideo(channelMajorReference, referenceTokens, 128);
+        packed.CopyTo(video, canvasValues); packed.CopyTo(clean, canvasValues);
+        var positions = new float[checked(tokens * 6)];
+        Ltx25Geometry.VideoPositions(settings.LatentFrames, settings.LatentHeight, settings.LatentWidth, settings.Fps).Boundaries.CopyTo(positions, 0);
+        Ltx25Geometry.VideoPositions(referenceLatentFrames, referenceLatentHeight, referenceLatentWidth, settings.Fps).Boundaries.CopyTo(positions, settings.VideoTokens * 6);
+        return new()
+        {
+            Video = video, VideoTokens = tokens, Audio = initial.Audio, AudioTokens = initial.AudioTokens,
+            VideoContext = initial.VideoContext, VideoContextTokens = initial.VideoContextTokens,
+            AudioContext = initial.AudioContext, AudioContextTokens = initial.AudioContextTokens,
+            VideoPositions = new(tokens, 3, positions), AudioPositions = initial.AudioPositions,
+            VideoSigma = initial.VideoSigma, AudioSigma = initial.AudioSigma, FrequencyPrecision = initial.FrequencyPrecision,
+            VideoDenoiseMask = mask, CleanVideo = clean, KeyframeMask = markers, UseReferenceLora = true,
+        };
+    }
+}

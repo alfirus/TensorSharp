@@ -46,12 +46,14 @@ using System.IO;
 
 using TensorSharp;
 using TensorSharp.Cpu;
+using TensorSharp.Cuda;
+using TensorSharp.MLX;
 using TensorSharp.Models.Direct;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
-    /// <summary>Managed MiniMax-H3 causal 3-D video VAE encoder (no ggml).</summary>
+    /// <summary>CPU/CUDA/MLX causal 3-D video VAE encoder (no ggml).</summary>
     internal sealed class MiniMaxH3DirectVideoVaeEncoder3D : IDisposable
     {
         /// <summary>One 3-D convolution, held as its KD separate 2-D taps: tap j is
@@ -129,10 +131,6 @@ namespace TensorSharp.Models.MiniMaxH3
             if (groups <= 0) throw new ArgumentOutOfRangeException(nameof(groups));
 
             _ctx = new DirectContext(allocator);
-            if (_ctx.IsCuda)
-                throw new NotSupportedException(
-                    "MiniMaxH3DirectVideoVaeEncoder3D is the managed CPU path; MiniMax-H3 on " +
-                    "BackendType.Cuda is not implemented (use a GGML backend, or BackendType.Cpu).");
 
             _groups = groups; _eps = eps; _latentChannels = latentChannels;
 
@@ -327,6 +325,12 @@ namespace TensorSharp.Models.MiniMaxH3
         /// permutes in the whole stage; the interior never moves an axis.</summary>
         private unsafe Tensor BuildInput(float[] video, int width, int height, int frames)
         {
+            if (_ctx.IsAccelerated)
+            {
+                using var planar = _ctx.FromFloats(video, frames, 3, height, width);
+                using var permuted = planar.Permute(0, 2, 3, 1);
+                return Ops.NewContiguous(permuted);
+            }
             Tensor x = _ctx.NewF32(frames, height, width, 3);
             float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
             long w = width, hgt = height, plane = w * hgt;
@@ -359,6 +363,14 @@ namespace TensorSharp.Models.MiniMaxH3
         {
             long lh = h.Sizes[1], lw = h.Sizes[2], c = h.Sizes[3], plane = lh * lw;
             long lc = _latentChannels;
+            if (_ctx.IsAccelerated)
+            {
+                using var mean = h.Narrow(3, 0, lc);
+                using var planar = mean.Permute(0, 3, 1, 2);
+                using var contiguous = Ops.NewContiguous(planar);
+                contiguous.GetElementsAsFloat(checked((int)contiguous.ElementCount())).CopyTo(outp, 0);
+                return;
+            }
             float* ph = (float*)CpuNativeHelpers.GetBufferStart(h);
             fixed (float* pinned = outp)
             {
@@ -458,13 +470,13 @@ namespace TensorSharp.Models.MiniMaxH3
                             {
                                 using Tensor col = src.View(h * w, ic);
                                 using Tensor band = col.Narrow(0, y0 * ow, rows * ow);
-                                DirectOps.CpuGemmABt(band, c.Taps[j], dst, 1f, wrote ? 1f : 0f);
+                                Gemm(band, c.Taps[j], dst, wrote);
                             }
                             else
                             {
                                 using Tensor col = _ctx.NewF32(rows * ow, kdim);
                                 Im2ColReflect(col, src, ic, h, w, k, ow, padLeft, padTop, stride, y0, rows);
-                                DirectOps.CpuGemmABt(col, c.Taps[j], dst, 1f, wrote ? 1f : 0f);
+                                Gemm(col, c.Taps[j], dst, wrote);
                             }
                             wrote = true;
                         }
@@ -494,10 +506,20 @@ namespace TensorSharp.Models.MiniMaxH3
         ///
         /// <para>Column order is ic, then kh, then kw -- exactly the flattened kernel
         /// row [OC][IC][KH][KW] the repack produced.</para></summary>
-        private static unsafe void Im2ColReflect(Tensor col, Tensor frame, int ic, long h, long w,
+        private unsafe void Im2ColReflect(Tensor col, Tensor frame, int ic, long h, long w,
                                                  int k, long ow, int padLeft, int padTop,
                                                  int stride, long y0, long rows)
         {
+            if (_ctx.IsAccelerated)
+            {
+                bool ok = _ctx.IsCuda
+                    ? CudaMiniMaxH3Ops.TryTransform(col, frame, null, null, 0, ic, checked((int)h), checked((int)w), k,
+                        checked((int)ow), padLeft, padTop, stride, checked((int)y0))
+                    : MlxMiniMaxH3Ops.TryTransform(col, frame, null, null, 0, ic, checked((int)h), checked((int)w), k,
+                        checked((int)ow), padLeft, padTop, stride, checked((int)y0));
+                if (!ok) throw new NotSupportedException("The selected H3 backend cannot execute F32 reflect im2col.");
+                return;
+            }
             float* src = (float*)CpuNativeHelpers.GetBufferStart(frame);
             float* dst = (float*)CpuNativeHelpers.GetBufferStart(col);
             long kdim = (long)ic * k * k;
@@ -550,6 +572,14 @@ namespace TensorSharp.Models.MiniMaxH3
             if (c % _groups != 0)
                 throw new InvalidOperationException(
                     $"MiniMax-H3 3-D video encode: {c} channels do not divide into {_groups} groups.");
+            if (_ctx.IsAccelerated)
+            {
+                bool ok = _ctx.IsCuda
+                    ? CudaMiniMaxH3Ops.TryGroupNormSilu(dst, x, gain, bias, _groups, _eps)
+                    : MlxMiniMaxH3Ops.TryGroupNormSilu(dst, x, gain, bias, _groups, _eps);
+                if (!ok) throw new NotSupportedException("The selected H3 backend cannot execute F32 frame group normalization.");
+                return;
+            }
             long cpg = c / _groups, rows = h * w, n = rows * cpg;
             float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
             float* pd = (float*)CpuNativeHelpers.GetBufferStart(dst);
@@ -606,12 +636,13 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <summary>h += t elementwise. Ops.Add would do it, but its contiguous fast
         /// path is single-threaded and counts elements in an int, and one level-0
         /// residual here is 142M of them.</summary>
-        private static unsafe void AddInPlace(Tensor h, Tensor t)
+        private unsafe void AddInPlace(Tensor h, Tensor t)
         {
             if (h.Sizes[3] != t.Sizes[3])
                 throw new InvalidOperationException(
                     $"MiniMax-H3 3-D video encode: residual channel mismatch ({h.Sizes[3]} vs " +
                     $"{t.Sizes[3]}); a channel-widening block is missing its nin_shortcut.");
+            if (_ctx.IsAccelerated) { Ops.Add(h, h, t); return; }
             long rows = h.Sizes[0] * h.Sizes[1] * h.Sizes[2], cols = h.Sizes[3];
             float* ph = (float*)CpuNativeHelpers.GetBufferStart(h);
             float* pt = (float*)CpuNativeHelpers.GetBufferStart(t);
@@ -629,6 +660,29 @@ namespace TensorSharp.Models.MiniMaxH3
             });
         }
 
+        private void Gemm(Tensor input, Tensor weight, Tensor output, bool accumulate)
+        {
+            if (_ctx.IsCuda)
+            {
+                if (!CudaMiniMaxH3Ops.TryMatmul(output,input,weight,accumulate ? 1f : 0f))
+                    throw new NotSupportedException("The selected H3 CUDA backend cannot execute F32 video convolution.");
+            }
+            else if (_ctx.IsMlx)
+            {
+                using var transpose = weight.Transpose();
+                if (input.Sizes[0]*input.Sizes[1]*weight.Sizes[0] <= 16_000_000L)
+                {
+                    using var contiguous = Ops.NewContiguous(transpose);
+                    using var exact = _ctx.NewF32(output.Sizes);
+                    if (!MlxExactOps.TryMatmul(exact,input,contiguous))
+                        throw new NotSupportedException("The selected H3 MLX backend cannot execute exact small F32 video convolution.");
+                    if (accumulate) Ops.Add(output,output,exact); else Ops.Copy(output,exact);
+                }
+                else Ops.Addmm(output, accumulate ? 1f : 0f, output, 1f, input, transpose);
+            }
+            else DirectOps.CpuGemmABt(input, weight, output, 1f, accumulate ? 1f : 0f);
+        }
+
         private static void Replace(ref Tensor slot, Tensor next)
         {
             Tensor old = slot;
@@ -644,13 +698,24 @@ namespace TensorSharp.Models.MiniMaxH3
         /// path lands closer to the PyTorch reference than to the GGML one -- but a
         /// stage-by-stage diff is the only practical way to localize a mismatch.
         /// </summary>
-        private static unsafe void DumpProbe(Tensor probe)
+        private unsafe void DumpProbe(Tensor probe)
         {
             string path = Environment.GetEnvironmentVariable("TS_H3_ENC3D_DUMP");
             if (string.IsNullOrEmpty(path)) return;
 
             long t = probe.Sizes[0], h = probe.Sizes[1], c = probe.Sizes[3];
             int w = checked((int)probe.Sizes[2]);
+            if (_ctx.IsAccelerated)
+            {
+                using var planar = probe.Permute(0, 3, 1, 2);
+                using var contiguous = Ops.NewContiguous(planar);
+                float[] values = contiguous.GetElementsAsFloat(checked((int)contiguous.ElementCount()));
+                using var deviceDump = new FileStream(path, FileMode.Create, FileAccess.Write);
+                using var writer = new BinaryWriter(deviceDump);
+                writer.Write(w); writer.Write((int)h); writer.Write((int)c); writer.Write((int)t);
+                foreach (float value in values) writer.Write(value);
+                return;
+            }
             float* p = (float*)CpuNativeHelpers.GetBufferStart(probe);
             var row = new float[w];
             var bytes = new byte[(long)w * sizeof(float)];

@@ -80,8 +80,6 @@ public static class ServerOptionsBuilder
         int embeddingContextSize = ReadEmbeddingIntOption(args, "--embedding-context-size");
         if (embeddingsEnabled && string.IsNullOrWhiteSpace(startupModelPath))
             throw new ArgumentException("--embeddings requires --model.");
-        if (embeddingsEnabled && startupMmProjPath != null)
-            throw new ArgumentException("--embeddings does not support --mmproj.");
         if (!embeddingsEnabled && (embeddingThreads > 0 || embeddingContextSize > 0))
             throw new ArgumentException("--embedding-threads and --embedding-context-size require --embeddings.");
 
@@ -97,7 +95,7 @@ public static class ServerOptionsBuilder
         var supportedBackends = embeddingsEnabled && BackendCatalog.Canonicalize(requestedBackend) == "cpu"
             ? new[] { new BackendOption("cpu", "CPU (Pure C#)") }
             : BackendCatalogProbes.GetSupportedBackends()
-                .Where(backend => !embeddingsEnabled || backend.Value is "cpu" or "ggml_cpu" or "ggml_metal" or "ggml_cuda")
+                .Where(backend => !embeddingsEnabled || backend.Value is "cpu" or "ggml_cpu" or "ggml_metal" or "ggml_cuda" or "cuda" or "mlx")
                 .ToArray();
         string defaultBackend = BackendCatalog.ResolveDefaultBackend(requestedBackend, supportedBackends);
 
@@ -803,6 +801,20 @@ public static class ServerOptionsBuilder
                 changed = true;
                 continue;
             }
+            // x2 latent upscaler for two-stage video models (LTX 2.5).
+            if (TryReadOption(args, ref i, "--video-upscaler", out string? videoUpscalerOpt))
+            {
+                SetQwenImageCompanionEnv("--video-upscaler", "TS_VIDEO_UPSCALER", videoUpscalerOpt);
+                changed = true;
+                continue;
+            }
+            // Opt-in LTX 2.5 diffusion video decoder (MLX and CPU; CUDA refuses it).
+            if (TryReadOption(args, ref i, "--video-diffusion-vae", out string? videoDiffusionVaeOpt))
+            {
+                SetQwenImageCompanionEnv("--video-diffusion-vae", "TS_VIDEO_DIFFUSION_VAE", videoDiffusionVaeOpt);
+                changed = true;
+                continue;
+            }
             // Default output size for image requests that name neither a size nor a
             // target area of their own. Read by QwenImage21Pipeline.ResolveDimensions as
             // TS_QWEN_IMAGE_WIDTH/HEIGHT, which needs both (a half-set or unparsable pair is
@@ -1389,6 +1401,8 @@ public static class ServerOptionsBuilder
                 || TryReadOption(args, ref i, "--video-text-encoder", out _)
                 || TryReadOption(args, ref i, "--video-dit2", out _)
                 || TryReadOption(args, ref i, "--audio-vae", out _)
+                || TryReadOption(args, ref i, "--video-upscaler", out _)
+                || TryReadOption(args, ref i, "--video-diffusion-vae", out _)
                 || TryReadOption(args, ref i, "--video-width", out _)
                 || TryReadOption(args, ref i, "--video-height", out _)
                 || TryReadOption(args, ref i, "--video-steps", out _)
@@ -1442,7 +1456,7 @@ public static class ServerOptionsBuilder
             "--redis-url",
             "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
             "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", QwenImageVariantFlag.Flag,
-            "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae",
+            "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae", "--video-upscaler", "--video-diffusion-vae",
             "--video-width", "--video-height", "--video-steps", "--video-mode",
             "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",
             "--tp", "--tp-node-id", "--tp-peers",

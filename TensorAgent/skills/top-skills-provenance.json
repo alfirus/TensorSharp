@@ -1,0 +1,860 @@
+{
+  "leaderboard": "https://www.skills.sh/",
+  "snapshot_date": "2026-10-13",
+  "top_ten_audit": [
+    {
+      "rank": 1,
+      "name": "find-skills",
+      "repository": "vercel-labs/skills",
+      "revision": "13e4063a1cf913f5606d57d42ab83a86f5001e04",
+      "license": "MIT",
+      "disposition": "adapted and installed",
+      "reason": "Uses TensorSharp-owned native search, immutable revision inspection and managed installation instead of npx or global writes. Runtime compatibility is checked separately from installation; validation scope is recorded by the find-skills tests."
+    },
+    {
+      "rank": 2,
+      "name": "grill-me",
+      "disposition": "installed"
+    },
+    {
+      "rank": 3,
+      "name": "grill-with-docs",
+      "disposition": "installed"
+    },
+    {
+      "rank": 4,
+      "name": "agent-browser",
+      "repository": "vercel-labs/agent-browser",
+      "revision": "d9570915f4dd6504dee4070379d2c4f79d81dbb2",
+      "license": "Apache-2.0",
+      "disposition": "excluded",
+      "reason": "Only a discovery stub; requires an external native CLI and Chrome/CDP, unavailable in TensorAgent's in-process mobile runtime. Existing validated desktop playwright remains available."
+    },
+    {
+      "rank": 5,
+      "name": "improve-codebase-architecture",
+      "disposition": "excluded after live validation",
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles."
+    },
+    {
+      "rank": 6,
+      "name": "tdd",
+      "disposition": "installed"
+    },
+    {
+      "rank": 7,
+      "name": "setup-matt-pocock-skills",
+      "repository": "mattpocock/skills",
+      "revision": "49dd158d1076134a641b33efb035946536778336",
+      "license": "MIT",
+      "disposition": "excluded",
+      "reason": "Assumes a persistent repository, git remote/config and optional gh/glab tracker mutation. No such repository/tracker integration is established in a TensorAgent session; not validated end to end."
+    },
+    {
+      "rank": 8,
+      "name": "frontend-design",
+      "repository": "anthropics/skills",
+      "audited_revision": "dbd4588f9e1033efb41dad4bef2f7947c8993d44",
+      "license": "Apache-2.0",
+      "disposition": "preexisting retained",
+      "reason": "Retain the established design body with a targeted workspace-delivery hint; no duplicate upstream pack is installed.",
+      "integrated_files": {
+        "LICENSE.txt": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "SKILL.md": "39e1bddc8f4e72d01f3b381bbac55e9e69877b66ce710fbd43bce63c450e30c2"
+      },
+      "workflow_validation": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 2048,
+        "scope": "One fixed offline HTML task; browser render coverage is recorded separately."
+      }
+    },
+    {
+      "rank": 9,
+      "name": "handoff",
+      "disposition": "installed"
+    },
+    {
+      "rank": 10,
+      "name": "hyperframes-cli",
+      "repository": "heygen-com/hyperframes",
+      "revision": "e8eb358fe21d6f1a611e04f8df27ca366b337ce9",
+      "license": "Apache-2.0",
+      "disposition": "excluded",
+      "reason": "Requires Node >=22, npx, FFmpeg and browser rendering plus multiple missing sibling skills. No mobile renderer or local end-to-end renderer validation is available."
+    }
+  ],
+  "installed": [
+    {
+      "name": "grill-me",
+      "repository": "mattpocock/skills",
+      "revision": "49dd158d1076134a641b33efb035946536778336",
+      "path": "skills/productivity/grill-me",
+      "license": "MIT",
+      "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+      "upstream_files": [
+        {
+          "skill": "grill-me",
+          "file": "SKILL.md",
+          "sha256": "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637"
+        },
+        {
+          "skill": "grilling",
+          "file": "SKILL.md",
+          "sha256": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15"
+        }
+      ],
+      "integrated_files": {
+        "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+        "SKILL.md": "1ac86786f01c4848f8d8587ba71f68fe2260ca0df03472b9eff55beb7bcd87a0"
+      },
+      "workflow_validation": {
+        "validated_model": "gemma-4-E2B-it-Q8_0",
+        "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 8,
+        "max_tokens_per_round": 1536,
+        "scope": "One fixed task through the real local HTTP endpoint; not a general model-quality guarantee."
+      }
+    },
+    {
+      "name": "grill-with-docs",
+      "repository": "mattpocock/skills",
+      "revision": "49dd158d1076134a641b33efb035946536778336",
+      "path": "skills/engineering/grill-with-docs",
+      "license": "MIT",
+      "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+      "upstream_files": [
+        {
+          "skill": "grill-with-docs",
+          "file": "SKILL.md",
+          "sha256": "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe"
+        },
+        {
+          "skill": "grilling",
+          "file": "SKILL.md",
+          "sha256": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15"
+        },
+        {
+          "skill": "domain-modeling",
+          "file": "SKILL.md",
+          "sha256": "7b925d7b1e341a2eeae33ad68a8a8c0ab889a38ddd22a7598e4c240e5a7556a3"
+        },
+        {
+          "skill": "domain-modeling",
+          "file": "GLOSSARY-FORMAT.md",
+          "sha256": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801"
+        },
+        {
+          "skill": "domain-modeling",
+          "file": "ADR-FORMAT.md",
+          "sha256": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0"
+        }
+      ],
+      "integrated_files": {
+        "ADR-FORMAT.md": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0",
+        "GLOSSARY-FORMAT.md": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801",
+        "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+        "SKILL.md": "fa42273253fe1cf0d82e1b942b0d9190c82eedd9c674b26a0d260defc04ac4b8",
+        "domain-modeling.md": "89fe9ba785772fcc7032e216316922d35b5e48086d63efd1fcaf8f350e5b31d2"
+      },
+      "workflow_validation": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 1536,
+        "scope": "One fixed task through the real local HTTP endpoint; not a general model-quality guarantee."
+      },
+      "model_capacity_requirement": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 1536,
+        "earlier_failed_model": "gemma-4-E2B-it-Q8_0",
+        "earlier_failed_max_skill_rounds": 8,
+        "earlier_model_at_24_rounds": "not validated",
+        "other_models": "not validated"
+      }
+    },
+    {
+      "name": "tdd",
+      "repository": "mattpocock/skills",
+      "revision": "49dd158d1076134a641b33efb035946536778336",
+      "path": "skills/engineering/tdd",
+      "license": "MIT",
+      "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+      "upstream_files": [
+        {
+          "skill": "tdd",
+          "file": "SKILL.md",
+          "sha256": "5505d25bbaa8fc14a79e4d20163936958992a2995b7f1dd1d6197edc9ed722e0"
+        },
+        {
+          "skill": "codebase-design",
+          "file": "SKILL.md",
+          "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2"
+        },
+        {
+          "skill": "codebase-design",
+          "file": "DEEPENING.md",
+          "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1"
+        },
+        {
+          "skill": "codebase-design",
+          "file": "DESIGN-IT-TWICE.md",
+          "sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010"
+        },
+        {
+          "skill": "tdd",
+          "file": "tests.md",
+          "sha256": "859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a"
+        },
+        {
+          "skill": "tdd",
+          "file": "mocking.md",
+          "sha256": "3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef"
+        }
+      ],
+      "integrated_files": {
+        "DEEPENING.md": "05232a408eb885a1a8fced1a8e54a8ca900969b034e3185c7547f05db6caead6",
+        "DESIGN-IT-TWICE.md": "2477ffbc68c50f0ae2eb62185a4cf3a5db46362067ffafbdd1e1b4aeb7ec10dc",
+        "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+        "SKILL.md": "7778199a27486e0bcb223a7b3657761c40d01ff1c9970b0c6e97e543f6aa388c",
+        "codebase-design.md": "9153e20f10ff70df8ac0c9f4dcf9935a4328079252d2bf33c5765775eb40ef83",
+        "mocking.md": "3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef",
+        "tests.md": "859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a"
+      },
+      "workflow_validation": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 1536,
+        "scope": "One fixed task through the real local HTTP endpoint; not a general model-quality guarantee."
+      },
+      "model_capacity_requirement": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 1536,
+        "earlier_failed_model": "gemma-4-E2B-it-Q8_0",
+        "earlier_failed_max_skill_rounds": 8,
+        "earlier_model_at_24_rounds": "not validated",
+        "other_models": "not validated"
+      }
+    },
+    {
+      "name": "handoff",
+      "repository": "mattpocock/skills",
+      "revision": "49dd158d1076134a641b33efb035946536778336",
+      "path": "skills/productivity/handoff",
+      "license": "MIT",
+      "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+      "upstream_files": [
+        {
+          "skill": "handoff",
+          "file": "SKILL.md",
+          "sha256": "4cbb043950dad2ffd3662ff1a5a0b51ae676004b5cae10e3787e8ee7a4ee69d3"
+        }
+      ],
+      "integrated_files": {
+        "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+        "SKILL.md": "988bf972f317ce4d9de4505f8b5065000e57ad0b60c4965c29f7b9ac3c12a274"
+      },
+      "workflow_validation": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 1536,
+        "scope": "One fixed task through the real local HTTP endpoint; not a general model-quality guarantee."
+      },
+      "model_capacity_requirement": {
+        "validated_model": "gemma-4-E4B-it-Q8_0",
+        "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        "context_tokens": 16384,
+        "max_skill_rounds": 24,
+        "max_tokens_per_round": 1536,
+        "earlier_failed_model": "gemma-4-E2B-it-Q8_0",
+        "earlier_failed_max_skill_rounds": 8,
+        "earlier_model_at_24_rounds": "not validated",
+        "other_models": "not validated"
+      }
+    },
+    {
+      "name": "find-skills",
+      "repository": "vercel-labs/skills",
+      "revision": "13e4063a1cf913f5606d57d42ab83a86f5001e04",
+      "path": "skills/find-skills",
+      "license": "MIT",
+      "adaptations": "Native skills_search, skills_inspect and skills_install; request-local activation; host-managed installation; explicit compatibility and execution validation boundaries.",
+      "upstream_files": [
+        {
+          "skill": "find-skills",
+          "file": "SKILL.md",
+          "sha256": "c00eeea0e13e74fe4a9d84ba0a8542205a1b736d65f13134fe1a6647eb14976f"
+        },
+        {
+          "skill": "find-skills",
+          "file": "LICENSE",
+          "sha256": "661142e53c313d2bb5e1b055f5c0a39001450ff1b5e27b89dc4bc7de9a6352ca"
+        }
+      ],
+      "integrated_files": {
+        "LICENSE.txt": "661142e53c313d2bb5e1b055f5c0a39001450ff1b5e27b89dc4bc7de9a6352ca",
+        "SKILL.md": "bd4085e197c2c107850b553008307bd29969190b57f3ba537f9da75abbc86686"
+      },
+      "workflow_validation": {
+        "date": "2026-10-15",
+        "sampled_model": "gemma-4-E4B-it-Q8_0",
+        "backend": "ggml_metal",
+        "platform": "macOS arm64",
+        "controlled_sampling": {
+          "temperature": 0,
+          "seed": 42
+        },
+        "runtime_validation": "Passed native search, immutable inspection, managed installation, same-request resource access and script execution against actual upstream packages.",
+        "controlled_model_samples": {
+          "TensorSharp.Server.Host": {
+            "frontend_design_html": "passed",
+            "skill_creator_helper_help": "passed"
+          },
+          "TensorAgent.AgentAppHost": {
+            "frontend_design_html": "failed strict semantic requirement: a styled anchor replaced the requested button element, despite successful search, inspect, install, read and artifact creation",
+            "skill_creator_helper_help": "passed"
+          },
+          "strict_passed": 3,
+          "total": 4
+        },
+        "additional_script_validation": "The separate live managed probe ran the unchanged anthropics/skills skill-creator aggregate_benchmark.py helper in the production macOS sandbox against six fixtures and verified generated JSON/Markdown aggregation outputs. Model script cases exercised --help only.",
+        "earlier_model_samples": "Earlier stochastic runs passed 1 of 4 strict task oracles; a separate server HTML retry with an explicit read reminder passed 1 of 1. These are retained separately from controlled samples.",
+        "tensoragent_regression": {
+          "passed": 315,
+          "skipped": 0,
+          "failed": 0,
+          "scope": "FindSkillsHostTests, SkillCatalogVisibilityTests, TopSkillsHostTests, WebUiPageTests and InProcessShellTests"
+        },
+        "evidence": "Generated reports and failure history are summarized in ignored artifacts/find-skills/summary.json; final TensorAgent regression log is in docs/validation/find-skills-tensoragent-tests.log.",
+        "limitations": [
+          "One observation per controlled task on one model/backend; no minimum model requirement or universal model-quality claim is established.",
+          "No physical iOS or Windows device, native TensorAgent GUI, or other platform/device coverage.",
+          "No universal marketplace compatibility claim: downloaded workflows retain their external tool, runtime and credential requirements.",
+          "Warm-cache and individual request timings are not concurrent throughput benchmarks."
+        ]
+      }
+    }
+  ],
+  "rejected_after_validation": [
+    {
+      "name": "improve-codebase-architecture",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "context_tokens": 16384,
+      "max_skill_rounds": 24,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "no_raw_tool_markup",
+        "finished_without_length_limit",
+        "saved_report",
+        "offline_report"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "source_provenance": {
+        "name": "improve-codebase-architecture",
+        "repository": "mattpocock/skills",
+        "revision": "49dd158d1076134a641b33efb035946536778336",
+        "path": "skills/engineering/improve-codebase-architecture",
+        "license": "MIT",
+        "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+        "upstream_files": [
+          {
+            "skill": "improve-codebase-architecture",
+            "file": "SKILL.md",
+            "sha256": "552240a5ab5cec6b67c15dd1ad6e9f6962b1bca6ce870059a8c2713760c20392"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "SKILL.md",
+            "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2"
+          },
+          {
+            "skill": "grilling",
+            "file": "SKILL.md",
+            "sha256": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "SKILL.md",
+            "sha256": "7b925d7b1e341a2eeae33ad68a8a8c0ab889a38ddd22a7598e4c240e5a7556a3"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "DEEPENING.md",
+            "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "DESIGN-IT-TWICE.md",
+            "sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "GLOSSARY-FORMAT.md",
+            "sha256": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "ADR-FORMAT.md",
+            "sha256": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0"
+          },
+          {
+            "skill": "improve-codebase-architecture",
+            "file": "HTML-REPORT.md",
+            "sha256": "581e8bb5a521e46bbda8ca7e19b15948bed882187108092ebb90c62513b77528"
+          }
+        ],
+        "integrated_files": {
+          "ADR-FORMAT.md": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0",
+          "DEEPENING.md": "05232a408eb885a1a8fced1a8e54a8ca900969b034e3185c7547f05db6caead6",
+          "DESIGN-IT-TWICE.md": "2477ffbc68c50f0ae2eb62185a4cf3a5db46362067ffafbdd1e1b4aeb7ec10dc",
+          "GLOSSARY-FORMAT.md": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801",
+          "HTML-REPORT.md": "6ace35de4c86318140fc344ce39869de03350cfb6c1c003269a99265612c90db",
+          "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "SKILL.md": "6ffae4e7d6d6a8d112636fcba9d7fb8edd78eb3d4f877d0ca366feb30fb77e97",
+          "codebase-design.md": "9153e20f10ff70df8ac0c9f4dcf9935a4328079252d2bf33c5765775eb40ef83",
+          "domain-modeling.md": "89fe9ba785772fcc7032e216316922d35b5e48086d63efd1fcaf8f350e5b31d2",
+          "grilling.md": "39b097915f9137903385e9caf5b70fa9610a495a40d1a13872a6e9e68e08d641"
+        }
+      }
+    }
+  ],
+  "earlier_validation_failures": [
+    {
+      "name": "handoff",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "credential_redacted"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "source_provenance": {
+        "name": "handoff",
+        "repository": "mattpocock/skills",
+        "revision": "49dd158d1076134a641b33efb035946536778336",
+        "path": "skills/productivity/handoff",
+        "license": "MIT",
+        "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+        "upstream_files": [
+          {
+            "skill": "handoff",
+            "file": "SKILL.md",
+            "sha256": "4cbb043950dad2ffd3662ff1a5a0b51ae676004b5cae10e3787e8ee7a4ee69d3"
+          }
+        ],
+        "integrated_files": {
+          "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "SKILL.md": "4cb26db9de6a7df840dfb974bcea265188207efe7c8ffe1db5793198bdf7eb3e"
+        }
+      },
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "grill-with-docs",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "saved_glossary"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "source_provenance": {
+        "name": "grill-with-docs",
+        "repository": "mattpocock/skills",
+        "revision": "49dd158d1076134a641b33efb035946536778336",
+        "path": "skills/engineering/grill-with-docs",
+        "license": "MIT",
+        "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+        "upstream_files": [
+          {
+            "skill": "grill-with-docs",
+            "file": "SKILL.md",
+            "sha256": "7de372c13488f1ee96cc11cd8907b56b6809cc93eef776eeddd37de6b6cbe3fe"
+          },
+          {
+            "skill": "grilling",
+            "file": "SKILL.md",
+            "sha256": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "SKILL.md",
+            "sha256": "7b925d7b1e341a2eeae33ad68a8a8c0ab889a38ddd22a7598e4c240e5a7556a3"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "GLOSSARY-FORMAT.md",
+            "sha256": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "ADR-FORMAT.md",
+            "sha256": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0"
+          }
+        ],
+        "integrated_files": {
+          "ADR-FORMAT.md": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0",
+          "GLOSSARY-FORMAT.md": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801",
+          "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "SKILL.md": "95eee4c2bf37d3edbc9858a273fd59426c4222cba4bb7de724aa0ed04df210c9",
+          "domain-modeling.md": "89fe9ba785772fcc7032e216316922d35b5e48086d63efd1fcaf8f350e5b31d2"
+        }
+      },
+      "subsequent_failed_model": "gemma-4-E2B-it-Q8_0",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "improve-codebase-architecture",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "no_raw_tool_markup",
+        "finished_without_length_limit",
+        "saved_report",
+        "offline_report"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "source_provenance": {
+        "name": "improve-codebase-architecture",
+        "repository": "mattpocock/skills",
+        "revision": "49dd158d1076134a641b33efb035946536778336",
+        "path": "skills/engineering/improve-codebase-architecture",
+        "license": "MIT",
+        "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+        "upstream_files": [
+          {
+            "skill": "improve-codebase-architecture",
+            "file": "SKILL.md",
+            "sha256": "552240a5ab5cec6b67c15dd1ad6e9f6962b1bca6ce870059a8c2713760c20392"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "SKILL.md",
+            "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2"
+          },
+          {
+            "skill": "grilling",
+            "file": "SKILL.md",
+            "sha256": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "SKILL.md",
+            "sha256": "7b925d7b1e341a2eeae33ad68a8a8c0ab889a38ddd22a7598e4c240e5a7556a3"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "DEEPENING.md",
+            "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "DESIGN-IT-TWICE.md",
+            "sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "GLOSSARY-FORMAT.md",
+            "sha256": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801"
+          },
+          {
+            "skill": "domain-modeling",
+            "file": "ADR-FORMAT.md",
+            "sha256": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0"
+          },
+          {
+            "skill": "improve-codebase-architecture",
+            "file": "HTML-REPORT.md",
+            "sha256": "581e8bb5a521e46bbda8ca7e19b15948bed882187108092ebb90c62513b77528"
+          }
+        ],
+        "integrated_files": {
+          "ADR-FORMAT.md": "944c92aa790e8fbdc9199640b170979abb8a34ba8d0fe18c2a01a63bce140ca0",
+          "DEEPENING.md": "05232a408eb885a1a8fced1a8e54a8ca900969b034e3185c7547f05db6caead6",
+          "DESIGN-IT-TWICE.md": "2477ffbc68c50f0ae2eb62185a4cf3a5db46362067ffafbdd1e1b4aeb7ec10dc",
+          "GLOSSARY-FORMAT.md": "21dcc40cdec8e151a829b98ab1517c1867bc444e3665134a98c6983411996801",
+          "HTML-REPORT.md": "6ace35de4c86318140fc344ce39869de03350cfb6c1c003269a99265612c90db",
+          "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "SKILL.md": "6ffae4e7d6d6a8d112636fcba9d7fb8edd78eb3d4f877d0ca366feb30fb77e97",
+          "codebase-design.md": "9153e20f10ff70df8ac0c9f4dcf9935a4328079252d2bf33c5765775eb40ef83",
+          "domain-modeling.md": "89fe9ba785772fcc7032e216316922d35b5e48086d63efd1fcaf8f350e5b31d2",
+          "grilling.md": "39b097915f9137903385e9caf5b70fa9610a495a40d1a13872a6e9e68e08d641"
+        }
+      },
+      "subsequent_failed_model": "gemma-4-E2B-it-Q8_0"
+    },
+    {
+      "name": "tdd",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "saved_implementation",
+        "saved_tests"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "source_provenance": {
+        "name": "tdd",
+        "repository": "mattpocock/skills",
+        "revision": "49dd158d1076134a641b33efb035946536778336",
+        "path": "skills/engineering/tdd",
+        "license": "MIT",
+        "adaptations": "self-contained dependency references, TensorSharp tool names, workspace artifacts, optional delegation, offline architecture report",
+        "upstream_files": [
+          {
+            "skill": "tdd",
+            "file": "SKILL.md",
+            "sha256": "5505d25bbaa8fc14a79e4d20163936958992a2995b7f1dd1d6197edc9ed722e0"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "SKILL.md",
+            "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "DEEPENING.md",
+            "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1"
+          },
+          {
+            "skill": "codebase-design",
+            "file": "DESIGN-IT-TWICE.md",
+            "sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010"
+          },
+          {
+            "skill": "tdd",
+            "file": "tests.md",
+            "sha256": "859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a"
+          },
+          {
+            "skill": "tdd",
+            "file": "mocking.md",
+            "sha256": "3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef"
+          }
+        ],
+        "integrated_files": {
+          "DEEPENING.md": "05232a408eb885a1a8fced1a8e54a8ca900969b034e3185c7547f05db6caead6",
+          "DESIGN-IT-TWICE.md": "2477ffbc68c50f0ae2eb62185a4cf3a5db46362067ffafbdd1e1b4aeb7ec10dc",
+          "LICENSE.txt": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "SKILL.md": "7731407631fb84dde4c0fba1b41cd34872b14cca3e2474b34d59a6266243219c",
+          "codebase-design.md": "9153e20f10ff70df8ac0c9f4dcf9935a4328079252d2bf33c5765775eb40ef83",
+          "mocking.md": "3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef",
+          "tests.md": "859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a"
+        }
+      },
+      "subsequent_failed_model": "gemma-4-E2B-it-Q8_0",
+      "oracle_correction": "Decode JSON tool-content newlines before detecting unittest OK; the selected first slice had real red/green, but the 8-round task remained incomplete.",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "grill-with-docs",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "saved_glossary",
+        "preserves_reservation"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_failed_model": "gemma-4-E4B-it-Q8_0"
+    },
+    {
+      "name": "improve-codebase-architecture",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "saved_report",
+        "offline_report",
+        "before_after",
+        "no_raw_tool_markup"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_failed_model": "gemma-4-E4B-it-Q8_0"
+    },
+    {
+      "name": "tdd",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "failed_checks": [
+        "actual_red_run"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_failed_model": "gemma-4-E4B-it-Q8_0"
+    },
+    {
+      "name": "grill-with-docs",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "context_tokens": null,
+      "max_skill_rounds": 8,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "saved_glossary",
+        "preserves_reservation"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_failed_model": "gemma-4-E4B-it-Q8_0"
+    },
+    {
+      "name": "improve-codebase-architecture",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "context_tokens": null,
+      "max_skill_rounds": 8,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "saved_report",
+        "offline_report",
+        "before_after",
+        "no_raw_tool_markup"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_failed_model": "gemma-4-E4B-it-Q8_0"
+    },
+    {
+      "name": "tdd",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "context_tokens": null,
+      "max_skill_rounds": 8,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "actual_red_run"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_failed_model": "gemma-4-E4B-it-Q8_0"
+    },
+    {
+      "name": "handoff",
+      "model": "gemma-4-E2B-it-Q8_0",
+      "model_sha256": "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+      "backend": "ggml_cpu",
+      "context_tokens": null,
+      "max_skill_rounds": 8,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "credential_redacted"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "grill-with-docs",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "context_tokens": null,
+      "max_skill_rounds": 8,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "saved_glossary"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "tdd",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "context_tokens": null,
+      "max_skill_rounds": 8,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "saved_implementation",
+        "saved_tests"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "grill-with-docs",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "context_tokens": 16384,
+      "max_skill_rounds": 24,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "saved_glossary"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    },
+    {
+      "name": "frontend-design",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+      "backend": "ggml_cpu",
+      "context_tokens": 16384,
+      "max_skill_rounds": 24,
+      "max_tokens_per_round": 1536,
+      "skill_manifest_sha256": null,
+      "failed_checks": [
+        "no_raw_tool_markup",
+        "finished_without_length_limit",
+        "saved_landing_page",
+        "complete_html",
+        "offline",
+        "required_content",
+        "internal_cta"
+      ],
+      "error": null,
+      "reason": "Failed the real local model workflow after tool-contract adaptations and targeted fixes; removed from active app bundles.",
+      "subsequent_passing_model": "gemma-4-E4B-it-Q8_0",
+      "subsequent_passing_model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a"
+    }
+  ]
+}

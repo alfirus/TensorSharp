@@ -13,7 +13,7 @@ public sealed class ModelBrowserTests
     public void EveryCatalogEntryAppearsExactlyOnceUnderItsFamilyWithoutCopyingIt()
     {
         var groups = Browse();
-        Assert.Equal(14, groups.Count);
+        Assert.Equal(15, groups.Count);
         Assert.Equal(groups.Count, groups.Select(group => group.Id).Distinct().Count());
         CatalogModel[] results = groups.SelectMany(group => group.Models).ToArray();
         Assert.Equal(ModelCatalog.BuiltIn.Count, results.Length);
@@ -36,6 +36,7 @@ public sealed class ModelBrowserTests
     [InlineData(CatalogFamily.Bonsai, "bonsai", "Bonsai")]
     [InlineData(CatalogFamily.MuseGlimmer, "muse-glimmer", "Muse-Glimmer")]
     [InlineData(CatalogFamily.MiniMaxH3, "minimax-h3", "MiniMax H3")]
+    [InlineData(CatalogFamily.Ltx25, "ltx", "LTX")]
     [InlineData(CatalogFamily.DeepSeek4, "deepseek", "DeepSeek")]
     [InlineData(CatalogFamily.DeepSeek41, "deepseek", "DeepSeek")]
     [InlineData(CatalogFamily.Glm5, "glm", "GLM")]

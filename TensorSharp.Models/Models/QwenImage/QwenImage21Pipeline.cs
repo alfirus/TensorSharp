@@ -795,7 +795,14 @@ namespace TensorSharp.Models.QwenImage
         /// four words and rounds to float, so two streams' values coincide only by chance.
         /// Word 0 stays free for a sampler that draws more than once.
         /// </summary>
-        internal static float[] Noise(int count, long seed, ulong stream)
+        internal static float[] Noise(int count, long seed, ulong stream) => Noise(count, seed, stream, 0);
+
+        /// <summary>
+        /// <see cref="Noise(int, long, ulong)"/> at Philox word 0 = <paramref name="draw"/>: a
+        /// sampler's independent repeated draws for one seed and stream. Draw 0 is the
+        /// initial-noise sequence.
+        /// </summary>
+        internal static float[] Noise(int count, long seed, ulong stream, uint draw)
         {
             var result = new float[count];
             const float inv32 = 2.3283064e-10f;
@@ -803,7 +810,7 @@ namespace TensorSharp.Models.QwenImage
             uint streamLow = (uint)stream, streamHigh = (uint)(stream >> 32);
             for (int i = 0; i < count; i++)
             {
-                uint a = 0, b = streamLow, c = (uint)i, d = streamHigh;
+                uint a = draw, b = streamLow, c = (uint)i, d = streamHigh;
                 uint k0 = (uint)seed, k1 = (uint)((ulong)seed >> 32);
                 for (int round = 0; round < 10; round++)
                 {

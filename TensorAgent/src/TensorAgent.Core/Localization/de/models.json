@@ -87,5 +87,6 @@
   "models.alert.delete.title": "Modell löschen",
   "models.alert.delete.message": "{model} von diesem Gerät entfernen? Es kann erneut heruntergeladen werden.",
   "models.alert.delete.messageLocal": "{model} von diesem Gerät entfernen? Zum Wiederherstellen musst du die ursprüngliche lokale GGUF-Datei erneut auswählen.",
-  "models.alert.delete.confirm": "Löschen"
+  "models.alert.delete.confirm": "Löschen",
+  "models.action.unavailable": "Nicht verfügbar"
 }

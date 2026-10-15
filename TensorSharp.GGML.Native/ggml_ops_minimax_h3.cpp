@@ -36,6 +36,7 @@
 // ============================================================================
 #include "ggml_ops_internal.h"
 #include "ggml-alloc.h"
+#include "ggml_h3_weight_upload.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -107,6 +108,27 @@ struct TSGgmlMiniMaxH3VideoVaeDecodeDesc
 };
 
 namespace {
+
+// Keep ordinary submissions unchanged. Opt-in profiling uses the existing
+// TensorSharp profiler and stage tags; it synchronizes every node and therefore
+// must never supply baseline performance measurements.
+ggml_status h3_compute(ggml_backend_t backend, ggml_cgraph* graph, const char* tag)
+{
+    const char * upload_profile = std::getenv("TS_H3_UPLOAD_PROFILE");
+    const bool time_compute = upload_profile != nullptr && std::strcmp(upload_profile, "1") == 0;
+    const auto begin = time_compute ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const ggml_status status = graph_node_profile_enabled()
+        ? graph_compute_profiled(backend, graph, tag)
+        : compute_graph(backend, graph);
+    // compute_graph is already synchronous; this timer adds no device fence.
+    if (time_compute) {
+        std::fprintf(stderr, "[h3-compute] tag=%s graph_compute_seconds=%.6f status=%d\n", tag,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(), static_cast<int>(status));
+        std::fflush(stderr);
+    }
+    return status;
+}
+
 
 // Rotate-half RoPE over the leading `rot` dims of each head.
 // x: [head_dim, heads, seq]; cos/sin: [rot, seq].
@@ -438,12 +460,15 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/video-vae-decode");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(latent, d->latent, 0, static_cast<std::size_t>(lc) * ntok * f);
         ggml_backend_tensor_set(cosf, d->cosf, 0, static_cast<std::size_t>(rot) * seq * f);
         ggml_backend_tensor_set(sinf, d->sinf, 0, static_cast<std::size_t>(rot) * seq * f);
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/video-vae-decode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3VideoVaeDecode: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(pdim) * ntok * f);
@@ -687,7 +712,10 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
 
         const std::size_t f = sizeof(float);
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/text-encode");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(x, d->embeddings, 0, static_cast<std::size_t>(hidden) * seq * f);
         if (deepstack != nullptr)
             ggml_backend_tensor_set(deepstack, d->deepstack, 0, ggml_nbytes(deepstack));
@@ -696,7 +724,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         if (causalMask)
             ggml_backend_tensor_set(causalMask, causalMaskData.data(), 0, causalMaskData.size() * f);
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/text-encode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3TextEncode: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, static_cast<std::size_t>(hidden) * seq * f);
@@ -971,10 +999,8 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_tensor* voutT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->video_patch_dim, d->video_count);
         ggml_tensor* aoutT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d->audio_channels, d->audio_count);
 
-        // Shared attention over a packed sequence: no mask anywhere in this model.
-        // cos/sin are per-token tables over the FULL packed sequence; the token
-        // refiner runs on the text prefix only, so it needs the matching prefix of
-        // the tables rather than the whole thing.
+        // Shared bidirectional attention. Packed diffusion blocks apply RoPE;
+        // the text token refiner has no positional rotation.
         auto attention = [&](ggml_tensor* h, ggml_tensor* qkvw, ggml_tensor* qkvb,
                              ggml_tensor* qn, ggml_tensor* kn, ggml_tensor* ow, ggml_tensor* ob,
                              int seq, ggml_tensor* cosT, ggml_tensor* sinT) {
@@ -989,8 +1015,11 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                 static_cast<std::size_t>(2) * inner * f));
             if (qn) q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), qn);
             if (kn) k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), kn);
-            q = h3_vit_rope(ctx, q, cosT, sinT, hd, heads, seq, rot);
-            k = h3_vit_rope(ctx, k, cosT, sinT, hd, heads, seq, rot);
+            if (cosT != nullptr && sinT != nullptr)
+            {
+                q = h3_vit_rope(ctx, q, cosT, sinT, hd, heads, seq, rot);
+                k = h3_vit_rope(ctx, k, cosT, sinT, hd, heads, seq, rot);
+            }
             ggml_tensor* merged = h3_attend(ctx, g_backend, q, k, v, hd, heads, seq,
                                             scale, /*allowFlash*/ true);
             return lin(ow, merged, ob);
@@ -1014,10 +1043,6 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
             ggml_tensor *cpw, *cpb;
             declLin(d->condition_proj, cpw, cpb);
             ctxTok = lin(cpw, tin, cpb);
-            ggml_tensor* tcos = ggml_cont(ctx, ggml_view_2d(ctx, cosf, rot, d->text_count,
-                                                            cosf->nb[1], 0));
-            ggml_tensor* tsin = ggml_cont(ctx, ggml_view_2d(ctx, sinf, rot, d->text_count,
-                                                            sinf->nb[1], 0));
             for (int i = 0; i < nref; i++)
             {
                 const TSGH3RefinerBlockW& rw = d->refiner[i];
@@ -1030,7 +1055,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
                 declLin(rw.fc1, w1, b1); declLin(rw.fc2, w2, b2);
                 ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, ctxTok, eps), n1w);
                 ctxTok = ggml_add(ctx, ctxTok,
-                    attention(n1, qkvw, qkvb, qn, kn, ow, ob, d->text_count, tcos, tsin));
+                    attention(n1, qkvw, qkvb, qn, kn, ow, ob, d->text_count, nullptr, nullptr));
                 ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, ctxTok, eps), n2w);
                 ctxTok = ggml_add(ctx, ctxTok, mlp(n2, w1, b1, w2, b2));
             }
@@ -1241,7 +1266,10 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/dit-forward");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(vin, d->video_tokens, 0, ggml_nbytes(vin));
         ggml_backend_tensor_set(ain, d->audio_tokens, 0, ggml_nbytes(ain));
         if (acin != nullptr)
@@ -1251,7 +1279,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         ggml_backend_tensor_set(sinf, d->sinf, 0, ggml_nbytes(sinf));
         if (tin) ggml_backend_tensor_set(tin, d->text_hidden, 0, ggml_nbytes(tin));
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/dit-forward") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3DitForward: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(voutT, d->video_out, 0, ggml_nbytes(voutT));
@@ -1513,10 +1541,13 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode(const TSGgmlMiniMaxH3VideoVaeEncod
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/video-vae-encode");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(img, d->image, 0, ggml_nbytes(img));
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/video-vae-encode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3VideoVaeEncode: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, ggml_nbytes(outT));
@@ -1825,10 +1856,13 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeDecode(const TSGgmlMiniMaxH3AudioVaeDecod
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/audio-vae-decode");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(z, d->latent, 0, ggml_nbytes(z));
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/audio-vae-decode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3AudioVaeDecode: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, ggml_nbytes(outT));
@@ -2144,13 +2178,16 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/vision-encode");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(patches, d->patches, 0, ggml_nbytes(patches));
         ggml_backend_tensor_set(posEmbed, d->pos_embed, 0, ggml_nbytes(posEmbed));
         ggml_backend_tensor_set(cosf, d->cosf, 0, ggml_nbytes(cosf));
         ggml_backend_tensor_set(sinf, d->sinf, 0, ggml_nbytes(sinf));
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/vision-encode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3VisionEncode: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, ggml_nbytes(outT));
@@ -2472,11 +2509,14 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeEncode(const TSGgmlMiniMaxH3AudioVaeEncod
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/audio-vae-encode");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(wave, d->wave, 0, ggml_nbytes(wave));
         ggml_backend_tensor_set(mask, maskData.data(), 0, ggml_nbytes(mask));
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/audio-vae-encode") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3AudioVaeEncode: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, ggml_nbytes(outT));
@@ -2805,7 +2845,10 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
                 { set_last_error("MiniMaxH3VideoVaeEncode3D: probe buffer alloc failed."); return 0; }
             }
             host_read_barrier();
-            for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+            H3WeightUpload weight_upload(g_backend, "minimax-h3/video-vae-encode-3d-probe");
+            weight_upload.prefault(uploads);
+            for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+            weight_upload.finish();
             ggml_backend_tensor_set(video, d->video, 0, ggml_nbytes(video));
             if (tsg::compute_graph(g_backend, pg) != GGML_STATUS_SUCCESS)
             { set_last_error("MiniMaxH3VideoVaeEncode3D: probe compute failed."); return 0; }
@@ -2875,10 +2918,13 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
         }
 
         host_read_barrier();
-        for (auto& u : uploads) ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
+        H3WeightUpload weight_upload(g_backend, "minimax-h3/video-vae-encode-3d");
+        weight_upload.prefault(uploads);
+        for (auto& u : uploads) weight_upload.set(u.t, u.data, u.bytes);
+        weight_upload.finish();
         ggml_backend_tensor_set(video, d->video, 0, ggml_nbytes(video));
 
-        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        if (h3_compute(g_backend, graph, "minimax-h3/video-vae-encode-3d") != GGML_STATUS_SUCCESS)
         { set_last_error("MiniMaxH3VideoVaeEncode3D: graph compute failed."); return 0; }
         tsg::sync_backend(g_backend);
         ggml_backend_tensor_get(outT, d->out, 0, ggml_nbytes(outT));

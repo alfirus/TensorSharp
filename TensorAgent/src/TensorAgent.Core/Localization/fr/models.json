@@ -87,5 +87,6 @@
   "models.alert.delete.title": "Supprimer le modèle",
   "models.alert.delete.message": "Supprimer {model} de cet appareil ? Vous pourrez le télécharger à nouveau.",
   "models.alert.delete.messageLocal": "Supprimer {model} de cet appareil ? Vous devrez sélectionner à nouveau le GGUF local d’origine pour le restaurer.",
-  "models.alert.delete.confirm": "Supprimer"
+  "models.alert.delete.confirm": "Supprimer",
+  "models.action.unavailable": "Indisponible"
 }

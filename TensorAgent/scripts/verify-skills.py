@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decide which skills can actually run inside the TensorAgent app.
+"""Check static script compatibility with the TensorAgent app's bundled runtime.
 
 A skill on a phone is not the same proposition as a skill on a workstation. There
 is no pip at run time, no browser to drive, no child process to spawn, and the
@@ -23,8 +23,10 @@ Run it against the staged runtime:
         --skills <a checkout of github.com/anthropics/skills>/skills \\
         --runtime TensorAgent/python-runtime/simulator
 
-It prints a verdict per skill and exits non-zero if a skill named with --require
-does not pass, which is what makes it usable from CI.
+It prints a compatibility verdict per skill and exits non-zero if a skill named
+with --require does not pass. It does not execute tasks, verify required tools named
+in prose, or measure model quality. Instructions-only skills require separate
+workflow and live-model validation; a valid manifest is not an end-to-end pass.
 """
 
 from __future__ import annotations
@@ -164,8 +166,9 @@ def inspect(skill: Path, available: set[str]) -> Verdict:
     python_files = [p for p in scripts if p.suffix == ".py"]
 
     if not scripts:
-        # Instructions only. Nothing to run means nothing to fail: these work here
-        # exactly as well as they work anywhere.
+        # No executable runtime dependencies were found. Instructions can still
+        # refer to missing tools, sibling skills, or external CLIs; this is only a
+        # static compatibility verdict, not a successful workflow execution.
         return Verdict(name, True, "instructions only")
 
     verdict = Verdict(name, True, "scripts", scripts=len(scripts))
@@ -227,7 +230,7 @@ def main() -> int:
     verdicts = [inspect(p, available) for p in sorted(args.skills.iterdir()) if p.is_dir()]
     passed = [v for v in verdicts if v.ok]
 
-    print("Skills that work end to end in the app:")
+    print("Skills compatible with the bundled runtime (static inspection):")
     for verdict in verdicts:
         if verdict.ok:
             print(verdict.line())

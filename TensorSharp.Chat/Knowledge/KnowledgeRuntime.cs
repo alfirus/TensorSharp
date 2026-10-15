@@ -17,8 +17,8 @@ public static class KnowledgeRuntime
             if (!string.IsNullOrWhiteSpace(model))
                 embeddings = new GgufKnowledgeEmbeddingProvider(model,
                     Environment.GetEnvironmentVariable("TS_KNOWLEDGE_EMBEDDING_BACKEND") ?? "CPU",
-                    Environment.GetEnvironmentVariable("TS_KNOWLEDGE_QUERY_PREFIX") ?? "",
-                    Environment.GetEnvironmentVariable("TS_KNOWLEDGE_DOCUMENT_PREFIX") ?? "");
+                    Environment.GetEnvironmentVariable("TS_KNOWLEDGE_QUERY_PREFIX"),
+                    Environment.GetEnvironmentVariable("TS_KNOWLEDGE_DOCUMENT_PREFIX"));
             var media = modelService == null ? null : new ModelKnowledgeMediaExtractor(modelService);
             var requested = PdfOcrOptions.FromEnvironment();
             IKnowledgePdfPageExtractor pages = managedPdfOcr != null && PdfOcrProvisioner.ShouldManage(requested)

@@ -5,7 +5,7 @@ when — a task needs it. The folder holds a `SKILL.md` written for the model
 rather than for a person, plus whatever scripts, reference documents and assets
 those instructions refer to. TensorSharp discovers such folders, advertises
 their one-line descriptions to the model, and lets the model pull the rest in
-mid-answer through two built-in tools that TensorSharp executes **itself**.
+mid-answer through built-in tools that TensorSharp executes **itself**.
 
 That last part is what makes the feature usable from an ordinary client. A
 caller sends `"skills": ["pdf"]` on a normal chat request and gets back a
@@ -44,6 +44,56 @@ Knowledge support and active response steering were added after `v2026.10.10`;
 use a source build until a release includes them.
 
 ## What a skill is
+
+### Discover and install community skills
+
+The bundled `find-skills` workflow adapts
+[Vercel's skill](https://github.com/vercel-labs/skills/tree/13e4063a1cf913f5606d57d42ab83a86f5001e04/skills/find-skills)
+to TensorSharp and TensorAgent. It uses shared .NET tools, so discovery and
+installation do not require `npx`, Node, Git or a child process on mobile.
+
+Enable Network in TensorAgent, or `--skills-allow-network` on the server, and ask
+for a skill or select `find-skills`. The tools are available only when that skill
+is reachable in the request; an explicit empty skill selection disables them.
+
+| Tool | Behavior |
+| --- | --- |
+| `skills_search(query, owner?)` | Searches skills.sh and returns package identifiers, sources, links and install counts. Successful searches are cached for five minutes with a bounded entry count. |
+| `skills_inspect(package)` | Downloads a public GitHub repository at an immutable commit and returns the selected skill's instructions, compatibility, license and file list. The entire response fits the request's read budget, with explicit truncation markers. No repository code is executed. |
+| `skills_install(package, revision?)` | Installs the exact package inspected in the same request into the host's writable skill registry. An optional revision must match the inspection. Existing skills are never overwritten. |
+
+Packages use `owner/repository@manifest-name`, for example
+`vercel-labs/agent-skills@vercel-react-best-practices`. Selection follows the
+manifest name even when the source folder has a different name. The complete
+skill subtree is copied unchanged, including scripts, references and assets.
+Only the installing request gains immediate access through `skills_read` and
+`skills_run`; unrelated active requests retain their original scope. Subsequent
+requests see the installed skill through normal registry discovery.
+
+Installation needs a writable `SkillRegistryOptions.InstallDirectory`. The
+server and TensorAgent configure this; the CLI's default registry remains
+read-only and offers search/inspection. Local `SkillsChatClient` delivery can
+opt in with `AllowSkillNetwork = true` and a writable registry. Network access
+alone does not enable script or code execution. Those use their existing host
+permissions and sandbox. A narrowed TensorAgent domain allow-list must allow
+`skills.sh` for search and `api.github.com` plus `codeload.github.com` for packages.
+
+The transport accepts public GitHub packages, bounds download/extraction sizes,
+rejects redirects, unsafe paths, links and ambiguous manifests, and retains at
+most two selected skill archives. Repositories exceeding those limits,
+private repositories, non-GitHub packages and unsupported runtime dependencies
+are reported as errors, not successful installations. Install counts do not
+prove quality. Inspect requirements, install only within the user's request,
+read the full installed instructions, perform the task, and validate its actual
+output. External CLI, browser, credential and device requirements can still make
+a discovered workflow unavailable on a particular host.
+
+Reusable live checks are in `eng/validation/FindSkillsProbe`; generated results
+belong in ignored `artifacts/find-skills/`. The probe distinguishes transport,
+resource/script execution and model-driven validation instead of treating an
+installation as proof that every ecosystem skill works.
+
+### Skill directory layout
 
 A skill is a directory whose name *is* the skill's name:
 
@@ -1429,10 +1479,133 @@ pedantry:
 * `template/` declares `name: template-skill`, which does not match its
   directory.
 
-Both load and both work — which is precisely the behaviour the forgiving reader
-exists for.
+Both load with warnings — which is the behaviour the forgiving reader
+exists for. Loading does not verify their external dependencies or task execution.
 
 This repository ships its own bundle under `TensorAgent/skills`, including a
 `playwright` skill that drives a real browser through `@playwright/cli` from
 `skills_run`. It runs on desktop hosts only. The flags it needs and its macOS
 setup are in [Running browser and native-runtime skills](playwright_agent.md).
+
+### Audited skills.sh bundle
+
+The CLI and standalone server copy the shared `TensorAgent/skills` source bundle
+to `skills/` beside their binaries and published applications. TensorAgent's desktop
+and mobile heads use the same source bundle, with the existing mobile exclusions.
+No personal Codex skill directory is imported or modified.
+
+The [skills.sh all-time leaderboard](https://www.skills.sh/) top ten were downloaded
+and audited on 2026-10-13. **Four new skills are retained: `grill-me`,
+`grill-with-docs`, `tdd`, and `handoff`.** The existing `frontend-design` pack is
+retained with a workspace-delivery fix. The new packs come from
+[`mattpocock/skills` at 49dd158](https://github.com/mattpocock/skills/tree/49dd158d1076134a641b33efb035946536778336)
+and include their MIT license. Their dependencies are bundled inside each selected
+skill, so explicit selection works with discovery disabled. Claude-specific
+invocation aliases, external report CDNs, and assumptions about OS temporary files
+were adapted to the app's actual tools and downloadable session artifacts.
+
+`TensorAgent/skills/top-skills-provenance.json` records the complete ranking,
+revisions, licenses, upstream SHA-256 hashes, distributed file hashes, model
+requirements, and earlier failed probes. The `research` and `market-data` catalog
+descriptions were shortened to preserve their lookup scope and network requirements
+under phone context budgets.
+
+| Rank / candidate | Final disposition and measured coverage |
+| --- | --- |
+| 1 `find-skills` | Adapted: native shared search, inspection and pinned installation replace `npx` and global folders. See the discovery workflow and its validation limits above. |
+| 2 `grill-me` | Kept: first interview round passed on E2B; a real three-turn E4B interview incorporated answers, asked the next independent recovery/pairing questions, and finished with an agreed plan without implementation tools. |
+| 3 `grill-with-docs` | Kept with E4B/16K/24-round requirements: final delivery instructions passed twice, with a downloaded glossary preserving the agreed Order/15-minute Reservation definitions and a question about late payment. Earlier variants created the file but omitted its link. |
+| 4 `agent-browser` | Excluded: an external native CLI/Chrome/CDP stub; the CLI is unavailable in the mobile runtime. Existing desktop Playwright is preserved. |
+| 5 `improve-codebase-architecture` | Removed: E2B and E4B produced malformed tool markup or incomplete output and no downloadable report, including the E4B 24-round probe. The E4B baseline produced a valid offline report. |
+| 6 `tdd` | Kept with E4B/16K/24-round requirements: actual assertion-failing red before green, downloaded implementation/tests, five passing unittest cases, and independent execution of all agreed cases. E2B missed the red cycle; eight-round E4B stopped after its first real red/green slice. |
+| 7 `setup-matt-pocock-skills` | Excluded: persistent repository/Git and tracker integration is not established or validated in an app session. |
+| 8 `frontend-design` | Existing design body kept; delivery guidance now keeps planning private and writes compact HTML directly. E4B passed the offline HTML task at TensorAgent's 2,048-token default and rendered at measured 1,280/500px widths. Earlier 1,536-token probes were incomplete. |
+| 9 `handoff` | Kept with E4B/16K/24-round requirements: the real saved/downloaded handoff preserved the blocker and unrun-test status and removed the fake credential from both artifact and reply. E2B repeated that value in a redaction annotation. |
+| 10 `hyperframes-cli` | Excluded: requires Node 22+, npm/npx, FFmpeg, browser rendering, and missing sibling workflows. No renderer capability is claimed. |
+
+The live checks use `ggml_cpu` on an M5 Pro with 48 GB RAM, greedy sampling and
+seed 42. The common profile has 16,384 context tokens, 1,536 generated tokens per
+round and the code-execution app's actual 24-round default. Frontend's final fair
+baseline/selected comparison uses 2,048 output tokens in both arms, matching
+TensorAgent's default; its earlier 1,536-token failures remain recorded. E4B
+`grill-with-docs`, `tdd`, and `handoff` expose the tested capacity profile in their
+manifest description/compatibility fields. E2B at 24 rounds and other models have
+not been validated for those workflows.
+
+The probes send fixed tasks through the real OpenAI endpoint, read actual skill
+resources, download returned artifacts, and inspect executed tool results. TDD's
+oracle decodes JSON log content and requires a real assertion failure before the
+first successful unittest run; setup errors, test labels and success claims do not
+satisfy it. Its final downloaded code is independently executed against all five
+agreed literal cases. Handoff checks both the answer and file for the original fake
+credential. Model, host/module and final manifest hashes are recorded with evidence.
+The retained final manifests were rechecked after their metadata/delivery changes.
+
+The frontend browser check uses already installed Chrome, inline/offline resources,
+and measured DOM layout widths. Chrome CLI clamps sub-500px windows: the earlier
+390px PNG was a cropped 500px layout and is not counted as 390px validation. The
+final 1,280/500px pages have readable content and no horizontal overflow; the narrow
+page can require vertical scrolling. Both baseline and selected designs are plain
+blue/white layouts. No aesthetic superiority, physical-phone execution, or broader
+responsive-layout guarantee is established.
+
+The final focused gates pass **97/97 InferenceWeb tests and 15/15 TensorAgent tests,
+zero skipped**. They cover pinned resource integrity, progressive disclosure,
+real HTTP catalog/resource/completion routes, JSON Content-Type, existing capability
+and phone catalog scope, Maui export retention, and desktop/in-process loopback
+modes. The transport generator is deterministic; separate real-model probes provide
+the workflow evidence. A valid manifest is a structural check: `verdicts.json` and
+`verify-skills.py` report static bundled-runtime compatibility, not model task quality.
+Separate document-runtime tests had 13 unavailable-runtime skips; those are not
+included in the passing gates above.
+
+The warm catalog comparison holds the existing adaptations constant and excludes
+the four new imports from its baseline. Across 20 refreshes, median scan time was
+0.9215 ms for 12 skills and 0.9225 ms for 16 skills; this difference is within noise.
+The imports add 42,591 stored bytes. Across 5,000 prompt plans, mean planning cost
+was about 3.4–3.9 microseconds for the baseline and 4.1–7.6 microseconds with imports.
+All 16 names remain visible at 8K/32K/128K contexts. At 8K/32K the host compacts
+descriptions (1,543 approximate tokens); at 128K the full catalog is 1,905 tokens,
+156 more than the baseline. These use the host's bytes/4 approximation, not model
+tokenization. No cold-start, inference-throughput, or mobile-speed claim is made.
+
+Request times include tool rounds, cache state and prompt differences. Only a few
+fixed greedy samples were run; the interview and handoff also passed without their
+selected skill, while the architecture baseline outperformed its selected variant.
+Brief other-agent GPU/audio checks and downloads were allowed during CPU quality
+runs. These measurements establish bounded task behavior and catalog cost, not
+statistical reliability or a general quality improvement over the baseline.
+
+Reusable tools are under `eng/validation`; required fixtures are under
+`InferenceWeb.Tests/Fixtures/TopSkills`:
+
+```bash
+dotnet run --project eng/validation/TopSkillsProbe -c Release -- \
+  TensorAgent/skills docs/validation/top-skills/catalog-benchmark.json
+
+# Start a local model with MAX_CONTEXT=16384, ggml_cpu, --code-exec,
+# --no-multi-agent, --skills-max-rounds 24, and a server output cap >= 2048.
+python3 eng/validation/top-skills-quality.py \
+  --base http://127.0.0.1:18592 \
+  --model-file /absolute/path/to/model.gguf \
+  --binary TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --server-log docs/validation/top-skills/server.log --max-tokens 1536 \
+  --output docs/validation/top-skills/quality
+
+python3 eng/validation/top-skills-interview.py \
+  --model-file /absolute/path/to/model.gguf \
+  --binary TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --server-log docs/validation/top-skills/server.log \
+  --output docs/validation/top-skills/interview
+
+# Run frontend-design separately with --max-tokens 2048, then render its artifact.
+python3 eng/validation/top-skills-render.py \
+  --html /absolute/path/to/cedar-landing.html \
+  --output docs/validation/top-skills/frontend-render
+```
+
+The live task tool probes only candidates present in the active catalog unless
+explicit `--skills` are named. Absent tasks are recorded as not run, never passed.
+`--selected-only` rechecks final manifests without repeating a baseline. Generated
+sources, browser profiles, responses, logs and reports remain in ignored
+`docs/validation/` or `artifacts/`; they must not be force-added to Git.

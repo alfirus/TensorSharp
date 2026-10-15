@@ -1159,6 +1159,46 @@ namespace TensorSharp.Cuda
             return true;
         }
 
+        public static bool HasEmbeddingAttention(CudaAllocator allocator)
+            => allocator != null && TryGetKernels(allocator, out CudaKernels kernels) &&
+                kernels.EmbeddingAttentionSupports(256, 2) && kernels.EmbeddingAttentionSupports(512, 4);
+
+        public static bool TryEmbeddingAttention(Tensor result, Tensor query, Tensor key, Tensor value,
+            int batch, int queryHeads, int kvHeads, int headDim, int seqLen, int windowRadius, float scale,
+            Tensor sequenceBounds)
+        {
+            if (batch <= 0 || batch > 65535 || queryHeads <= 0 || kvHeads <= 0 || queryHeads % kvHeads != 0 ||
+                seqLen <= 0 || seqLen > 8192 || windowRadius < 0 || windowRadius > 8192 || !float.IsFinite(scale) ||
+                !TryGetContiguousFloat(result, out CudaStorage resultStorage, out IntPtr resultPtr, out _) ||
+                !TryGetContiguousFloat(query, out CudaStorage queryStorage, out IntPtr queryPtr, out _) ||
+                !TryGetContiguousFloat(key, out CudaStorage keyStorage, out IntPtr keyPtr, out _) ||
+                !TryGetContiguousFloat(value, out CudaStorage valueStorage, out IntPtr valuePtr, out _) ||
+                query.DimensionCount != 4 || key.DimensionCount != 4 || !SameShape(result, query) || !SameShape(key, value) ||
+                query.Sizes[0] != batch || query.Sizes[1] != seqLen || query.Sizes[2] != queryHeads || query.Sizes[3] != headDim ||
+                key.Sizes[0] != batch || key.Sizes[1] != seqLen || key.Sizes[2] != kvHeads || key.Sizes[3] != headDim)
+                return false;
+            CudaAllocator allocator = resultStorage.AllocatorImpl;
+            if (!ReferenceEquals(allocator, queryStorage.AllocatorImpl) || !ReferenceEquals(allocator, keyStorage.AllocatorImpl) ||
+                !ReferenceEquals(allocator, valueStorage.AllocatorImpl) ||
+                !TryGetKernels(allocator, out CudaKernels kernels) || !kernels.EmbeddingAttentionSupports(headDim, queryHeads / kvHeads))
+                return false;
+            IntPtr boundsPtr = IntPtr.Zero;
+            if (sequenceBounds != null)
+            {
+                if (sequenceBounds.ElementType != DType.Int32 || sequenceBounds.DimensionCount != 3 ||
+                    sequenceBounds.Sizes[0] != batch || sequenceBounds.Sizes[1] != seqLen || sequenceBounds.Sizes[2] != 2 ||
+                    !TryGetContiguous(sequenceBounds, out CudaStorage boundsStorage, out boundsPtr, out _) ||
+                    !ReferenceEquals(allocator, boundsStorage.AllocatorImpl)) return false;
+                boundsStorage.EnsureDeviceCurrent();
+            }
+            queryStorage.EnsureDeviceCurrent(); keyStorage.EnsureDeviceCurrent(); valueStorage.EnsureDeviceCurrent();
+            allocator.Context.MakeCurrent();
+            kernels.LaunchEmbeddingAttention(queryPtr, keyPtr, valuePtr, boundsPtr, resultPtr,
+                batch, queryHeads, kvHeads, headDim, seqLen, windowRadius, scale, allocator.Stream.Handle);
+            resultStorage.MarkDeviceModified();
+            return true;
+        }
+
         public static bool TryGqaPrefillAttention(
             Tensor result,
             Tensor query,

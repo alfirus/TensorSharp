@@ -5,7 +5,7 @@
 
 ## Embedding service
 
-Host a BERT/XLM-R GGUF with `--model encoder.gguf --embeddings`. Select pure C# `cpu` or native `ggml_cpu`, `ggml_metal`, or `ggml_cuda`; each process keeps one encoder resident, and a chat service uses a separate port. `--embedding-threads N` configures CPU execution on `cpu` and `ggml_cpu`; `--embedding-context-size N` reduces the per-input token limit (default: the model's context length). Both take positive integers only.
+Host a supported GGUF encoder with `--model encoder.gguf --embeddings`. BERT/XLM-R support pure C# `cpu` or native `ggml_cpu`, `ggml_metal`, and `ggml_cuda`; EmbeddingGemma 2 also supports direct `cuda` and `mlx`. Add `--mmproj projector.gguf` for EmbeddingGemma 2 media inputs. Each process keeps one encoder resident, and a chat service uses a separate port. `--embedding-threads N` configures CPU execution on `cpu` and `ggml_cpu`; `--embedding-context-size N` reduces the per-input token limit (EmbeddingGemma 2 defaults to its published 8192-token window). Both take positive integers only.
 
 - OpenAI: `POST /v1/embeddings`, single/batched strings or token IDs, `encoding_format` of `float` / `base64`, optional `dimensions`.
 - Ollama: `POST /api/embed`, a string or string array; `truncate` defaults to `true`.
@@ -525,7 +525,7 @@ script gets that error instead of watching a setting be ignored.
 | `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan; `17k+5` for MiniMax-H3 — 5, 22, 39, 56, 73, 90 …). Default: 33; 49 for Wan2.2-TI2V, 22 for MiniMax-H3. `1` generates a still image where the model supports it (use `--output out.png`). |
 | `--fps <N>` | Playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. |
 | `--flow-shift <F>` | FlowMatch timestep shift (default: the model's official recipe — 5.0 for Wan 2.2, 12.0 for A14B T2V, 8.0/3.0/5.0 for Wan 2.1, 12.0 for MiniMax-H3). On models with a joint audio stream this shifts the video stream only. |
-| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. A Wan-family knob — MiniMax-H3 runs its own flow-match schedule and does not read it. |
+| `--sampler <name>` | Sampler: `unipc` (the official Wan sampler, default for Wan) or `euler`. LTX 2.5 defaults to `euler_ancestral`, the publisher's recipe; `euler` selects deterministic Euler there as a diagnostic. MiniMax-H3 runs its own flow-match schedule and does not read it. |
 | `--negative-prompt <text>` | Negative prompt for classifier-free guidance (default: the model's official negative prompt). Unused at `--cfg 1.0`, where no negative pass runs — so it does nothing at all on MiniMax-H3, which only accepts `--cfg 1.0`. |
 | _(step-distilled checkpoints)_ | Auto-detected from the DiT file name (`Turbo`, `distill`, `Lightning`, `lightx2v`, `FastWan`, `-dmd`, or an explicit `…-4steps-…` / `…8step…` for 1–16): the pipeline switches to that step count with guidance off, turning the official 50-step × CFG recipe's 100 DiT passes into 4. This is the single biggest speed lever anywhere in TensorSharp — see **[Video generation (Wan)](#video-generation-wan)** below. `--diffusion-steps` / `--cfg` override it. |
 | `--cfg-cache-stride <N>` | Wan guidance cache: run the unconditional CFG pass on one step in `N` and reuse the cached guidance direction in between (default off — every step runs both passes). `2` ≈ 1.30x faster, `3` ≈ 1.43x; approximate, so leave it off when matching a reference sample matters. No effect at `--cfg 1.0`, and therefore none on MiniMax-H3. |
@@ -533,6 +533,8 @@ script gets that error instead of watching a setting be ignored.
 | `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Env: `TS_VIDEO_TEXT_ENCODER`. |
 | `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2`. |
 | `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
+| `--video-upscaler <path>` | x2 latent upscaler for two-stage video models: LTX 2.5 generates at half the output size, upscales the latent with `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`, then refines at full size. Default: `latent_upscale_models/` beside the model. Env: `TS_VIDEO_UPSCALER`. |
+| `--video-diffusion-vae <path>` | Opt-in LTX 2.5 diffusion video decoder (`ltx-2.5-video-vae-bf16.safetensors`): cleaner, with less grain and flicker, but softer than the default convolutional `--video-vae`. MLX and CPU only; CUDA refuses it. Default: off. Env: `TS_VIDEO_DIFFUSION_VAE`. |
 | `--video-mode <mode>` | How to read the images you pass, on models with more than one conditioning mode. Default: inferred from what you supply. MiniMax-H3 accepts `t2v` (text only), `i2v` (the image **is** the first frame and gets animated), `fl2v` (first and last frame) and `ref` (the images are identity/appearance references for a **new** scene). `i2v`/`fl2v` need the FL2VA checkpoint and `ref` needs Ref2VA — separate files, not settings, and asking for the wrong one fails with the name of the other. |
 | `--end-image <file>` | Last-frame conditioning image, on models that accept one (MiniMax-H3 first/last-frame mode). Combined with `--image` the clip is steered to start and end on the two frames. |
 | `--ref-image <file>` | Reference image for reference-conditioned models (MiniMax-H3 Ref2VA): the subject carries over while camera, background and composition come from the prompt. Repeatable up to 9; referred to in the prompt as `<Picture 1>`, `<Picture 2>`, … References are only ever scaled **down** and keep their own aspect ratio, so the output size still comes from `--width`/`--height`. |
@@ -721,7 +723,7 @@ Running `TensorSharp.Server.Host` (`dotnet TensorSharp.Server.Host/bin/TensorSha
 |---|---|
 | `--model <path>` | GGUF file to host (required for inference; when other options are passed without it, the server starts but `/api/models/load` will report no hosted model) |
 | `--mmproj <path>` | Multimodal projector: an mmproj GGUF, or — for the Gemma 4 family — a HuggingFace `.safetensors` shard holding the vision tower, for checkpoints published without an mmproj (DiffusionGemma's `model-00011-of-00011.safetensors`). Resolved relative to the model directory when only a filename is given; pass `none` to disable. Requires `--model`. A configured projector's download entry is skipped when `--mmproj` is given on the command line. |
-| `--embeddings` | Host a BERT/XLM-R GGUF embedding encoder instead of a chat model (see [Embedding service](#embedding-service)). Requires `--model` and refuses `--mmproj`; backends `cpu`, `ggml_cpu`, `ggml_metal` or `ggml_cuda`. The generation routes — chat, Responses, Ollama, `/v1/systemone`, and `/api/image-generate`, `/api/image-edit` and `/api/video-generate` with their `/stream` forms — answer 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.` An explicit `--backend` this machine does not have exits 2 with `error: model load refused: Backend 'X' is not supported on this machine.` |
+| `--embeddings` | Host a supported GGUF embedding encoder instead of a chat model (see [Embedding service](#embedding-service)). Requires `--model`; EmbeddingGemma 2 accepts `--mmproj` for media and backends `cpu`, `mlx`, `cuda`, `ggml_cpu`, `ggml_metal`, or `ggml_cuda`. BERT/XLM-R use CPU or GGML backends. The generation routes — chat, Responses, Ollama, `/v1/systemone`, and `/api/image-generate`, `/api/image-edit` and `/api/video-generate` with their `/stream` forms — answer 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.` An explicit `--backend` this machine does not have exits 2 with `error: model load refused: Backend 'X' is not supported on this machine.` |
 | `--embedding-threads <N>` / `--embedding-context-size <N>` | CPU threads for the encoder (default: the backend chooses) and the per-input token limit (default: the model's context length; cannot exceed it). Positive integers only. Require `--embeddings`. |
 | `--port <N>` / `--host <address>` | Listen port and bind interface (defaults: `5000`, `0.0.0.0` — every interface). On macOS port 5000 is taken by the AirPlay Receiver, so pick another port or turn that off. Env: `PORT` / `HOST`. |
 | `--urls <urls>` | Full listen URL(s), semicolon-separated, for what `--port`/`--host` cannot express (HTTPS, several endpoints). `--port`/`--host` win when both are given. Without any of the three, `PORT`/`HOST` apply, then `ASPNETCORE_URLS`. |
@@ -808,6 +810,8 @@ of quietly losing a setting.
 | `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Env: `TS_VIDEO_TEXT_ENCODER`. |
 | `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of `--model`). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2`. |
 | `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still runs and produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
+| `--video-upscaler <path>` | x2 latent upscaler for two-stage video models: LTX 2.5 generates at half the output size, upscales the latent with `ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`, then refines at full size. Default: `latent_upscale_models/` beside the model. Env: `TS_VIDEO_UPSCALER`. |
+| `--video-diffusion-vae <path>` | Opt-in LTX 2.5 diffusion video decoder (`ltx-2.5-video-vae-bf16.safetensors`): cleaner, with less grain and flicker, but softer than the default convolutional `--video-vae`. MLX and CPU only; CUDA refuses it. Default: off. Env: `TS_VIDEO_DIFFUSION_VAE`. |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | Override the Qwen-Image-2.1 companions the server otherwise finds next to the DiT GGUF: the VAE, the Qwen3-VL-8B text encoder and its vision projector (needed for editing). Checked at startup. Env: `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ`. |
 | `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds, same spelling and meaning as on the CLI: `turbo` samples Turbo's 8-step schedule at CFG 1 by default (a request's `steps` may only be 8) and refuses step-distillation `--lora` plug-ins. Applies to every Qwen-Image model the server loads; another model loads without it and the server logs a warning, as for `--lora`. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so. Checked at startup. Env: `TS_QWEN_IMAGE_VARIANT`. |
 | `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area; 1024×1024 on the `cpu` backend) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. |
@@ -1405,16 +1409,21 @@ two runs meant to be compared need it set explicitly.
 
 **On the server, size is a startup flag.** The browser sends the prompt plus whatever
 conditioning the hosted checkpoint advertises — a first frame, a last frame, or up to
-`maxReferenceImages` references — and nothing numeric at all, so every clip inherits
-the server defaults:
+`maxReferenceImages` references — together with the matching `videoMode`. Uploaded
+images go directly into generation; no `--image` server argument or local image path
+is needed. The browser sends no numeric parameters, so every clip inherits the server
+defaults:
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22 --port 5001
 ```
 
-`--video-mode` pins the conditioning mode for a deployment that only offers one;
-omit it and each request's mode is inferred from what it supplies.
+`--video-mode` supplies a default for requests that omit `videoMode`; omit it and the
+model infers the mode from the supplied inputs. Web chat and TensorAgent choose the
+mode from uploaded attachments and the loaded checkpoint, overriding this startup
+default when an image is attached. Ref2VA uses images as references for a new scene;
+to animate the uploaded image as the first frame, load `config/minimax-h3-fl2va.json`.
 
 Omit `--video-width`/`--video-height` and each request takes its aspect ratio from
 the uploaded image, which avoids stretching a 4:3 photo into a 16:9 frame.
@@ -2258,7 +2267,7 @@ The full picture, including the native loader's own knobs, is in the
 | Per-step latent / velocity magnitudes | OFF | `TS_H3_TRACE=1` | — |
 | Execution path | seven native whole-network ggml graphs | — | `--backend cpu` runs the same pipeline in pure C# instead (t2v, i2v, fl2v and reference conditioning) |
 | Managed-vs-GGML parity diagnostics | OFF | `TS_H3_DUMP_TE`, `TS_H3_DUMP_VEL_V`, `TS_H3_DUMP_VEL_A`, `TS_H3_DUMP_VIS` write those tensors to disk so ONE forward can be compared across the two paths; `TS_H3_DIT_LAYERS=N` truncates the trunk on BOTH paths, turning the comparison into an error-vs-depth curve; `TS_H3_NO_FLASH=1` runs GGML's explicit-softmax attention instead of its flash kernel | — |
-| Companion network + tokenizer overrides | resolved next to the denoiser | `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`, `TS_VIDEO_AUDIO_VAE`, `TS_VIDEO_TOKENIZER` | `--video-text-encoder`, `--video-vae`, `--audio-vae` |
+| Companion network + tokenizer overrides | resolved next to the denoiser | `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`, `TS_VIDEO_AUDIO_VAE`, `TS_VIDEO_TOKENIZER`, `TS_VIDEO_UPSCALER`, `TS_VIDEO_DIFFUSION_VAE` | `--video-text-encoder`, `--video-vae`, `--video-upscaler`, `--video-diffusion-vae`, `--audio-vae` |
 
 #### Qwen-Image-2.1
 

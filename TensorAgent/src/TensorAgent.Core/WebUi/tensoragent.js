@@ -308,6 +308,8 @@
     var edit = a.editFile || (a.editUrl ? uploadName(a.editUrl) : '');
     if (edit) chip.editFile = edit;
     if (a.editUnavailableReason) chip.editUnavailableReason = a.editUnavailableReason;
+    if (Number.isInteger(a.videoFrameIndex)) chip.videoFrameIndex = a.videoFrameIndex;
+    if (typeof a.videoStrength === 'number') chip.videoStrength = a.videoStrength;
     if (a.frames && a.frames.length) chip.frames = a.frames.slice();
     if (a.fileBacked === true) chip.fileBacked = true;
     if (typeof a.pageCount === 'number') chip.pageCount = a.pageCount;
@@ -693,6 +695,13 @@
       ok: f.ok !== false,
       files: f.files || null,
     };
+    // Chat installs update the same library as the Skills sheet. Refresh its
+    // cached roster immediately, preserving the user's explicit selection.
+    if (f.skill_step === 'skills_install' && f.ok === true) {
+      loadSkills().catch(function (error) {
+        skillsError(t('page.nav.skillsFailed', { error: (error && error.message) || error }));
+      });
+    }
   }
 
   function addCopy(turn, getText) {
@@ -757,6 +766,7 @@
   // ---- model state ---------------------------------------------------------
   function paintModel(d) {
     var previousModel = state.model;
+    var previousVideo = state.video;
     state.model = (d && d.loaded) || null;
     state.arch = (d && d.architecture) || null;
     state.backend = (d && d.loadedBackend) || null;
@@ -781,7 +791,14 @@
     state.maxTokens = (d && d.defaultMaxTokens) || 2048;
     // What a video model can be given besides its description. The host reports it
     // for a video model and null for every other one.
-    state.video = (d && d.video) || null;
+    state.video = d && d.video ? Object.assign({}, d.video) : null;
+    // A foreground capability refresh must not discard an unsent clip's
+    // length or image semantics. A different checkpoint starts a fresh choice.
+    if (previousModel === state.model && state.video && state.video.supportsKeyframeConditioning
+        && previousVideo && previousVideo.supportsKeyframeConditioning) {
+      if (Number.isInteger(previousVideo.clipFrames)) state.video.clipFrames = previousVideo.clipFrames;
+      if (state.video.supportsReferenceConditioning && previousVideo.referenceMode) state.video.referenceMode = true;
+    }
     paintComposerHint();
     paintModelButton();
     paintChips();
@@ -816,6 +833,8 @@
   // one); the references checkpoint puts the people, things and sounds it is shown
   // into a scene of its own. The composer says which, before anything is attached.
   function videoPlaceholder(v) {
+    if (v.supportsKeyframeConditioning && v.referenceMode) return t('page.composer.videoWithIdentityReferences');
+    if (v.supportsKeyframeConditioning) return t('page.composer.videoWithKeyframes');
     if (v.supportsReferenceConditioning) return t('page.composer.videoWithReferences');
     if (v.supportsImageConditioning) return t('page.composer.videoFromPhoto');
     return t('page.composer.video');
@@ -1565,6 +1584,13 @@
     if (textParts.length) msg.content = textParts.join('\n\n') + '\n\n' + msg.content;
     if (imagePaths.length) msg.imagePaths = imagePaths;
     if (stillImagePaths.length) msg.stillImagePaths = stillImagePaths;
+    if (state.video && state.video.supportsKeyframeConditioning && state.video.clipFrames) msg.videoFrames = state.video.clipFrames;
+    if (stillImagePaths.length && state.video && state.video.supportsKeyframeConditioning && state.video.referenceMode) {
+      msg.videoMode = 'ref';
+    } else if (state.video && state.video.supportsKeyframeConditioning) {
+      var conditions = videoImageConditions(atts, state.video.clipFrames || state.video.defaultPreviewFrames || 17);
+      if (conditions) msg.imageConditions = conditions;
+    }
     if (videoFilePaths.length) msg.videoFilePaths = videoFilePaths;
     if (audioPaths.length) msg.audioPaths = audioPaths;
     if (textFilePaths.length) msg.textFilePaths = textFilePaths;
@@ -2784,6 +2810,47 @@
       .finally(function () { state.maskEditing = false; paintChips(); });
   }
 
+  function videoImageConditions(attachments, frames) {
+    var images = attachments.filter(function (a) { return a.mediaType === 'image'; });
+    if (!images.some(function (a) { return typeof a.videoFrameIndex === 'number' || typeof a.videoStrength === 'number'; })) return null;
+    return images.map(function (a, index) { return {
+      imagePath: a.file,
+      frameIndex: typeof a.videoFrameIndex === 'number' ? a.videoFrameIndex
+        : images.length < 2 ? 0 : Math.round(index * (frames - 1) / (images.length - 1)),
+      strength: typeof a.videoStrength === 'number' ? a.videoStrength : 1
+    }; });
+  }
+
+  function videoKeyframeControls(attachment, index, count) {
+    var frames = state.video.clipFrames || state.video.defaultPreviewFrames || 17;
+    var automatic = count < 2 ? 0 : Math.round(index * (frames - 1) / (count - 1));
+    var controls = el('div', 'video-keyframe-controls');
+    var frame = el('select', 'video-frame-position'); frame.setAttribute('aria-label', t('page.chips.framePosition'));
+    [['auto', t('page.chips.autoFrame', { frame: automatic })], ['0', t('page.chips.firstFrame')],
+      ['-1', t('page.chips.lastFrame')], ['custom', t('page.chips.frameNumber')]].forEach(function (pair) {
+      var option = el('option', null, pair[1]); option.value = pair[0]; frame.appendChild(option);
+    });
+    frame.value = attachment.videoFrameIndex === -1 ? '-1' : attachment.videoFrameIndex === 0 ? '0'
+      : Number.isInteger(attachment.videoFrameIndex) ? 'custom' : 'auto';
+    frame.disabled = state.generating || state.visionChecking;
+    var number = el('input', 'video-frame-number'); number.type = 'number'; number.min = '0'; number.max = String(frames - 1); number.step = '1';
+    number.value = String(attachment.videoFrameIndex >= 0 ? attachment.videoFrameIndex : automatic);
+    number.hidden = frame.value !== 'custom'; number.disabled = frame.disabled;
+    number.setAttribute('aria-label', t('page.chips.frameNumber'));
+    frame.addEventListener('change', function () {
+      number.hidden = frame.value !== 'custom';
+      if (frame.value === 'auto') delete attachment.videoFrameIndex;
+      else attachment.videoFrameIndex = frame.value === 'custom' ? Number(number.value) : Number(frame.value);
+    });
+    number.addEventListener('change', function () { attachment.videoFrameIndex = Number(number.value); });
+    var strength = el('input', 'video-frame-strength'); strength.type = 'number'; strength.min = '0'; strength.max = '1'; strength.step = '.05';
+    strength.value = String(attachment.videoStrength == null ? 1 : attachment.videoStrength); strength.disabled = frame.disabled;
+    strength.setAttribute('aria-label', t('page.chips.frameStrength'));
+    strength.addEventListener('change', function () { attachment.videoStrength = Number(strength.value); });
+    var label = el('label', null, t('page.chips.frameStrength') + ' '); label.appendChild(strength);
+    controls.appendChild(frame); controls.appendChild(number); controls.appendChild(label); return controls;
+  }
+
   function paintChips() {
     var box = $('chips');
     box.innerHTML = '';
@@ -2801,23 +2868,53 @@
       box.appendChild(shared);
     });
     var imageIndex = 0;
+    var imageCount = state.attachments.filter(function (a) { return a.mediaType === 'image'; }).length;
+    if (imageCount && state.video && state.video.supportsKeyframeConditioning && !state.video.referenceMode) {
+      var lengthLabel = el('label', 'video-keyframe-controls', t('page.chips.clipLength') + ' ');
+      var lengthChoice = el('select', 'video-clip-length'); lengthChoice.setAttribute('aria-label', t('page.chips.clipLength'));
+      [[17, t('page.chips.previewLength')], [33, '1.4 s'], [97, '4 s'], [121, '5 s']].forEach(function (pair) {
+        var option = el('option', null, pair[1]); option.value = String(pair[0]); lengthChoice.appendChild(option);
+      });
+      lengthChoice.value = String(state.video.clipFrames || state.video.defaultPreviewFrames || 17);
+      lengthChoice.disabled = state.generating || state.visionChecking;
+      lengthChoice.addEventListener('change', function () { state.video.clipFrames = Number(lengthChoice.value); paintChips(); });
+      lengthLabel.appendChild(lengthChoice); box.appendChild(lengthLabel);
+    }
+    if (imageCount && state.video && state.video.supportsKeyframeConditioning && state.video.supportsReferenceConditioning) {
+      var label = el('label', 'video-keyframe-controls', t('page.chips.guidanceMode') + ' ');
+      var choice = el('select', 'video-guidance-mode'); choice.setAttribute('aria-label', t('page.chips.guidanceMode'));
+      choice.disabled = state.generating || state.visionChecking;
+      [['keyframes', t('page.chips.temporalGuides')], ['ref', t('page.chips.identityGuides')]].forEach(function (pair) {
+        var option = el('option', null, pair[1]); option.value = pair[0]; choice.appendChild(option);
+      });
+      choice.value = state.video.referenceMode ? 'ref' : 'keyframes';
+      choice.addEventListener('change', function () { state.video.referenceMode = choice.value === 'ref'; paintComposerHint(); paintChips(); });
+      label.appendChild(choice); box.appendChild(label);
+      if (state.video.referenceMode) box.appendChild(el('div', 'video-reference-help', t('page.composer.videoWithIdentityReferences')));
+    }
     state.attachments.forEach(function (a, i) {
       var c = el('div', 'chip'), name = shownName(a) || a.file;
       if (a.mediaType === 'image') {
         var img = document.createElement('img'); img.src = previewOf(a); c.appendChild(img);
         // Preparing a selection needs no model. Keep the control discoverable while
         // Qwen is loading or another model is selected; Send checks compatibility.
-        var active = imageIndex++ === 0;
+        var ordinal = imageIndex++, active = ordinal === 0;
         c.classList.add('editable-image');
+        var keyframe = state.video && state.video.supportsKeyframeConditioning;
+        if (keyframe && !state.video.referenceMode) c.appendChild(videoKeyframeControls(a, ordinal, imageCount));
+        else if (keyframe) { /* Identity sheets do not have temporal frame controls. */ }
+        else {
         var select = el('button', 'filechip mask-select', a.maskPath ? t('page.chips.selectionSaved') : t('page.chips.selectArea'));
         select.type = 'button'; select.disabled = state.generating || state.visionChecking || state.maskEditing;
         select.setAttribute('aria-label', a.maskPath
           ? t('page.chips.adjustSelectionFor', { name: name })
           : t('page.chips.selectAreaIn', { name: name }));
         select.addEventListener('click', function () { selectImageArea(a); }); c.appendChild(select);
+        }
         var details = el('span', 'image-details');
         details.appendChild(el('span', active ? 'image-edit-source' : 'image-reference',
-          active ? t('page.chips.editingTarget') : t('page.chips.reference')));
+          keyframe ? t(state.video.referenceMode ? 'page.chips.reference' : 'page.chips.keyframe')
+            : active ? t('page.chips.editingTarget') : t('page.chips.reference')));
         details.appendChild(el('span', 'nm', name));
         c.appendChild(details);
       } else {

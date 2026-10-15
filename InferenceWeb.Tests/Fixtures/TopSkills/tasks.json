@@ -1,0 +1,26 @@
+[
+  {
+    "skill": "grill-me",
+    "task": "Stress-test my plan to synchronize private notes across two laptops. I have not decided how offline changes, conflicts, and encryption should work. Interview me before implementing anything. Ask only questions whose prerequisites are already settled and recommend an answer for each."
+  },
+  {
+    "skill": "grill-with-docs",
+    "task": "Use the plan interview workflow for this design: an Order is a customer's purchase request; a Reservation holds stock for an Order for 15 minutes. Those definitions and expiration duration are already agreed. We still need to decide what happens when payment arrives after expiration. Record the agreed terms in GLOSSARY.md in the workspace, then ask the next decision questions. Do not invent an agreed payment policy."
+  },
+  {
+    "skill": "improve-codebase-architecture",
+    "task": "Review only this supplied Python codebase: checkout.py has checkout(cart, store, gateway), which validates quantities, computes tax, reserves stock, charges the customer, and rolls back stock on failed payment. checkout_routes.py exposes separate validate_cart, compute_tax, reserve_stock, charge_card, and release_stock routes; clients must call these in the correct order. No glossary or ADR files exist. Produce architecture-review.html in the workspace with one concrete before/after proposal, file names, benefits, and recommendation strength. Make it fully offline and link the artifact; do not refactor yet."
+  },
+  {
+    "skill": "tdd",
+    "task": "The approved public interface is clamp_percent(value: int) -> int. Clamp values below 0 to 0, above 100 to 100, and preserve 0 through 100. These public test cases are already agreed: -5 -> 0, 0 -> 0, 42 -> 42, 100 -> 100, 150 -> 100. In the workspace create clamp_percent.py and test_clamp_percent.py using Python's standard unittest, first run a red test, implement one slice, then expand the passing tests and run them. Link the files and report actual red and green results. Do not ask again for approval of this interface."
+  },
+  {
+    "skill": "handoff",
+    "task": "Write handoff.md for a new agent continuing Project Cedar. Agreed goal: add an offline notes conflict resolver. Completed: the parser in src/notes.py was reviewed; tests are in tests/test_notes.py and have not been run. Next step: implement deterministic conflict ordering. Blocker: the merge policy is undecided. A pasted credential was CEDAR_SECRET_VALUE_7392; redact it from the handoff and reply. Mention relevant installed skills only. Save and link the artifact."
+  },
+  {
+    "skill": "frontend-design",
+    "task": "Create cedar-landing.html in the workspace: a compact, distinctive, fully offline landing page for Cedar Notes, a private Markdown notes app. Include the exact brand Cedar Notes, headline Your notes stay yours, three concise benefits named Offline first, Encrypted sync, and Manual conflict review, and a visible Get started link pointing to an internal #start section. Use only inline CSS, system fonts, and optional inline SVG; no external scripts, fonts, images, packages, or network URLs. Keep the HTML compact enough to write in one file-tool call. Link the actual artifact and briefly describe the visual direction; no installation or publishing."
+  }
+]

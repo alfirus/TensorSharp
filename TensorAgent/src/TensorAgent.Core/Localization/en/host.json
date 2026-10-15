@@ -68,5 +68,8 @@
   "host.engine.networkOn": "network on",
   "host.engine.networkOff": "network off",
   "host.engine.skills": "{count} skills",
-  "host.engine.unknown": "unknown"
+  "host.engine.unknown": "unknown",
+  "host.video.keyframesUnavailable": "This video model does not accept image keyframes at arbitrary frame positions.",
+  "host.video.ingredientsUnavailable": "Ingredients identity references require an IC-LoRA checkpoint; choose image keyframes with LTX 2.5 Distilled.",
+  "host.video.invalidFrames": "LTX clip length must be positive and follow the 8n+1 frame grid."
 }

@@ -40,7 +40,9 @@ backends actually being used, and record native build options (including BLAS).
 The output directory contains raw vectors, exact inputs/commands, model SHA256,
 sample latencies, medians, p95, tokens/second, texts/second, comparisons, and server
 logs. `binary_artifacts` records SHA-256 hashes of the host assemblies and nearby
-GGML/llama binaries outside the measured work. Requests include tokenization and JSON serialization. No result caching is
+GGML/llama binaries outside the measured work. The runner hashes them again
+after both servers stop and fails if they changed; use a frozen output directory
+when other work might rebuild the host. Requests include tokenization and JSON serialization. No result caching is
 used. Both engines receive a ten-second runtime prewarm before per-shape warmups;
 `--prewarm-seconds` controls this and the output records its duration/call count.
 This matters for tiny models that can complete the correctness corpus before

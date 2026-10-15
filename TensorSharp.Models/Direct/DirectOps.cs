@@ -25,6 +25,7 @@ using System.Threading.Tasks;
 using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Cuda;
+using TensorSharp.MLX;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.Direct
@@ -34,16 +35,22 @@ namespace TensorSharp.Models.Direct
     {
         public IAllocator Allocator { get; }
         public bool IsCuda { get; }
+        public bool IsMlx { get; }
+        public bool IsAccelerated => IsCuda || IsMlx;
         public CudaAllocator CudaAllocator { get; }
+        public MlxAllocator MlxAllocator { get; }
 
         private readonly Dictionary<long, Tensor> _ones = new();
         private readonly List<Tensor> _owned = new();
+        private readonly List<DirectLinear> _linears = new();
 
         public DirectContext(IAllocator allocator)
         {
             Allocator = allocator;
             CudaAllocator = allocator as CudaAllocator;
             IsCuda = CudaAllocator != null;
+            MlxAllocator = allocator as MlxAllocator;
+            IsMlx = MlxAllocator != null;
         }
 
         public Tensor NewF32(params long[] sizes) => new Tensor(Allocator, DType.Float32, sizes);
@@ -64,6 +71,19 @@ namespace TensorSharp.Models.Direct
 
         /// <summary>Track a long-lived tensor (weights) for disposal with the context.</summary>
         public Tensor Own(Tensor t) { _owned.Add(t); return t; }
+        internal DirectLinear Track(DirectLinear linear)
+        {
+            linear.RetainDeviceWeight();
+            _linears.Add(linear);
+            return linear;
+        }
+
+        /// <summary>Release unshared cached device weights while keeping host
+        /// descriptors valid for a later forward pass.</summary>
+        internal void ReleaseDeviceResidency()
+        {
+            foreach (var linear in _linears) linear.ReleaseDeviceResidency();
+        }
 
         public Tensor FromFloats(float[] data, params long[] sizes)
         {
@@ -75,6 +95,10 @@ namespace TensorSharp.Models.Direct
         /// <summary>Hand back everything this context holds on the device.</summary>
         public void Dispose()
         {
+            // Contexts share the model allocator. Release only their own
+            // descriptors, preserving other live networks' resident weights.
+            foreach (var linear in _linears) linear.Dispose();
+            _linears.Clear();
             foreach (var t in _owned) t.Dispose();
             _owned.Clear();
             lock (_ones)
@@ -82,8 +106,6 @@ namespace TensorSharp.Models.Direct
                 foreach (var t in _ones.Values) t.Dispose();
                 _ones.Clear();
             }
-            if (CudaAllocator != null)
-                CudaQuantizedOps.ClearDeviceCache(CudaAllocator);
         }
     }
 
@@ -104,9 +126,69 @@ namespace TensorSharp.Models.Direct
         private Tensor _wCpuT;                // transposed view [ne0, ne1]
         private Tensor _bias;                 // [ne1] F32 or null
         private readonly bool _prescale;      // q8_1-activation overflow guard (quantized types)
+        private readonly bool _h3MappedDense; // H3 keeps dense mapped weights and F32 activations
+        private readonly bool _h3PreserveFloat32; // H3 quantized projections avoid q8_1/Half activation narrowing
+        private readonly CudaLtx25ProjectionSession _ltxProjection;
+        private readonly bool _exactFloat32;
+        private ResidentWeightLease _residentWeight;
+        private bool _disposed;
+
+        // Two model contexts can bind the same mapped tensor. Cache eviction
+        // belongs to the final live descriptor, rather than the first context
+        // disposed. CUDA caches by allocator; MLX caches by device ID.
+        private sealed class ResidentWeightLease
+        {
+            private readonly record struct Key(CudaAllocator Cuda, int MlxDevice, IntPtr Host);
+            private static readonly object Sync = new();
+            private static readonly Dictionary<Key, int> Owners = new();
+            private readonly DirectContext _context;
+            private readonly Key _key;
+
+            private ResidentWeightLease(DirectContext context, Key key)
+            {
+                _context = context;
+                _key = key;
+                lock (Sync)
+                    Owners[key] = Owners.TryGetValue(key, out int count) ? count + 1 : 1;
+            }
+
+            public static ResidentWeightLease Acquire(DirectContext context, IntPtr host)
+                => host == IntPtr.Zero || !context.IsAccelerated ? null
+                    : new ResidentWeightLease(context, new Key(context.CudaAllocator,
+                        context.IsMlx ? context.MlxAllocator.DeviceId : -1, host));
+
+            private void Evict()
+            {
+                if (_context.IsCuda)
+                    CudaQuantizedOps.ReleaseQuantizedWeight(_context.CudaAllocator, _key.Host);
+                else
+                    MlxQuantizedOps.ReleaseQuantizedWeight(_context.MlxAllocator, _key.Host);
+            }
+
+            public void Release()
+            {
+                lock (Sync)
+                {
+                    if (!Owners.TryGetValue(_key, out int count)) return;
+                    if (count > 1) Owners[_key] = count - 1;
+                    else
+                    {
+                        Owners.Remove(_key);
+                        Evict();
+                    }
+                }
+            }
+
+            public void EvictIfUnshared()
+            {
+                lock (Sync)
+                    if (Owners.TryGetValue(_key, out int count) && count == 1) Evict();
+            }
+        }
 
         public long InDim { get; }
         public long OutDim { get; }
+        internal IntPtr CacheKey => _host;
 
         // The ggml activation-quantization (q8_1 blocks with FP16 block sums)
         // overflows for very large activations (UMT5-XXL hidden states reach the
@@ -128,15 +210,22 @@ namespace TensorSharp.Models.Direct
             ManagedQuantizedOps.SupportsCpuQuantizedStorage((GgmlTensorType)_type);
 
         private DirectLinear(DirectContext ctx, IntPtr host, IntPtr ownedHost, int type,
-                                long ne0, long ne1, long bytes, Tensor bias, bool prescale)
+                                long ne0, long ne1, long bytes, Tensor bias, bool prescale, bool h3MappedDense = false,
+                                bool h3PreserveFloat32 = false, CudaLtx25ProjectionSession ltxProjection = null,
+                                bool exactFloat32 = false)
         {
             _ctx = ctx; _host = host; _ownedHost = ownedHost; _type = type;
             InDim = ne0; OutDim = ne1; _bytes = bytes; _bias = bias; _prescale = prescale;
+            _h3MappedDense = h3MappedDense;
+            _h3PreserveFloat32 = h3PreserveFloat32;
+            _ltxProjection = ltxProjection;
+            _exactFloat32 = exactFloat32;
         }
 
         /// <summary>Load from a GGUF tensor (weights [ne1, ne0] in GGUF row-major).</summary>
         public static DirectLinear FromGguf(DirectContext ctx, GgufFile gguf, string weightName,
-                                               string biasName = null, bool prescale = false)
+                                               string biasName = null, bool prescale = false, bool h3PreserveFloat32 = false,
+                                               CudaLtx25ProjectionSession ltxProjection = null)
         {
             var info = gguf.Tensors[weightName];
             long ne0 = (long)info.Shape[0];
@@ -151,10 +240,13 @@ namespace TensorSharp.Models.Direct
                 bias = ctx.Own(ctx.FromFloats(DirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
 
             var lin = new DirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias,
-                                          prescale && GgufFile.GetBlockSize(info.Type) > 1);
-            if (!ctx.IsCuda && !lin.UseManagedQuantOnCpu)
+                                          prescale && !h3PreserveFloat32 && GgufFile.GetBlockSize(info.Type) > 1,
+                                          h3PreserveFloat32: h3PreserveFloat32, ltxProjection: ltxProjection);
+            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadQuantizedType((int)info.Type))
+                MlxQuantizedOps.PreloadQuantizedWeight(ctx.MlxAllocator, p, p, (int)info.Type, ne0, ne1, bytes);
+            else if (!ctx.IsCuda && (ctx.IsMlx || !lin.UseManagedQuantOnCpu))
                 lin.SetCpuWeight(DirectOps.DequantTensor(gguf, weightName), ne0, ne1);
-            return lin;
+            return ctx.Track(lin);
         }
 
         /// <summary>Load the 5D patch-embedding conv as the flattened
@@ -177,13 +269,15 @@ namespace TensorSharp.Models.Direct
             if (biasName != null && gguf.Tensors.ContainsKey(biasName))
                 bias = ctx.Own(ctx.FromFloats(DirectOps.DequantTensor(gguf, biasName), (long)gguf.Tensors[biasName].NumElements));
             var lin = new DirectLinear(ctx, p, IntPtr.Zero, (int)info.Type, ne0, ne1, bytes, bias, false);
-            if (!ctx.IsCuda && !lin.UseManagedQuantOnCpu)
+            if (ctx.IsMlx && MlxQuantizedOps.CanPreloadQuantizedType((int)info.Type))
+                MlxQuantizedOps.PreloadQuantizedWeight(ctx.MlxAllocator, p, p, (int)info.Type, ne0, ne1, bytes);
+            else if (!ctx.IsCuda && (ctx.IsMlx || !lin.UseManagedQuantOnCpu))
                 lin.SetCpuWeight(DirectOps.DequantTensor(gguf, weightName), ne0, ne1);
-            return lin;
+            return ctx.Track(lin);
         }
 
         /// <summary>Load from a managed F32 array (weight [ne1, ne0] row-major, e.g. VAE safetensors).</summary>
-        public static DirectLinear FromFloats(DirectContext ctx, float[] weight, long ne0, long ne1, float[] bias)
+        public static DirectLinear FromFloats(DirectContext ctx, float[] weight, long ne0, long ne1, float[] bias, bool exactFloat32 = false)
         {
             Tensor biasT = bias != null ? ctx.Own(ctx.FromFloats(bias, bias.LongLength)) : null;
             if (ctx.IsCuda)
@@ -192,12 +286,25 @@ namespace TensorSharp.Models.Direct
                 long bytes = weight.LongLength * sizeof(float);
                 IntPtr host = Marshal.AllocHGlobal((IntPtr)bytes);
                 Marshal.Copy(weight, 0, host, weight.Length);
-                return new DirectLinear(ctx, host, host, 0 /*F32*/, ne0, ne1, bytes, biasT, false);
+                return ctx.Track(new DirectLinear(ctx, host, host, 0 /*F32*/, ne0, ne1, bytes, biasT, false, exactFloat32: exactFloat32));
             }
             var lin = new DirectLinear(ctx, IntPtr.Zero, IntPtr.Zero, 0, ne0, ne1, 0, biasT, false);
             lin._wCpu = ctx.Own(ctx.FromFloats(weight, ne1, ne0));
             lin._wCpuT = lin._wCpu.Transpose();
-            return lin;
+            return ctx.Track(lin);
+        }
+
+        /// <summary>H3-specific CUDA dense projection: the owner keeps the mapped
+        /// weight alive, and CUDA converts bounded F16/BF16 slices for F32 GEMM.
+        /// Activations and results retain F32 storage and arithmetic.</summary>
+        internal static DirectLinear FromMappedH3Dense(DirectContext ctx, IntPtr host, int type,
+            long ne0, long ne1, long bytes, float[] bias)
+        {
+            if (!ctx.IsCuda || host == IntPtr.Zero || type is not (0 or 1 or 30) || ne0 <= 0 || ne1 <= 0 ||
+                bytes != checked(ne0*ne1*(type == 0 ? sizeof(float) : sizeof(ushort))))
+                throw new ArgumentException("H3 mapped CUDA dense weights require a valid F16/BF16/F32 matrix.");
+            Tensor biasT=bias != null ? ctx.Own(ctx.FromFloats(bias,bias.LongLength)) : null;
+            return ctx.Track(new DirectLinear(ctx,host,IntPtr.Zero,type,ne0,ne1,bytes,biasT,false,h3MappedDense:true));
         }
 
         internal void SetCpuWeight(float[] w, long ne0, long ne1)
@@ -209,53 +316,86 @@ namespace TensorSharp.Models.Direct
         /// <summary>x [rows, InDim] contiguous F32 -> new tensor [rows, OutDim].</summary>
         public Tensor Forward(Tensor x)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var r = _ctx.NewF32(x.Sizes[0], OutDim);
-            if (_ctx.IsCuda)
+            try
             {
-                Tensor xin = x;
-                Tensor scaled = null;
-                if (_prescale)
+                if (_ctx.IsCuda)
                 {
-                    scaled = _ctx.NewF32(x.Sizes[0], InDim);
-                    Ops.Mul(scaled, x, 1.0f / MmScale);
-                    xin = scaled;
+                    Tensor xin = x;
+                    Tensor scaled = null;
+                    if (_prescale)
+                    {
+                        scaled = _ctx.NewF32(x.Sizes[0], InDim);
+                        Ops.Mul(scaled, x, 1.0f / MmScale);
+                        xin = scaled;
+                    }
+                    bool completed = _exactFloat32 ? CudaLtx25LoraOps.TryLinear(r, xin, _host, InDim, OutDim, _bytes) :
+                        _ltxProjection?.TryPrefillLinear(r, xin, _host, _type, InDim, OutDim, _bytes) == true ||
+                        _ltxProjection?.TryLinear(r, xin, _host, _type, InDim, OutDim, _bytes) == true || (_h3PreserveFloat32
+                        ? CudaMiniMaxH3Ops.TryLinear(r, xin, _host, _type, InDim, OutDim, _bytes)
+                        : _h3MappedDense
+                            ? CudaMiniMaxH3Ops.TryMappedDense(r, xin, _host, _type, InDim, OutDim, _bytes)
+                            : CudaQuantizedOps.TryAddmmQuantizedToFloat32(r, xin, _host, _host, _type, InDim, OutDim, _bytes));
+                    if (!completed)
+                        throw new InvalidOperationException(
+                            $"CUDA quantized linear failed (type {_type}, [{x.Sizes[0]},{InDim}]x[{InDim},{OutDim}]).");
+                    if (scaled != null)
+                    {
+                        Ops.Mul(r, r, MmScale);
+                        scaled.Dispose();
+                    }
                 }
-                if (!CudaQuantizedOps.TryAddmmQuantizedToFloat32(r, xin, _host, _host, _type, InDim, OutDim, _bytes))
-                    throw new InvalidOperationException(
-                        $"CUDA quantized linear failed (type {_type}, [{x.Sizes[0]},{InDim}]x[{InDim},{OutDim}]).");
-                if (scaled != null)
+                else if (_ctx.IsMlx)
                 {
-                    Ops.Mul(r, r, MmScale);
-                    scaled.Dispose();
+                    if (_wCpu != null)
+                        Ops.Addmm(r, 0f, r, 1f, x, _wCpuT);
+                    else if (!MlxQuantizedOps.TryAddmmQuantizedToFloat32(r, x, _host, _host, _type,
+                        InDim, OutDim, _bytes, preserveFloat32: true))
+                        throw new InvalidOperationException(
+                            $"MLX compressed F32 linear failed (type {_type}, [{x.Sizes[0]},{InDim}]x[{InDim},{OutDim}]).");
                 }
-            }
-            else if (_wCpu == null)
-            {
-                unsafe
+                else if (_wCpu == null)
                 {
-                    float* xp = (float*)CpuNativeHelpers.GetBufferStart(x);
-                    float* rp = (float*)CpuNativeHelpers.GetBufferStart(r);
-                    ManagedQuantizedOps.AddmmQuantizedToFloat32(
-                        _type, _host, InDim, OutDim,
-                        xp, checked((int)InDim), checked((int)x.Sizes[0]),
-                        rp, checked((int)OutDim));
+                    unsafe
+                    {
+                        float* xp = (float*)CpuNativeHelpers.GetBufferStart(x);
+                        float* rp = (float*)CpuNativeHelpers.GetBufferStart(r);
+                        ManagedQuantizedOps.AddmmQuantizedToFloat32(
+                            _type, _host, InDim, OutDim,
+                            xp, checked((int)InDim), checked((int)x.Sizes[0]),
+                            rp, checked((int)OutDim));
+                    }
                 }
+                else
+                {
+                    DirectOps.CpuGemmABt(x, _wCpu, r, 1f, 0f);
+                }
+                if (_bias != null) DirectOps.AddBiasRows(_ctx, r, _bias);
+                return r;
             }
-            else
-            {
-                DirectOps.CpuGemmABt(x, _wCpu, r, 1f, 0f);
-            }
-            if (_bias != null) DirectOps.AddBiasRows(_ctx, r, _bias);
-            return r;
+            catch { r.Dispose(); throw; }
         }
 
         public void Dispose()
         {
-            if (_ctx.IsCuda && _host != IntPtr.Zero && _ctx.CudaAllocator != null)
-                CudaQuantizedOps.ReleaseQuantizedWeight(_ctx.CudaAllocator, _host);
+            if (_disposed) return;
+            _disposed = true;
+            _residentWeight?.Release();
+            _wCpuT?.Dispose();
             if (_ownedHost != IntPtr.Zero)
                 Marshal.FreeHGlobal(_ownedHost);
             // _wCpu/_bias are context-owned tensors.
+        }
+
+        internal void ReleaseDeviceResidency()
+        {
+            if (!_disposed) _residentWeight?.EvictIfUnshared();
+        }
+
+        internal void RetainDeviceWeight()
+        {
+            _residentWeight ??= ResidentWeightLease.Acquire(_ctx, _host);
         }
     }
 
@@ -354,6 +494,12 @@ namespace TensorSharp.Models.Direct
         /// C may be a contiguous-row view — row stride taken from its Strides).</summary>
         public static unsafe void CpuGemmABt(Tensor a, Tensor b, Tensor c, float alpha, float beta)
         {
+            if (a.Storage is MlxStorage)
+            {
+                using var transposed = b.Transpose();
+                Ops.Addmm(c, beta, c, alpha, a, transposed);
+                return;
+            }
             RequireContiguousRows(c);
             CpuSgemm.Gemm(checked((int)a.Sizes[0]), checked((int)b.Sizes[0]), checked((int)a.Sizes[1]), alpha,
                 (float*)CpuNativeHelpers.GetBufferStart(a), a.Strides[0], a.Strides[1],
@@ -364,6 +510,11 @@ namespace TensorSharp.Models.Direct
         /// <summary>C[m,n] = beta*C + alpha * A[m,k] x B[k,n] (saxpy form; both row-major).</summary>
         public static unsafe void CpuGemmAB(Tensor a, Tensor b, Tensor c, float alpha, float beta)
         {
+            if (a.Storage is MlxStorage)
+            {
+                Ops.Addmm(c, beta, c, alpha, a, b);
+                return;
+            }
             RequireContiguousRows(c);
             CpuSgemm.Gemm(checked((int)a.Sizes[0]), checked((int)b.Sizes[1]), checked((int)a.Sizes[1]), alpha,
                 (float*)CpuNativeHelpers.GetBufferStart(a), a.Strides[0], a.Strides[1],
@@ -382,6 +533,12 @@ namespace TensorSharp.Models.Direct
         /// <summary>t[r, c] += bias[c] for every row.</summary>
         public static void AddBiasRows(DirectContext ctx, Tensor t, Tensor bias)
         {
+            if (ctx.IsMlx)
+            {
+                using var row = bias.View(1, t.Sizes[1]);
+                Ops.Add(t, t, row);
+                return;
+            }
             if (ctx.IsCuda)
             {
                 if (!CudaFusedOps.TryAddBiasRows(t, bias))
@@ -405,6 +562,17 @@ namespace TensorSharp.Models.Direct
                                         long rowFrom, long rowCount)
         {
             long cols = x.Sizes[1];
+            if (ctx.IsMlx)
+            {
+                using var input = x.Narrow(0, rowFrom, rowCount);
+                using var target = y.Narrow(0, rowFrom, rowCount);
+                using var scalePlusOne = Ops.Add(null, scale, 1f);
+                using var scaleRow = scalePlusOne.View(1, cols);
+                using var shiftRow = shift.View(1, cols);
+                using var scaled = Ops.Mul(null, input, scaleRow);
+                Ops.Add(target, scaled, shiftRow);
+                return;
+            }
             if (ctx.IsCuda)
             {
                 if (!CudaWanOps.TryModulateRows(y, x, shift, scale, rowFrom, rowCount))
@@ -430,6 +598,15 @@ namespace TensorSharp.Models.Direct
                                        long rowFrom, long rowCount)
         {
             long cols = x.Sizes[1];
+            if (ctx.IsMlx)
+            {
+                using var target = x.Narrow(0, rowFrom, rowCount);
+                using var update = v.Narrow(0, rowFrom, rowCount);
+                using var gateRow = gate.View(1, cols);
+                using var gated = Ops.Mul(null, update, gateRow);
+                Ops.Add(target, target, gated);
+                return;
+            }
             if (ctx.IsCuda)
             {
                 if (!CudaWanOps.TryGateAddRows(x, v, gate, rowFrom, rowCount))
@@ -453,6 +630,12 @@ namespace TensorSharp.Models.Direct
         /// are folded into the norm ops; this covers the odd cases).</summary>
         public static void MulColsRows(DirectContext ctx, Tensor x, Tensor gain)
         {
+            if (ctx.IsMlx)
+            {
+                using var row = gain.View(1, x.Sizes[1]);
+                Ops.Mul(x, x, row);
+                return;
+            }
             if (ctx.IsCuda)
             {
                 if (!CudaWanOps.TryScaleCols(x, gain))
@@ -555,6 +738,12 @@ namespace TensorSharp.Models.Direct
                                            int heads, int headDim)
         {
             int seq = checked((int)x.Sizes[0]);
+            if (ctx.IsMlx)
+            {
+                if (!MlxDirectOps.TryRopeInterleaved(x, cos, sin, heads, seq, headDim))
+                    throw new InvalidOperationException("MLX F32 interleaved RoPE failed.");
+                return;
+            }
             if (ctx.IsCuda)
             {
                 if (!CudaWanOps.TryRopeInterleaved(x, cos, sin, heads, seq, headDim))
@@ -599,6 +788,20 @@ namespace TensorSharp.Models.Direct
             int sq = checked((int)q.Sizes[0]);
             int sk = checked((int)k.Sizes[0]);
             var outT = ctx.NewF32(sq, (long)heads * headDim);
+            if (ctx.IsMlx)
+            {
+                try
+                {
+                    using var q4 = q.View(1, sq, heads, headDim);
+                    using var k4 = k.View(1, sk, heads, headDim);
+                    using var v4 = v.View(1, sk, heads, headDim);
+                    using var result4 = outT.View(1, sq, heads, headDim);
+                    using var mask = bias?.View(1, heads, sq, sk);
+                    Ops.ScaledDotProductAttention(result4, q4, k4, v4, mask, scale);
+                    return outT;
+                }
+                catch { outT.Dispose(); throw; }
+            }
 
             bool trace = Environment.GetEnvironmentVariable("TS_WAN_DIRECT_TIMING") == "1";
             bool fused = Environment.GetEnvironmentVariable("TS_WAN_DIRECT_FUSED_ATTN") != "0";

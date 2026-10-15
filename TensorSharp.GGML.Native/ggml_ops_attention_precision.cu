@@ -327,9 +327,12 @@ void tsg_attention_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
     CUDA_CHECK(cudaSetDevice(context->device));
     if (desc.kind == TSG_ATTN_VISION_F32) {
         const auto q = tensor_view(dst->src[0]), k = tensor_view(dst->src[1]), v = tensor_view(dst->src[2]);
-        GGML_ASSERT(q.ne[0] == 72 && (q.ne[1] + 127) / 128 <= INT_MAX && q.ne[2] <= 65535 && q.ne[3] <= 65535);
+        GGML_ASSERT((q.ne[0] == 64 || q.ne[0] == 72) && (q.ne[1] + 127) / 128 <= INT_MAX && q.ne[2] <= 65535 && q.ne[3] <= 65535);
         const dim3 blocks(unsigned((q.ne[1] + 127) / 128), unsigned(q.ne[2]), unsigned(q.ne[3]));
-        vision_kernel<72><<<blocks, 128, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
+        if (q.ne[0] == 64)
+            vision_kernel<64><<<blocks, 128, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
+        else
+            vision_kernel<72><<<blocks, 128, 0, stream>>>(q, k, v, desc.f0, static_cast<float *>(dst->data));
     } else if (desc.kind == TSG_ATTN_MASK_COMPACT) {
         const int64_t rows = ggml_nelements(dst) / dst->ne[0];
         GGML_ASSERT(rows <= INT_MAX);

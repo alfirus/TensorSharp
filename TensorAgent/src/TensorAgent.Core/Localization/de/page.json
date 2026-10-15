@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "Nächste Chats",
   "page.knowledge.noChats": "Keine gespeicherten Chats entsprechen dieser Suche.",
   "page.knowledge.indexingChats": "Chats werden kopiert und indexiert…",
-  "page.knowledge.chatImportComplete": "{added} Chats indexiert · {failed} Probleme erfordern Aufmerksamkeit"
+  "page.knowledge.chatImportComplete": "{added} Chats indexiert · {failed} Probleme erfordern Aufmerksamkeit",
+  "page.chips.keyframe": "Schlüsselbild",
+  "page.chips.framePosition": "Bildposition im Video",
+  "page.chips.autoFrame": "Automatisch (Bild {frame})",
+  "page.chips.firstFrame": "Erstes Bild",
+  "page.chips.lastFrame": "Letztes Bild",
+  "page.chips.frameNumber": "Bildnummer",
+  "page.chips.frameStrength": "Stärke",
+  "page.composer.videoWithKeyframes": "Video beschreiben… Bilder für Zeitpunkte hinzufügen",
+  "page.chips.guidanceMode": "Bildführung",
+  "page.chips.temporalGuides": "Erste/letzte und zeitlich festgelegte Bilder",
+  "page.chips.identityGuides": "Identitätsreferenzen (Ingredients)",
+  "page.chips.clipLength": "Cliplänge",
+  "page.chips.previewLength": "0,7 s Vorschau",
+  "page.composer.videoWithIdentityReferences": "Beschreibe die Zielszene und jedes Referenzbild anhand seiner Position; klare Motive ohne Text eignen sich am besten. Bei mehreren Referenzen kann die Anordnung der Bildtafeln erhalten bleiben; mit einem Bild ist die Komposition vorhersehbarer."
 }

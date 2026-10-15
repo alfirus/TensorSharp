@@ -39,7 +39,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
-    /// <summary>Managed Qwen3-VL vision tower for MiniMax-H3 (no ggml).</summary>
+        /// <summary>Direct Qwen3-VL vision tower for MiniMax-H3.</summary>
     internal sealed class MiniMaxH3DirectVisionEncoder : IDisposable
     {
         private sealed class BlockW
@@ -58,6 +58,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         private readonly DirectContext _ctx;
+        private readonly MiniMaxH3TensorOps _tensorOps;
         private readonly DirectLinear _patchEmbed;
         private readonly BlockW[] _blocks;
         private readonly MergerW[] _mergers;          // [0] final, [1..] DeepStack
@@ -75,7 +76,7 @@ namespace TensorSharp.Models.MiniMaxH3
         /// <param name="mergeSize">Spatial merge factor; each output token folds mergeSize^2 patches.</param>
         /// <param name="deepstackLayers">Block indices whose output feeds a DeepStack merger.</param>
         /// <param name="eps">LayerNorm epsilon, applied inside the sqrt.</param>
-        /// <param name="allocator">Direct-backend allocator; CUDA is rejected.</param>
+        /// <param name="allocator">CPU, CUDA or MLX direct-backend allocator.</param>
         public MiniMaxH3DirectVisionEncoder(GgufFile gguf, int dim, int heads, int outDim,
                                             int patchDim, int mergeSize, int[] deepstackLayers,
                                             float eps, IAllocator allocator)
@@ -83,10 +84,7 @@ namespace TensorSharp.Models.MiniMaxH3
             if (gguf == null) throw new ArgumentNullException(nameof(gguf));
             if (deepstackLayers == null) throw new ArgumentNullException(nameof(deepstackLayers));
             _ctx = new DirectContext(allocator);
-            if (_ctx.IsCuda)
-                throw new NotSupportedException(
-                    "MiniMaxH3DirectVisionEncoder is the managed CPU path; MiniMax-H3 on " +
-                    "BackendType.Cuda is not implemented (use a GGML backend, or BackendType.Cpu).");
+            _tensorOps = new MiniMaxH3TensorOps(_ctx);
 
             if (heads <= 0 || dim <= 0 || dim % heads != 0)
                 throw new ArgumentException($"bad vision head geometry: dim {dim}, heads {heads}.");
@@ -100,7 +98,8 @@ namespace TensorSharp.Models.MiniMaxH3
 
             DirectLinear Lin(string w, string b)
             {
-                var l = DirectLinear.FromGguf(_ctx, gguf, w, gguf.Tensors.ContainsKey(b ?? "") ? b : null);
+                var l = DirectLinear.FromGguf(_ctx, gguf, w, gguf.Tensors.ContainsKey(b ?? "") ? b : null,
+                    prescale: true, h3PreserveFloat32: true);
                 _owned.Add(l);
                 return l;
             }
@@ -356,6 +355,8 @@ namespace TensorSharp.Models.MiniMaxH3
         /// </summary>
         private unsafe Tensor LayerNormRows(Tensor x, Tensor gamma, Tensor beta)
         {
+            if (_tensorOps.IsAccelerated)
+                return DirectOps.LayerNorm(_ctx, x, gamma, beta, _eps);
             long rows = x.Sizes[0], cols = x.Sizes[1];
             float eps = _eps;
             Tensor outT = _ctx.NewF32(rows, cols);
@@ -412,9 +413,14 @@ namespace TensorSharp.Models.MiniMaxH3
         /// branch is dead. BuildRope duplicates the halves (cos[j] == cos[j + hd/2]),
         /// but the +half index is written out so this stays correct if it ever stops.
         /// </summary>
-        private static unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
+        private unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
                                             int seq, int heads, int hd)
         {
+            if (_tensorOps.IsAccelerated)
+            {
+                _tensorOps.RopeHalf(x, cos, sin, seq, heads, hd, hd);
+                return;
+            }
             int half = hd / 2;
             float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
             fixed (float* pcos = cos, psin = sin)
@@ -443,8 +449,13 @@ namespace TensorSharp.Models.MiniMaxH3
         /// ggml_gelu_erf, in place: 0.5 * x * (1 + erf(x / sqrt(2))). This is NOT
         /// Ops.GELU, which is the tanh approximation the block MLP wants.
         /// </summary>
-        private static unsafe void GeluErf(Tensor t)
+        private unsafe void GeluErf(Tensor t)
         {
+            if (_tensorOps.IsAccelerated)
+            {
+                _tensorOps.GeluErf(t);
+                return;
+            }
             const float InvSqrt2 = 0.70710678118654752440f;
             long rows = t.Sizes[0], cols = t.Sizes[1];
             float* p = (float*)CpuNativeHelpers.GetBufferStart(t);
@@ -520,6 +531,7 @@ namespace TensorSharp.Models.MiniMaxH3
             _disposed = true;
             foreach (var l in _owned) l.Dispose();
             _owned.Clear();
+            _tensorOps.Dispose();
             _ctx.Dispose();
         }
     }

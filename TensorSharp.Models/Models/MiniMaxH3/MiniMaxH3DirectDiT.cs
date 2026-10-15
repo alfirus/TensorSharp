@@ -17,6 +17,8 @@
 // and modulation is applied per segment of that packed sequence.
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
 
 using TensorSharp;
 using TensorSharp.Cpu;
@@ -36,6 +38,7 @@ namespace TensorSharp.Models.MiniMaxH3
         }
 
         private readonly DirectContext _ctx;
+        private readonly MiniMaxH3TensorOps _tensorOps;
         private readonly MiniMaxH3Config _cfg;
         private readonly BlockW[] _blocks;
         private readonly BlockW[] _refiner;      // no AdaLn on refiner blocks
@@ -43,21 +46,42 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly DirectLinear _finalAdaLn, _finalVideoOut, _finalAudioOut;
         private readonly Tensor _finalNorm, _refinerFinalNorm;
         private readonly List<DirectLinear> _owned = new();
+        // The projection and refiner depend only on text conditioning, which is
+        // constant throughout denoising. Keep one prompt, on the selected device.
+        // Snapshot its bytes because callers may reuse and mutate their buffer.
+        private float[] _cachedTextHidden;
+        private Tensor _cachedTextTokens;
         private bool _disposed;
+
+        // Explicit diagnostic boundary snapshots. Device synchronization and
+        // downloads occur only when this evidence directory is requested.
+        private static readonly string TraceDirectory =
+            Environment.GetEnvironmentVariable("TS_H3_DIT_TRACE_DIR");
+
+        private static void Trace(string name, float[] values)
+        {
+            if (string.IsNullOrEmpty(TraceDirectory)) return;
+            Directory.CreateDirectory(TraceDirectory);
+            using var stream = File.Create(Path.Combine(TraceDirectory, name + ".f32"));
+            using var writer = new BinaryWriter(stream);
+            foreach (float value in values) writer.Write(value);
+        }
+
+        private static void Trace(string name, Tensor value)
+        {
+            if (!string.IsNullOrEmpty(TraceDirectory)) Trace(name, DirectOps.ToArray(value));
+        }
 
         public MiniMaxH3DirectDiT(GgufFile gguf, MiniMaxH3Config config, IAllocator allocator)
         {
             _cfg = config;
             _ctx = new DirectContext(allocator);
-            if (_ctx.IsCuda)
-                throw new NotSupportedException(
-                    "MiniMaxH3DirectDiT is the managed CPU path; MiniMax-H3 on BackendType.Cuda " +
-                    "is not implemented (use a GGML backend, or BackendType.Cpu).");
+            _tensorOps = new MiniMaxH3TensorOps(_ctx);
 
             string p = config.Prefix;
             DirectLinear Lin(string w, string b)
             {
-                var l = DirectLinear.FromGguf(_ctx, gguf, w, b);
+                var l = DirectLinear.FromGguf(_ctx, gguf, w, b, prescale: true, h3PreserveFloat32: true);
                 _owned.Add(l);
                 return l;
             }
@@ -145,10 +169,15 @@ namespace TensorSharp.Models.MiniMaxH3
         /// sequence - NOT the pair-duplicated layout DirectOps.RopeInterleaved wants,
         /// which is why this model needs its own.
         /// </summary>
-        private static unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
+        private unsafe void RopeHalf(Tensor x, float[] cos, float[] sin,
                                             int seq, int heads, int hd, int rot)
         {
             if (rot <= 0) return;
+            if (_tensorOps.IsAccelerated)
+            {
+                _tensorOps.RopeHalf(x, cos, sin, seq, heads, hd, rot);
+                return;
+            }
             int half = rot / 2;
             float* px = (float*)CpuNativeHelpers.GetBufferStart(x);
             fixed (float* pcos = cos, psin = sin)
@@ -174,7 +203,7 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
-        private Tensor Attention(Tensor h, BlockW w, int seq, float[] cos, float[] sin)
+        private Tensor Attention(Tensor h, BlockW w, int seq, float[] cos, float[] sin, bool applyRope = true)
         {
             int heads = _cfg.NumAttentionHeads, hd = _cfg.AttentionHeadDim;
             int inner = _cfg.AttentionInnerDim, rot = _cfg.RopeRotaryDim;
@@ -195,8 +224,11 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (w.QNorm != null) q = NormHeads(q, w.QNorm, seq, heads, hd);
                 if (w.KNorm != null) k = NormHeads(k, w.KNorm, seq, heads, hd);
 
-                RopeHalf(q, cos, sin, seq, heads, hd, rot);
-                RopeHalf(k, cos, sin, seq, heads, hd, rot);
+                if (applyRope)
+                {
+                    RopeHalf(q, cos, sin, seq, heads, hd, rot);
+                    RopeHalf(k, cos, sin, seq, heads, hd, rot);
+                }
 
                 using Tensor merged = DirectOps.Attention(_ctx, q, k, v, heads, hd, scale);
                 return w.Out.Forward(merged);
@@ -256,6 +288,70 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
+        private void ClearTextCache()
+        {
+            _cachedTextTokens?.Dispose();
+            _cachedTextTokens = null;
+            _cachedTextHidden = null;
+        }
+
+        // The returned reference is borrowed storage with its own lifetime. The
+        // caller copies it into the packed sequence before any trunk mutation.
+        internal Tensor RefineText(float[] textHidden, int textCount)
+        {
+            if (textHidden == null || textCount <= 0 ||
+                textHidden.LongLength != (long)textCount * _cfg.TextDim)
+                throw new ArgumentException("MiniMax-H3 text conditioning has an invalid shape.");
+
+            // Trace mode deliberately executes every boundary, including the
+            // intermediate refiner blocks that are absent from the final cache.
+            bool cache = string.IsNullOrEmpty(TraceDirectory);
+            if (cache && _cachedTextTokens != null &&
+                MemoryMarshal.AsBytes(textHidden.AsSpan()).SequenceEqual(
+                    MemoryMarshal.AsBytes(_cachedTextHidden.AsSpan())))
+                return _cachedTextTokens.CopyRef();
+
+            ClearTextCache();
+            Tensor ctxTok = null;
+            try
+            {
+                using (Tensor tin = _ctx.FromFloats(textHidden, textCount, _cfg.TextDim))
+                    ctxTok = _conditionProj.Forward(tin);
+                Trace("condition-proj", ctxTok);
+
+                // The official H3 token refiner has no positional embedding.
+                // RoPE belongs to the subsequent packed transformer trunk.
+                int refinerIndex = 0;
+                foreach (var rw in _refiner)
+                {
+                    using (Tensor n1 = DirectOps.RmsNorm(_ctx, ctxTok, rw.Norm1, _cfg.NormEps))
+                    using (Tensor a = Attention(n1, rw, textCount, null, null, applyRope: false))
+                        Ops.Add(ctxTok, ctxTok, a);
+                    using (Tensor n2 = DirectOps.RmsNorm(_ctx, ctxTok, rw.Norm2, _cfg.NormEps))
+                    using (Tensor m = Mlp(n2, rw))
+                        Ops.Add(ctxTok, ctxTok, m);
+                    Trace("refiner-" + refinerIndex++, ctxTok);
+                }
+                if (_refinerFinalNorm != null)
+                {
+                    using Tensor prev = ctxTok;
+                    ctxTok = DirectOps.RmsNorm(_ctx, prev, _refinerFinalNorm, _cfg.NormEps);
+                }
+
+                if (!cache)
+                {
+                    Tensor result = ctxTok;
+                    ctxTok = null;
+                    return result;
+                }
+                _cachedTextHidden = (float[])textHidden.Clone();
+                _cachedTextTokens = ctxTok;
+                ctxTok = null;
+                return _cachedTextTokens.CopyRef();
+            }
+            finally { ctxTok?.Dispose(); }
+        }
+
         // ---- forward ---------------------------------------------------------
 
         /// <summary>
@@ -281,32 +377,17 @@ namespace TensorSharp.Models.MiniMaxH3
             float eps = _cfg.NormEps;
 
             using Tensor temb = _ctx.FromFloats(timeEmbed, nTimesteps, _cfg.TimeEmbedDim);
+            Trace("time-embed", timeEmbed);
+            Trace("physical-audio-input", audioLatent);
+            Trace("video-input", videoInput);
+            if (textHidden != null) Trace("text-hidden-input", textHidden);
 
             // ---- text: project, then refine ----
             Tensor ctxTok = null;
             if (textCount > 0 && textHidden != null)
-            {
-                using (Tensor tin = _ctx.FromFloats(textHidden, textCount, _cfg.TextDim))
-                    ctxTok = _conditionProj.Forward(tin);
-
-                // Text sits at the head of the packed sequence, so the refiner wants
-                // the matching PREFIX of the rope tables - which is what indexing
-                // them from token 0 gives.
-                foreach (var rw in _refiner)
-                {
-                    using (Tensor n1 = DirectOps.RmsNorm(_ctx, ctxTok, rw.Norm1, eps))
-                    using (Tensor a = Attention(n1, rw, textCount, cos, sin))
-                        Ops.Add(ctxTok, ctxTok, a);
-                    using (Tensor n2 = DirectOps.RmsNorm(_ctx, ctxTok, rw.Norm2, eps))
-                    using (Tensor m = Mlp(n2, rw))
-                        Ops.Add(ctxTok, ctxTok, m);
-                }
-                if (_refinerFinalNorm != null)
-                {
-                    using Tensor prev = ctxTok;
-                    ctxTok = DirectOps.RmsNorm(_ctx, prev, _refinerFinalNorm, eps);
-                }
-            }
+                ctxTok = RefineText(textHidden, textCount);
+            else
+                ClearTextCache();
 
             // ---- patchify video and audio, then pack ----
             // Conditioning frames share the patch projection of the target, exactly
@@ -385,6 +466,7 @@ namespace TensorSharp.Models.MiniMaxH3
             if (row != nTok)
                 throw new InvalidOperationException(
                     $"MiniMax-H3 DiT: packed {row} tokens but the layout declares {nTok}.");
+            Trace("packed-in", x);
 
             try
             {
@@ -396,6 +478,7 @@ namespace TensorSharp.Models.MiniMaxH3
                     // embedding straight into the projection.
                     using Tensor modsRaw = bw.AdaLn.Forward(temb);          // [nts, 18*hidden]
                     using Tensor mods = modsRaw.View(18L * nTimesteps, hidden);
+                    if (l == 0) Trace("block-0-mods", mods);
 
                     using (Tensor h = DirectOps.RmsNorm(_ctx, x, bw.Norm1, eps))
                     {
@@ -409,6 +492,7 @@ namespace TensorSharp.Models.MiniMaxH3
                         using Tensor m = Mlp(h, bw);
                         GatedResidual(x, m, mods, segments, 5);
                     }
+                    Trace("block-" + l, x);
                 }
 
                 // ---- final layer ----
@@ -435,12 +519,14 @@ namespace TensorSharp.Models.MiniMaxH3
                 using (Tensor vs = FinalSlice(videoStart, videoCount, videoCol))
                 using (Tensor vo = _finalVideoOut.Forward(vs))
                 {
+                    Trace("raw-video-output", vo);
                     Ops.Mul(vo, vo, videoScale);
                     videoOut = DirectOps.ToArray(vo);
                 }
                 using (Tensor asl = FinalSlice(audioStart, audioCount, audioCol))
                 using (Tensor ao = _finalAudioOut.Forward(asl))
                 {
+                    Trace("raw-audio-output", ao);
                     Ops.Mul(ao, ao, audioScale);
                     audioOut = DirectOps.ToArray(ao);
                 }
@@ -452,12 +538,21 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
+        internal void ReleaseDeviceResidency()
+        {
+            if (_disposed) return;
+            ClearTextCache();
+            _ctx.ReleaseDeviceResidency();
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+            ClearTextCache();
             foreach (var l in _owned) l.Dispose();
             _owned.Clear();
+            _tensorOps.Dispose();
             _ctx.Dispose();
         }
     }

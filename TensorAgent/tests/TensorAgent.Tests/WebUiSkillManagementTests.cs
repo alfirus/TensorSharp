@@ -11,6 +11,42 @@ namespace TensorAgent.Tests;
 
 public sealed partial class WebUiPageTests
 {
+    [WebJavaScriptTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ChatSkillInstallationRefreshesTheRosterOnlyAfterSuccessAndPreservesSelection(bool success)
+    {
+        JsonElement result = Run(ManagedSkills + $$"""
+            R['/api/chat'] = function () {
+              if ({{(success ? "true" : "false")}}) managedCatalog.skills.push({
+                id: 'portable-report', name: 'portable-report', description: 'Create reports.', origin: 'installed'
+              });
+              return { __sse: [
+                { skill_step: 'skills_install', skill: 'portable-report', ok: {{(success ? "true" : "false")}} },
+                { tool_progress: 'finished', tool: 'skills_install', seconds: 1 },
+                { token: 'Done.' }, { done: true, truncated: false }
+              ] };
+            };
+            """, """
+            return openManagedSkills().then(function () {
+              var before = __page.requests('/api/skills').length;
+              __page.byId['text'].value = 'Find and install a report skill';
+              __page.byId['send'].dispatch('click');
+              return settle(30).then(function () {
+                var installed = managedSkill('portable-report');
+                return { reads: __page.requests('/api/skills').length - before,
+                  present: !!installed, installedSelected: installed && installed.querySelector('.skill-toggle').checked,
+                  originalSelected: managedSkill('documents').querySelector('.skill-toggle').checked };
+              });
+            });
+            """);
+
+        Assert.Equal(success ? 1 : 0, result.GetProperty("reads").GetInt32());
+        Assert.Equal(success, result.GetProperty("present").GetBoolean());
+        if (success) Assert.False(result.GetProperty("installedSelected").GetBoolean());
+        Assert.True(result.GetProperty("originalSelected").GetBoolean());
+    }
+
     // The real menu opens the real skills sheet; the tiny DOM fixture otherwise has
     // no static menu buttons. Its roster includes a bundled and a user-installed
     // skill, both of which TensorAgent can remove through its configured registry.

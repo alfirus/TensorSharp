@@ -36,12 +36,6 @@ namespace TensorSharp.Models.MiniMaxH3
         private MiniMaxH3AudioVae _audioVae;
         private bool _disposed;
 
-        /// <summary>Ceiling on the latent voxels handed to one VAE decode call.
-        /// Flash attention means the score matrix is never materialized, so this is a
-        /// memory-headroom guard rather than the hard O(n^2) wall it would otherwise
-        /// be — the reference tiles at 256 px, we do not need to.</summary>
-        private const int MaxVaeTokensPerCall = 16384;
-
         /// <summary>TS_H3_PHASE=1 prints a per-stage breakdown - encoder open vs trunk,
         /// every denoise step, and VAE open vs decode. The existing one-line summaries
         /// tell you a phase was slow; this tells you which half of it.</summary>
@@ -95,6 +89,7 @@ namespace TensorSharp.Models.MiniMaxH3
         public GeneratedVideo Generate(string prompt, VideoGenerationParams p)
         {
             p ??= new VideoGenerationParams();
+            ValidateSamplingParameters(p);
             var total = Stopwatch.StartNew();
 
             // Resolve the canvas. A 256x256 default is far too small for faces to hold
@@ -107,17 +102,12 @@ namespace TensorSharp.Models.MiniMaxH3
                 p.Frames > 0 ? p.Frames : 22,
                 p.Fps > 0 ? p.Fps : MiniMaxH3Geometry.Fps);
 
-            // 20 is the reference implementation's default. H3 is step-distilled and
-            // runs at 4-8, but measured on a 640x384 image-to-video the low end leaves
-            // visible chromatic fringing around moving subjects that is gone by ~20.
-            int steps = p.Steps > 0 ? p.Steps : 20;
+            // 20 matches stable-diffusion.cpp's CLI default. Fewer steps reduce
+            // latency, but low-step quality requires its own validation rather than
+            // inheriting the guarantees of separately distilled FastH3 checkpoints.
+            int steps = p.Steps > 0 ? p.Steps : MiniMaxH3Scheduler.DefaultSteps;
             float videoShift = p.FlowShift > 0 ? p.FlowShift : MiniMaxH3Scheduler.VideoShift;
             long seed = p.Seed >= 0 ? p.Seed : Random.Shared.NextInt64() & 0x7fffffff;
-
-            if (p.CfgScale > 1.0f)
-                throw new ArgumentException(
-                    "MiniMax-H3 is CFG-distilled: guidance above 1.0 degrades it badly. " +
-                    "Use --cfg 1.0 (the default).", nameof(p));
 
             var mode = MiniMaxH3ModeResolver.Resolve(p, _model.Partition);
             Report(p, "text-encode", 0, steps, total);
@@ -200,11 +190,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 }
                 else if (references is { Count: > 0 })
                 {
-                    if (!te.HasVision)
-                        throw new InvalidOperationException(
-                            "reference conditioning needs the Qwen3-VL vision tower, and this " +
-                            "text-encoder checkpoint does not carry one. Point --video-text-encoder " +
-                            "at the full qwen3vl_32b_minimax_h3 GGUF.");
+                    RequireReferenceVision(te.HasVision, references);
                     (presented, promptImages) = BuildReferencePrompt(te, references, prompt);
                     Console.WriteLine($"  [h3] ref2va: {references.Count} reference(s) -> " +
                                       $"{promptImages.Count} vision span(s)");
@@ -288,7 +274,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 {
                     float[] latent = _vae.EncodeFrame(scaled);
                     _vae.NormalizeLatent(latent);
-                    AddVisualNoise(latent, seed);
+                    MiniMaxH3Noise.AddVisual(latent, seed, 1, shape.LatentHeight, shape.LatentWidth);
                     parts.Add(MiniMaxH3DiT.PatchifyVideo(latent, 1, shape.LatentHeight,
                         shape.LatentWidth, MiniMaxH3Geometry.VideoLatentChannels));
                     conditionFrames.Add(1);
@@ -375,7 +361,7 @@ namespace TensorSharp.Models.MiniMaxH3
                             ? EncodeSingle(first, out latentT)
                             : _vae.EncodeClip(reference.Frames, out latentT);
                         _vae.NormalizeLatent(refLatent);
-                        AddVisualNoise(refLatent, seed);
+                        MiniMaxH3Noise.AddVisual(refLatent, seed, latentT, latentH, latentW);
                         videoParts.Add(MiniMaxH3DiT.PatchifyVideo(refLatent, latentT, latentH, latentW,
                             MiniMaxH3Geometry.VideoLatentChannels));
                         thisVideo = videoIndex++;
@@ -416,13 +402,9 @@ namespace TensorSharp.Models.MiniMaxH3
 
             // ---- initial noise ----
             // sigma[0] is 1.0, so noise_scaling(init=0) reduces to pure noise.
-            var rng = new PhiloxLikeRng(seed);
             int videoCount = shape.VideoTokenCount;
             int audioCount = shape.AudioTokenCount;
-            var videoPatches = new float[(long)videoCount * _dit.Config.VideoPatchDim];
-            var audioLatent = new float[(long)audioCount * _dit.Config.AudioLatentChannels];
-            for (long i = 0; i < videoPatches.LongLength; i++) videoPatches[i] = rng.NextNormal();
-            for (long i = 0; i < audioLatent.LongLength; i++) audioLatent[i] = rng.NextNormal();
+            var (videoPatches, audioLatent) = MiniMaxH3Noise.Initial(shape, seed);
 
             float[] sigmas = MiniMaxH3Scheduler.BuildSigmas(steps, videoShift);
 
@@ -439,8 +421,12 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (step == 0) RequireChunksMatchLayout(condChunks, layout);
 
                 var stepClock = Stopwatch.StartNew();
+                // The shared sigma schedule carries scaled audio, as in the
+                // reference sampler. DiT consumes physical audio latents instead.
+                float[] audioInput = MiniMaxH3Scheduler.AudioInputFromCarrier(
+                    audioLatent, sigma, videoShift);
                 var (vVel, aVel) = _dit.Forward(
-                    videoPatches, videoCount, audioLatent, audioCount,
+                    videoPatches, videoCount, audioInput, audioCount,
                     textHidden, textLength, layout, sigma,
                     conditionTokens, conditionCount,
                     conditionAudio, conditionAudioCount, condChunks, videoShift);
@@ -449,10 +435,14 @@ namespace TensorSharp.Models.MiniMaxH3
                 // clip down; check them before it is integrated into the latent.
                 RequireFinite(vVel, "video velocity", step, steps, layout.TokenCount);
                 RequireFinite(aVel, "audio velocity", step, steps, layout.TokenCount);
+                MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(audioInput, aVel, sigma, videoShift);
+                RequireFinite(aVel, "audio carrier velocity", step, steps, layout.TokenCount);
                 if (step == 0) DumpVelocity(vVel, aVel);
 
                 MiniMaxH3Scheduler.EulerStep(videoPatches, vVel, sigma, sigmas[step + 1]);
                 MiniMaxH3Scheduler.EulerStep(audioLatent, aVel, sigma, sigmas[step + 1]);
+                RequireFinite(videoPatches, "video latent", step, steps, layout.TokenCount);
+                RequireFinite(audioLatent, "audio carrier", step, steps, layout.TokenCount);
 
                 p.OnStep?.Invoke(step + 1, steps);
                 Report(p, "denoise", step + 1, steps, total);
@@ -498,6 +488,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 videoPatches, shape.LatentFrames, shape.LatentHeight, shape.LatentWidth,
                 MiniMaxH3Geometry.VideoLatentChannels);
             _vae.DenormalizeLatent(latent);
+            RequireFiniteOutput(latent, "video VAE input");
 
             var vaeRunClock = Stopwatch.StartNew();
             float[] pixels = _vae.Decode(
@@ -511,10 +502,15 @@ namespace TensorSharp.Models.MiniMaxH3
             // The decoder now hands back exactly the clip's frames, warm-up and
             // chunk overlaps already resolved.
             int decodedFrames = MiniMaxH3VideoVae.DecodedFrameCount(shape.LatentFrames);
+            RequireFiniteOutput(pixels, "video VAE output");
             MiniMaxH3VideoVae.ToRgb(pixels, decodedFrames, shape.Height, shape.Width);
             RgbImage[] frames = TakeFrames(pixels, decodedFrames, shape);
 
             // ---- decode the joint audio track ----
+            // The final sampler carrier has a videoShift/audioShift factor.
+            // Undo it before VAE denormalization (H3AVFlowDenoiser.process_latent_out).
+            MiniMaxH3Scheduler.AudioOutputFromCarrierInPlace(audioLatent, videoShift);
+            RequireFiniteOutput(audioLatent, "audio VAE input");
             // H3 denoises audio alongside video whether or not we decode it, so this
             // is purely the vocoder step; without the audio VAE the clip is simply
             // silent rather than wrong.
@@ -526,6 +522,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 {
                     Report(p, "audio-decode", steps, steps, total);
                     audio = _audioVae.DecodeStereo(audioLatent, shape.AudioLatentFrames);
+                    foreach (float[] channel in audio.Channels)
+                        RequireFiniteOutput(channel, "audio VAE output");
                     // The audio grid is 40 Hz and the video grid 24 fps, so the tracks
                     // rarely land on the same length; trim to the video's duration.
                     int wanted = (int)Math.Round(shape.Frames / (double)shape.Fps * audio.SampleRate);
@@ -919,6 +917,17 @@ namespace TensorSharp.Models.MiniMaxH3
                 RequireVisionTokens(tokenizer);
         }
 
+        /// <summary>Audio references are presented as text labels and encoded by the
+        /// audio VAE, so they do not require a vision tower in the text checkpoint.</summary>
+        internal static void RequireReferenceVision(bool hasVision, IReadOnlyList<MiniMaxH3Reference> references)
+        {
+            if (!hasVision && references.Any(reference => reference.Kind != MiniMaxH3ReferenceKind.Audio))
+                throw new InvalidOperationException(
+                    "visual reference conditioning needs the Qwen3-VL vision tower, and this " +
+                    "text-encoder checkpoint does not carry one. Point --video-text-encoder " +
+                    "at the full qwen3vl_32b_minimax_h3 GGUF.");
+        }
+
         /// <summary>Format a timestamp exactly as the reference's C++ stream does.
         ///
         /// <para>Presented frames sit 12 apart at 24 fps, so a pair's midpoint is always
@@ -1095,7 +1104,7 @@ namespace TensorSharp.Models.MiniMaxH3
         /// saturated buzz, and nothing anywhere reported an error. A flow-matching
         /// velocity is O(1) by construction, so a non-finite one is a numeric failure
         /// upstream and there is nothing left to salvage from the run.</para></summary>
-        private static void RequireFinite(float[] values, string what, int step, int steps, int tokens)
+        internal static void RequireFinite(float[] values, string what, int step, int steps, int tokens)
         {
             for (long i = 0; i < values.LongLength; i++)
             {
@@ -1111,19 +1120,29 @@ namespace TensorSharp.Models.MiniMaxH3
             }
         }
 
-        /// <summary>Nudge a conditioning latent off the clean manifold.
-        ///
-        /// The model never sees a perfectly clean latent during training, so a
-        /// reference or keyframe is mixed with a sliver of noise to match the
-        /// near-clean timestep its tokens are modulated at.</summary>
-        private static void AddVisualNoise(float[] latent, long seed)
+        /// <summary>Check decoder values before RGB or PCM conversion can hide a
+        /// numeric failure by saturating infinities or replacing NaNs.</summary>
+        internal static void RequireFiniteOutput(float[] values, string stage)
         {
-            // The reference reseeds per latent, so every conditioning frame in a
-            // request gets the same noise draw rather than consecutive slices of one.
-            var rng = new PhiloxLikeRng(seed);
-            const float t = MiniMaxH3Scheduler.VisualConditionTimestep;
-            for (long i = 0; i < latent.LongLength; i++)
-                latent[i] = latent[i] * t + rng.NextNormal() * (1f - t);
+            for (long i = 0; i < values.LongLength; i++)
+                if (!float.IsFinite(values[i]))
+                    throw new InvalidOperationException(
+                        $"MiniMax-H3 {stage} contains a non-finite value at element {i} " +
+                        $"of {values.LongLength}. Generation stopped before media conversion.");
+        }
+
+        /// <summary>Reject unsupported settings before loading the text encoder.
+        /// Zero retains the shared request type's model-default convention.</summary>
+        internal static void ValidateSamplingParameters(VideoGenerationParams p)
+        {
+            if (!float.IsFinite(p.CfgScale) || (p.CfgScale != 0f && p.CfgScale != 1f))
+                throw new ArgumentException(
+                    "MiniMax-H3 is CFG-distilled and requires guidance 1.0. " +
+                    "Use --cfg 1.0 (the default).", nameof(p));
+            if (!float.IsFinite(p.FlowShift) || p.FlowShift < 0f)
+                throw new ArgumentException("MiniMax-H3 flow shift must be finite and positive, or 0 for the default.", nameof(p));
+            if (p.Steps < 0)
+                throw new ArgumentException("MiniMax-H3 steps must be positive, or 0 for the default.", nameof(p));
         }
 
         /// <summary>Default generation area when the request does not give a size.
@@ -1261,39 +1280,5 @@ namespace TensorSharp.Models.MiniMaxH3
             _audioVae?.Dispose();
         }
 
-        /// <summary>A small counter-based normal generator. Deterministic across
-        /// platforms and independent of System.Random's implementation, so a seed
-        /// reproduces the same clip anywhere.</summary>
-        private sealed class PhiloxLikeRng
-        {
-            private ulong _state;
-            private float _spare;
-            private bool _hasSpare;
-
-            public PhiloxLikeRng(long seed) { _state = (ulong)seed * 6364136223846793005UL + 1442695040888963407UL; }
-
-            private uint NextUInt()
-            {
-                _state = _state * 6364136223846793005UL + 1442695040888963407UL;
-                ulong x = _state;
-                x ^= x >> 33; x *= 0xff51afd7ed558ccdUL;
-                x ^= x >> 33;
-                return (uint)(x >> 32);
-            }
-
-            private double NextDouble() => (NextUInt() + 0.5) / 4294967296.0;
-
-            /// <summary>Box-Muller, keeping the second deviate so pairs are not wasted.</summary>
-            public float NextNormal()
-            {
-                if (_hasSpare) { _hasSpare = false; return _spare; }
-                double u1 = NextDouble(), u2 = NextDouble();
-                double r = Math.Sqrt(-2.0 * Math.Log(u1));
-                double theta = 2.0 * Math.PI * u2;
-                _spare = (float)(r * Math.Sin(theta));
-                _hasSpare = true;
-                return (float)(r * Math.Cos(theta));
-            }
-        }
     }
 }

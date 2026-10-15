@@ -50,7 +50,7 @@ namespace TensorSharp.Server.RequestParsers
             if (root.TryGetProperty("steps", out var st) && st.TryGetInt32(out int si)) p.Steps = si;
             if (root.TryGetProperty("cfg", out var cf) && cf.TryGetSingle(out float cv)) p.CfgScale = cv;
             if (root.TryGetProperty("cfg2", out var cf2) && cf2.TryGetSingle(out float cv2)) p.CfgScale2 = cv2;
-            if (root.TryGetProperty("seed", out var se) && se.TryGetInt64(out long sv) && sv != 0) p.Seed = sv;
+            if (root.TryGetProperty("seed", out var se) && se.TryGetInt64(out long sv)) p.Seed = sv;
             if (root.TryGetProperty("fps", out var fp) && fp.TryGetInt32(out int fv)) p.Fps = fv;
             if (root.TryGetProperty("flowShift", out var fs) && fs.TryGetSingle(out float fsv)) p.FlowShift = fsv;
             if (root.TryGetProperty("negativePrompt", out var np) && np.ValueKind == JsonValueKind.String)
@@ -76,7 +76,7 @@ namespace TensorSharp.Server.RequestParsers
             // file ("imagePath" — the bare server filename from /api/upload, or an
             // absolute path inside the upload directory) or inline base64 ("image", API
             // flow; a data:...;base64, prefix is accepted).
-            if (root.TryGetProperty("imagePath", out var ip) && ip.ValueKind == JsonValueKind.String
+            if (TryGetEither(root, "imagePath", "image_path", out var ip) && ip.ValueKind == JsonValueKind.String
                 && !string.IsNullOrWhiteSpace(ip.GetString()))
             {
                 if (!UploadFileReference.TryResolve(options.UploadDirectory, ip.GetString(), out string full)
@@ -126,7 +126,91 @@ namespace TensorSharp.Server.RequestParsers
                 "referenceVideoAudios", ref error);
             if (error != null) return p;
 
+            p.ImageConditions = ParseImageConditions(root, options, ref error);
+
             return p;
+        }
+
+        private static List<VideoImageCondition> ParseImageConditions(
+            JsonElement root, ServerHostingOptions options, ref string error)
+        {
+            if (!TryGetEither(root, "imageConditions", "image_conditions", out var conditions))
+                return null;
+            if (conditions.ValueKind != JsonValueKind.Array)
+            {
+                error = "imageConditions must be an array of image, frameIndex and strength objects.";
+                return null;
+            }
+            var result = new List<VideoImageCondition>();
+            var frames = new HashSet<int>();
+            foreach (var item in conditions.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                {
+                    error = "imageConditions entries must be objects.";
+                    return null;
+                }
+                var condition = new VideoImageCondition();
+                if (!(TryGetEither(item, "frameIndex", "frame_index", out var frame)
+                        || TryGetEither(item, "frameIdx", "frame_idx", out frame))
+                    || frame.ValueKind != JsonValueKind.Number || !frame.TryGetInt32(out int index)
+                    || index < -1)
+                {
+                    error = "imageConditions frameIndex must be a non-negative integer, or -1 for the last frame.";
+                    return null;
+                }
+                condition.FrameIndex = index;
+                if (!frames.Add(index))
+                {
+                    error = "imageConditions must not contain duplicate frameIndex values.";
+                    return null;
+                }
+                if (item.TryGetProperty("strength", out var strength))
+                {
+                    if (strength.ValueKind != JsonValueKind.Number || !strength.TryGetSingle(out float value)
+                        || !float.IsFinite(value) || value < 0 || value > 1)
+                    {
+                        error = "imageConditions strength must be a finite number between 0 and 1.";
+                        return null;
+                    }
+                    condition.Strength = value;
+                }
+                if (TryGetEither(item, "imagePath", "image_path", out var path))
+                {
+                    if (path.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(path.GetString())
+                        || !TryResolveUpload(options, path.GetString(), out string full))
+                    {
+                        error = "imageConditions imagePath must reference a previously uploaded file.";
+                        return null;
+                    }
+                    condition.ImagePath = full;
+                }
+                else if (item.TryGetProperty("image", out var encoded) && encoded.ValueKind == JsonValueKind.String)
+                {
+                    string base64 = encoded.GetString();
+                    int comma = base64.IndexOf(',');
+                    if (base64.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && comma > 0)
+                        base64 = base64[(comma + 1)..];
+                    try { condition.ImageBytes = Convert.FromBase64String(base64); }
+                    catch (FormatException)
+                    {
+                        error = "imageConditions image must be base64-encoded (optionally a data: URL).";
+                        return null;
+                    }
+                    if (condition.ImageBytes.Length == 0)
+                    {
+                        error = "imageConditions image must contain an encoded image.";
+                        return null;
+                    }
+                }
+                else
+                {
+                    error = "imageConditions entries require imagePath or a base64-encoded image.";
+                    return null;
+                }
+                result.Add(condition);
+            }
+            return result.Count == 0 ? null : result;
         }
 
         // Accept either spelling of a field name; camelCase wins when both are present.

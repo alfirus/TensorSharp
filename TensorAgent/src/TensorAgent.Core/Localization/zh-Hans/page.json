@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "下一页聊天",
   "page.knowledge.noChats": "没有符合搜索条件的已保存聊天。",
   "page.knowledge.indexingChats": "正在复制聊天并建立索引…",
-  "page.knowledge.chatImportComplete": "已为 {added} 个聊天建立索引 · {failed} 个问题需要处理"
+  "page.knowledge.chatImportComplete": "已为 {added} 个聊天建立索引 · {failed} 个问题需要处理",
+  "page.chips.keyframe": "关键帧",
+  "page.chips.framePosition": "图像帧位置",
+  "page.chips.autoFrame": "自动（第 {frame} 帧）",
+  "page.chips.firstFrame": "首帧",
+  "page.chips.lastFrame": "尾帧",
+  "page.chips.frameNumber": "帧编号",
+  "page.chips.frameStrength": "强度",
+  "page.composer.videoWithKeyframes": "描述视频…添加图像关键帧引导时间线",
+  "page.chips.guidanceMode": "图像引导",
+  "page.chips.temporalGuides": "首尾帧和指定帧",
+  "page.chips.identityGuides": "身份参考（Ingredients）",
+  "page.chips.clipLength": "视频长度",
+  "page.chips.previewLength": "0.7 秒预览",
+  "page.composer.videoWithIdentityReferences": "描述目标场景，并按位置说明每张参考图的内容；主体清晰、无文字的图片效果更好。多张参考图可能让视频沿用参考板的拼图布局；单张图片的构图更可预测。"
 }

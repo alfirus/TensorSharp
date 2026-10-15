@@ -37,7 +37,7 @@ public sealed class ExpandedCatalogTests
     public void WanCompanionsAreRequiredAndSwitchingFamiliesClearsStaleNetworks()
     {
         string root = Path.Combine(Path.GetTempPath(), "tensoragent-wan-catalog-" + Guid.NewGuid().ToString("N"));
-        string[] variables = { "TS_VIDEO_TEXT_ENCODER", "TS_VIDEO_VAE", "TS_VIDEO_DIT2", "TS_VIDEO_AUDIO_VAE", "TS_VIDEO_TOKENIZER" };
+        string[] variables = { "TS_VIDEO_TEXT_ENCODER", "TS_VIDEO_VAE", "TS_VIDEO_DIT2", "TS_VIDEO_AUDIO_VAE", "TS_VIDEO_TOKENIZER", "TS_VIDEO_UPSCALER" };
         var saved = variables.ToDictionary(v => v, Environment.GetEnvironmentVariable);
         var store = new ModelStore(root);
         try
@@ -55,6 +55,7 @@ public sealed class ExpandedCatalogTests
                 Environment.SetEnvironmentVariable("TS_VIDEO_AUDIO_VAE", "stale-audio");
                 Environment.SetEnvironmentVariable("TS_VIDEO_TOKENIZER", "stale-tokenizer");
                 Environment.SetEnvironmentVariable("TS_VIDEO_DIT2", "stale-expert");
+                Environment.SetEnvironmentVariable("TS_VIDEO_UPSCALER", "stale-upscaler");
 
                 var published = DiffusionCompanions.Publish(model, store);
                 foreach (var pair in new[]
@@ -71,6 +72,7 @@ public sealed class ExpandedCatalogTests
                 }
                 Assert.Null(Environment.GetEnvironmentVariable("TS_VIDEO_AUDIO_VAE"));
                 Assert.Null(Environment.GetEnvironmentVariable("TS_VIDEO_TOKENIZER"));
+                Assert.Null(Environment.GetEnvironmentVariable("TS_VIDEO_UPSCALER"));
             }
             DiffusionCompanions.Publish(ModelCatalog.Find("qwen3.5-9b-iq4xs"), store);
             Assert.All(variables, v => Assert.Null(Environment.GetEnvironmentVariable(v)));

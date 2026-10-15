@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>annotations</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../../TensorSharp.Backends.MLX/MlxQ4KRepack.cs" Link="MlxQ4KRepack.cs" />
+  </ItemGroup>
+</Project>

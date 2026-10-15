@@ -26,9 +26,11 @@ namespace TensorSharp.AgentHost.Skills
     ///
     /// <para>
     /// These are unlike every other tool in the system: TensorSharp executes them
-    /// itself rather than handing them back to the caller. That is safe because they
-    /// are read-only and confined by <see cref="SkillPathGuard"/> to a directory the
-    /// operator already chose to expose, and it is necessary because progressive
+    /// itself rather than handing them back to the caller. Reads are confined by
+    /// <see cref="SkillPathGuard"/> to directories the operator chose to expose;
+    /// script execution and marketplace access require separate host permissions.
+    /// Marketplace installation additionally requires a writable registry and a
+    /// request-local inspection. Host execution is necessary because progressive
     /// disclosure has to work for a client that knows nothing about skills — an
     /// ordinary OpenAI client sends <c>skills: ["pdf"]</c>, and gets back a finished
     /// answer, not a tool call it has no idea how to service.
@@ -61,7 +63,8 @@ namespace TensorSharp.AgentHost.Skills
         public static bool IsSkillTool(string? name) =>
             string.Equals(name, ListToolName, StringComparison.Ordinal)
             || string.Equals(name, ReadToolName, StringComparison.Ordinal)
-            || string.Equals(name, RunToolName, StringComparison.Ordinal);
+            || string.Equals(name, RunToolName, StringComparison.Ordinal)
+            || SkillMarketplaceTools.IsTool(name);
 
         /// <summary>
         /// True when TensorSharp answers <paramref name="name"/> itself rather than
@@ -398,14 +401,16 @@ namespace TensorSharp.AgentHost.Skills
         public static List<ToolFunction> Merge(
             List<ToolFunction>? clientTools,
             bool allowScripts,
-            out IReadOnlyList<string> shadowed)
+            out IReadOnlyList<string> shadowed,
+            SkillMarketplaceSession? marketplace = null)
         {
             var conflicts = new List<string>();
             var merged = clientTools != null ? new List<ToolFunction>(clientTools) : new List<ToolFunction>();
             var existing = new HashSet<string>(
                 merged.Select(t => t.Name ?? string.Empty), StringComparer.OrdinalIgnoreCase);
 
-            foreach (ToolFunction tool in BuiltIn(allowScripts))
+            foreach (ToolFunction tool in BuiltIn(allowScripts).Concat(
+                marketplace == null ? Array.Empty<ToolFunction>() : SkillMarketplaceTools.BuiltIn(marketplace.CanInstall)))
             {
                 if (existing.Contains(tool.Name))
                 {
@@ -481,6 +486,8 @@ namespace TensorSharp.AgentHost.Skills
                     ListToolName => ExecuteList(context),
                     ReadToolName => ExecuteRead(call, context),
                     RunToolName => ExecuteRun(call, context, onToolOutput),
+                    _ when SkillMarketplaceTools.IsTool(call.Name) =>
+                        SkillMarketplaceTools.Execute(call, context, cancellationToken),
                     _ when Knowledge.KnowledgeTools.IsTool(call.Name) =>
                         Knowledge.KnowledgeTools.Execute(call, context.Knowledge,
                             context.CodeRunner?.CanRun == true ? context.Workspace : null, cancellationToken, context.KnowledgeRetrieval),
@@ -968,7 +975,7 @@ namespace TensorSharp.AgentHost.Skills
         public SkillToolContext(IReadOnlyList<Skill> reachable, int maxReadBytes = SkillTools.DefaultMaxReadBytes)
         {
             ArgumentNullException.ThrowIfNull(reachable);
-            Reachable = reachable;
+            _reachable = reachable.ToArray();
             MaxReadBytes = maxReadBytes > 0 ? maxReadBytes : SkillTools.DefaultMaxReadBytes;
             _byId = new Dictionary<string, Skill>(reachable.Count, StringComparer.OrdinalIgnoreCase);
             foreach (Skill skill in reachable)
@@ -976,9 +983,24 @@ namespace TensorSharp.AgentHost.Skills
         }
 
         private readonly Dictionary<string, Skill> _byId;
+        private readonly object _scopeGate = new();
+        private volatile IReadOnlyList<Skill> _reachable;
 
         /// <summary>Every skill this conversation may read from, sorted by id.</summary>
-        public IReadOnlyList<Skill> Reachable { get; }
+        public IReadOnlyList<Skill> Reachable => _reachable;
+
+        /// <summary>Network discovery and installation explicitly enabled for this request.</summary>
+        public SkillMarketplaceSession? Marketplace { get; init; }
+
+        /// <summary>Grant only the skill this request installed; never rescan another request's scope.</summary>
+        internal void GrantInstalled(Skill skill)
+        {
+            lock (_scopeGate)
+            {
+                _byId[skill.Id] = skill;
+                _reachable = _byId.Values.OrderBy(s => s.Id, StringComparer.Ordinal).ToArray();
+            }
+        }
 
         /// <summary>Ceiling on one read's returned bytes.</summary>
         public int MaxReadBytes { get; }
@@ -1020,10 +1042,13 @@ namespace TensorSharp.AgentHost.Skills
         public bool TryResolve(string name, out Skill? skill, out string? error)
         {
             string key = (name ?? string.Empty).Trim();
-            if (_byId.TryGetValue(key, out skill))
+            lock (_scopeGate)
             {
-                error = null;
-                return true;
+                if (_byId.TryGetValue(key, out skill))
+                {
+                    error = null;
+                    return true;
+                }
             }
 
             skill = null;

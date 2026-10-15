@@ -25,6 +25,9 @@ namespace TensorSharp.Runtime
     /// <c>--</c>); <see cref="Expand"/> translates each key/value into the
     /// equivalent argv tokens and splices them in <em>before</em> the caller's
     /// real command-line arguments.
+    /// A reserved <c>"$unavailable"</c> nonempty string marks a preset that cannot
+    /// currently run. Naming that preset refuses startup with its reason before
+    /// any file is downloaded, even when command-line options override its values.
     ///
     /// The command line wins over every file, and a later <c>--config</c> file wins
     /// over an earlier one. Only the winning entry of a replacing option is
@@ -91,7 +94,7 @@ namespace TensorSharp.Runtime
         // Keys with a meaning of their own rather than a flag to emit.
         private static readonly HashSet<string> ReservedKeys = new(StringComparer.OrdinalIgnoreCase)
         {
-            "variables", "vars", "$schema",
+            "variables", "vars", "$schema", "$unavailable",
         };
 
         // Options where every occurrence counts, so a config's values are kept even when
@@ -140,6 +143,7 @@ namespace TensorSharp.Runtime
         /// <exception cref="ArgumentException">A <c>--config</c> flag has no path, or a config file is malformed.</exception>
         /// <exception cref="FileNotFoundException">A named config file, or a referenced file with no download URL, does not exist.</exception>
         /// <exception cref="IOException">A referenced file could not be downloaded from any URL.</exception>
+        /// <exception cref="NotSupportedException">A named preset declares that it is unavailable.</exception>
         public static string[] Expand(string[] args) =>
             Expand(args, Console.Error, interactiveProgress: !Console.IsErrorRedirected);
 
@@ -410,6 +414,22 @@ namespace TensorSharp.Runtime
                 JsonElement root = document.RootElement;
                 if (root.ValueKind != JsonValueKind.Object)
                     throw new ArgumentException($"Configuration file '{fullPath}' must contain a JSON object at its root, but found {root.ValueKind}.");
+
+                // Availability belongs to the whole preset, not to an option that can
+                // lose an override. All configs are loaded before ExpandFile resolves
+                // anything, so even an unavailable later file prevents earlier downloads.
+                foreach (JsonProperty property in root.EnumerateObject())
+                {
+                    if (!property.Name.Equals("$unavailable", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (property.Value.ValueKind != JsonValueKind.String ||
+                        string.IsNullOrWhiteSpace(property.Value.GetString()))
+                        throw new ArgumentException(
+                            $"Configuration file '{fullPath}': '$unavailable' must be a nonempty string explaining why the preset cannot run.");
+                    throw new NotSupportedException(
+                        $"Configuration file '{fullPath}' is unavailable: {property.Value.GetString()} " +
+                        "Startup stopped before downloading any model files.");
+                }
 
                 // A removed option is refused by name before any value is resolved: the
                 // same key's download spec would otherwise fetch a file nothing can use,

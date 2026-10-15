@@ -42,8 +42,8 @@ public enum CatalogFileRole
     Weights,
     /// <summary>Vision/audio projector (mmproj) for a multimodal model.</summary>
     Projector,
-    /// <summary>A diffusion model's text encoder GGUF (Qwen3-VL-8B for Qwen-Image-2.1,
-    /// Qwen3-VL-32B for MiniMax-H3).</summary>
+    /// <summary>A diffusion model's text encoder weights, in the format its family
+    /// requires (GGUF or safetensors).</summary>
     TextEncoder,
     /// <summary>Qwen-Image-2.1 vision mmproj (image-grounded conditioning; required for editing).</summary>
     VisionProjector,
@@ -51,8 +51,7 @@ public enum CatalogFileRole
     Vae,
     /// <summary>Speculative-decoding draft head.</summary>
     Draft,
-    /// <summary>MiniMax-H3's audio VAE safetensors, which turns the soundtrack it generates
-    /// into sound (and encodes a reference recording).</summary>
+    /// <summary>A diffusion model's audio VAE safetensors.</summary>
     AudioVae,
     /// <summary>One of the loose tokenizer files a text encoder whose GGUF carries no
     /// tokenizer needs beside it (MiniMax-H3: vocab.json, merges.txt, tokenizer_config.json).</summary>
@@ -65,6 +64,9 @@ public enum CatalogFileRole
     /// <summary>The second Wan A14B denoiser, loaded after the first expert's stage.
     /// This is an independent GGUF, not a shard of the primary weights.</summary>
     SecondaryWeights,
+    /// <summary>A two-stage video model's x2 latent upscaler (LTX 2.5), run between its
+    /// half-size and full-size denoising passes.</summary>
+    LatentUpscaler,
 }
 
 /// <summary>One downloadable artifact of a catalog entry.</summary>
@@ -92,7 +94,7 @@ public enum CatalogFamily
 {
     // Append new families: the numeric values are part of persisted catalog data.
     Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext,
-    DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan,
+    DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan, Ltx25,
 }
 
 /// <summary>Dense or mixture-of-experts.</summary>
@@ -127,6 +129,7 @@ public sealed record CatalogModel
     private readonly string _parameters = string.Empty;
     private readonly string _quantization = string.Empty;
     private readonly string? _notes;
+    private readonly string? _unavailableReason;
     private readonly string _license = string.Empty;
 
     public required string Id { get; init; }
@@ -236,6 +239,11 @@ public sealed record CatalogModel
     /// <summary>Marked in the UI: requires a constrained memory budget or has limited
     /// device/backend validation. See the entry's notes for its tested configuration.</summary>
     public bool Experimental { get; init; }
+    /// <summary>Why this build cannot download or run the entry. Unlike Experimental,
+    /// this is a functional readiness gate, independent of device memory. A localized
+    /// catalog key is resolved when read. Null means the ordinary activation checks apply.</summary>
+    public string? UnavailableReason { get => CatalogText.Read(_unavailableReason); init => _unavailableReason = value; }
+    public bool IsAvailable => string.IsNullOrWhiteSpace(_unavailableReason);
     public string? Notes { get => CatalogText.Read(_notes); init => _notes = value; }
     public required string License { get => CatalogText.Read(_license); init => _license = value; }
     /// <summary>

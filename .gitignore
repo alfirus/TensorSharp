@@ -96,6 +96,8 @@ benchmarks/engine_comparison/results/
 /models/
 *.gguf
 *.safetensors
+# ...except the tiny synthetic checkpoints that unit tests embed as fixtures.
+!/InferenceWeb.Tests/Fixtures/Ltx25/*.safetensors
 
 # JetBrains Rider / IntelliJ per-user project settings.
 .idea/

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="$(TensorSharpBatchProbeSnapshot)/*.dll"
+               Exclude="$(TensorSharpBatchProbeSnapshot)/TensorSharp.Server.Host.dll;$(TensorSharpBatchProbeSnapshot)/GgmlOps.dll" />
+  </ItemGroup>
+  <Target Name="RequireFrozenBatchProbe" BeforeTargets="ResolveReferences">
+    <Error Condition="'$(TensorSharpBatchProbeSnapshot)' == '' Or !Exists('$(TensorSharpBatchProbeSnapshot)/TensorSharp.Models.dll') Or !Exists('$(TensorSharpBatchProbeSnapshot)/TensorSharp.Runtime.dll')"
+           Text="Set TensorSharpBatchProbeSnapshot to an immutable inference directory; production dependencies are not rebuilt." />
+  </Target>
+</Project>

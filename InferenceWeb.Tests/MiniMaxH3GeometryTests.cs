@@ -299,6 +299,72 @@ namespace InferenceWeb.Tests
             }
         }
 
+        [Theory]
+        [InlineData(12f, 3f)]
+        [InlineData(5f, 3f)]
+        [InlineData(3f, 3f)]
+        public void AudioCarrierVelocityMatchesIndependentTrajectoryDerivative(float videoShift, float audioShift)
+        {
+            // Independent continuous flow: x(a)=clean+a*(noise-clean),
+            // a=b/(r+(1-r)*b), c(b)=b*x(a)/a. Its derivative is noise-r*clean.
+            const double clean = 0.37, noise = -1.23;
+            double ratio = videoShift / (double)audioShift;
+            double Carrier(double b)
+            {
+                double a = b / (ratio + (1 - ratio) * b);
+                return b / a * (clean + a * (noise - clean));
+            }
+            foreach (float sigma in new[] { 1f, 0.9f, 0.5f, 0.01f, 1e-6f })
+            {
+                float[] carrier = [(float)Carrier(sigma)];
+                float[] input = MiniMaxH3Scheduler.AudioInputFromCarrier(carrier, sigma, videoShift, audioShift);
+                double a = sigma / (ratio + (1 - ratio) * sigma);
+                Assert.Equal((float)(clean + a * (noise - clean)), input[0], 5);
+                float[] velocity = [(float)(noise - clean) * MiniMaxH3Scheduler.ShiftSlope(sigma, videoShift, audioShift)];
+                MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(input, velocity, sigma, videoShift, audioShift);
+                Assert.Equal((float)(noise - ratio * clean), velocity[0], 5);
+                if (sigma > 0.01f && sigma < 1f)
+                {
+                    const double h = 1e-6;
+                    Assert.Equal((float)((Carrier(sigma + h) - Carrier(sigma - h)) / (2 * h)), velocity[0], 5);
+                }
+            }
+        }
+
+        [Fact]
+        public void SingleAudioCarrierStepIncludesNoiseCancellingDrift()
+        {
+            float[] carrier = [1.25f, -0.5f];
+            float[] input = MiniMaxH3Scheduler.AudioInputFromCarrier(carrier, 1f);
+            // Zero clean endpoint: the physical flow velocity is the input noise.
+            float[] velocity = [4f * input[0], 4f * input[1]];
+            MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(input, velocity, 1f);
+            MiniMaxH3Scheduler.EulerStep(carrier, velocity, 1f, 0f);
+            Assert.Equal(new[] { 0f, 0f }, carrier);
+        }
+
+        [Theory]
+        [InlineData(12f, 3f)]
+        [InlineData(6f, 4f)]
+        [InlineData(1.5f, 3f)]
+        public void AudioCarrierEndpointRestoresCleanPhysicalAudio(float videoShift, float audioShift)
+        {
+            // Independent linear physical flow x(a)=clean+a*(noise-clean).
+            // At b=1 the carrier equals noise; one Euler step produces r*clean,
+            // and process_latent_out must undo r=videoShift/audioShift.
+            float[] clean = [.37f, -.81f], noise = [-1.23f, .92f];
+            float[] carrier = (float[])noise.Clone();
+            float[] input = MiniMaxH3Scheduler.AudioInputFromCarrier(carrier, 1, videoShift, audioShift);
+            float slope = MiniMaxH3Scheduler.ShiftSlope(1, videoShift, audioShift);
+            float[] velocity = [(noise[0] - clean[0]) * slope, (noise[1] - clean[1]) * slope];
+            MiniMaxH3Scheduler.ConvertAudioVelocityToCarrier(input, velocity, 1, videoShift, audioShift);
+            MiniMaxH3Scheduler.EulerStep(carrier, velocity, 1, 0);
+            for (int i = 0; i < clean.Length; ++i)
+                Assert.InRange(Math.Abs(carrier[i] - clean[i] * videoShift / audioShift), 0, 1e-6);
+            MiniMaxH3Scheduler.AudioOutputFromCarrierInPlace(carrier, videoShift, audioShift);
+            for (int i = 0; i < clean.Length; ++i) Assert.InRange(Math.Abs(carrier[i] - clean[i]), 0, 1e-6);
+        }
+
         [Fact]
         public void SigmaMappingIsAnInvolutionBetweenShifts()
         {

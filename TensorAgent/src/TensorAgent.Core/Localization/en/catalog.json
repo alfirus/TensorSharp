@@ -64,5 +64,7 @@
   "catalog.extended.30b3b.parameters": "30B (3B active)",
   "catalog.extended.744b40b.parameters": "744B (40B active)",
   "catalog.extended.384experts.parameters": "MoE, 384 routed experts",
-  "catalog.extended.14bExpert.parameters": "14B per expert"
+  "catalog.extended.14bExpert.parameters": "14B per expert",
+  "catalog.model.ltx25.notes": "Experimental native text/image-to-video with 48 kHz stereo audio. LTX 2.5 Distilled runs 8 ancestral Euler steps at half size, a x2 latent upscale and 3 refinement steps, at CFG 1 and accepts first/last frames or multiple image keyframes with position and strength. These guide the output timeline; identity reference and video/audio adapters need separate checkpoints. Pinned downloads total 44.76 GB and require approved Hugging Face access. Conservative 48 GB device tier; validated on short 1024×1024 clips.",
+  "catalog.license.ltx25": "LTX-2.5 and Gemma terms"
 }

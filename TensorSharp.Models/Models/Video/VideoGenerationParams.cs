@@ -18,6 +18,11 @@ namespace TensorSharp.Models.Video
     /// <summary>Sampling parameters for a video-generation request.</summary>
     public class VideoGenerationParams
     {
+        /// <summary>Cooperative cancellation for models that support it. Passed to
+        /// encoder/decoder work so cancellation follows a dedicated backend worker.</summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        public System.Threading.CancellationToken CancellationToken { get; set; }
+
         /// <summary>Output width in pixels, rounded to the model's grid (16 px for most
         /// Wan checkpoints, 32 for Wan2.2-TI2V and MiniMax-H3). 0 = the model's default,
         /// or the conditioning image's aspect for image-to-video.</summary>
@@ -57,7 +62,7 @@ namespace TensorSharp.Models.Video
         /// the guidance scale is 1.0, since no negative pass runs.</summary>
         public string NegativePrompt { get; set; }
 
-        /// <summary>Sampler name, e.g. "unipc" or "euler". null = the model's default.</summary>
+        /// <summary>Sampler name, e.g. "unipc", "euler" or LTX 2.5's "euler_ancestral". null = the model's default.</summary>
         public string Sampler { get; set; }
 
         /// <summary>Playback frame rate for the saved video. 0 = the model's default. Models
@@ -75,16 +80,23 @@ namespace TensorSharp.Models.Video
         /// <summary>Conditioning image as a file path.</summary>
         public string ImagePath { get; set; }
 
-        /// <summary>Last-frame conditioning image, on models that accept one (MiniMax-H3's
-        /// first-and-last-frame mode). Combined with <see cref="Image"/> the generation is
+        /// <summary>Last-frame conditioning image, on models that accept one (LTX or
+        /// MiniMax-H3). Combined with <see cref="Image"/> the generation is
         /// steered to start and end on the two supplied frames.</summary>
         public RgbImage EndImage { get; set; }
 
         /// <summary>Last-frame conditioning image as a file path.</summary>
         public string EndImagePath { get; set; }
 
-        /// <summary>Reference images for reference-conditioned models. The prompt refers to
-        /// them positionally ("the cat from &lt;Picture 1&gt;").</summary>
+        /// <summary>Images anchored at explicit output pixel-frame indices. LTX uses
+        /// frame zero as a first-frame latent and other frames as appended temporal
+        /// guides. An index of -1 selects the last output frame.</summary>
+        public IList<VideoImageCondition> ImageConditions { get; set; }
+
+        /// <summary>Reference images for reference-conditioned models. MiniMax-H3
+        /// refers to them positionally ("the cat from &lt;Picture 1&gt;"). LTX treats
+        /// this list as ordered temporal image guides, evenly spaced first to last;
+        /// use ImageConditions to select their exact positions and strengths.</summary>
         public IList<string> ReferenceImagePaths { get; set; }
 
         /// <summary>Reference video clips for reference-conditioned models.</summary>
@@ -107,7 +119,10 @@ namespace TensorSharp.Models.Video
         /// not the first frame).</para>
         /// <para>The distinction matters: "animate this photo" is <c>i2v</c>, while
         /// "put this person somewhere new" is <c>ref</c>, and they use different
-        /// checkpoints.</para></summary>
+        /// checkpoints.</para>
+        /// <para>LTX accepts t2v/t2va, i2v, fl2v and keyframes. Its stock distilled
+        /// preset uses temporal image guides; identity mode ref needs a separate
+        /// Ingredients IC-LoRA workflow.</para></summary>
         public string Mode { get; set; }
 
         /// <summary>Decode the audio stream on models that generate audio jointly with video.
@@ -161,5 +176,20 @@ namespace TensorSharp.Models.Video
             if (!string.IsNullOrWhiteSpace(EndImagePath)) return QwenImage.ImageIO.Load(EndImagePath);
             return null;
         }
+    }
+
+    /// <summary>A temporal image guide, with strength in [0,1].</summary>
+    public sealed class VideoImageCondition
+    {
+        public RgbImage Image { get; set; }
+        public byte[] ImageBytes { get; set; }
+        public string ImagePath { get; set; }
+        public int FrameIndex { get; set; }
+        public float Strength { get; set; } = 1;
+
+        internal RgbImage ResolveImage(bool preserveAlpha = false) => Image ??
+            (ImageBytes is { Length: > 0 } ? QwenImage.ImageIO.Decode(ImageBytes, preserveAlpha) :
+                !string.IsNullOrWhiteSpace(ImagePath) ? QwenImage.ImageIO.Load(ImagePath, preserveAlpha) :
+                throw new ArgumentException("Each image condition requires an image."));
     }
 }

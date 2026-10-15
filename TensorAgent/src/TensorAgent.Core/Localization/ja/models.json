@@ -87,5 +87,6 @@
   "models.alert.delete.title": "モデルを削除",
   "models.alert.delete.message": "{model} をこのデバイスから削除しますか？再度ダウンロードできます。",
   "models.alert.delete.messageLocal": "{model} をこのデバイスから削除しますか？復元するには、元のローカル GGUF をもう一度選ぶ必要があります。",
-  "models.alert.delete.confirm": "削除"
+  "models.alert.delete.confirm": "削除",
+  "models.action.unavailable": "利用不可"
 }

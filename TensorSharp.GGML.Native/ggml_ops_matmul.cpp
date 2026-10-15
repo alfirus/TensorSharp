@@ -9,6 +9,9 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 #include "ggml_ops_internal.h"
+#if defined(TSG_GGML_USE_METAL)
+#include "ggml_gemma4_audio_metal_precision.h"
+#endif
 
 using namespace tsg;
 
@@ -20,10 +23,16 @@ namespace {
         const TensorView2DDesc& m1_desc,
         const TensorView2DDesc& m2_desc,
         float beta,
-        float alpha)
+        float alpha,
+        bool require_float32_metal = false)
     {
         if (!ensure_backend())
         {
+            return 0;
+        }
+        if (require_float32_metal && g_backend_type != BACKEND_TYPE_METAL)
+        {
+            set_last_error("Precise Metal addmm requires the Metal backend.");
             return 0;
         }
 
@@ -198,6 +207,11 @@ namespace {
             set_last_error("Failed to create ggml matmul node.");
             return 0;
         }
+        if (require_float32_metal)
+        {
+            ggml_prec_set_acc(mm_tensor, GGML_PREC_F32);
+            ggml_set_name(mm_tensor, "tsg_gemma4_f32_projection");
+        }
 
         ggml_tensor* combined_tensor = mm_tensor;
         if (alpha != 1.0f)
@@ -275,7 +289,18 @@ namespace {
                 upload_binding(m2_binding, packed_m2.data(), m2_binding.raw_bytes);
         }
 
-        ggml_status status = tsg::compute_graph(g_backend, graph);
+        ggml_status status = GGML_STATUS_SUCCESS;
+        bool owned_compute = false;
+#if defined(TSG_GGML_USE_METAL)
+        if (require_float32_metal)
+            owned_compute = tsg_gemma4_audio_metal_graph_compute(g_backend, graph, &status, true);
+#endif
+        if (require_float32_metal && !owned_compute)
+        {
+            set_last_error("Scoped F32 Metal projection execution is unavailable.");
+            return 0;
+        }
+        if (!owned_compute) status = tsg::compute_graph(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("ggml backend graph execution failed.");
@@ -283,6 +308,9 @@ namespace {
         }
 
         finalize_compute(use_zero_copy, result_binding.storage, result_desc.data, result_binding.raw_bytes);
+        // A streamed result download must finish before this per-call graph
+        // buffer is freed. Owned Metal execution itself completed synchronously.
+        if (require_float32_metal && !use_zero_copy) host_read_barrier();
 
         clear_last_error();
         return 1;
@@ -1314,6 +1342,15 @@ TSG_EXPORT int TSGgml_AddmmF32(
         set_last_error("Unknown ggml addmm failure.");
         return 0;
     }
+}
+
+TSG_EXPORT int TSGgml_AddmmF32PreciseMetal(
+    TensorView2DDesc result, TensorView2DDesc src, TensorView2DDesc m1,
+    TensorView2DDesc m2, float beta, float alpha)
+{
+    try { return addmm_f32_impl(result, src, m1, m2, beta, alpha, true); }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown precise Metal addmm failure."); return 0; }
 }
 
 TSG_EXPORT int TSGgml_AddmmQuantF32(

@@ -335,5 +335,19 @@
   "page.knowledge.nextChats": "次のチャット",
   "page.knowledge.noChats": "検索に一致する保存済みチャットはありません。",
   "page.knowledge.indexingChats": "チャットをコピーして索引を作成中…",
-  "page.knowledge.chatImportComplete": "{added} 件のチャットに索引を作成 · {failed} 件の問題を確認してください"
+  "page.knowledge.chatImportComplete": "{added} 件のチャットに索引を作成 · {failed} 件の問題を確認してください",
+  "page.chips.keyframe": "キーフレーム",
+  "page.chips.framePosition": "画像のフレーム位置",
+  "page.chips.autoFrame": "自動（フレーム {frame}）",
+  "page.chips.firstFrame": "最初のフレーム",
+  "page.chips.lastFrame": "最後のフレーム",
+  "page.chips.frameNumber": "フレーム番号",
+  "page.chips.frameStrength": "強度",
+  "page.composer.videoWithKeyframes": "動画を説明…画像キーフレームで時間軸を指定",
+  "page.chips.guidanceMode": "画像ガイド",
+  "page.chips.temporalGuides": "最初・最後と指定フレーム",
+  "page.chips.identityGuides": "人物・物体の参照（Ingredients）",
+  "page.chips.clipLength": "動画の長さ",
+  "page.chips.previewLength": "0.7 秒プレビュー",
+  "page.composer.videoWithIdentityReferences": "生成する場面と各参照画像の内容を位置とともに説明してください。被写体が明確で文字のない画像が適しています。複数の参照画像ではシートのパネル配置が映像に残ることがあります。1枚の画像の方が構図を予測しやすくなります。"
 }

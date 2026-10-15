@@ -728,6 +728,34 @@ The skill name opens its full description. When the Skills master switch is off,
 chat switches are disabled, while removal remains available. Failed removals show
 an error in the list and keep the skill and its selection intact.
 
+The bundled **find-skills** workflow searches the skills.sh ecosystem from chat.
+Ask, for example, "Find a skill for React performance" or "Find, install and use a
+skill for this task." With Network enabled, the host offers native `skills_search`
+and `skills_inspect` tools; a writable skills directory also enables `skills_install`.
+The workflow inspects the candidate's instructions, files, requirements and immutable
+Git revision before installing that revision into the app's managed skills directory.
+The requesting turn can immediately read and run the new skill. Existing requests
+keep their original skill scope, and selecting no skills explicitly disables this
+discovery workflow.
+
+These tools work without Node.js, npm or an external installer, including on the
+in-process execution path. An installed skill still needs the tools and runtime its
+workflow requires: iOS cannot run browser or external CLI workflows, and installation
+does not install dependencies or run setup hooks. The host's Network and Run code
+settings still apply. Inspecting or installing a package is separate from validating
+that its actual task succeeds. ZIP and ZIP/list URL installation remain available in
+the Skills sheet.
+
+Validation sampled Gemma 4 E4B Q8_0 on Metal/macOS with temperature 0 and seed 42.
+The native discovery/install/read workflow and an upstream helper's `--help` ran
+through both server and AgentAppHost. Three of four controlled model tasks passed
+their full checks: TensorAgent's HTML task produced a styled link instead of the
+requested button, despite completing the tool workflow and saving the artifact.
+Earlier stochastic samples also had strict instruction/output failures. The separate
+managed probe verified the helper's actual aggregation artifacts. These results cover
+only the sampled workflows, with no physical iOS, Windows or native GUI validation;
+details and retained failures are in ignored `artifacts/find-skills/summary.json`.
+
 **Code, generated and run.** The agent host's shell tool works here, backed by an
 in-process POSIX shell, an embedded CPython 3.13 and JavaScriptCore, because iOS
 allows no child processes at all. With "Run code" on, a chat is declared `shell`,

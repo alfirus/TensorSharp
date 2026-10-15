@@ -91,7 +91,9 @@ public class ConfigFileArgsTests : IDisposable
         Assert.Contains("--audio-vae", result);
     }
 
-    // ---- every shipped config must be startable by BOTH hosts ----------------
+    // ---- every shipped config uses options accepted by BOTH hosts ------------
+    // An explicitly unavailable preset is refused before option expansion; its
+    // readiness metadata is not a host option.
     // config/README.md promises "Every file works with both hosts (only
     // host-recognized keys are used)". That promise has teeth on the server: an
     // unrecognized flag is not ignored there, it refuses to start. Config keys ARE
@@ -118,7 +120,7 @@ public class ConfigFileArgsTests : IDisposable
         "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj",
         // Which Qwen-Image-2.1 checkpoint the GGUF holds (QwenImageVariantFlag), same spelling on the CLI.
         "qwen-image-variant",
-        "video-vae", "video-text-encoder", "video-dit2", "audio-vae",
+        "video-vae", "video-text-encoder", "video-dit2", "audio-vae", "video-upscaler", "video-diffusion-vae",
         "video-width", "video-height", "video-steps", "video-mode", "video-frames", "fps",
         "width", "height",
         // Qwen-Image-2.1 LoRA plug-ins (LoraCliFlags.Flags): applied by the companion
@@ -212,7 +214,7 @@ public class ConfigFileArgsTests : IDisposable
     {
         "model", "mmproj", "draft-model",
         "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj",
-        "video-vae", "video-text-encoder", "video-dit2", "audio-vae",
+        "video-vae", "video-text-encoder", "video-dit2", "audio-vae", "video-upscaler", "video-diffusion-vae",
     };
 
     [Fact]
@@ -348,7 +350,8 @@ public class ConfigFileArgsTests : IDisposable
     private static bool IsReserved(string key) =>
         key.Equals("variables", StringComparison.OrdinalIgnoreCase)
         || key.Equals("vars", StringComparison.OrdinalIgnoreCase)
-        || key.Equals("$schema", StringComparison.OrdinalIgnoreCase);
+        || key.Equals("$schema", StringComparison.OrdinalIgnoreCase)
+        || key.Equals("$unavailable", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The shipped configs are JSON with comments, read here exactly as
     /// <see cref="ConfigFileArgs"/> reads them.</summary>
@@ -729,6 +732,105 @@ public class ConfigFileArgsTests : IDisposable
         { "model": { "foo": "bar" } }
         """);
         Assert.Throws<ArgumentException>(() => ConfigFileArgs.Expand(new[] { "--config", cfg }));
+    }
+
+    [Theory]
+    [InlineData("$unavailable")]
+    [InlineData("$UNAVAILABLE")]
+    public void Expand_UnavailablePresetRefusesBeforeAnyModelOrCompanionDownload(string key)
+    {
+        using var server = new TinyHttpServer();
+        string directory = Path.Combine(_dir, "downloads");
+        string[] names = ["model.gguf", "video.safetensors", "text.safetensors", "audio.safetensors"];
+        foreach (string name in names) server.AddFile("/" + name, [1, 2, 3]);
+        const string reason = "The LTX 2.5 full generation pipeline is not implemented.";
+        string cfg = WriteConfig($$"""
+        {
+          "model": { "path": {{JsonQuote(Path.Combine(directory, names[0]))}}, "url": {{JsonQuote(server.UrlFor("/" + names[0]))}} },
+          "video-vae": { "path": {{JsonQuote(Path.Combine(directory, names[1]))}}, "url": {{JsonQuote(server.UrlFor("/" + names[1]))}} },
+          "video-text-encoder": { "path": {{JsonQuote(Path.Combine(directory, names[2]))}}, "url": {{JsonQuote(server.UrlFor("/" + names[2]))}} },
+          "audio-vae": { "path": {{JsonQuote(Path.Combine(directory, names[3]))}}, "url": {{JsonQuote(server.UrlFor("/" + names[3]))}} },
+          {{JsonQuote(key)}}: {{JsonQuote(reason)}}
+        }
+        """);
+
+        var error = Assert.Throws<NotSupportedException>(() =>
+            ConfigFileArgs.Expand(["--config", cfg], TextWriter.Null, false));
+
+        Assert.Contains(reason, error.Message, StringComparison.Ordinal);
+        Assert.Contains(Path.GetFileName(cfg), error.Message, StringComparison.Ordinal);
+        Assert.Contains("before downloading", error.Message, StringComparison.Ordinal);
+        Assert.All(names, name => Assert.Equal(0, server.RequestCount("/" + name)));
+        Assert.False(Directory.Exists(directory));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Expand_UnavailablePresetCannotBeBypassedByOptionOverrides(bool laterConfig)
+    {
+        string cfg = WriteConfig("""
+        {
+          "model": { "path": "${UNRESOLVED_UNAVAILABLE_MODEL}/model.gguf" },
+          "$unavailable": "This preset cannot run yet."
+        }
+        """);
+        string[] args = laterConfig
+            ? ["--config", cfg, "--config", WriteConfig("""{ "model": "override.gguf" }""", "later.json")]
+            : ["--config", cfg, "--model", "override.gguf"];
+
+        var error = Assert.Throws<NotSupportedException>(() =>
+            ConfigFileArgs.Expand(args, TextWriter.Null, false));
+
+        Assert.Contains("This preset cannot run yet.", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Undefined variable", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expand_UnavailableLaterPresetPreventsEarlierConfigDownloads()
+    {
+        using var server = new TinyHttpServer();
+        server.AddFile("/first.gguf", [1, 2, 3]);
+        string target = Path.Combine(_dir, "downloads", "first.gguf");
+        string first = WriteConfig($$"""
+        { "model": { "path": {{JsonQuote(target)}}, "url": {{JsonQuote(server.UrlFor("/first.gguf"))}} } }
+        """, "first.json");
+        string later = WriteConfig("""{ "$unavailable": "Later preset is unavailable." }""", "later.json");
+
+        Assert.Throws<NotSupportedException>(() =>
+            ConfigFileArgs.Expand(["--config", first, "--config", later], TextWriter.Null, false));
+
+        Assert.Equal(0, server.RequestCount("/first.gguf"));
+        Assert.False(Directory.Exists(Path.GetDirectoryName(target)));
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("false")]
+    [InlineData("true")]
+    [InlineData("42")]
+    [InlineData("{}")]
+    [InlineData("[]")]
+    [InlineData("\"\"")]
+    [InlineData("\" \\t \"")]
+    public void Expand_InvalidUnavailableMetadataRefusesBeforeDownload(string value)
+    {
+        using var server = new TinyHttpServer();
+        server.AddFile("/model.gguf", [1, 2, 3]);
+        string target = Path.Combine(_dir, "downloads", "model.gguf");
+        string cfg = WriteConfig($$"""
+        {
+          "model": { "path": {{JsonQuote(target)}}, "url": {{JsonQuote(server.UrlFor("/model.gguf"))}} },
+          "$unavailable": {{value}}
+        }
+        """);
+
+        var error = Assert.Throws<ArgumentException>(() =>
+            ConfigFileArgs.Expand(["--config", cfg], TextWriter.Null, false));
+
+        Assert.Contains("'$unavailable' must be a nonempty string", error.Message, StringComparison.Ordinal);
+        Assert.Equal(0, server.RequestCount("/model.gguf"));
+        Assert.False(Directory.Exists(Path.GetDirectoryName(target)));
     }
 
     // ----- Removed options -----

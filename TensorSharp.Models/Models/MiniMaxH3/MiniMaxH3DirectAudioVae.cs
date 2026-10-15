@@ -9,11 +9,9 @@
 // TSGgml_MiniMaxH3AudioVaeDecode in managed code, so BackendType.Cpu (the 100%
 // pure-C# backend) can turn audio latents into samples with no ggml.
 //
-// Everything here works on plain [channel][time] float arrays rather than
-// Tensors: the ops are 1-D convolutions, a transposed convolution, replicate
-// padding and a per-channel activation, none of which the tensor layer has, and
-// the channel counts are small enough that a direct loop is the clearest and
-// fastest expression of them.
+// The CPU path retains its [channel][time] float arrays. CUDA and MLX execute
+// in [time, channel] device tensors through MiniMaxH3AudioTensorOps, with resident
+// weights and TensorSharp-owned F32 convolution, resampling and Snake kernels.
 //
 // Conventions that MUST match ggml, because the weights were laid out for it:
 //   - conv:  out[oc][t] = sum_ic sum_kk x[ic][t*s - p + kk*d] * w[oc][ic][kk]
@@ -26,8 +24,8 @@ using System;
 
 namespace TensorSharp.Models.MiniMaxH3
 {
-    /// <summary>Managed MiniMax-H3 audio VAE decoder (no ggml).</summary>
-    internal sealed class MiniMaxH3DirectAudioVae
+    /// <summary>CPU/CUDA/MLX MiniMax-H3 audio VAE decoder (no ggml).</summary>
+    internal sealed class MiniMaxH3DirectAudioVae : IDisposable
     {
         internal sealed class Conv
         {
@@ -46,6 +44,7 @@ namespace TensorSharp.Models.MiniMaxH3
             public int Channels, Kernel;
         }
 
+        private readonly MiniMaxH3AudioTensorOps _device;
         private readonly Conv _decInProj, _convPre, _convPost;
         private readonly Conv[] _convs;
         private readonly Act[] _acts;
@@ -53,8 +52,9 @@ namespace TensorSharp.Models.MiniMaxH3
         private readonly int _ampsPerStage;
 
         public MiniMaxH3DirectAudioVae(Conv decInProj, Conv convPre, Conv convPost,
-                                       Conv[] convs, Act[] acts, int[] rates, int ampsPerStage)
+                                       Conv[] convs, Act[] acts, int[] rates, int ampsPerStage, IAllocator allocator = null)
         {
+            if (allocator != null) _device = new MiniMaxH3AudioTensorOps(allocator);
             _decInProj = decInProj; _convPre = convPre; _convPost = convPost;
             _convs = convs; _acts = acts; _rates = rates; _ampsPerStage = ampsPerStage;
         }
@@ -233,6 +233,7 @@ namespace TensorSharp.Models.MiniMaxH3
         /// </summary>
         public float[] Decode(float[] latent, int latentChannels, int latentLen, int samples)
         {
+            if (_device?.IsAccelerated == true) return DecodeDevice(latent, latentChannels, latentLen, samples);
             float[] h = Conv1d(latent, latentChannels, latentLen, _decInProj, out int t);
             h = Conv1d(h, _decInProj.Oc, t, _convPre, out t);
             int c = _convPre.Oc;
@@ -301,6 +302,71 @@ namespace TensorSharp.Models.MiniMaxH3
             for (int i = 0; i < n; i++) outp[i] = Math.Clamp(h[i], -1f, 1f);
             return outp;
         }
+
+        private float[] DecodeDevice(float[] latent, int channels, int time, int samples)
+        {
+            Tensor h = _device.Input(latent, channels, time);
+            try
+            {
+                MiniMaxH3AudioTensorOps.Replace(ref h, _device.Conv(h, _decInProj));
+                MiniMaxH3AudioTensorOps.Replace(ref h, _device.Conv(h, _convPre));
+                int convIndex = _rates.Length, actIndex = 0;
+                for (int stage = 0; stage < _rates.Length; stage++)
+                {
+                    Conv up = _convs[stage]; int rate = _rates[stage], trim = (up.K-rate)/2;
+                    MiniMaxH3AudioTensorOps.Replace(ref h, _device.Conv(h, up, rate));
+                    if (trim > 0)
+                    {
+                        using var selected = h.Narrow(0, trim, h.Sizes[0]-2*trim);
+                        MiniMaxH3AudioTensorOps.Replace(ref h, Ops.NewContiguous(selected));
+                    }
+                    if (up.B != null) TensorSharp.Models.Direct.DirectOps.AddBiasRows(_device.Context,h,_device.Vector(up.B));
+                    Tensor accumulation = null;
+                    try
+                    {
+                        for (int amp = 0; amp < _ampsPerStage; amp++)
+                        {
+                            Tensor x = h;
+                            try
+                            {
+                                for (int dilation = 0; dilation < 3; dilation++)
+                                {
+                                    using var a1 = _device.Activation(x,_acts[actIndex+dilation*2]);
+                                    using var c1 = _device.Conv(a1,_convs[convIndex+dilation]);
+                                    using var a2 = _device.Activation(c1,_acts[actIndex+dilation*2+1]);
+                                    Tensor residual = _device.Conv(a2,_convs[convIndex+3+dilation]);
+                                    try
+                                    {
+                                        if (residual.Sizes[0] != x.Sizes[0] || residual.Sizes[1] != x.Sizes[1])
+                                            throw new InvalidOperationException("H3 device audio decoder residual geometry mismatch.");
+                                        Ops.Add(residual,x,residual);
+                                    }
+                                    catch { residual.Dispose(); throw; }
+                                    if (!ReferenceEquals(x,h)) x.Dispose();
+                                    x = residual;
+                                }
+                                convIndex += 6; actIndex += 6;
+                                if (accumulation == null) { accumulation=x; x=h; }
+                                else Ops.Add(accumulation,accumulation,x);
+                            }
+                            finally { if (!ReferenceEquals(x,h)) x.Dispose(); }
+                        }
+                        Ops.Mul(accumulation,accumulation,1f/_ampsPerStage);
+                        MiniMaxH3AudioTensorOps.Replace(ref h,accumulation); accumulation=null;
+                    }
+                    finally { accumulation?.Dispose(); }
+                }
+                MiniMaxH3AudioTensorOps.Replace(ref h,_device.Activation(h,_acts[actIndex]));
+                MiniMaxH3AudioTensorOps.Replace(ref h,_device.Conv(h,_convPost));
+                Ops.Clamp(h,h,-1,1);
+                float[] waveform=_device.Output(h), result=new float[samples];
+                Array.Copy(waveform,result,Math.Min(samples,checked((int)h.Sizes[0])));
+                return result;
+            }
+            finally { h.Dispose(); }
+        }
+
+        public void Dispose() => _device?.Dispose();
     }
 
     /// <summary>Thin adapter so this file can use the shared CPU pool without

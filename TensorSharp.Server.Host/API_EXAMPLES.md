@@ -1100,7 +1100,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"ltx-2.5"`, `"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsKeyframeConditioning`, `defaultPreviewFrames`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -1535,9 +1535,51 @@ shipped plug-ins and the plug-in config format are in
 Three endpoints share one parser and one gate: `POST /api/video-generate`,
 `POST /api/video-generate/stream` (SSE, what the Web UI chat uses) and the
 OpenAI-shaped `POST /v1/videos/generations`. Any model that implements the video
-seam serves all three — MiniMax-H3 or Wan 2.1 / 2.2 — and anything else answers
+seam serves all three — LTX 2.5, MiniMax-H3 or Wan 2.1 / 2.2 — and anything else answers
 400 with `The loaded model is not a video-generation model.` The `video` block on
 `GET /api/models` says which conditioning the hosted checkpoint actually accepts.
+
+#### LTX 2.5 — image keyframes and native 48 kHz stereo audio
+
+The distilled checkpoint accepts a first image (`imagePath`), a last image
+(`endImage`, including last-image-only generation), or multiple temporal image
+guides (`imageConditions`). Upload each image through `/api/upload` first.
+Each guide names an exact zero-based output frame and a strength in `[0,1]`;
+`frameIndex: -1` selects the final frame. `width` and `height` are the output
+size, in multiples of 64; omit them to use the server's `--video-width` /
+`--video-height` (1024 × 1024 in the shipped preset). Like the publisher's
+pipeline, the model samples eight steps at half that size, upscales the latent
+x2, and refines three steps at full size; `steps: 8` names that published
+schedule. For example:
+
+```json
+{
+  "prompt": "The woman smiles, then blows a kiss toward the camera.",
+  "width": 1024, "height": 1024, "frames": 17, "fps": 24,
+  "steps": 8, "cfg": 1, "sampler": "euler_ancestral", "videoMode": "keyframes",
+  "imageConditions": [
+    { "imagePath": "portrait.png", "frameIndex": 0, "strength": 1 },
+    { "imagePath": "kiss.png", "frameIndex": -1, "strength": 0.8 }
+  ]
+}
+```
+
+`image_conditions`, `image_path` and `frame_index` (also official-style
+`frame_idx`) are accepted aliases. A condition may supply `image` as base64 or
+a data URL in place of `imagePath`. `/api/models.video` advertises
+`supportsKeyframeConditioning`, `defaultPreviewFrames`, and the image limit in
+`maxReferenceImages`. In the web UI and TensorAgent, one photo starts the clip,
+two are first and last frames, and three or more are spaced along the timeline.
+Each attached photo also has a frame-position and strength control.
+For a last-frame-only request, omit `videoMode` or select `keyframes`;
+`fl2v` requires both first and last frames.
+
+These images guide moments in the video. Ingredients identity references,
+video-to-video, retake, and audio reference adapters require their own model
+weights and are not enabled by the distilled checkpoint. LTX's
+`referenceImages` alias means ordered timeline guides rather than identity
+references. See [LTX 2.5](../docs/models/ltx-2.5.md) for checkpoint details and
+validation limits.
 
 #### MiniMax-H3 — video **and** native 32 kHz stereo audio
 
@@ -1690,6 +1732,8 @@ track jointly with the video, take these additional fields — each accepted in
 both camelCase and snake_case (camelCase wins when both are present), and each
 naming a file previously uploaded via `/api/upload` (paths outside the upload
 directory are rejected):
+`imageConditions`/`image_conditions` (image guides with `imagePath`/`image_path`
+or inline `image`, `frameIndex`/`frame_index`, and optional `strength`),
 `endImage`/`end_image` (last-frame conditioning),
 `referenceImages`/`reference_images`, `referenceVideos`/`reference_videos`,
 `referenceAudios`/`reference_audios` (arrays, referred to in the prompt as
@@ -1703,7 +1747,7 @@ of them.
 
 Everything else is camelCase only — `width`, `height`, `frames`, `steps`, `cfg`,
 `cfg2`, `seed`, `fps`, `flowShift`, `negativePrompt`, `sampler`,
-`cfgCacheStride`, `imagePath` (a previously uploaded file) and `image` (the
+`cfgCacheStride`, `imagePath`/`image_path` (a previously uploaded file) and `image` (the
 inline base64 alternative). `size`, `negative_prompt` and `response_format`
 exist on `/v1/videos/generations` alone.
 

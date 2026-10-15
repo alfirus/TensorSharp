@@ -16,7 +16,7 @@ public enum ModelBrowseFilter { All, Compatible, Downloaded }
 public sealed record ModelFamilyGroup(string Id, string DisplayName, IReadOnlyList<CatalogModel> Models);
 
 /// <summary>Device-aware browsing and search over the catalog, without changing model or
-/// companion identities. Compatibility here is the catalog's memory tier; callers must
+/// companion identities. Compatibility includes runtime availability and memory tier; callers must
 /// still use their usual download and activation checks.</summary>
 public static class ModelBrowser
 {
@@ -56,7 +56,7 @@ public static class ModelBrowser
         foreach (CatalogModel model in models)
         {
             bool installed = installedIds.Contains(model.Id);
-            bool compatible = model.MinDeviceMemoryGB <= deviceMemoryGB;
+            bool compatible = model.IsAvailable && model.MinDeviceMemoryGB <= deviceMemoryGB;
             if (filter == ModelBrowseFilter.Compatible && !compatible
                 || filter == ModelBrowseFilter.Downloaded && !installed)
                 continue;
@@ -88,6 +88,7 @@ public static class ModelBrowser
         CatalogFamily.HunyuanDense => ("hunyuan", "Hunyuan"),
         CatalogFamily.DiffusionGemma => ("diffusiongemma", "DiffusionGemma"),
         CatalogFamily.Wan => ("wan", "Wan"),
+        CatalogFamily.Ltx25 => ("ltx", "LTX"),
         _ => (family.ToString().ToLowerInvariant(), family.ToString()),
     };
 

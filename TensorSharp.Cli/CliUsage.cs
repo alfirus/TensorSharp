@@ -691,7 +691,9 @@ namespace TensorSharp.Cli
                     "--flow-shift 5.0"),
                 new OptionHelp("--sampler <name>",
                     "Sampler: unipc (the official Wan sampler; multistep predictor-corrector, better quality " +
-                    "at the same step count) or euler. Default: the model's own (unipc for Wan).",
+                    "at the same step count) or euler. LTX 2.5 samples with euler_ancestral (the publisher's " +
+                    "recipe); euler selects deterministic Euler there as a diagnostic. Default: the model's own " +
+                    "(unipc for Wan, euler_ancestral for LTX 2.5).",
                     "--sampler unipc"),
                 new OptionHelp("--negative-prompt <text>",
                     "Image/video negative prompt for classifier-free guidance. Default: empty for Qwen-Image, " +
@@ -765,6 +767,15 @@ namespace TensorSharp.Cli
                     "(minimax_h3_audio_vae_fp32.safetensors). Without it such a model still runs and produces " +
                     "video, just no audio (TS_VIDEO_AUDIO_VAE env var also works).",
                     "--audio-vae minimax_h3_audio_vae_fp32.safetensors"),
+                new OptionHelp("--video-upscaler <path>",
+                    "x2 latent upscaler for two-stage models (LTX 2.5: generate at half size, upscale, refine). " +
+                    "Default: latent_upscale_models/ beside the model (TS_VIDEO_UPSCALER env var also works).",
+                    "--video-upscaler ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"),
+                new OptionHelp("--video-diffusion-vae <path>",
+                    "Opt-in LTX 2.5 diffusion video decoder (ltx-2.5-video-vae-bf16.safetensors): cleaner, with less " +
+                    "grain and flicker, but softer than the default convolutional --video-vae. MLX and CPU only. " +
+                    "Default: off (TS_VIDEO_DIFFUSION_VAE env var also works).",
+                    "--video-diffusion-vae ltx-2.5-video-vae-bf16.safetensors"),
             }),
             ("Configuration file", new[]
             {

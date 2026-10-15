@@ -291,7 +291,7 @@ extern "C" ggml_tensor * tsg_attention_f32(ggml_context * ctx, ggml_tensor * q, 
 extern "C" ggml_tensor * tsg_vision_attention_f32(ggml_context * ctx, ggml_tensor * q,
     ggml_tensor * k, ggml_tensor * v, float scale) {
     GGML_ASSERT(q && k && v && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
-    GGML_ASSERT(q->ne[0] == 72 && std::isfinite(scale) && q->ne[1] > 0 && k->ne[1] > 0);
+    GGML_ASSERT((q->ne[0] == 64 || q->ne[0] == 72) && std::isfinite(scale) && q->ne[1] > 0 && k->ne[1] > 0);
     GGML_ASSERT(k->ne[0] == q->ne[0] && v->ne[0] == q->ne[0] && v->ne[1] == k->ne[1]);
     GGML_ASSERT(q->ne[2] == k->ne[2] && q->ne[2] == v->ne[2] && q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3]);
     auto * desc = new (ggml_new_buffer(ctx, sizeof(tsg_dsv4_fused_desc))) tsg_dsv4_fused_desc;

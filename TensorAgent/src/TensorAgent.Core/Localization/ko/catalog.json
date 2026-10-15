@@ -64,5 +64,7 @@
   "catalog.extended.30b3b.parameters": "300억(활성 30억)",
   "catalog.extended.744b40b.parameters": "7440억(활성 400억)",
   "catalog.extended.384experts.parameters": "MoE, 라우팅 전문가 384개",
-  "catalog.extended.14bExpert.parameters": "전문가당 140억"
+  "catalog.extended.14bExpert.parameters": "전문가당 140억",
+  "catalog.model.ltx25.notes": "48kHz 스테레오 오디오를 포함한 실험적 텍스트/이미지 동영상 생성입니다. LTX 2.5 Distilled는 CFG 1에서 절반 크기로 Ancestral Euler 8단계, 잠재 공간 2배 업스케일, 다듬기 3단계를 실행하며 첫/마지막 프레임과 위치 및 강도를 지정한 여러 이미지 키프레임을 지원합니다. 이미지는 출력 타임라인을 유도합니다. 인물 참조 및 동영상/오디오 어댑터에는 별도 체크포인트가 필요합니다. 고정 다운로드는 총 44.76GB이며 Hugging Face 승인 접근이 필요합니다. 기기 메모리 등급은 보수적으로 48GB이며 짧은 1024×1024 영상으로 검증했습니다.",
+  "catalog.license.ltx25": "LTX-2.5 및 Gemma 약관"
 }

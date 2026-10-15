@@ -15,5 +15,6 @@
   <ItemGroup>
     <PackageReference Include="StackExchange.Redis" Version="2.8.31" />
     <ProjectReference Include="..\TensorSharp.Memory\TensorSharp.Memory.csproj" />
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.7" />
   </ItemGroup>
 </Project>

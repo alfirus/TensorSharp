@@ -9,8 +9,16 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_attention_precision.h"
+#include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "gemma4_vision_stack.h"
+#include "embedding_cpu_matmul.h"
+#include "embedding_cpu_attention.h"
+#if defined(TSG_GGML_USE_METAL)
+#include "ggml_gemma4_audio_metal_precision.h"
+#endif
 #include <chrono>   // TS_VISION_PROF per-block timing
+#include <limits>
 
 using namespace tsg;
 
@@ -1767,6 +1775,176 @@ int fused_vision_attention_f32_impl(
 // All weights (F32) are cached on-device by host pointer across encodes; the
 // whole block is one upload + one download, replacing ~30 per-op round-trips.
 // ============================================================================
+void gemma4_vision_cpu_gelu_mul_f32(ggml_tensor* dst, int ith, int nth, void*)
+{
+    // Upstream CPU GELU rounds even F32 inputs and results through a half lookup
+    // table. This tower's qualified F32 path needs the actual tanh equation.
+    // Both projection/clamp leaves are contiguous and output partitions are
+    // disjoint, so this also avoids a separate GELU intermediate and multiply.
+    const auto* gate = static_cast<const float*>(dst->src[0]->data);
+    const auto* up = static_cast<const float*>(dst->src[1]->data);
+    auto* result = static_cast<float*>(dst->data);
+    const int64_t count = ggml_nelements(dst);
+    const int64_t begin = count * ith / nth, end = count * (ith + 1) / nth;
+    for (int64_t i = begin; i < end; ++i)
+    {
+        const float x = gate[i];
+        const float gelu = x <= -10.0f ? 0.0f : x >= 10.0f ? x :
+            0.5f * x * (1.0f + std::tanh(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
+        result[i] = gelu * up[i];
+    }
+}
+
+// Shared node builder: the block and stack retain exactly the same arithmetic.
+// Owner-provided weights, positions and callback state outlive graph execution.
+struct Gemma4VisionNodeWeights {
+    ggml_tensor* matrices[7]; // Q,K,V,out,gate,up,down
+    ggml_tensor* norms[6];    // ln1,Qnorm,Knorm,attention post,ln2,FFN post
+};
+
+ggml_tensor* build_gemma4_vision_block_nodes(ggml_context* ctx, ggml_tensor* input,
+    const Gemma4VisionNodeWeights& w, ggml_tensor* pos_x_t, ggml_tensor* pos_y_t,
+    const float* clamps, float eps, float rope_theta, int N, int D, int nH, int hd,
+    bool precise_metal, bool precise_cuda, tsg_embeddings::linux_blas_plan* vision_cpu_blas,
+    tsg_embeddings::cpu_attention_workspace* vision_cpu_attention,
+    std::vector<std::unique_ptr<tsg_embeddings::cpu_attention_node>>& vision_cpu_attention_nodes)
+{
+    const int half = hd / 2;
+    auto* q_w_t=w.matrices[0]; auto* k_w_t=w.matrices[1]; auto* v_w_t=w.matrices[2];
+    auto* out_w_t=w.matrices[3]; auto* gate_w_t=w.matrices[4];
+    auto* up_w_t=w.matrices[5]; auto* down_w_t=w.matrices[6];
+    auto* ln1_w_t=w.norms[0]; auto* q_norm_t=w.norms[1]; auto* k_norm_t=w.norms[2];
+    auto* apn_t=w.norms[3]; auto* ln2_w_t=w.norms[4]; auto* fpn_t=w.norms[5];
+    const float NC = 3.0e38f;
+    auto clampt = [&](ggml_tensor* x, float lo, float hi) -> ggml_tensor* {
+        if (lo <= -NC && hi >= NC) return x;
+        return ggml_clamp(ctx, x, lo, hi);
+    };
+
+    // 2D split RoPE as two ggml_rope_ext nodes instead of the ~25-node
+    // cont/mul/sub/add/concat expansion this used to build.
+    //
+    // The tower's rotation is: dims [0, hd/2) rotated by the patch's X index and
+    // dims [hd/2, hd) by its Y index, in both cases pairing element j with
+    // element j + hd/4 and using angle pos * rope_theta^(-2j / (hd/2)). That is
+    // exactly GGML_ROPE_TYPE_NEOX with n_dims = hd/2 (NeoX pairs j with
+    // j + n_dims/2 and uses freq_base^(-2j/n_dims)), applied twice: once at
+    // offset 0 with the X positions and once at offset hd/2 with the Y positions.
+    // ggml_rope_set_offset provides that second window; every backend in the tree
+    // (CPU, Metal, CUDA, Vulkan, SYCL) implements n_offs, and llama.cpp builds the
+    // same 2D rope from two ggml_rope_ext calls in tools/mtmd/clip.cpp
+    // (build_rope_2d), using two views plus a concat rather than the offset.
+    //
+    // The second rope is NOT built in place on the first one's output, although
+    // ggml_rope_ext_inplace would let the backends skip re-copying the already-final
+    // X half: measured on this tower it is worth nothing (330.3 vs 330.5 ms steady,
+    // bit-identical output), which does not pay for aliasing a node the graph
+    // allocator would otherwise be free to place anywhere.
+    // Must stay in lockstep with Gemma4VisionEncoder.Apply2DRoPE, the per-op
+    // managed fallback, which walks the same four quarters by hand.
+    auto rope2d = [&](ggml_tensor* x3 /*[hd, nH, N] contiguous*/) -> ggml_tensor* {
+        ggml_tensor* rx = ggml_rope_ext(ctx, x3, pos_x_t, nullptr, half,
+            GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_tensor* ry = ggml_rope_ext(ctx, rx, pos_y_t, nullptr, half,
+            GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        return ggml_rope_set_offset(ry, half);
+    };
+
+    // ---------------- Build graph ----------------
+    ggml_tensor* inp = ggml_cont(ctx, input);   // [D, N]
+    auto projection = [&](ggml_tensor* weight, ggml_tensor* input) {
+        ggml_tensor* output = precise_cuda ? tsg_matmul_f32(ctx, weight, input) : vision_cpu_blas
+            ? tsg_embeddings::cpu_matmul(ctx, weight, input, 1, vision_cpu_blas) : nullptr;
+        if (precise_cuda && !output)
+            throw std::runtime_error("Gemma4 required precise CUDA projection node unavailable.");
+        if (!output) output = ggml_mul_mat(ctx, weight, input);
+        if (precise_metal)
+        {
+            ggml_prec_set_acc(output, GGML_PREC_F32);
+            ggml_set_name(output, "tsg_gemma4_vision_f32_projection");
+        }
+        return output;
+    };
+
+    // Attention sublayer.
+    ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, inp, eps), ln1_w_t);
+    ggml_tensor* q = clampt(projection(q_w_t, clampt(n1, clamps[0], clamps[1])), clamps[2], clamps[3]);
+    ggml_tensor* k = clampt(projection(k_w_t, clampt(n1, clamps[4], clamps[5])), clamps[6], clamps[7]);
+    ggml_tensor* v = clampt(projection(v_w_t, clampt(n1, clamps[8], clamps[9])), clamps[10], clamps[11]);
+
+    ggml_tensor* qn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, q, hd, nH * N), eps), q_norm_t);
+    ggml_tensor* kn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, k, hd, nH * N), eps), k_norm_t);
+    ggml_tensor* vn = ggml_rms_norm(ctx, ggml_reshape_2d(ctx, v, hd, nH * N), eps);  // unweighted
+
+    ggml_tensor* qr = rope2d(ggml_reshape_3d(ctx, qn, hd, nH, N));
+    ggml_tensor* kr = rope2d(ggml_reshape_3d(ctx, kn, hd, nH, N));
+    if (!backend_supports_op(qr))
+    {
+        set_last_error("fused_gemma4_vision_block: rope(NEOX, offset) unsupported for this backend.");
+        return nullptr;
+    }
+    ggml_tensor* v3 = ggml_reshape_3d(ctx, vn, hd, nH, N);
+
+    ggml_tensor* qp = ggml_permute(ctx, qr, 0, 2, 1, 3);  // [hd, N, nH]
+    ggml_tensor* kp = ggml_permute(ctx, kr, 0, 2, 1, 3);
+    ggml_tensor* flash = nullptr;
+#if defined(TSG_GGML_USE_METAL)
+    if (precise_metal)
+        flash = tsg_gemma4_vision_metal_attention(ctx, qp, kp, ggml_permute(ctx, v3, 0, 2, 1, 3), N, nH, hd);
+#endif
+    if (!flash && precise_cuda)
+        // The qualified embedding tower has 64-wide global vision heads.
+        // Share F32 K/V tiles across queries; keep the existing generic F32
+        // route for any other explicitly precise Gemma4 head geometry.
+        flash = hd == 64
+            ? tsg_vision_attention_f32(ctx, qp, kp, ggml_permute(ctx, v3, 0, 2, 1, 3), 1.0f)
+            : tsg_attention_f32(ctx, qp, kp, ggml_permute(ctx, v3, 0, 2, 1, 3), nullptr, nullptr, 1.0f);
+    if (precise_cuda && !flash)
+        throw std::runtime_error("Gemma4 required precise CUDA attention node unavailable.");
+    if (!flash && vision_cpu_attention)
+        // Gemma4 vision uses global attention with scale exactly one. Keep the
+        // head/row strides from the axial RoPE views; the owned tiled helper
+        // accepts those directly and returns the same flattened token layout.
+        flash = tsg_embeddings::cpu_attention(ctx, qp, kp, ggml_permute(ctx, v3, 0, 2, 1, 3),
+            nullptr, -1, 1.0f, *vision_cpu_attention, vision_cpu_attention_nodes);
+    const bool owned_attention = flash != nullptr;
+    // CPU has no bandwidth benefit from narrowing these short-lived operands:
+    // retain F32 K/V so the independent EmbeddingGemma 2 raw-row oracle stays
+    // within its error bound. Metal's qualified path already retains F32.
+    if (!flash) flash = build_vision_attention(ctx, qp, kp, v3, N, nH, hd, 1.0f,
+        /*kv_f16=*/ !precise_metal && g_backend_type != BACKEND_TYPE_CPU);
+    if (!owned_attention && !backend_supports_op(flash))
+    {
+        set_last_error("fused_gemma4_vision_block: flash_attn unsupported for this head_dim/backend.");
+        return nullptr;
+    }
+    ggml_tensor* aflat = ggml_reshape_2d(ctx, ggml_cont(ctx, flash), D, N);
+    ggml_tensor* o = clampt(projection(out_w_t, clampt(aflat, clamps[12], clamps[13])), clamps[14], clamps[15]);
+    ggml_tensor* postA = ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), apn_t);
+    ggml_tensor* r1 = ggml_add(ctx, postA, inp);
+
+    // MLP sublayer (gated gelu_pytorch_tanh).
+    // Gemma 4's vision config declares hidden_activation = "gelu_pytorch_tanh", so this uses
+    // ggml_gelu (the tanh approximation), NOT ggml_gelu_quick. Must stay in lockstep with the
+    // managed fallback in Gemma4VisionEncoder.VisionMLP, which calls Ops.GELUMul.
+    ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, r1, eps), ln2_w_t);
+    ggml_tensor* g = clampt(projection(gate_w_t, clampt(n2, clamps[16], clamps[17])), clamps[18], clamps[19]);
+    ggml_tensor* u = clampt(projection(up_w_t, clampt(n2, clamps[20], clamps[21])), clamps[22], clamps[23]);
+    ggml_tensor* act = nullptr;
+    if (g_backend_type == BACKEND_TYPE_CPU && ggml_is_contiguous(g) && ggml_is_contiguous(u))
+    {
+        ggml_tensor* args[] = {g, u};
+        act = ggml_custom_4d(ctx, GGML_TYPE_F32, g->ne[0], g->ne[1], g->ne[2], g->ne[3],
+            args, 2, gemma4_vision_cpu_gelu_mul_f32, GGML_N_TASKS_MAX, nullptr);
+    }
+    if (!act) act = ggml_mul(ctx, ggml_gelu(ctx, g), u);
+    ggml_tensor* dn = clampt(projection(down_w_t, clampt(act, clamps[24], clamps[25])), clamps[26], clamps[27]);
+    ggml_tensor* postF = ggml_mul(ctx, ggml_rms_norm(ctx, dn, eps), fpn_t);
+    ggml_tensor* outv = ggml_add(ctx, postF, r1);   // normed first: lets ggml-metal fuse rms_norm+mul+add into one kernel
+
+    return outv;
+}
+
 int fused_gemma4_vision_block_f32_impl(
     const TensorView2DDesc& hidden_desc,        // [N, D] in/out
     float eps,
@@ -1784,12 +1962,24 @@ int fused_gemma4_vision_block_f32_impl(
     const float* down_w, int down_ne0, int down_ne1, std::size_t down_bytes,
     const float* ffn_post_norm_w,
     const float* clamps,
-    int num_patches, int num_heads, int head_dim)
+    int num_patches, int num_heads, int head_dim, bool require_float32_precision,
+    bool require_cuda_precision = false)
 {
     if (!ensure_backend())
         return 0;
     if (!validate_desc(hidden_desc, "hidden"))
         return 0;
+
+    if (require_float32_precision && g_backend_type != BACKEND_TYPE_METAL)
+    {
+        set_last_error("fused_gemma4_vision_block: precise Metal entry point requires the Metal backend.");
+        return 0;
+    }
+    if (require_cuda_precision && g_backend_type != BACKEND_TYPE_CUDA)
+    {
+        set_last_error("fused_gemma4_vision_block: precise CUDA entry point requires the CUDA backend.");
+        return 0;
+    }
 
     const int N  = hidden_desc.dim0;       // num_patches
     const int D  = hidden_desc.dim1;       // hidden_size
@@ -1797,6 +1987,18 @@ int fused_gemma4_vision_block_f32_impl(
     const int nH = num_heads;
     const int half = hd / 2;
     const int ff = gate_ne1;               // intermediate_size
+
+    // The embedding tower is checked against raw independent F32 rows. Its
+    // learned projections cannot use Metal's internally narrowed multiply.
+    // The explicit precision entry point is used only by a qualified tower.
+    const char* metal_precision = std::getenv("TS_GEMMA4_VISION_METAL_PRECISE");
+    const bool precise_metal = g_backend_type == BACKEND_TYPE_METAL &&
+        (require_float32_precision ||
+            (metal_precision && metal_precision[0] == '1' && metal_precision[1] == '\0'));
+    // Ordinary CUDA F32 projections/attention can narrow operands internally.
+    // This block preserves its F32 contract through owned graph nodes and a
+    // private precision backend; other backends keep their existing routes.
+    const bool precise_cuda = require_cuda_precision;
 
     // The 2D rope below rotates [0, half) by the patch X index and [half, hd) by
     // the patch Y index, each as a NeoX pair (j, j + hd/4). ggml_rope_ext needs an
@@ -1850,7 +2052,7 @@ int fused_gemma4_vision_block_f32_impl(
     else
         hidden_binding = create_standard_binding(ctx, hidden_desc);
 
-    // Weights are never given a DEVICE COPY: the vision tower runs briefly (once
+    // Ordinary chat vision weights are never given a DEVICE COPY: the tower runs briefly (once
     // per image) and its ~0.5 GB of F32 weights would otherwise pile into VRAM via
     // the persistent device-copy cache, stealing residency from the (much larger)
     // language model and triggering paging that worsens block by block on a
@@ -1859,10 +2061,12 @@ int fused_gemma4_vision_block_f32_impl(
     // They are instead bound ZERO-COPY where that costs no device memory at all:
     // on unified-memory Metal an MTLBuffer can wrap the weight's existing host
     // pages (ggml_backend_dev_buffer_from_host_ptr), so the GPU reads the bytes in
-    // place. Nothing new becomes resident — the cache entry is the wrapper object,
+    // place. CPU also wraps the existing host memory, but keeps that wrapper only
+    // for this synchronous block call; it needs neither a copy nor a persistent
+    // cache entry. Nothing new becomes resident — the Metal cache entry is the wrapper object,
     // not a copy, which is why DeviceCopyCacheResidentBytes() excludes it — so the
     // rationale above is unaffected: this bound is zero by construction rather
-    // than by a budget. On every other backend, and for any weight whose pointer
+    // than by a budget. On ordinary CUDA calls, and for any weight whose pointer
     // the backend cannot wrap, the weight stays a plain graph leaf STREAMED fresh
     // into the reused per-graph buffer below, exactly as before.
     //
@@ -1870,7 +2074,8 @@ int fused_gemma4_vision_block_f32_impl(
     // drops from 36.04 MB / 0.79 ms to 0.04 MB / 0.19 ms (only the position leaves
     // below are still streamed), 8 ms of a 329 ms encode.
     //
-    // CONTRACT: the wrapper is cached by host pointer and outlives this call, so the
+    // CONTRACT: the Metal wrapper or qualified CUDA copy is cached by host pointer
+    // and outlives this call, so the
     // owner of these weights MUST invalidate it before freeing them
     // (Gemma4VisionEncoder.Dispose -> GgmlBasicOps.InvalidateTensorHostBuffer). Skipping
     // that leaves a live GPU mapping over memory the allocator hands out again; measured
@@ -1879,37 +2084,102 @@ int fused_gemma4_vision_block_f32_impl(
     // one process on Metal, which is what catches it.
     struct UP { ggml_tensor* t; const void* data; std::size_t bytes; };
     std::vector<UP> ups;
+    std::size_t ts_cached_up_bytes = 0;
+    double ts_cached_upload_ms = 0;
 
     ggml_backend_dev_t w_dev = ggml_backend_get_device(g_backend);
-    // Only where the wrap allocates nothing: this must not fall through to
-    // try_get_cacheable_tensor_buffer's device-copy branch (see above).
-    const bool w_zero_copy_backend =
-        w_dev != nullptr && g_backend_type == BACKEND_TYPE_METAL;
-    auto bind_zero_copy = [&](ggml_tensor* t, const void* d, std::size_t bytes) -> bool {
+    // The validated embedding-only CUDA constructor has a small fixed tower:
+    // 16 blocks of seven matrices, 36 MiB per block / 576 MiB in total. Retain
+    // those immutable matrices across images, subject to the existing global
+    // device-copy budget. Ordinary chat towers keep streaming their weights.
+    const bool cache_cuda_weights = precise_cuda && D == 768 && ff == 3072 &&
+        nH == 12 && hd == 64 && q_ne0 == D && q_ne1 == D &&
+        k_ne0 == D && k_ne1 == D && v_ne0 == D && v_ne1 == D &&
+        out_ne0 == D && out_ne1 == D && gate_ne0 == D && gate_ne1 == ff &&
+        up_ne0 == D && up_ne1 == ff && down_ne0 == ff && down_ne1 == D;
+    // CPU/Metal only wrap existing host pages; CUDA residency is explicitly
+    // limited to the required embedding entry point and geometry above.
+    const bool cpu_weight_alias = g_backend_type == BACKEND_TYPE_CPU;
+    const bool w_zero_copy_backend = w_dev != nullptr &&
+        (g_backend_type == BACKEND_TYPE_METAL || cpu_weight_alias);
+    auto bind_readonly_weight = [&](ggml_tensor* t, const void* d, std::size_t bytes) -> bool {
+        if (cache_cuda_weights && w_dev != nullptr && t != nullptr && bytes >= 4096)
+        {
+            ggml_backend_buffer_t buf = nullptr;
+            void* addr = nullptr;
+            bool needs_upload = false;
+            void* data = const_cast<void*>(d);
+            if (try_get_cacheable_tensor_buffer(g_backend, w_dev, t, data, bytes,
+                                               buf, addr, needs_upload))
+            {
+                if (ggml_backend_tensor_alloc(buf, t, addr) == GGML_STATUS_SUCCESS)
+                {
+                    // The cache publishes a new entry before filling it. Upload
+                    // immediately: a later graph/allocation failure must never
+                    // leave an uninitialized entry that the next call accepts.
+                    if (needs_upload)
+                    {
+                        const auto upload_start = ts_prof ? ts_now() : ts_clock::time_point{};
+                        try
+                        {
+                            host_read_barrier();
+                            ggml_backend_tensor_set(t, resolve_upload_source(data), 0, bytes);
+                        }
+                        catch (...)
+                        {
+                            invalidate_cached_buffer(data);
+                            t->buffer = nullptr;
+                            t->data = nullptr;
+                            throw;
+                        }
+                        ts_cached_up_bytes += bytes;
+                        if (ts_prof)
+                        {
+                            sync_backend(g_backend);
+                            ts_cached_upload_ms += ts_ms(upload_start, ts_now());
+                        }
+                    }
+                    return true;
+                }
+                invalidate_cached_buffer(data);
+                // Upstream attaches these fields before init_tensor, even if
+                // initialization fails. The streamed fallback must be a leaf
+                // without a dangling reference to the discarded cache buffer.
+                t->buffer = nullptr;
+                t->data = nullptr;
+            }
+            // Budget/allocation refusal leaves this weight streamed normally.
+        }
         if (!w_zero_copy_backend || t == nullptr || bytes < 4096) return false;
         void* data = const_cast<void*>(d);
         if (!host_ptr_buffer_capable(g_backend, w_dev, data, bytes)) return false;
         ggml_backend_buffer_t buf = nullptr;
-        if (!try_get_host_ptr_buffer(g_backend, w_dev, data, bytes, /*cacheable=*/ true, buf,
+        if (!try_get_host_ptr_buffer(g_backend, w_dev, data, bytes, /*cacheable=*/ !cpu_weight_alias, buf,
                                      /*allow_unified_weight=*/ true))
             return false;
         if (ggml_backend_tensor_alloc(buf, t, data) != GGML_STATUS_SUCCESS)
         {
-            invalidate_cached_buffer(data);
+            if (cpu_weight_alias) ggml_backend_buffer_free(buf);
+            else invalidate_cached_buffer(data);
             return false;
         }
+        // CPU graph execution completes before this call returns. Borrowing
+        // read-only weights therefore requires no owner-side invalidation and
+        // cannot retain a mapping after a tensor is disposed or its address is
+        // reused. Keep the wrapper alive through compute and final readback.
+        if (cpu_weight_alias) host_ptr_buffers.emplace_back(buf);
         return true;
     };
 
     auto w1d = [&](const float* d, int n) {
         ggml_tensor* t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
         const std::size_t bytes = (std::size_t)n * sizeof(float);
-        if (!bind_zero_copy(t, d, bytes)) ups.push_back({ t, d, bytes });
+        if (!bind_readonly_weight(t, d, bytes)) ups.push_back({ t, d, bytes });
         return t; };
 
     auto w2d = [&](const float* d, int ne0, int ne1, std::size_t bytes) {
         ggml_tensor* t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
-        if (!bind_zero_copy(t, d, bytes)) ups.push_back({ t, d, bytes });
+        if (!bind_readonly_weight(t, d, bytes)) ups.push_back({ t, d, bytes });
         return t; };
 
     ggml_tensor* ln1_w_t   = w1d(ln1_w, D);
@@ -1944,88 +2214,31 @@ int fused_gemma4_vision_block_f32_impl(
         return 0;
     }
 
-    const float NC = 3.0e38f;
-    auto clampt = [&](ggml_tensor* x, float lo, float hi) -> ggml_tensor* {
-        if (lo <= -NC && hi >= NC) return x;
-        return ggml_clamp(ctx, x, lo, hi);
-    };
+    // The optional Linux provider belongs to this synchronous block call. Its
+    // graph callbacks finish before destruction, without changing OpenBLAS's
+    // global worker policy or retaining a shared model/device cache.
+    std::unique_ptr<tsg_embeddings::linux_blas_plan> vision_cpu_blas;
+    std::unique_ptr<tsg_embeddings::cpu_attention_workspace> vision_cpu_attention;
+    std::vector<std::unique_ptr<tsg_embeddings::cpu_attention_node>> vision_cpu_attention_nodes;
+#if defined(__linux__)
+    const char* vision_blas_setting = std::getenv("TSG_EMBEDDING_LINUX_BLAS");
+    if (g_backend_type == BACKEND_TYPE_CPU && vision_blas_setting &&
+        std::strcmp(vision_blas_setting, "1") == 0)
+        vision_cpu_blas = std::make_unique<tsg_embeddings::linux_blas_plan>(
+            std::getenv("TSG_EMBEDDING_BLAS_LIBRARY"), 8);
+    const char* vision_attention_setting = std::getenv("TSG_EMBEDDING_CPU_ATTENTION");
+    if (vision_cpu_blas && vision_cpu_blas->available() && vision_attention_setting &&
+        std::strcmp(vision_attention_setting, "1") == 0)
+        vision_cpu_attention = std::make_unique<tsg_embeddings::cpu_attention_workspace>(vision_cpu_blas.get());
+#endif
 
-    // 2D split RoPE as two ggml_rope_ext nodes instead of the ~25-node
-    // cont/mul/sub/add/concat expansion this used to build.
-    //
-    // The tower's rotation is: dims [0, hd/2) rotated by the patch's X index and
-    // dims [hd/2, hd) by its Y index, in both cases pairing element j with
-    // element j + hd/4 and using angle pos * rope_theta^(-2j / (hd/2)). That is
-    // exactly GGML_ROPE_TYPE_NEOX with n_dims = hd/2 (NeoX pairs j with
-    // j + n_dims/2 and uses freq_base^(-2j/n_dims)), applied twice: once at
-    // offset 0 with the X positions and once at offset hd/2 with the Y positions.
-    // ggml_rope_set_offset provides that second window; every backend in the tree
-    // (CPU, Metal, CUDA, Vulkan, SYCL) implements n_offs, and llama.cpp builds the
-    // same 2D rope from two ggml_rope_ext calls in tools/mtmd/clip.cpp
-    // (build_rope_2d), using two views plus a concat rather than the offset.
-    //
-    // The second rope is NOT built in place on the first one's output, although
-    // ggml_rope_ext_inplace would let the backends skip re-copying the already-final
-    // X half: measured on this tower it is worth nothing (330.3 vs 330.5 ms steady,
-    // bit-identical output), which does not pay for aliasing a node the graph
-    // allocator would otherwise be free to place anywhere.
-    // Must stay in lockstep with Gemma4VisionEncoder.Apply2DRoPE, the per-op
-    // managed fallback, which walks the same four quarters by hand.
-    auto rope2d = [&](ggml_tensor* x3 /*[hd, nH, N] contiguous*/) -> ggml_tensor* {
-        ggml_tensor* rx = ggml_rope_ext(ctx, x3, pos_x_t, nullptr, half,
-            GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        ggml_tensor* ry = ggml_rope_ext(ctx, rx, pos_y_t, nullptr, half,
-            GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        return ggml_rope_set_offset(ry, half);
-    };
-
-    // ---------------- Build graph ----------------
-    ggml_tensor* inp = ggml_cont(ctx, hidden_binding.tensor);   // [D, N]
-
-    // Attention sublayer.
-    ggml_tensor* n1 = ggml_mul(ctx, ggml_rms_norm(ctx, inp, eps), ln1_w_t);
-    ggml_tensor* q = clampt(ggml_mul_mat(ctx, q_w_t, clampt(n1, clamps[0], clamps[1])), clamps[2], clamps[3]);
-    ggml_tensor* k = clampt(ggml_mul_mat(ctx, k_w_t, clampt(n1, clamps[4], clamps[5])), clamps[6], clamps[7]);
-    ggml_tensor* v = clampt(ggml_mul_mat(ctx, v_w_t, clampt(n1, clamps[8], clamps[9])), clamps[10], clamps[11]);
-
-    ggml_tensor* qn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, q, hd, nH * N), eps), q_norm_t);
-    ggml_tensor* kn = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_reshape_2d(ctx, k, hd, nH * N), eps), k_norm_t);
-    ggml_tensor* vn = ggml_rms_norm(ctx, ggml_reshape_2d(ctx, v, hd, nH * N), eps);  // unweighted
-
-    ggml_tensor* qr = rope2d(ggml_reshape_3d(ctx, qn, hd, nH, N));
-    ggml_tensor* kr = rope2d(ggml_reshape_3d(ctx, kn, hd, nH, N));
-    if (!backend_supports_op(qr))
-    {
-        set_last_error("fused_gemma4_vision_block: rope(NEOX, offset) unsupported for this backend.");
-        return 0;
-    }
-    ggml_tensor* v3 = ggml_reshape_3d(ctx, vn, hd, nH, N);
-
-    ggml_tensor* qp = ggml_permute(ctx, qr, 0, 2, 1, 3);  // [hd, N, nH]
-    ggml_tensor* kp = ggml_permute(ctx, kr, 0, 2, 1, 3);
-    ggml_tensor* flash = build_vision_attention(ctx, qp, kp, v3, N, nH, hd, 1.0f,
-        /*kv_f16=*/ true);
-    if (!backend_supports_op(flash))
-    {
-        set_last_error("fused_gemma4_vision_block: flash_attn unsupported for this head_dim/backend.");
-        return 0;
-    }
-    ggml_tensor* aflat = ggml_reshape_2d(ctx, ggml_cont(ctx, flash), D, N);
-    ggml_tensor* o = clampt(ggml_mul_mat(ctx, out_w_t, clampt(aflat, clamps[12], clamps[13])), clamps[14], clamps[15]);
-    ggml_tensor* postA = ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), apn_t);
-    ggml_tensor* r1 = ggml_add(ctx, postA, inp);
-
-    // MLP sublayer (gated gelu_pytorch_tanh).
-    // Gemma 4's vision config declares hidden_activation = "gelu_pytorch_tanh", so this uses
-    // ggml_gelu (the tanh approximation), NOT ggml_gelu_quick. Must stay in lockstep with the
-    // managed fallback in Gemma4VisionEncoder.VisionMLP, which calls Ops.GELUMul.
-    ggml_tensor* n2 = ggml_mul(ctx, ggml_rms_norm(ctx, r1, eps), ln2_w_t);
-    ggml_tensor* g = clampt(ggml_mul_mat(ctx, gate_w_t, clampt(n2, clamps[16], clamps[17])), clamps[18], clamps[19]);
-    ggml_tensor* u = clampt(ggml_mul_mat(ctx, up_w_t, clampt(n2, clamps[20], clamps[21])), clamps[22], clamps[23]);
-    ggml_tensor* act = ggml_mul(ctx, ggml_gelu(ctx, g), u);
-    ggml_tensor* dn = clampt(ggml_mul_mat(ctx, down_w_t, clampt(act, clamps[24], clamps[25])), clamps[26], clamps[27]);
-    ggml_tensor* postF = ggml_mul(ctx, ggml_rms_norm(ctx, dn, eps), fpn_t);
-    ggml_tensor* outv = ggml_add(ctx, postF, r1);   // normed first: lets ggml-metal fuse rms_norm+mul+add into one kernel
+    const Gemma4VisionNodeWeights node_weights{
+        {q_w_t,k_w_t,v_w_t,out_w_t,gate_w_t,up_w_t,down_w_t},
+        {ln1_w_t,q_norm_t,k_norm_t,apn_t,ln2_w_t,fpn_t}};
+    ggml_tensor* outv = build_gemma4_vision_block_nodes(ctx, hidden_binding.tensor, node_weights,
+        pos_x_t, pos_y_t, clamps, eps, rope_theta, N, D, nH, hd, precise_metal, precise_cuda,
+        vision_cpu_blas.get(), vision_cpu_attention.get(), vision_cpu_attention_nodes);
+    if (!outv) return 0;
 
     ggml_tensor* output = ggml_cpy(ctx, outv, hidden_binding.tensor);
     if (!output)
@@ -2060,7 +2273,7 @@ int fused_gemma4_vision_block_f32_impl(
 
     if (!use_zero_copy)
         upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
-    std::size_t ts_up_bytes = 0;
+    std::size_t ts_up_bytes = ts_cached_up_bytes;
     for (auto& u : ups)
     {
         ggml_backend_tensor_set(u.t, u.data, 0, u.bytes);
@@ -2069,7 +2282,32 @@ int fused_gemma4_vision_block_f32_impl(
     if (ts_prof) sync_backend(g_backend);
     auto ts_t2 = ts_now();   // end of weight upload
 
-    ggml_status status = tsg::compute_graph(g_backend, graph);
+    ggml_status status = GGML_STATUS_SUCCESS;
+    bool owned_compute = false;
+#if defined(TSG_GGML_USE_METAL)
+    if (precise_metal)
+        owned_compute = tsg_gemma4_audio_metal_graph_compute(g_backend, graph, &status, true);
+#endif
+    if (!owned_compute && precise_metal) {
+        set_last_error("fused_gemma4_vision_block: required F32 Metal helper did not execute."); return 0;
+    }
+#if defined(TSG_GGML_USE_CUDA)
+    if (precise_cuda)
+    {
+        // Same owned backend used by qualified audio graphs: its cuBLAS handle
+        // is private and pedantic, while ordinary nodes keep the CUDA stream.
+        // Finish all graph work before releasing either the wrapper or leaves.
+        std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> precise(
+            tsg_dsv4_fused_backend_init(g_backend), &ggml_backend_free);
+        if (!precise) {
+            set_last_error("fused_gemma4_vision_block: cannot create scoped precise CUDA backend."); return 0;
+        }
+        status = ggml_backend_graph_compute(precise.get(), graph);
+        ggml_backend_synchronize(precise.get());
+        owned_compute = true;
+    }
+#endif
+    if (!owned_compute) status = tsg::compute_graph(g_backend, graph);
     if (status != GGML_STATUS_SUCCESS) { set_last_error("fused_gemma4_vision_block: compute failed."); return 0; }
     if (ts_prof)
     {
@@ -2077,10 +2315,24 @@ int fused_gemma4_vision_block_f32_impl(
         auto ts_t3 = ts_now();
         std::fprintf(stderr,
             "[vision-prof] N=%d D=%d ff=%d nodes=%d build+alloc=%.2fms upload=%.2fms (%.2f MB, %.1f GB/s) compute=%.2fms total=%.2fms\n",
-            N, D, ff, ggml_graph_n_nodes(graph), ts_ms(ts_t0, ts_t1), ts_ms(ts_t1, ts_t2),
+            N, D, ff, ggml_graph_n_nodes(graph), ts_ms(ts_t0, ts_t1) - ts_cached_upload_ms,
+            ts_ms(ts_t1, ts_t2) + ts_cached_upload_ms,
             ts_up_bytes / 1048576.0,
-            (ts_up_bytes / 1e9) / (ts_ms(ts_t1, ts_t2) / 1000.0),
+            (ts_up_bytes / 1e9) / ((ts_ms(ts_t1, ts_t2) + ts_cached_upload_ms) / 1000.0),
             ts_ms(ts_t2, ts_t3), ts_ms(ts_t0, ts_t3));
+        if (vision_cpu_blas)
+        {
+            const auto counts = vision_cpu_blas->counts();
+            std::fprintf(stderr,
+                "[vision-cpu-blas-prof] available=%d provider=%s reason=%s gemm_calls=%llu channel_calls=%llu token_calls=%llu workers=0x%llx shape_rejections=%llu policy_rejections=%llu active_calls=%llu attention_tiles=%llu attention_scalar_products=%llu\n",
+                vision_cpu_blas->available() ? 1 : 0, vision_cpu_blas->library_path().c_str(),
+                vision_cpu_blas->reason().c_str(), (unsigned long long)counts.gemm_calls,
+                (unsigned long long)counts.output_channel_calls, (unsigned long long)counts.token_row_calls,
+                (unsigned long long)counts.worker_mask, (unsigned long long)counts.shape_rejections,
+                (unsigned long long)counts.policy_rejections, (unsigned long long)counts.active_calls,
+                vision_cpu_attention ? (unsigned long long)vision_cpu_attention->tiles.load() : 0,
+                vision_cpu_attention ? (unsigned long long)vision_cpu_attention->scalar_products.load() : 0);
+        }
     }
     finalize_compute(use_zero_copy, hidden_binding.storage, hidden_desc.data, hidden_binding.raw_bytes);
     // Drain the queued async download before the per-call fallback buffer frees
@@ -2089,6 +2341,156 @@ int fused_gemma4_vision_block_f32_impl(
 
     clear_last_error();
     return 1;
+}
+
+// CUDA-only transient stack. Admission never changes either caller activation.
+// No tensor, graph, private backend or scratch pointer survives this call.
+int gemma4_vision_stack_f32_precise_cuda_impl(const Gemma4VisionStackArgs* args)
+{
+    auto fail = [](const char* message) { set_last_error(message); return GEMMA4_VISION_STACK_FAILURE; };
+    if (!args || args->struct_bytes != sizeof(Gemma4VisionStackArgs) || args->version != 1 ||
+        args->block_struct_bytes != sizeof(Gemma4VisionStackBlockDesc) || args->block_count != 16 ||
+        !args->blocks || !args->pos_x || !args->pos_y || args->heads != 12 || args->head_dim != 64 ||
+        !std::isfinite(args->eps) || args->eps <= 0 || !std::isfinite(args->rope_theta) || args->rope_theta <= 0)
+        return fail("Gemma4 CUDA stack: invalid descriptor/version or unqualified geometry.");
+    const int N=args->input.dim0, D=768;
+    auto matrix = [](const TensorView2DDesc& d, int rows, int columns) {
+        const auto address=reinterpret_cast<std::uintptr_t>(d.data);
+        const auto expected=static_cast<std::int64_t>(rows)*columns*sizeof(float);
+        return rows > 0 && columns > 0 && d.data && d.dim0 == rows && d.dim1 == columns &&
+            d.stride0 == columns && d.stride1 == 1 && d.raw_bytes == expected &&
+            address <= std::numeric_limits<std::uintptr_t>::max()-static_cast<std::uintptr_t>(expected);
+    };
+    if (N <= 0 || N > 16384 || args->position_count != N ||
+        !matrix(args->input,N,D) || !matrix(args->result,N,D))
+        return fail("Gemma4 CUDA stack: invalid contiguous activation/position span.");
+    const auto input_address=reinterpret_cast<std::uintptr_t>(args->input.data);
+    const auto result_address=reinterpret_cast<std::uintptr_t>(args->result.data);
+    const auto bytes=static_cast<std::uintptr_t>(args->input.raw_bytes);
+    if ((input_address <= result_address && result_address-input_address < bytes) ||
+        (result_address < input_address && input_address-result_address < bytes))
+        return fail("Gemma4 CUDA stack: transactional result must not overlap input.");
+    auto result_overlaps=[&](const TensorView2DDesc& d) {
+        const auto address=reinterpret_cast<std::uintptr_t>(d.data);
+        return result_address < address+static_cast<std::uintptr_t>(d.raw_bytes) && address < result_address+bytes;
+    };
+    std::unordered_map<void*,std::int64_t> cache_key_sizes;
+    for (int b=0;b<16;++b) {
+        const auto& block=args->blocks[b];
+        for (int m=0;m<7;++m) {
+            const int rows=m==4 || m==5 ? 3072 : D;
+            const int columns=m==6 ? 3072 : D;
+            const auto& d=block.matrices[m];
+            if (!matrix(d,rows,columns) || result_overlaps(d))
+                return fail("Gemma4 CUDA stack: invalid or result-overlapping learned F32 matrix span.");
+            const auto key=cache_key_sizes.emplace(d.data,d.raw_bytes);
+            if (!key.second && key.first->second!=d.raw_bytes)
+                return fail("Gemma4 CUDA stack: inconsistent byte spans for one immutable matrix cache key.");
+        }
+        for (int n=0;n<6;++n)
+            if (!matrix(block.norms[n],1,n==1 || n==2 ? 64 : D) || result_overlaps(block.norms[n]))
+                return fail("Gemma4 CUDA stack: invalid or result-overlapping learned F32 norm span.");
+        for (int c=0;c<28;c+=2)
+            if (!std::isfinite(block.clamps[c]) || !std::isfinite(block.clamps[c+1]) || block.clamps[c]>block.clamps[c+1])
+                return fail("Gemma4 CUDA stack: invalid activation clamp bounds.");
+    }
+    for (int i=0;i<N;++i) if (args->pos_x[i]<0 || args->pos_y[i]<0)
+        return fail("Gemma4 CUDA stack: negative patch coordinates.");
+#if !defined(TSG_GGML_USE_CUDA)
+    clear_last_error(); return GEMMA4_VISION_STACK_NOT_APPLICABLE;
+#else
+    // Tensor parallelism and diagnostic per-block observations keep their old path.
+    auto diagnostic=[](const char* name) { const char* v=std::getenv(name); return v && *v && *v!='0'; };
+    if (g_active_rank!=0 || g_device_count.load(std::memory_order_acquire)!=1 ||
+        diagnostic("TS_VISION_STAGE") || diagnostic("TS_VISION_TRACE") || diagnostic("TS_VISION_PROF")) {
+        clear_last_error(); return GEMMA4_VISION_STACK_NOT_APPLICABLE;
+    }
+    if (!ensure_backend()) return GEMMA4_VISION_STACK_FAILURE;
+    if (g_backend_compute_failed.load(std::memory_order_acquire))
+        return fail("Gemma4 CUDA stack: backend has a prior sticky compute failure.");
+    if (g_backend_type!=BACKEND_TYPE_CUDA) {
+        clear_last_error(); return GEMMA4_VISION_STACK_NOT_APPLICABLE;
+    }
+    PooledContextHandle context;
+    if (!context.init(16*1024*1024)) return fail("Gemma4 CUDA stack: metadata allocation failed.");
+    auto* ctx=context.value;
+    Gemma4VisionNodeWeights weights[16]{};
+    auto* device=ggml_backend_get_device(g_backend);
+    if (!device) return fail("Gemma4 CUDA stack: missing CUDA device.");
+    // Admission is all-or-nothing for this graph. Budget refusal preserves the
+    // old one-layer streaming bound; already-filled immutable cache entries are
+    // valid for that fallback and are not discarded or copied into graph scratch.
+    for (int b=0;b<16;++b) for (int m=0;m<7;++m) {
+        const auto& d=args->blocks[b].matrices[m];
+        auto* tensor=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,d.dim1,d.dim0);
+        if (!tensor) return fail("Gemma4 CUDA stack: matrix metadata allocation failed.");
+        ggml_backend_buffer_t buffer=nullptr; void* address=nullptr; bool upload=false;
+        if (!try_get_cacheable_tensor_buffer(g_backend,device,tensor,d.data,static_cast<std::size_t>(d.raw_bytes),buffer,address,upload)) {
+            clear_last_error(); return GEMMA4_VISION_STACK_NOT_APPLICABLE;
+        }
+        if (ggml_backend_tensor_alloc(buffer,tensor,address)!=GGML_STATUS_SUCCESS) {
+            invalidate_cached_buffer(d.data); tensor->buffer=nullptr; tensor->data=nullptr;
+            clear_last_error(); return GEMMA4_VISION_STACK_NOT_APPLICABLE;
+        }
+        if (upload) {
+            try { host_read_barrier(); ggml_backend_tensor_set(tensor,resolve_upload_source(d.data),0,static_cast<std::size_t>(d.raw_bytes)); }
+            catch (...) { invalidate_cached_buffer(d.data); tensor->buffer=nullptr; tensor->data=nullptr; throw; }
+        }
+        weights[b].matrices[m]=tensor;
+    }
+    // Do not alias the caller's result: even a failed graph leaves its bytes
+    // untouched until the final successful synchronous readback.
+    auto input=create_standard_binding(ctx,args->input);
+    auto result=create_standard_binding(ctx,args->result);
+    if (!input.tensor || !input.storage || !result.tensor || !result.storage)
+        return fail("Gemma4 CUDA stack: activation metadata allocation failed.");
+    ggml_set_input(input.storage);
+    auto* px=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,N);
+    auto* py=ggml_new_tensor_1d(ctx,GGML_TYPE_I32,N);
+    if (!px || !py) return fail("Gemma4 CUDA stack: position metadata allocation failed.");
+    ggml_set_input(px); ggml_set_input(py);
+    for (int b=0;b<16;++b) for (int n=0;n<6;++n) {
+        const auto& d=args->blocks[b].norms[n];
+        weights[b].norms[n]=ggml_new_tensor_1d(ctx,GGML_TYPE_F32,d.dim1);
+        if (!weights[b].norms[n]) return fail("Gemma4 CUDA stack: norm metadata allocation failed.");
+        ggml_set_input(weights[b].norms[n]);
+    }
+    std::vector<std::unique_ptr<tsg_embeddings::cpu_attention_node>> no_cpu_nodes;
+    auto* hidden=input.tensor;
+    for (int b=0;b<16;++b) {
+        hidden=build_gemma4_vision_block_nodes(ctx,hidden,weights[b],px,py,args->blocks[b].clamps,
+            args->eps,args->rope_theta,N,D,12,64,false,true,nullptr,nullptr,no_cpu_nodes);
+        if (!hidden) return GEMMA4_VISION_STACK_FAILURE;
+    }
+    auto* output=ggml_cpy(ctx,hidden,result.tensor);
+    if (!output) return fail("Gemma4 CUDA stack: final copy allocation failed.");
+    ggml_set_output(output);
+    auto* graph=ggml_new_graph_custom(ctx,8192,false);
+    if (!graph) return fail("Gemma4 CUDA stack: graph allocation failed.");
+    ggml_build_forward_expand(graph,output);
+    struct Allocator { ggml_gallocr_t value=nullptr; ~Allocator() { if(value) ggml_gallocr_free(value); } } allocator;
+    allocator.value=ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+    if (!allocator.value || !ggml_gallocr_alloc_graph(allocator.value,graph))
+        return fail("Gemma4 CUDA stack: dedicated graph scratch allocation failed.");
+    upload_binding(input,args->input.data,input.raw_bytes);
+    ggml_backend_tensor_set(px,args->pos_x,0,static_cast<std::size_t>(N)*sizeof(std::int32_t));
+    ggml_backend_tensor_set(py,args->pos_y,0,static_cast<std::size_t>(N)*sizeof(std::int32_t));
+    for (int b=0;b<16;++b) for (int n=0;n<6;++n)
+        ggml_backend_tensor_set(weights[b].norms[n],args->blocks[b].norms[n].data,0,
+            static_cast<std::size_t>(args->blocks[b].norms[n].raw_bytes));
+    struct PreciseBackend {
+        ggml_backend_t value=nullptr;
+        ~PreciseBackend() { if(value) { ggml_backend_synchronize(value); ggml_backend_free(value); } }
+    } precise;
+    precise.value=tsg_dsv4_fused_backend_init(g_backend);
+    if (!precise.value) return fail("Gemma4 CUDA stack: required private precision backend unavailable.");
+    const auto status=tsg::compute_graph(precise.value,graph);
+    tsg::sync_backend(precise.value);
+    if (status!=GGML_STATUS_SUCCESS || g_backend_compute_failed.load(std::memory_order_acquire))
+        return fail("Gemma4 CUDA stack: required precise graph execution failed.");
+    ggml_backend_tensor_get(result.storage,args->result.data,0,result.raw_bytes);
+    clear_last_error(); return GEMMA4_VISION_STACK_SUCCESS;
+#endif
 }
 
 // ============================================================================
@@ -3814,6 +4216,13 @@ TSG_EXPORT int TSGgml_Qwen21VisionEncoderF32(
     catch (...) { set_last_error("Unknown error in fused vision encoder."); return 0; }
 }
 
+TSG_EXPORT int TSGgml_Gemma4VisionStackF32PreciseCuda(const Gemma4VisionStackArgs* args)
+{
+    try { return gemma4_vision_stack_f32_precise_cuda_impl(args); }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return GEMMA4_VISION_STACK_FAILURE; }
+    catch (...) { set_last_error("Unknown error in Gemma4 CUDA vision stack."); return GEMMA4_VISION_STACK_FAILURE; }
+}
+
 TSG_EXPORT int TSGgml_FusedGemma4VisionBlockF32(
     TensorView2DDesc hidden, float eps,
     const float* ln1_w,
@@ -3843,7 +4252,77 @@ TSG_EXPORT int TSGgml_FusedGemma4VisionBlockF32(
             gate_w, gate_ne0, gate_ne1, static_cast<std::size_t>(gate_bytes),
             up_w, up_ne0, up_ne1, static_cast<std::size_t>(up_bytes),
             down_w, down_ne0, down_ne1, static_cast<std::size_t>(down_bytes),
-            ffn_post_norm_w, clamps, num_patches, num_heads, head_dim);
+            ffn_post_norm_w, clamps, num_patches, num_heads, head_dim, false);
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in fused gemma4 vision block."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_FusedGemma4VisionBlockF32PreciseMetal(
+    TensorView2DDesc hidden, float eps,
+    const float* ln1_w,
+    const float* q_w, int q_ne0, int q_ne1, std::int64_t q_bytes,
+    const float* k_w, int k_ne0, int k_ne1, std::int64_t k_bytes,
+    const float* v_w, int v_ne0, int v_ne1, std::int64_t v_bytes,
+    const float* q_norm_w, const float* k_norm_w,
+    const float* attn_post_norm_w,
+    const float* out_w, int out_ne0, int out_ne1, std::int64_t out_bytes,
+    const std::int32_t* pos_x, const std::int32_t* pos_y, float rope_theta,
+    const float* ln2_w,
+    const float* gate_w, int gate_ne0, int gate_ne1, std::int64_t gate_bytes,
+    const float* up_w, int up_ne0, int up_ne1, std::int64_t up_bytes,
+    const float* down_w, int down_ne0, int down_ne1, std::int64_t down_bytes,
+    const float* ffn_post_norm_w,
+    const float* clamps,
+    int num_patches, int num_heads, int head_dim)
+{
+    try {
+        return fused_gemma4_vision_block_f32_impl(hidden, eps, ln1_w,
+            q_w, q_ne0, q_ne1, static_cast<std::size_t>(q_bytes),
+            k_w, k_ne0, k_ne1, static_cast<std::size_t>(k_bytes),
+            v_w, v_ne0, v_ne1, static_cast<std::size_t>(v_bytes),
+            q_norm_w, k_norm_w, attn_post_norm_w,
+            out_w, out_ne0, out_ne1, static_cast<std::size_t>(out_bytes),
+            pos_x, pos_y, rope_theta, ln2_w,
+            gate_w, gate_ne0, gate_ne1, static_cast<std::size_t>(gate_bytes),
+            up_w, up_ne0, up_ne1, static_cast<std::size_t>(up_bytes),
+            down_w, down_ne0, down_ne1, static_cast<std::size_t>(down_bytes),
+            ffn_post_norm_w, clamps, num_patches, num_heads, head_dim, true);
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error in fused gemma4 vision block."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_FusedGemma4VisionBlockF32PreciseCuda(
+    TensorView2DDesc hidden, float eps,
+    const float* ln1_w,
+    const float* q_w, int q_ne0, int q_ne1, std::int64_t q_bytes,
+    const float* k_w, int k_ne0, int k_ne1, std::int64_t k_bytes,
+    const float* v_w, int v_ne0, int v_ne1, std::int64_t v_bytes,
+    const float* q_norm_w, const float* k_norm_w,
+    const float* attn_post_norm_w,
+    const float* out_w, int out_ne0, int out_ne1, std::int64_t out_bytes,
+    const std::int32_t* pos_x, const std::int32_t* pos_y, float rope_theta,
+    const float* ln2_w,
+    const float* gate_w, int gate_ne0, int gate_ne1, std::int64_t gate_bytes,
+    const float* up_w, int up_ne0, int up_ne1, std::int64_t up_bytes,
+    const float* down_w, int down_ne0, int down_ne1, std::int64_t down_bytes,
+    const float* ffn_post_norm_w,
+    const float* clamps,
+    int num_patches, int num_heads, int head_dim)
+{
+    try {
+        return fused_gemma4_vision_block_f32_impl(hidden, eps, ln1_w,
+            q_w, q_ne0, q_ne1, static_cast<std::size_t>(q_bytes),
+            k_w, k_ne0, k_ne1, static_cast<std::size_t>(k_bytes),
+            v_w, v_ne0, v_ne1, static_cast<std::size_t>(v_bytes),
+            q_norm_w, k_norm_w, attn_post_norm_w,
+            out_w, out_ne0, out_ne1, static_cast<std::size_t>(out_bytes),
+            pos_x, pos_y, rope_theta, ln2_w,
+            gate_w, gate_ne0, gate_ne1, static_cast<std::size_t>(gate_bytes),
+            up_w, up_ne0, up_ne1, static_cast<std::size_t>(up_bytes),
+            down_w, down_ne0, down_ne1, static_cast<std::size_t>(down_bytes),
+            ffn_post_norm_w, clamps, num_patches, num_heads, head_dim, false, true);
     }
     catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
     catch (...) { set_last_error("Unknown error in fused gemma4 vision block."); return 0; }

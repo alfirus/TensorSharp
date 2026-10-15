@@ -700,6 +700,18 @@ namespace TensorSharp.Runtime
             return true;
         }
 
+        /// <summary>Positional read from the same physical file handle that backs
+        /// this reader's mapping. May return fewer bytes at EOF. The reader owns
+        /// the handle; callers must finish reads before disposing the reader.</summary>
+        public int ReadMappedBytes(long fileOffset, Span<byte> destination)
+        {
+            ObjectDisposedException.ThrowIf(_stream == null, this);
+            if (fileOffset < 0 || fileOffset > long.MaxValue - destination.Length)
+                throw new ArgumentOutOfRangeException(nameof(fileOffset));
+            EnsureMappedView();
+            return RandomAccess.Read(_stream.SafeFileHandle, destination, fileOffset);
+        }
+
         public long GetTensorByteCount(GgufTensorInfo tensorInfo)
         {
             long ne0 = (long)tensorInfo.Shape[0];
@@ -1007,12 +1019,10 @@ namespace TensorSharp.Runtime
 
             if (_mappedFile == null)
             {
-                // Map from an explicitly read-only, share-read stream: the string-path
-                // CreateFromFile overload would open it writable and collide with the
-                // other read handles on the same GGUF (loader streams, second instances).
-                var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                _mappedFile = MemoryMappedFile.CreateFromFile(fs, null, 0, MemoryMappedFileAccess.Read,
-                    HandleInheritability.None, leaveOpen: false);
+                // Keep parsing, mapped pointers and positional uploads on the
+                // same opened inode, including if its path is replaced later.
+                _mappedFile = MemoryMappedFile.CreateFromFile(_stream, null, 0, MemoryMappedFileAccess.Read,
+                    HandleInheritability.None, leaveOpen: true);
             }
             _mappedView ??= _mappedFile.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
 

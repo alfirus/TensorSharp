@@ -75,6 +75,15 @@ find_package(Threads REQUIRED)
 
 set(GGML_SCHED_MAX_COPIES 4 CACHE STRING "" FORCE)
 
+# Use upstream's existing tiled CPU GEMM on new Linux x86 builds. Preserve an
+# explicit GGML_LLAMAFILE setting (including an existing OFF cache); no fetched
+# source is modified. Apple/Windows/other architectures keep their defaults.
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
+    NOT DEFINED GGML_LLAMAFILE_DEFAULT)
+    set(GGML_LLAMAFILE_DEFAULT ON)
+endif()
+
 # Upstream ggml-org/ggml derives GGML_VERSION/GGML_COMMIT in its root CMakeLists and
 # injects them onto its own targets, so we no longer set them here.
 
@@ -275,6 +284,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_q8_weight_policy.cpp
     ggml_ops_q8_streaming.cpp
     ggml_ops_elementwise.cpp
+    ggml_ops_gemma4_audio.cpp
     ggml_ops_norm_attn.cpp
     ggml_ops_training.cpp
     ggml_ops_fused.cpp
@@ -324,10 +334,12 @@ if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
     list(APPEND TSG_GGMLOPS_SOURCES tsg_metal_msl_default.m)
     # Wan VAE convolutions on MPSGraph (see tsg_metal_mps_conv.mm).
     list(APPEND TSG_GGMLOPS_SOURCES tsg_metal_mps_conv.mm)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_gemma4_audio_metal_precision.mm)
     # This bridge stores Objective-C objects in C++ cache entries and releases
     # them by clearing entries/assigning nil. ARC is required for those ownership
     # operations, including temporary MPSGraphTensorData and grown staging buffers.
     set_source_files_properties(tsg_metal_mps_conv.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    set_source_files_properties(ggml_gemma4_audio_metal_precision.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
@@ -444,7 +456,22 @@ target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src"
 )
-target_link_libraries(GgmlOps PRIVATE ggml)
+target_link_libraries(GgmlOps PRIVATE ggml ${CMAKE_DL_LIBS})
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+    CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND GGML_LLAMAFILE)
+    set_property(SOURCE ggml_ops_embeddings.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS TSG_EMBEDDING_CPU_TILED_GEMM=1)
+endif()
+
+if (APPLE AND GGML_ACCELERATE)
+    find_library(TSG_EMBEDDING_ACCELERATE_FRAMEWORK Accelerate)
+    if (TSG_EMBEDDING_ACCELERATE_FRAMEWORK)
+        target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_ACCELERATE=1
+            ACCELERATE_NEW_LAPACK ACCELERATE_LAPACK_ILP64)
+        target_link_libraries(GgmlOps PRIVATE ${TSG_EMBEDDING_ACCELERATE_FRAMEWORK})
+    endif()
+endif()
 
 if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_METAL=1)
@@ -524,6 +551,35 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(cuda-cache-memory-single cuda-cache-memory-multi PROPERTIES
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
     endif()
+    add_executable(GgmlOpsGemma4VisionStackTest tests/gemma4_vision_stack_test.cpp)
+    target_include_directories(GgmlOpsGemma4VisionStackTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsGemma4VisionStackTest PRIVATE GgmlOps)
+    add_test(NAME gemma4-vision-stack-descriptors COMMAND GgmlOpsGemma4VisionStackTest)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME gemma4-vision-stack-cuda-admission COMMAND GgmlOpsGemma4VisionStackTest --require-cuda)
+        set_tests_properties(gemma4-vision-stack-cuda-admission PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+    endif()
+    add_executable(GgmlOpsEmbeddingCpuRmsTest tests/embedding_cpu_rms_test.cpp)
+    target_include_directories(GgmlOpsEmbeddingCpuRmsTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsEmbeddingCpuRmsTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME embedding-cpu-rms COMMAND GgmlOpsEmbeddingCpuRmsTest)
+    add_executable(GgmlOpsEmbeddingCpuAttentionTest tests/embedding_cpu_attention_test.cpp)
+    target_include_directories(GgmlOpsEmbeddingCpuAttentionTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsEmbeddingCpuAttentionTest PRIVATE ggml-cpu ggml-base ${CMAKE_DL_LIBS})
+    add_test(NAME embedding-cpu-attention COMMAND GgmlOpsEmbeddingCpuAttentionTest)
+    add_executable(GgmlOpsEmbeddingCpuMatmulTest tests/embedding_cpu_matmul_test.cpp)
+    target_include_directories(GgmlOpsEmbeddingCpuMatmulTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(GgmlOpsEmbeddingCpuMatmulTest PRIVATE ggml-cpu ggml-base ${CMAKE_DL_LIBS})
+    if (TSG_EMBEDDING_ACCELERATE_FRAMEWORK)
+        target_compile_definitions(GgmlOpsEmbeddingCpuMatmulTest PRIVATE TSG_GGML_USE_ACCELERATE=1
+            ACCELERATE_NEW_LAPACK ACCELERATE_LAPACK_ILP64)
+        target_link_libraries(GgmlOpsEmbeddingCpuMatmulTest PRIVATE ${TSG_EMBEDDING_ACCELERATE_FRAMEWORK})
+    endif()
+    add_test(NAME embedding-cpu-matmul COMMAND GgmlOpsEmbeddingCpuMatmulTest)
     set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_qwen4exp_arena.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)
@@ -894,6 +950,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
 
     # Compile the owned implementation into each precision test so Windows
     # exercises the same code without depending on DLL re-export details.
+    add_executable(GgmlOpsAudioCpuProjectionTest tests/embedding_audio_cpu_projection_test.cpp)
+    target_include_directories(GgmlOpsAudioCpuProjectionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsAudioCpuProjectionTest PRIVATE ggml-cpu ggml-base ${CMAKE_DL_LIBS})
+    add_test(NAME audio-cpu-projection-policy COMMAND GgmlOpsAudioCpuProjectionTest)
     add_executable(GgmlOpsMatmulPrecisionCpuTest tests/cuda_matmul_precision_test.cpp
         ggml_ops_matmul_precision.cpp)
     target_include_directories(GgmlOpsMatmulPrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

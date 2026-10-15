@@ -5,7 +5,7 @@ using TensorSharp.Cuda.Interop;
 
 namespace TensorSharp.Cuda
 {
-    internal sealed unsafe class CudaKernels : IDisposable
+    internal sealed unsafe partial class CudaKernels : IDisposable
     {
         private const int BlockSize = 256;
 
@@ -44,6 +44,8 @@ namespace TensorSharp.Cuda
         private readonly IntPtr softmaxF32;
         private readonly IntPtr attentionSoftmaxSinksF32;
         private readonly IntPtr scaledDotProductAttentionF32;
+        private readonly IntPtr embeddingAttentionGroup2D256F32;
+        private readonly IntPtr embeddingAttentionGroup4D512F32;
         // head_dim -> ts_vision_attention_d<D>_f32 (bidirectional flash attention
         // for vision encoders). Only the instantiated head dims are present.
         private readonly System.Collections.Generic.Dictionary<int, IntPtr> visionAttentionF32 = new();
@@ -212,6 +214,8 @@ namespace TensorSharp.Cuda
             wanIm2colF32 = GetOptionalFunction(module, "ts_wan_im2col_f32", missingOptional);
             wanChanRmsF32 = GetOptionalFunction(module, "ts_wan_chan_rms_f32", missingOptional);
             wanUpsample2xF32 = GetOptionalFunction(module, "ts_wan_upsample2x_f32", missingOptional);
+            embeddingAttentionGroup2D256F32 = GetOptionalFunction(module, "ts_embedding_attention_group2_d256_f32", missingOptional);
+            embeddingAttentionGroup4D512F32 = GetOptionalFunction(module, "ts_embedding_attention_group4_d512_f32", missingOptional);
             WarnOptionalKernelsMissing(missingOptional);
             gqaPrefillAttentionF32 = module.GetFunction("ts_gqa_prefill_attention_f32");
             gqaPrefillAttentionF16 = module.GetFunction("ts_gqa_prefill_attention_f16");
@@ -1169,6 +1173,22 @@ namespace TensorSharp.Cuda
                 &seqLenArg, &kvLenArg, &headDimArg, &maskStartArg, &windowSizeArg, &scaleArg, &kvStrideArg
             };
             Launch(gqaPrefillAttentionF32, (uint)numQHeads, (uint)seqLen, 1, BlockSize, 1, 1, (uint)(kvLen * sizeof(float)), stream, args);
+        }
+
+        public bool EmbeddingAttentionSupports(int headDim, int groupSize) =>
+            headDim == 256 && groupSize == 2 && embeddingAttentionGroup2D256F32 != IntPtr.Zero ||
+            headDim == 512 && groupSize == 4 && embeddingAttentionGroup4D512F32 != IntPtr.Zero;
+
+        public void LaunchEmbeddingAttention(IntPtr query, IntPtr key, IntPtr value, IntPtr bounds, IntPtr output,
+            int batch, int queryHeads, int kvHeads, int headDim, int seqLen, int radius, float scale, IntPtr stream)
+        {
+            IntPtr function = headDim == 256 ? embeddingAttentionGroup2D256F32 : embeddingAttentionGroup4D512F32;
+            int qRows = headDim == 256 ? 8 : 4, group = queryHeads / kvHeads, rows = qRows * group;
+            uint shared = checked((uint)((rows * (headDim + 128) + 3 * rows) * sizeof(float)));
+            void** args = stackalloc void*[] { &query, &key, &value, &bounds, &output,
+                &batch, &queryHeads, &kvHeads, &seqLen, &radius, &scale };
+            Launch(function, (uint)kvHeads, (uint)((seqLen + qRows - 1) / qRows), (uint)batch,
+                BlockSize, 1, 1, shared, stream, args);
         }
 
         public void LaunchGqaPrefillAttentionF16(

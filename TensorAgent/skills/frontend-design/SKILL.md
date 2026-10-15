@@ -1,10 +1,14 @@
 ---
 name: frontend-design
-description: Guidance for distinctive, intentional visual design when building new UI or reshaping an existing one. Helps with aesthetic direction, typography, and making choices that don't read as templated defaults.
+description: Design distinctive UI with intentional aesthetics and typography. Read the workflow first; save HTML with the offered file tool and return its download link.
 license: Complete terms in LICENSE.txt
 ---
 
 # Frontend Design
+
+## Workspace delivery
+
+Read this workflow with `skills_read` before designing. When the user requests a saved HTML artifact, your next action after planning is the offered `write_file` tool with a compact, complete document. Planning stays private: do not print a design plan, palette, wireframe, or HTML before the file-tool call. For a compact brief, use concise CSS and markup rather than long comments or redundant declarations. Duplicating source or publishing planning wastes the output budget and can leave the call incomplete. After a successful write, copy the exact Markdown download link from the tool result into your answer, followed by a brief description of the visual direction. Use only tools offered by the host. If a workspace or file tool is unavailable, state that no file was saved. Follow the user's offline/dependency constraints and keep all required content intact.
 
 Approach this as the design lead at a small studio known for giving every client a visual identity that could not be mistaken for anyone else's. This client has already rejected proposals that felt templated, and is paying for a distinctive point of view: make deliberate, opinionated choices about palette, typography, and layout that are specific to this brief, and take one real aesthetic risk you can justify.
 

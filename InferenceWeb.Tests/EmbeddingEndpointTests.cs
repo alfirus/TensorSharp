@@ -140,6 +140,28 @@ public class EmbeddingEndpointTests
     }
 
     [Theory]
+    [InlineData("""[{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]""")]
+    [InlineData("""[{"content":[{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,aGVsbG8="}}]}]""")]
+    [InlineData("""[{"content":[{"type":"video_url","video_url":{"url":"https://example.com/video.mp4"}}]}]""")]
+    [InlineData("""[{"content":[]}]""")]
+    public async Task MediaInputRequiresLoadedProjectorAndReturnsProtocolErrorsWithoutTextInference(string input)
+    {
+        foreach (bool openAI in new[] { true, false })
+        {
+            var model = new FakeModel();
+            using var adapter = new EmbeddingAdapter(model, Options());
+            var context = Context(openAI ? "/v1/embeddings" : "/api/embed", "{\"model\":\"test-encoder\",\"input\":" + input + "}");
+            if (openAI) await adapter.OpenAIAsync(context);
+            else await adapter.OllamaAsync(context);
+            Assert.Equal(400, context.Response.StatusCode);
+            var error = ReadResponse(context).GetProperty("error");
+            if (openAI) Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
+            else Assert.Equal(JsonValueKind.String, error.ValueKind);
+            Assert.Equal(0, model.Calls);
+        }
+    }
+
+    [Theory]
     [InlineData("/v1/embeddings", false, false, 400)]
     [InlineData("/api/embed", true, false, 200)]
     [InlineData("/api/embed", true, true, 400)]
