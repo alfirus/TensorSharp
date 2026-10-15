@@ -907,6 +907,14 @@ namespace tsg
         int pooled_model_experts = 0;
         int hidden = 0;
         int n_ff = 0;
+        // The NEXT host-MoE layer's F32 router [hidden, num_experts], when the
+        // builder knows it: lets a decode seam predict that layer's experts from
+        // this layer's input (diagnostics and prefetch). Null = unknown.
+        const float* next_router = nullptr;
+        // Decode only: that router's top-K experts scored on THIS layer's routed
+        // input, computed in the segment before the seam (I32 [K, seq]). The
+        // seam prefetches the predicted experts the next layer's cache lacks.
+        ggml_tensor* next_ids = nullptr;
 
         // --- tensor parallelism ---
         // Under TP the offloaded layer is computed ONCE, on the host, from the
@@ -1274,7 +1282,8 @@ namespace tsg
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
                                   bool* output_on_device = nullptr,
-                                  ggml_backend_t explicit_backend = nullptr);
+                                  ggml_backend_t explicit_backend = nullptr,
+                                  const HostMoeSegment* next_segment = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
     // CPU dot kernels on a team woken once per layer instead of a ggml graph per
@@ -1299,6 +1308,14 @@ namespace tsg
     int host_moe_cached_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                const float* weights, float* out, const char* kernel_name,
                                ggml_backend_t explicit_backend = nullptr);
+    // Decode prefetch (opt-in TS_HOST_MOE_DECODE_PREFETCH=1): a scalar seam
+    // that knows the next host-expert layer's predicted experts starts reading
+    // the ones that layer's cache lacks, overlapping this layer's work. The
+    // reads land in victim slots that the next cache call publishes first.
+    constexpr int kHostMoeDecodePrefetchCandidates = 10;
+    bool host_moe_decode_prefetch_enabled();
+    void host_moe_cache_prefetch(const HostMoeSegment& next, const std::int32_t* predicted, int count,
+                                 ggml_backend_t explicit_backend);
     void host_moe_expert_cache_on_drop(const void* ptr);
     void host_moe_expert_cache_release_backend(ggml_backend_t backend);
     void host_moe_expert_cache_stats(std::int64_t* reserved, std::int64_t* budget,
@@ -1909,7 +1926,8 @@ ggml_tensor* q4e_nodes_ffn(
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
     int n_embd, int hc, int hc_low_rank, int T,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh, float eps,
-    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1);
+    ggml_cgraph* graph = nullptr, std::vector<tsg::HostMoeSegment>* host_moe = nullptr, int layer = -1,
+    const TSGgmlQwen4ExpFfnArgs* next = nullptr);
 
 ggml_tensor* q4e_nodes_gdn(
     ggml_context* ctx, Q4eBinder& bnd,

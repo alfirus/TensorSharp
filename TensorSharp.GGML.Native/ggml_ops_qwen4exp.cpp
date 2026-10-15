@@ -956,7 +956,8 @@ ggml_tensor* q4e_nodes_ffn(
     const TSGgmlQwen4ExpFfnArgs* a, ggml_tensor* res_in,
     int n_embd, int hc, int hc_low_rank, int T,
     int n_expert, int n_expert_used, int n_ff, int n_ff_sh, float eps,
-    ggml_cgraph* graph, std::vector<tsg::HostMoeSegment>* host_moe, int layer)
+    ggml_cgraph* graph, std::vector<tsg::HostMoeSegment>* host_moe, int layer,
+    const TSGgmlQwen4ExpFfnArgs* next)
 {
     const bool cpu_moe = a->cpu_moe != 0;
     if (cpu_moe && (graph == nullptr || host_moe == nullptr))
@@ -1074,6 +1075,21 @@ ggml_tensor* q4e_nodes_ffn(
         ggml_build_forward_expand(graph, hm.moe_in);
         ggml_build_forward_expand(graph, hm.sel_ids);
         ggml_build_forward_expand(graph, hm.weights);
+
+        // Decode: score the next host-expert layer's router on this layer's
+        // routed input. Consecutive layers' inputs are close enough that its
+        // top-K covers most of the next layer's real routes, so the seam can
+        // start reading the missing experts while this layer still computes.
+        if (next != nullptr && next->cpu_moe != 0 && T == 1 && tsg::host_moe_decode_prefetch_enabled()
+            && next->router_type == a->router_type && next->router_bytes == a->router_bytes)
+        {
+            ggml_tensor* w_router_next = ggml_new_tensor_2d(ctx, (ggml_type)next->router_type, n_embd, n_expert);
+            bnd.add(w_router_next, next->router, (std::size_t)next->router_bytes);
+            ggml_tensor* next_logits = q4e_mul_mat(ctx, w_router_next, mixed);
+            hm.next_ids = boundary(ggml_argsort_top_k(ctx, next_logits,
+                std::min(tsg::kHostMoeDecodePrefetchCandidates, n_expert)));
+            ggml_build_forward_expand(graph, hm.next_ids);
+        }
 
         // Written by the host between segments: an input (no producer) that is
         // also an output, so ggml-alloc keeps it for the whole pass.
@@ -2757,10 +2773,15 @@ static int q4e_token_span_impl(
             // ---- FFN half ----
             // An offloaded layer expands its seam's boundary tensors itself, before
             // the nodes that read the host's result exist (see q4e_nodes_ffn).
+            const std::size_t seams_before = host_moe.size();
             res = q4e_nodes_ffn(ctx, binder, &ffn[il], res,
                     n_embd, hc, hc_low_rank, T,
                     n_expert, n_expert_used, n_ff, n_ff_sh, eps,
-                    graph, &host_moe, il);
+                    graph, &host_moe, il, il + 1 < layer_end ? &ffn[il + 1] : nullptr);
+            if (host_moe.size() > seams_before && il + 1 < layer_end && ffn[il + 1].cpu_moe != 0
+                && ffn[il + 1].router_type == GGML_TYPE_F32
+                && ffn[il + 1].router_bytes == (long long)n_embd * n_expert * (long long)sizeof(float))
+                host_moe.back().next_router = static_cast<const float*>(ffn[il + 1].router);
             ggml_build_forward_expand(graph, res);
             if (q4e_span_trace()) { ggml_set_output(res); trace_res.push_back(res); }
         }

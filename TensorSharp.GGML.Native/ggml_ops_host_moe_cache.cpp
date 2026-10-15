@@ -26,9 +26,13 @@
 #include "ggml-cuda.h"
 #endif
 
+#include "dsv41_engram_io.h"
 #include <cerrno>
+#include <condition_variable>
 #include <cstdlib>
 #include <list>
+#include <mutex>
+#include <thread>
 #include <optional>
 #include <exception>
 
@@ -297,6 +301,8 @@ namespace tsg
             std::vector<int> expert_for_slot;
             std::vector<ExpertSourceIdentity> source_for_slot;
             std::vector<std::uint64_t> last_used;
+            // Slots a decode prefetch filled and no route has used yet (stats).
+            std::vector<std::uint8_t> prefetched;
             std::uint64_t clock = 0;
             ExpertEvictionPolicy eviction_policy;
             ExpertPrefetchPolicy prefetch_policy;
@@ -365,6 +371,7 @@ namespace tsg
             }
             void invalidate_slot(int slot) {
                 expert_for_slot[slot] = -1; source_for_slot[slot].invalidate();
+                if (static_cast<std::size_t>(slot) < prefetched.size()) prefetched[static_cast<std::size_t>(slot)] = 0;
             }
             void publish_slot(int slot, int expert) {
                 expert_for_slot[slot] = expert; source_for_slot[slot].publish(current_source(), expert);
@@ -380,6 +387,9 @@ namespace tsg
         // per-layer slots. Each layer has at most budget / layer_count bytes,
         // preventing early layers from consuming every slot on the first token.
         std::list<std::unique_ptr<CacheEntry>> g_entries;
+        // Caller holds g_cache_mutex; see DecodePrefetch. Must run before any
+        // path that can erase an entry.
+        void drain_decode_prefetch(bool publish);
         std::optional<HostMoeGroupQuotaPlan> g_group_plan;
         std::optional<HostMoePhaseQuotaPlan> g_phase_plan;
         ggml_backend_t g_group_backend = nullptr;
@@ -414,6 +424,7 @@ namespace tsg
         bool reclaim_phase_room(std::size_t incoming, std::size_t replacing,
             const CacheEntry* keep, std::size_t budget) {
             if (!g_phase_plan || incoming > budget || replacing > g_reserved) return false;
+            drain_decode_prefetch(false);
             while (g_reserved - replacing > budget - incoming) {
                 auto victim = g_entries.end();
                 for (auto it = g_entries.begin(); it != g_entries.end(); ++it)
@@ -467,6 +478,102 @@ namespace tsg
         } g_file_read_buffer;
 
 #ifdef TSG_GGML_USE_CUDA
+        // ---- Next-layer decode prefetch --------------------------------------
+        // One prefetch in flight. g_cache_mutex guards every field the main
+        // thread touches. The worker only reads files into `staging` and uploads
+        // them into the target entry's chosen slots on its own CUDA stream; those
+        // slots stay invalid (unmatched, free) until the main thread drains the
+        // job and publishes them. Every consumer of the target entry and every
+        // path that can erase entries drains first.
+        struct DecodePrefetch {
+            std::thread thread;
+            std::mutex mutex;
+            std::condition_variable cv;
+            bool stop = false, job = false, done = true;
+            std::exception_ptr error;
+            CacheEntry* entry = nullptr;                 // target, valid until drained
+            std::vector<std::pair<int, int>> fills;      // (slot, expert)
+            std::vector<ExpertReadTask> tasks;
+            std::vector<std::pair<int, int>> task_slot_part;
+            ggml_backend_t upload = nullptr;             // second backend: its own stream
+            ggml_backend_buffer_t staging = nullptr;
+            std::shared_ptr<SharedCacheCharge> staging_charge;
+            std::uint64_t issued = 0, published = 0, used = 0;
+
+            static tsg_dsv41::engram_io_pool& readers() {
+                // Separate from the seam's own reader pool, so the next layer's
+                // reads do not queue behind this layer's misses.
+                static tsg_dsv41::engram_io_pool pool(8);
+                return pool;
+            }
+            void run() {
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        cv.wait(lock, [&] { return stop || job; });
+                        if (stop) return;
+                        job = false;
+                    }
+                    std::exception_ptr failure;
+                    try {
+                        readers().run(tasks.size(), [&](std::size_t i) { tasks[i].prepare(); });
+                        for (std::size_t i = 0; i < tasks.size(); ++i) {
+                            const auto [slot, part] = task_slot_part[i];
+                            ggml_backend_tensor_set_async(upload, entry->weight[part], tasks[i].destination,
+                                static_cast<std::size_t>(slot) * entry->stride[part], tasks[i].bytes);
+                        }
+                        ggml_backend_synchronize(upload);
+                    } catch (...) { failure = std::current_exception(); }
+                    std::lock_guard<std::mutex> lock(mutex);
+                    error = failure;
+                    done = true;
+                    cv.notify_all();
+                }
+            }
+            void start() {
+                if (!thread.joinable()) thread = std::thread([this] { run(); });
+                std::lock_guard<std::mutex> lock(mutex);
+                done = false; job = true; error = nullptr;
+                cv.notify_all();
+            }
+            void wait() {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return done; });
+            }
+            // Caller holds g_cache_mutex. Publishes the filled slots unless the
+            // read/upload failed or the caller is discarding the target.
+            void drain(bool publish) {
+                if (entry == nullptr) return;
+                wait();
+                if (publish && !error)
+                    for (const auto& [slot, expert] : fills) {
+                        entry->publish_slot(slot, expert);
+                        entry->last_used[slot] = ++entry->clock;
+                        if (entry->prefetched.size() != static_cast<std::size_t>(entry->capacity))
+                            entry->prefetched.assign(static_cast<std::size_t>(entry->capacity), 0);
+                        entry->prefetched[static_cast<std::size_t>(slot)] = 1;
+                        ++published;
+                    }
+                entry = nullptr; fills.clear(); tasks.clear(); task_slot_part.clear(); error = nullptr;
+            }
+            void release_resources() {
+                drain(false);
+                if (staging) ggml_backend_buffer_free(staging);
+                staging = nullptr; staging_charge.reset();
+                if (upload) ggml_backend_free(upload);
+                upload = nullptr;
+            }
+            ~DecodePrefetch() {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    stop = true;
+                    cv.notify_all();
+                }
+                if (thread.joinable()) thread.join();
+            }
+        } g_prefetch;
+        void drain_decode_prefetch(bool publish) { g_prefetch.drain(publish); }
+
         bool valid_layout(const HostMoeSegment& hm, std::size_t (&stride)[3], int max_rows, bool explicit_model = false)
         {
             if (hm.seq_len <= 0 || hm.seq_len > max_rows
@@ -1528,6 +1635,10 @@ namespace tsg
         if (pooled_glm) graph_rows = std::max(graph_rows, compact_group_rows);
         auto found = g_entries.begin();
         while (found != g_entries.end() && !(*found)->matches(hm, backend)) ++found;
+        // A prefetch into this entry is published before its lookup. Creating
+        // an entry can evict others, so any prefetch is drained first then.
+        if (g_prefetch.entry != nullptr && (found == g_entries.end() || found->get() == g_prefetch.entry))
+            drain_decode_prefetch(true);
         std::unique_ptr<CacheEntry> planned;
         int bulk_rows = bulk_prefill ? hm.seq_len : 0;
         if (found != g_entries.end()) {
@@ -1687,6 +1798,11 @@ namespace tsg
                         remapped[k] = s;
                         protected_slots[s] = 1;
                         ++g_hits;
+                        if (static_cast<std::size_t>(s) < entry.prefetched.size() && entry.prefetched[static_cast<std::size_t>(s)])
+                        {
+                            entry.prefetched[static_cast<std::size_t>(s)] = 0;
+                            ++g_prefetch.used;
+                        }
                         break;
                     }
             for (int k = 0; k < selected_count; ++k)
@@ -1884,10 +2000,123 @@ namespace tsg
 #endif
     }
 
+    bool host_moe_decode_prefetch_enabled()
+    {
+        static const bool enabled = [] {
+            // Opt-in. Measured on a 16 GB laptop GPU with NVMe/page-cache misses
+            // read at ~4-5 GB/s: top-10 prediction raised the decode expert hit
+            // rate 79% -> ~87% but only ~47% of prefetched experts were used, and
+            // the extra bytes on a bandwidth-bound read path made decode slower
+            // (13-15 -> 10 tok/s). Useful where reads are latency-bound instead.
+            const char* e = std::getenv("TS_HOST_MOE_DECODE_PREFETCH");
+            return e != nullptr && e[0] == '1';
+        }();
+        return enabled;
+    }
+
+    void host_moe_cache_prefetch(const HostMoeSegment& next, const std::int32_t* predicted, int count,
+                                 ggml_backend_t explicit_backend)
+    {
+#ifdef TSG_GGML_USE_CUDA
+        if (!host_moe_decode_prefetch_enabled() || next.seq_len != 1 || predicted == nullptr || count <= 0) return;
+        ggml_backend_t backend = explicit_backend != nullptr ? explicit_backend : active_backend();
+        if (backend == nullptr || !ggml_backend_is_cuda(backend)) return;
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (cache_budget() == 0) return;
+        // The previous prediction's layer normally consumed it already.
+        drain_decode_prefetch(true);
+        CacheEntry* entry = nullptr;
+        for (const auto& candidate : g_entries)
+            if (candidate->matches(next, backend)) { entry = candidate.get(); break; }
+        // Pooled/split GLM tables keep their own staging contracts.
+        if (entry == nullptr || entry->pooled || entry->split_weights || entry->capacity < 2) return;
+        std::array<std::shared_ptr<ExpertFileSource>, 3> files;
+        for (int part = 0; part < 3; ++part) {
+            const auto source = g_file_sources.find(entry->source[part]);
+            if (source == g_file_sources.end()
+                || source->second->bytes() != entry->stride[part] * static_cast<std::size_t>(entry->num_experts)) return;
+            files[part] = source->second;
+        }
+        auto& p = g_prefetch;
+        // Keep every predicted expert that is already resident; fill the others
+        // into the slots the eviction policy would give up first.
+        std::vector<std::uint8_t> keep(static_cast<std::size_t>(entry->capacity), 0);
+        std::vector<int> wanted;
+        for (int k = 0; k < count; ++k) {
+            const int expert = predicted[k];
+            if (expert < 0 || expert >= entry->num_experts) return;
+            bool resident = false;
+            for (int s = 0; s < entry->capacity; ++s)
+                if (entry->slot_matches(s, expert)) { keep[static_cast<std::size_t>(s)] = 1; resident = true; break; }
+            if (!resident && std::find(wanted.begin(), wanted.end(), expert) == wanted.end()) wanted.push_back(expert);
+        }
+        // Never displace more than half of a layer's slots on a prediction.
+        const int limit = std::min(static_cast<int>(wanted.size()), entry->capacity / 2);
+        p.fills.clear();
+        for (int i = 0; i < limit; ++i) {
+            int victim = -1;
+            for (int s = 0; s < entry->capacity; ++s)
+                if (!keep[static_cast<std::size_t>(s)] && (victim < 0 || entry->eviction_policy.prefer(
+                        entry->expert_for_slot[s], entry->last_used[s],
+                        entry->expert_for_slot[victim], entry->last_used[victim]))) victim = s;
+            if (victim < 0) break;
+            keep[static_cast<std::size_t>(victim)] = 1;
+            p.fills.emplace_back(victim, wanted[static_cast<std::size_t>(i)]);
+        }
+        if (p.fills.empty()) return;
+        const std::size_t expert_bytes = entry->stride[0] + entry->stride[1] + entry->stride[2];
+        const std::size_t bytes = expert_bytes * p.fills.size();
+        if (p.staging == nullptr || ggml_backend_buffer_get_size(p.staging) < bytes) {
+            if (p.staging) ggml_backend_buffer_free(p.staging);
+            p.staging = nullptr; p.staging_charge.reset();
+            const std::size_t capacity = expert_bytes * static_cast<std::size_t>(kHostMoeDecodePrefetchCandidates);
+            auto charge = SharedCacheCharge::reserve(0, 3, capacity);
+            if (!charge || !charge->is_accounted()) { p.fills.clear(); return; }
+            ggml_backend_buffer_t staging = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), capacity);
+            if (staging == nullptr || !charge->commit(capacity)) {
+                if (staging) ggml_backend_buffer_free(staging);
+                p.fills.clear();
+                return;
+            }
+            p.staging = staging; p.staging_charge = std::move(charge);
+        }
+        if (p.upload == nullptr) {
+            p.upload = ggml_backend_dev_init(ggml_backend_get_device(backend), nullptr);
+            if (p.upload == nullptr) { p.fills.clear(); return; }
+        }
+        auto* base = static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(p.staging));
+        p.tasks.clear(); p.task_slot_part.clear();
+        std::size_t offset = 0;
+        for (const auto& [slot, expert] : p.fills) {
+            // The slot no longer holds its old expert from here on, even if the
+            // read fails: a failed prefetch leaves it free.
+            entry->invalidate_slot(slot);
+            for (int part = 0; part < 3; ++part) {
+                p.tasks.push_back({files[part].get(), static_cast<std::size_t>(expert) * entry->stride[part],
+                    base + offset, entry->stride[part]});
+                p.task_slot_part.emplace_back(slot, part);
+                offset += entry->stride[part];
+            }
+        }
+        p.entry = entry;
+        p.issued += p.fills.size();
+        static std::uint64_t prefetch_calls = 0;
+        if (diagnostics() && ++prefetch_calls % 2400 == 0)
+            std::fprintf(stderr, "[HOSTMOE-PREFETCH] issued=%llu published=%llu used=%llu hits=%llu misses=%llu\n",
+                static_cast<unsigned long long>(p.issued), static_cast<unsigned long long>(p.published),
+                static_cast<unsigned long long>(p.used), static_cast<unsigned long long>(g_hits),
+                static_cast<unsigned long long>(g_misses));
+        p.start();
+#else
+        (void)next; (void)predicted; (void)count; (void)explicit_backend;
+#endif
+    }
+
     void host_moe_expert_cache_on_drop(const void* ptr)
     {
         if (ptr == nullptr) return;
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+        drain_decode_prefetch(false);
         g_file_sources.erase(ptr);
         for (auto it = g_entries.begin(); it != g_entries.end();)
         {
@@ -1908,6 +2137,7 @@ namespace tsg
     {
         if (!backend) return;
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_prefetch.release_resources();
         for (auto it = g_entries.begin(); it != g_entries.end();) {
             if ((*it)->backend != backend) { ++it; continue; }
             const auto bytes = (*it)->bytes;
@@ -1919,7 +2149,12 @@ namespace tsg
     void host_moe_expert_cache_release()
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_prefetch.release_resources();
         host_moe_cpu_staging_release();
+        if (diagnostics() && g_prefetch.issued) std::fprintf(stderr,
+            "[HOSTMOE-PREFETCH] issued=%llu published=%llu used=%llu\n",
+            static_cast<unsigned long long>(g_prefetch.issued), static_cast<unsigned long long>(g_prefetch.published),
+            static_cast<unsigned long long>(g_prefetch.used));
         if (diagnostics() && (g_calls != 0 || g_reserved != 0)) std::fprintf(stderr,
             "[HOSTMOE-CACHE] calls=%llu hits=%llu misses=%llu reserved=%zu budget=%zu release\n",
             static_cast<unsigned long long>(g_calls), static_cast<unsigned long long>(g_hits),
@@ -1946,6 +2181,7 @@ namespace tsg
     {
         // Request-boundary maintenance also releases the one serial CPU layer's
         // reusable host arena, without dropping registered file sources.
+        drain_decode_prefetch(false);
         host_moe_cpu_staging_release();
         const auto before = g_reserved;
         for (auto it = g_entries.begin(); per_layer != (std::numeric_limits<std::size_t>::max)()

@@ -2564,6 +2564,11 @@ namespace tsg
                 return false;
             }
             int cut = (i_in > i_id ? (i_in > i_w ? i_in : i_w) : (i_id > i_w ? i_id : i_w)) + 1;
+            if (hm.next_ids != nullptr)
+            {
+                const int i_n = host_moe_graph_node_index(graph, hm.next_ids);
+                if (i_n + 1 > cut) cut = i_n + 1;
+            }
             if (hm.verify_gpu != nullptr)
             {
                 const int i_v = host_moe_graph_node_index(graph, hm.verify_gpu);
@@ -2616,9 +2621,58 @@ namespace tsg
         } catch (...) { g_moe_file_weights.clear(); g_moe_file_work.clear(); throw; }
     }
 
+    // TS_HOST_MOE_PREDICT_DIAG=1: how well this decode layer's routed input,
+    // scored by the NEXT layer's router, predicts the next layer's experts.
+    // Prints recall of the actual routes within the predicted top-K. Diagnostic
+    // only: it downloads the input and scores every expert on the host.
+    void host_moe_predict_diagnostic(const HostMoeSegment& hm, const std::int32_t* ids)
+    {
+        static const bool enabled = [] {
+            const char* e = std::getenv("TS_HOST_MOE_PREDICT_DIAG");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (!enabled) return;
+        static thread_local std::vector<std::vector<int>> predicted;
+        static thread_local std::array<std::uint64_t, 4> found{};
+        static thread_local std::uint64_t routes = 0, calls = 0;
+        constexpr int kRanks[4] = { 10, 16, 24, 32 };
+        if (hm.layer < 0 || hm.n_used <= 0) return;
+        if (predicted.size() <= static_cast<std::size_t>(hm.layer + 1)) predicted.resize(static_cast<std::size_t>(hm.layer + 2));
+        auto& mine = predicted[static_cast<std::size_t>(hm.layer)];
+        if (!mine.empty()) {
+            for (int r = 0; r < 4; ++r)
+                for (int k = 0; k < hm.n_used; ++k)
+                    for (int j = 0; j < (std::min)(kRanks[r], static_cast<int>(mine.size())); ++j)
+                        if (mine[static_cast<std::size_t>(j)] == ids[k]) { ++found[static_cast<std::size_t>(r)]; break; }
+            routes += static_cast<std::uint64_t>(hm.n_used);
+            mine.clear();
+        }
+        auto& next = predicted[static_cast<std::size_t>(hm.layer + 1)];
+        next.clear();
+        if (hm.next_router != nullptr) {
+            std::vector<float> x(static_cast<std::size_t>(hm.hidden));
+            ggml_backend_tensor_get(hm.moe_in, x.data(), 0, x.size() * sizeof(float));
+            std::vector<std::pair<float, int>> scores(static_cast<std::size_t>(hm.num_experts));
+            for (int e = 0; e < hm.num_experts; ++e) {
+                const float* w = hm.next_router + static_cast<std::size_t>(e) * static_cast<std::size_t>(hm.hidden);
+                float acc = 0.0f;
+                for (int i = 0; i < hm.hidden; ++i) acc += w[i] * x[static_cast<std::size_t>(i)];
+                scores[static_cast<std::size_t>(e)] = { acc, e };
+            }
+            const int keep = (std::min)(kRanks[3], hm.num_experts);
+            std::partial_sort(scores.begin(), scores.begin() + keep, scores.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (int j = 0; j < keep; ++j) next.push_back(scores[static_cast<std::size_t>(j)].second);
+        }
+        if (++calls % 4800 == 0 && routes > 0)
+            std::fprintf(stderr, "[HOSTMOE-PREDICT] next-layer recall top10=%.3f top16=%.3f top24=%.3f top32=%.3f over %llu routes\n",
+                found[0] / double(routes), found[1] / double(routes), found[2] / double(routes), found[3] / double(routes),
+                static_cast<unsigned long long>(routes));
+    }
+
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged, bool allow_device_stream, bool* output_on_device,
-                                  ggml_backend_t explicit_backend)
+                                  ggml_backend_t explicit_backend, const HostMoeSegment* next_segment)
     {
         if (output_on_device != nullptr) *output_on_device = false;
         if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
@@ -2644,6 +2698,20 @@ namespace tsg
         // The caller synchronized the segment that produced these, so the reads
         // see its results.
         ggml_backend_tensor_get(hm.sel_ids, s_ids.data(), 0, route_count * sizeof(std::int32_t));
+        if (hm.seq_len == 1) host_moe_predict_diagnostic(hm, s_ids.data());
+        // Start reading the next layer's predicted experts first, so those reads
+        // overlap this layer's own misses, expert graph and the next segment.
+        if (hm.seq_len == 1 && hm.next_ids != nullptr && next_segment != nullptr && allow_device_stream
+            && !g_moe_layer_residency.enabled)
+        {
+            const int candidates = static_cast<int>(hm.next_ids->ne[0]);
+            std::int32_t predicted[kHostMoeDecodePrefetchCandidates];
+            if (candidates > 0 && candidates <= kHostMoeDecodePrefetchCandidates)
+            {
+                ggml_backend_tensor_get(hm.next_ids, predicted, 0, static_cast<std::size_t>(candidates) * sizeof(std::int32_t));
+                host_moe_cache_prefetch(*next_segment, predicted, candidates, explicit_backend);
+            }
+        }
 
         // CUDA compact slots can keep activations and routing probabilities on
         // the device. The host only needs IDs for slot selection; retain staged
@@ -2884,7 +2952,8 @@ namespace tsg
             const auto t_host = s_pass_timing ? pass_clock::now() : pass_clock::time_point{};
             if (!host_moe_compute_segment(hm, s_moe_out, kernel_name,
                                           debug_this_call ? &staged : nullptr, true,
-                                          !debug_this_call && hm.verify_gpu == nullptr ? &output_on_device : nullptr))
+                                          !debug_this_call && hm.verify_gpu == nullptr ? &output_on_device : nullptr,
+                                          nullptr, seg + 1 < segments.size() ? &segments[seg + 1] : nullptr))
                 return false;
             if (s_pass_timing) s_acc_host += ms_since(t_host);
 
