@@ -12,6 +12,16 @@
 ggml_tensor * tsg_matmul_q8_f32(ggml_context *, ggml_tensor *, ggml_tensor *);
 bool tsg_is_matmul_q8_f32(const ggml_tensor *);
 
+// Original-format Q8_0/Q5_K weights times F32 activations. Q5_K
+// requires K%256==0 and its original 176-byte blocks; the Q8 API above retains
+// its type-specific meaning. Neither path expands a resident weight matrix or
+// quantizes activations. Row padding and F32 element strides remain supported.
+constexpr bool tsg_matmul_quant_f32_type_supported(ggml_type type) {
+    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_K;
+}
+ggml_tensor * tsg_matmul_quant_f32(ggml_context *, ggml_tensor *, ggml_tensor *);
+bool tsg_is_matmul_quant_f32(const ggml_tensor *);
+
 #ifdef TSG_GGML_USE_CUDA
 void tsg_matmul_q8_cuda_compute(ggml_tensor *, ggml_backend_t cuda_backend);
 // Raw owned-buffer submission for bounded streaming. Returns a CUDA error code;

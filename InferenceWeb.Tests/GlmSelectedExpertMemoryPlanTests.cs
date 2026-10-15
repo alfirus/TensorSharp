@@ -350,4 +350,37 @@ public sealed class GlmSelectedExpertMemoryPlanTests
         Assert.True(GlmSelectedExpertMemoryPlan.ForecastMinimum(geometry, 3, 1024)
             > GlmSelectedExpertMemoryPlan.ForecastMinimum(geometry, 3, 512));
     }
+
+    [Fact]
+    public void OptionalPrefixReplacementCannotPermanentlyReduceTheAdmittedPrefillWidth()
+    {
+        var geometry = Geometry();
+        var options = Options(prefill: 512) with
+        {
+            EnableAdaptiveGlmPrefill = true, AdaptiveGlmPrefillChunkTokens = 1024,
+        };
+        const int context = 32768;
+        long slot = geometry.SlotBytes(context);
+        long mandatoryExecution = geometry.AdaptiveExecutionPlacementReserve(context, 3);
+        long fullPrefillFloor = GlmSelectedExpertMemoryPlan.ForecastMinimum(geometry, 3, 1024);
+        // Three live requests, one retained public checkpoint and the idle
+        // primary coexist at this exact metadata-derived placement boundary.
+        // A future capture is optional and has not allocated any owner yet.
+        long ceiling = checked(geometry.DenseDeviceBytes + mandatoryExecution + fullPrefillFloor + 2 * slot);
+        var prefix = UnifiedMemoryPrefixCapacity.Select(1, slot, ceiling);
+        Assert.Equal(1, prefix.RetainedCopies);
+        var plan = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, options, context, ceiling,
+            checked(prefix.PlacementReserveBytes + slot));
+        Assert.Equal(1024, plan.PrefillRows);
+        Assert.Equal(fullPrefillFloor, plan.CacheMinimumForecastBytes);
+        Assert.Equal(fullPrefillFloor, plan.CacheCapacityBytes);
+        Assert.Equal(3, plan.CpuExpertLayers);
+        Assert.Equal(ceiling, geometry.DenseDeviceBytes + plan.ExecutionReserveBytes + prefix.PlacementReserveBytes + slot);
+
+        // The removed policy reserves an additional, nonexistent replacement
+        // for the session's entire lifetime and selects a smaller phase floor.
+        var oldPolicy = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, options, context, ceiling, 3 * slot);
+        Assert.True(oldPolicy.PrefillRows < plan.PrefillRows);
+        Assert.Equal(options.AdaptiveGlmPrefillChunkTokens, plan.PrefillRows);
+    }
 }

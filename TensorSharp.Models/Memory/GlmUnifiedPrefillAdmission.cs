@@ -2,7 +2,6 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using TensorSharp.GGML;
 using TensorSharp.Memory;
 using TensorSharp.Memory.Planning;
 using TensorSharp.Runtime.Scheduling;
@@ -150,42 +149,5 @@ internal static class GlmUnifiedPrefillAdmission
         }
         selected = default;
         return false;
-    }
-}
-
-/// <summary>Expert-cache maintenance at a fenced request boundary. Shrinking
-/// frees native payload before refunding its root; growth reserves first. This
-/// helper makes ordering and rollback independently testable without a GPU.</summary>
-internal static class GlmUnifiedExpertCapacity
-{
-    internal static bool Resize(GgmlHostMoeExpertCacheScope cache, BudgetReservation envelope,
-        long target, long immutableMinimum, IReadOnlyList<MemoryCharge> limits)
-    {
-        ArgumentNullException.ThrowIfNull(cache); ArgumentNullException.ThrowIfNull(envelope);
-        ArgumentNullException.ThrowIfNull(limits);
-        if (immutableMinimum < 0 || target < immutableMinimum || target > cache.MaximumBudgetBytes)
-            throw new ArgumentOutOfRangeException(nameof(target));
-        long previous = cache.BudgetBytes;
-        if (target == previous) return true;
-        MemoryCharge[] Charges(long bytes) => [new(UnifiedMemoryModelSession.DevicePool, bytes)];
-        if (target < previous)
-        {
-            cache.UpdateBudget(target); // Includes native fences/destruction.
-            long children = envelope.LiveChildCharges.Single(c => c.Pool == UnifiedMemoryModelSession.DevicePool).Bytes;
-            if (children > target || !envelope.TryResizeTotal(Charges(target)))
-                throw new InvalidOperationException("GLM expert trim did not release its complete shared physical ownership; existing credit remains owned.");
-            return true;
-        }
-        if (!envelope.TryResizeTotal(Charges(target), limits)) return false;
-        try { cache.UpdateBudget(target); }
-        catch
-        {
-            // Failed updates preserve the old native ceiling. Some successfully
-            // freed entries need not be recreated; only unused credit rolls back.
-            if (!envelope.TryResizeTotal(Charges(previous)))
-                throw new InvalidOperationException("GLM expert capacity could not restore its previous envelope after a failed native update.");
-            throw;
-        }
-        return true;
     }
 }

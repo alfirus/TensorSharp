@@ -66,11 +66,13 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private bool _disposed;
     private bool _disposing;
     private BudgetReservation? _executionEnvelope;
+    private AllocationOwner? _allocationOwner;
     private BudgetReservation? _sharedExpertEnvelope;
     private BudgetReservation? _sharedJointEnvelope;
     private long _allocationRefusalCount;
     private GgmlAllocationRefusal? _firstAllocationRefusal, _lastAllocationRefusal;
     internal Action? BeforeExecutionOwnerAllocation { get; set; }
+    internal Action? BeforeAllocationOwnerAllocation { get; set; }
 
     /// <summary>Bounded failure telemetry: no growing event log or successful-allocation sampling.</summary>
     public (long Count, GgmlAllocationRefusal? First, GgmlAllocationRefusal? Last) AllocationRefusals
@@ -209,10 +211,64 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         }
     }
 
+    /// <summary>Temporarily route synchronous GGML allocations to another owner,
+    /// for example a persistent checkpoint, including native worker callbacks.
+    /// Hold the model compute lock throughout; do not await or overlap model
+    /// work. Overrides may nest but must dispose in reverse order. Existing
+    /// shared expert/joint owners retain their dedicated allocation kinds.</summary>
+    public IDisposable EnterAllocationOwner(BudgetReservation envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_disposing) throw new InvalidOperationException("The GGML budget is being detached.");
+            if (!ReferenceEquals(envelope.Budget, _budget))
+                throw new ArgumentException("Allocation owner belongs to a different budget.", nameof(envelope));
+            // The final handle exists before either owner reference changes.
+            // OOM leaves the previous request/override fully active.
+            BeforeAllocationOwnerAllocation?.Invoke();
+            var owner = new AllocationOwner(this, _executionEnvelope, _allocationOwner);
+            _executionEnvelope = envelope;
+            _allocationOwner = owner;
+            return owner;
+        }
+    }
+
+    private sealed class AllocationOwner(GgmlCacheBudgetScope scope, BudgetReservation? previousEnvelope,
+        AllocationOwner? previousOwner) : IDisposable
+    {
+        private bool _disposed;
+        public void Dispose()
+        {
+            lock (scope._gate)
+            {
+                if (_disposed) return;
+                if (!ReferenceEquals(scope._allocationOwner, this))
+                    throw new InvalidOperationException("GGML allocation owners must be restored in reverse order.");
+                // Restore only references; no handle/closure/signal allocation
+                // can fail after removing the active persistent owner.
+                scope._executionEnvelope = previousEnvelope;
+                scope._allocationOwner = previousOwner;
+                _disposed = true;
+            }
+        }
+    }
+
     private sealed class Execution(GgmlCacheBudgetScope owner) : IDisposable
     {
         private bool _disposed;
-        public void Dispose() { lock (owner._gate) { if (_disposed) return; owner._executionEnvelope = null; _disposed = true; } }
+        public void Dispose()
+        {
+            lock (owner._gate)
+            {
+                if (_disposed) return;
+                if (owner._allocationOwner != null)
+                    throw new InvalidOperationException("Restore GGML allocation owners before leaving execution.");
+                owner._executionEnvelope = null;
+                _disposed = true;
+            }
+        }
     }
 
     public void Dispose()

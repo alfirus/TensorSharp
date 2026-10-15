@@ -1269,6 +1269,11 @@ internal sealed class PrefixTree
             Counters.EndStatesRefused++;
             return AttachResult.Refused;
         }
+        // Grow every fallible container before the first ownership/accounting
+        // mutation. Intrusive LRU/count/scope updates below allocate nothing.
+        BeforeEndStatePublicationCapacity?.Invoke();
+        _keyIndex.EnsureCapacity(checked(_keyIndex.Count + 1));
+        if (node.IsPublicBoundary) _publicBoundaries.EnsureCapacity(checked(_publicBoundaries.Count + 1));
         bool revived = node.HadEndState || node.Children.Count > 0 || node.PageCount > 0;
         ResourceVector before = ProtectedOf(node);
         node.EndState = payload;
@@ -2320,6 +2325,8 @@ internal sealed class PrefixTree
     }
 
     // ------------------------------------------------------------------ test hooks
+
+    internal Action? BeforeEndStatePublicationCapacity { get; set; }
 
     /// <summary>Test hook: sets the version without a mutation (invariant mutation tests).</summary>
     internal void UnsafeSetVersion(long version) => Version = version;

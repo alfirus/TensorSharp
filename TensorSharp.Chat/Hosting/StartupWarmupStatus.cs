@@ -24,13 +24,25 @@ public sealed class StartupWarmupStatus
     public StartupWarmupStatus(IEnumerable<Stage> stages, bool prefixRetentionRequested,
         IEnumerable<JointStage>? jointStages, bool jointWarmupRequested, string? jointWarmupSkipReason,
         bool kernelInitializationOnly)
+        : this(stages, prefixRetentionRequested, jointStages, jointWarmupRequested, jointWarmupSkipReason,
+            kernelInitializationOnly, true, null) { }
+
+    public StartupWarmupStatus(IEnumerable<Stage> stages, bool prefixRetentionRequested,
+        IEnumerable<JointStage>? jointStages, bool jointWarmupRequested, string? jointWarmupSkipReason,
+        bool kernelInitializationOnly, bool preferredThinking = true, string? singleVariantReason = null)
     {
         var snapshot = stages?.ToArray() ?? throw new ArgumentNullException(nameof(stages));
         Stages = Array.AsReadOnly(snapshot);
         PrefixRetentionRequested = prefixRetentionRequested;
         Scope = kernelInitializationOnly ? "kernel-initialization" : "default-chat-prefix";
-        Completed = snapshot.Length == 2 && snapshot.All(s => s.Completed)
-            && snapshot.Any(s => s.Thinking) && snapshot.Any(s => !s.Thinking);
+        PreferredThinking = preferredThinking;
+        SingleVariantReason = singleVariantReason;
+        Completed = singleVariantReason is null
+            ? snapshot.Length == 2 && snapshot.All(s => s.Completed)
+                && snapshot.Any(s => s.Thinking) && snapshot.Any(s => !s.Thinking)
+            : singleVariantReason == StartupWarmupPolicy.SinglePreferredVariantReason
+                && prefixRetentionRequested && !kernelInitializationOnly && snapshot.Length == 1
+                && snapshot[0].Completed && snapshot[0].Thinking == preferredThinking;
         ElapsedMilliseconds = snapshot.Sum(s => s.ElapsedMilliseconds);
         var joint = jointStages?.ToArray() ?? Array.Empty<JointStage>();
         JointStages = Array.AsReadOnly(joint);
@@ -46,6 +58,8 @@ public sealed class StartupWarmupStatus
     public string Scope { get; }
     public bool Completed { get; }
     public bool PrefixRetentionRequested { get; }
+    public bool PreferredThinking { get; }
+    public string? SingleVariantReason { get; }
     public double ElapsedMilliseconds { get; }
     public IReadOnlyList<Stage> Stages { get; }
     public bool JointWarmupRequested { get; }

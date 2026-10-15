@@ -28,11 +28,11 @@ bool has_precise_key(const void* key)
     return precise_keys.find(key) != precise_keys.end();
 }
 
-bool contains_q8_f32(ggml_cgraph* graph)
+bool contains_quant_f32(ggml_cgraph* graph)
 {
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i)
     {
-        if (tsg_is_matmul_q8_f32(ggml_graph_node(graph, i))) return true;
+        if (tsg_is_matmul_quant_f32(ggml_graph_node(graph, i))) return true;
     }
     return false;
 }
@@ -99,9 +99,10 @@ ggml_tensor* weight_mul_mat(ggml_context* context, ggml_tensor* weight,
 ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph* graph)
 {
 #if defined(TSG_GGML_USE_CUDA)
-    if (g_backend_type != BACKEND_TYPE_CUDA || !contains_q8_f32(graph)) return backend;
+    if (g_backend_type != BACKEND_TYPE_CUDA || !contains_quant_f32(graph)) return backend;
     // Other graph families can supply their own compatible fused-op wrapper.
-    // Only raw CUDA backends may be wrapped; those wrappers already handle Q8.
+    // Only raw CUDA backends may be wrapped; those wrappers handle the owned
+    // original-format quantized operators. Weight registration remains Q8-only.
     if (!ggml_backend_is_cuda(backend)) return backend;
     std::lock_guard<std::mutex> lock(backend_mutex);
     for (const auto& item : execution_backends)
@@ -109,7 +110,7 @@ ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph* gra
     const auto found = execution_backends.find(backend);
     if (found != execution_backends.end()) return found->second;
     ggml_backend_t wrapper = tsg_dsv4_fused_backend_init(backend);
-    if (wrapper == nullptr) throw std::runtime_error("Cannot initialize precise Q8 execution backend.");
+    if (wrapper == nullptr) throw std::runtime_error("Cannot initialize precise quantized execution backend.");
     try { execution_backends.emplace(backend, wrapper); }
     catch (...) { ggml_backend_free(wrapper); throw; }
     return wrapper;

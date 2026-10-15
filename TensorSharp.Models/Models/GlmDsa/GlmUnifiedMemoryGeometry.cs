@@ -297,15 +297,27 @@ public partial class GlmDsaModel
             if (_exec is NativeGlmExecutor native && !native.ConfigureGraphCache(UnifiedGraphCacheCapacity, onlyPrefill ? 2 : 1))
                 throw new InvalidOperationException("Native GLM idle graph reclamation was refused.");
     }
-    internal void TrimUnifiedRetainedSlots()
+    internal void TrimUnifiedRetainedSlots(bool terminalOnly = false)
     {
         lock (_nativeSync)
         {
             if (_retainedSlots == null || _exec == null) return;
-            string[] keys = _retainedSlots.Keys.ToArray();
-            SlotRetention.ReleaseSlots(_retainedSlots, keys, new ExecutorGlmSlotStore(_exec));
-            foreach (string key in keys) _prefixCacheSink?.OnPayloadInvalidated(key,
-                TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed);
+            // Discretionary wider-prefill reclamation must not discard the
+            // shared checkpoints which startup just prepared. Real pressure
+            // may still reclaim every idle owner through the default path.
+            string[] keys = terminalOnly
+                ? _retainedSlots.Where(entry => !entry.Value.IsCopy).Select(entry => entry.Key).ToArray()
+                : _retainedSlots.Keys.ToArray();
+            for (int i = 0; i < keys.Length; ++i)
+            {
+                SlotRetention.ReleaseSlots(_retainedSlots, keys.AsSpan(i, 1), new ExecutorGlmSlotStore(_exec));
+                // A refused physical free retains both its native ownership
+                // and reusable metadata. Notify each successful removal now,
+                // even if a later free throws before the trim can complete.
+                if (!_retainedSlots.ContainsKey(keys[i]))
+                    _prefixCacheSink?.OnPayloadInvalidated(keys[i],
+                        TensorSharp.Runtime.Scheduling.PrefixCache.InvalidationReason.NativeSlotReclaimed);
+            }
         }
     }
     internal bool TrimUnifiedMappedResidency()

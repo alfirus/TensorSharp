@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_q8_precision.h"
 #include "ggml_ops_q8_prefill_policy.h"
+#include "ggml_ops_precision_policy.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-cuda/common.cuh"
@@ -108,14 +109,97 @@ __global__ void q8_f32_vector(const char * weights, const char * input, float * 
     output[row] = sum;
 }
 
+// Decode directly from the checkpoint's original 256-value/176-byte Q5_K
+// block. The fifth bits and six-bit scale/minimum fields are interleaved by
+// 32-value groups. Explicit F32 rounding keeps vector and tiled decoding equal
+// even when the compilation enables contraction. No resident weight expansion.
+__device__ __forceinline__ float q5_weight(const char * block, int element) {
+    const auto * bytes = reinterpret_cast<const unsigned char *>(block);
+    const int group = element / 32, lane = element % 32;
+    const auto * scales = bytes + 4;
+    const int scale = group < 4 ? scales[group] & 63
+        : (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4);
+    const int minimum = group < 4 ? scales[group + 4] & 63
+        : (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4);
+    const unsigned char low = bytes[48 + (group / 2) * 32 + lane];
+    const int quant = ((group & 1) ? low >> 4 : low & 15)
+        | (((bytes[16 + lane] >> group) & 1) << 4);
+    const float d = __half2float(*reinterpret_cast<const half *>(block));
+    const float d_minimum = __half2float(*reinterpret_cast<const half *>(block + 2));
+    return __fsub_rn(__fmul_rn(__fmul_rn(d, float(scale)), float(quant)),
+        __fmul_rn(d_minimum, float(minimum)));
+}
+
+// A narrow lane consumes adjacent elements from the same 32-value group.
+// Share that group's scale/minimum products without reassociating either
+// decoded weight. Packed byte pairs require only Q5_K's two-byte alignment.
+__device__ __forceinline__ void q5_narrow_weights(const unsigned char * scales,
+        float d, float d_minimum, int group, uint16_t low, uint16_t high,
+        float & weight0, float & weight1) {
+    const int scale = group < 4 ? scales[group] & 63
+        : (scales[group + 4] & 15) | ((scales[group - 4] >> 6) << 4);
+    const int minimum = group < 4 ? scales[group + 4] & 63
+        : (scales[group + 4] >> 4) | ((scales[group] >> 6) << 4);
+    const int low_shift = (group & 1) * 4;
+    const int quant0 = ((low >> low_shift) & 15) | (((high >> group) & 1) << 4);
+    const int quant1 = ((low >> (8 + low_shift)) & 15) | (((high >> (8 + group)) & 1) << 4);
+    const float scaled_d = __fmul_rn(d, float(scale));
+    const float scaled_minimum = __fmul_rn(d_minimum, float(minimum));
+    weight0 = __fsub_rn(__fmul_rn(scaled_d, float(quant0)), scaled_minimum);
+    weight1 = __fsub_rn(__fmul_rn(scaled_d, float(quant1)), scaled_minimum);
+}
+
+// One whole warp owns each narrow output. Pair adjacent products before the
+// parallel-K lane reduction: summing all even and odd terms separately would
+// discard small alternating residuals. The fixed lane/pair/shuffle order is
+// identical at N1..N8; wide prefill retains its separate K-increasing tiles.
+// No activation narrowing, atomics, split-K scratch or resident weight expansion.
+__global__ void q5_f32_narrow(const char * weights, const char * input, float * output,
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride, size_t input_column_stride) {
+    const int lane = int(threadIdx.x) & 31;
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.x) / 32;
+    if (row >= rows) return;
+    input += size_t(blockIdx.y) * input_column_stride;
+    output += size_t(blockIdx.y) * rows;
+    const char * row_weights = weights + size_t(row) * weight_stride;
+    float sum = 0.0f;
+    const int group_lane = 2 * (lane & 15);
+    for (int block_index = 0; block_index < inner / 256; ++block_index) {
+        const char * block = row_weights + size_t(block_index) * 176;
+        const auto * bytes = reinterpret_cast<const unsigned char *>(block);
+        const float d = __half2float(*reinterpret_cast<const half *>(block));
+        const float d_minimum = __half2float(*reinterpret_cast<const half *>(block + 2));
+        const uint16_t high = *reinterpret_cast<const uint16_t *>(bytes + 16 + group_lane);
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            // This is exactly the former k=2*lane, k+=64 traversal. Each
+            // original block supplies four pairs; its half scales/high bytes
+            // stay live, while each pair reuses its group's decoded metadata.
+            const int group = lane / 16 + 2 * step;
+            const uint16_t low = *reinterpret_cast<const uint16_t *>(bytes + 48 + 32 * step + group_lane);
+            float weight0, weight1;
+            q5_narrow_weights(bytes + 4, d, d_minimum, group, low, high, weight0, weight1);
+            const int64_t k = int64_t(block_index) * 256 + 2 * lane + 64 * step;
+            const float x0 = *reinterpret_cast<const float *>(input + size_t(k) * input_inner_stride);
+            const float x1 = *reinterpret_cast<const float *>(input + size_t(k + 1) * input_inner_stride);
+            const float pair = __fadd_rn(__fmul_rn(weight0, x0), __fmul_rn(weight1, x1));
+            sum = __fadd_rn(sum, pair);
+        }
+    }
+    for (int shift = 16; shift > 0; shift /= 2)
+        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, shift));
+    if (lane == 0) output[row] = sum;
+}
+
 // Each CTA owns a 64-row output tile. Its 128 threads each accumulate four
 // rows and Columns/8 columns. Weight blocks widen once into shared memory and
 // are reused across the entire column tile, preserving quantized residency.
 // Padding the shared-memory leading dimensions avoids transposed-load bank
-// conflicts. Every output traverses K in the same order for every N dispatch;
-// changing companions or moving a column to another tile cannot change its
-// reduction order. No split-K, atomics, source narrowing, or activation quants.
-template<int Columns>
+// conflicts. Within these tiled paths every output traverses K in the same order
+// for every column geometry; changing companions or moving a column to another
+// tile cannot change its reduction order. Q5 narrow reduction is separate above.
+// No split-K, atomics, source narrowing, or activation quants.
+template<int Columns, bool Q5 = false>
 __global__ void q8_f32_tiled(const char * weights, const char * input, float * output,
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride) {
@@ -131,11 +215,16 @@ __global__ void q8_f32_tiled(const char * weights, const char * input, float * o
             const int row = index / TileInner, k = index % TileInner;
             float value = 0;
             if (row_base + row < rows) {
+                if constexpr (Q5) {
+                    const char * block = weights + size_t(row_base + row) * weight_stride + size_t(base / 256) * 176;
+                    value = q5_weight(block, base % 256 + k);
+                } else {
                 // Q8_0 blocks contain a two-byte scale and 32 signed bytes.
                 // The 34-byte block stride does not permit aligned int4 loads.
                 const char * block = weights + size_t(row_base + row) * weight_stride + size_t(base / 32) * 34;
                 const float scale = __half2float(*reinterpret_cast<const half *>(block));
                 value = scale * float(*reinterpret_cast<const int8_t *>(block + 2 + k));
+                }
             }
             ws[k][row] = value;
         }
@@ -170,16 +259,17 @@ __global__ void q8_f32_tiled(const char * weights, const char * input, float * o
     }
 }
 
-template<int Columns>
+template<int Columns, bool Q5 = false>
 void launch(const void * weights, const void * input, float * output,
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride, cudaStream_t stream) {
     const dim3 grid(unsigned((int64_t(rows) + 63) / 64), unsigned((columns + Columns - 1) / Columns));
-    q8_f32_tiled<Columns><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+    q8_f32_tiled<Columns, Q5><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
         static_cast<const char *>(input), output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride);
 }
 
+template<bool Q5 = false>
 int automatic_tile(int rows, int columns, int & selected) {
     if (columns < 64) { selected = 32; return int(cudaSuccess); }
     struct DevicePolicy { int device, multiprocessors, active64, active128; };
@@ -195,16 +285,46 @@ int automatic_tile(int rows, int columns, int & selected) {
         DevicePolicy item{device, 0, 0, 0};
         status = cudaDeviceGetAttribute(&item.multiprocessors, cudaDevAttrMultiProcessorCount, device);
         if (status != cudaSuccess) return int(status);
-        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64>, 128, 0);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64, Q5>, 128, 0);
         if (status != cudaSuccess) return int(status);
-        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128>, 128, 0);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128, Q5>, 128, 0);
         if (status != cudaSuccess) return int(status);
         policies.push_back(item); policy = &policies.back();
-        std::fprintf(stderr, "[q8-f32] Automatic K-ordered prefill tiling: device=%d SMs=%d active64=%d active128=%d; no global scratch.\n",
-            device, item.multiprocessors, item.active64, item.active128);
+        std::fprintf(stderr, "[%s-f32] Automatic K-ordered prefill tiling: device=%d SMs=%d active64=%d active128=%d; no global scratch.\n",
+            Q5 ? "q5" : "q8", device, item.multiprocessors, item.active64, item.active128);
     }
     selected = tsg_q8_prefill_auto_columns(rows, columns, policy->multiprocessors, policy->active64, policy->active128);
     return int(cudaSuccess);
+}
+
+int q5_cuda_launch(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, cudaStream_t stream) {
+    int tile = 32;
+    if (columns >= 64) {
+        tile = prefill_tile_columns();
+        if (tile == 0) {
+            const int status = automatic_tile<true>(rows, columns, tile);
+            if (status != int(cudaSuccess)) return status;
+        }
+    }
+    // The Q8-only parallel-K experiments never change this operator's
+    // arithmetic. Narrow Q5 owns fixed adjacent-pair reductions; wide Q5
+    // preserves its K-increasing FMA order. No cross-class bit identity promise.
+    if (columns <= TSG_PRECISION_DECODE_COLUMNS) {
+        const dim3 grid(unsigned((int64_t(rows) + 3) / 4), unsigned(columns));
+        q5_f32_narrow<<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
+    }
+    else if (columns <= 16) launch<16, true>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns >= 128 && tile == 128) launch<128, true>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns >= 64 && tile >= 64) launch<64, true>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else launch<32, true>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    return int(cudaGetLastError());
 }
 } // namespace
 
@@ -267,7 +387,7 @@ int tsg_matmul_q8_cuda_launch_reference(const void * weights, const void * input
 
 void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) {
     GGML_ASSERT(ggml_backend_is_cuda(cuda_backend) && ggml_is_contiguous(dst));
-    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_Q8_0 && dst->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(tsg_matmul_quant_f32_type_supported(dst->src[0]->type) && dst->src[1]->type == GGML_TYPE_F32);
     // CUDA y-grid is bounded even on modern devices. The encoder's maximum
     // 65536-token microbatch is well below this limit for every tile size.
     GGML_ASSERT(dst->ne[1] <= int64_t(65535) * 8);
@@ -276,7 +396,11 @@ void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) 
     const cudaStream_t stream = context->stream(context->device, 0);
     const auto * w = dst->src[0];
     const auto * x = dst->src[1];
-    CUDA_CHECK(static_cast<cudaError_t>(tsg_matmul_q8_cuda_launch(w->data, x->data,
+    const int status = w->type == GGML_TYPE_Q5_K
+        ? q5_cuda_launch(w->data, x->data, static_cast<float *>(dst->data),
+            int(w->ne[0]), int(w->ne[1]), int(x->ne[1]), w->nb[1], x->nb[0], x->nb[1], stream)
+        : tsg_matmul_q8_cuda_launch(w->data, x->data,
         static_cast<float *>(dst->data), int(w->ne[0]), int(w->ne[1]), int(x->ne[1]),
-        w->nb[1], x->nb[0], x->nb[1], stream)));
+        w->nb[1], x->nb[0], x->nb[1], stream);
+    CUDA_CHECK(static_cast<cudaError_t>(status));
 }

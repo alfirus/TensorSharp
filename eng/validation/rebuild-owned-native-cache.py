@@ -596,7 +596,40 @@ def live_pins(repository,base,libraries):
                 reference_compile_commands=copy.deepcopy(base['after']['reference_compile_commands']))
 
 
-def expected_capabilities(base, glm_adapter_version=None):
+def declared_added_exports(declarations):
+    """Explicit individual owned symbols, never export-name patterns."""
+    result = {mode: [] for mode in MODES}
+    if not isinstance(declarations, (list, tuple)) or len(declarations) > 32:
+        raise ValueError('Require at most32explicit added-export declarations.')
+    for declaration in declarations:
+        if not isinstance(declaration, str) or declaration.count(':') != 1:
+            raise ValueError('An added export must be an exact mode:TSGgml_name declaration.')
+        mode, name = declaration.split(':')
+        if mode not in MODES or not re.fullmatch(r'TSGgml_[A-Za-z][A-Za-z0-9_]*', name):
+            raise ValueError('Invalid mode or exact TensorSharp-owned export name.')
+        if mode == 'production' and 'Test' in name:
+            raise ValueError('Production added exports may not expose test hooks.')
+        if name in result[mode]:
+            raise ValueError('Duplicate added-export declaration.')
+        result[mode].append(name)
+    return {mode: sorted(names) for mode, names in result.items()}
+
+
+def validate_export_set(actual, base, additions, mode):
+    if mode not in MODES or not isinstance(additions, list):
+        raise ValueError('Require an explicit export mode and symbol list.')
+    declared = declared_added_exports([mode + ':' + name for name in additions])[mode]
+    actual, base = set(actual), set(base)
+    if not actual or not base or set(declared) & base:
+        raise ValueError('Added exports must be absent from the complete nonempty pinned base.')
+    if actual != base | set(declared):
+        raise ValueError('Native exports differ from the exact pinned base plus declared additions.')
+    if mode == 'production' and any('TSGgml_' in name and 'Test' in name for name in actual):
+        raise ValueError('Production DLL exposes test hooks.')
+    return dict(count=len(actual), added=declared, removed=[])
+
+
+def expected_capabilities(base, glm_adapter_version=None, glm_slot_copy_version=None):
     result = dict(base)
     if glm_adapter_version is not None:
         if type(glm_adapter_version) is not int or not 1 <= glm_adapter_version <= 100:
@@ -605,6 +638,13 @@ def expected_capabilities(base, glm_adapter_version=None):
         if name not in result:
             raise ValueError('The fixed base must already expose the GLM adapter capability.')
         result[name] = glm_adapter_version
+    if glm_slot_copy_version is not None:
+        if type(glm_slot_copy_version) is not int or not 1 <= glm_slot_copy_version <= 100:
+            raise ValueError('Require an explicit bounded positive GLM slot-copy version.')
+        name = 'TSGgml_GlmSlotCopyVersion'
+        if name in result and result[name] != glm_slot_copy_version:
+            raise ValueError('An inherited GLM slot-copy capability must remain unchanged.')
+        result[name] = glm_slot_copy_version
     return result
 
 
@@ -614,6 +654,7 @@ def prepare(args):
     if out.exists() or out==base_root or out in base_root.parents or base_root in out.parents:
         raise ValueError('Fresh independent output must not contain or sit inside the immutable base.')
     nodes=build_chain(base_root);base=nodes[0]['Summary']
+    export_additions=declared_added_exports(getattr(args, 'allow_added_export', []))
     libraries=cache_value(base_root/'build-hooks/CMakeCache.txt','TENSORSHARP_VALIDATION_LIBRARIES')
     before=live_pins(repo,base,libraries)
     added=set(before['current_sources'])-set(base['source_snapshot'])
@@ -636,6 +677,8 @@ def prepare(args):
               AncestorReceipts=[node['Receipt'] for node in nodes],
               AncestorPlans=[node['PlanPin'] for node in nodes if 'PlanPin' in node],DependencyEvidenceFiles={},
               ExplicitGlmAdapterVersion=getattr(args, 'expected_glm_adapter_version', None),
+              ExplicitGlmSlotCopyVersion=getattr(args, 'expected_glm_slot_copy_version', None),
+              ExplicitAddedExports=export_additions,
               ExplicitOwnedRecompiles=getattr(args, 'recompile_owned_target', []),
               Scope='Recorded Ninja deps select every affected owned TU. Any proposed reuse lacking valid generation/dependency proof causes all69ownedTUs of that mode to recompile. No ggml compilation, model, GPU graph, quality, throughput or default-readiness acceptance.')
     # Verify all base source snapshots and generated driver files before copying.
@@ -716,15 +759,22 @@ def prepare(args):
         link_argv=rewrite_link(final,configured_build,new,objects,None,new/'ggml_api_exports.def',object_paths=final_objects)
         linker=next((Path(value) for value in link_argv if Path(value).name.lower()=='link.exe'),None)
         if linker is None:raise ValueError('Missing pinned MSVC linker.')
+        dumpbin=str(linker.with_name('dumpbin.exe'))
+        base_symbols=symbols(subprocess.check_output([dumpbin,'/exports',str(old/'GgmlOps.dll')],text=True,timeout=60))
+        validate_export_set(base_symbols | set(export_additions[mode]),base_symbols,export_additions[mode],mode)
+        slot_copy_version=getattr(args, 'expected_glm_slot_copy_version', None)
+        if slot_copy_version is not None and 'TSGgml_GlmSlotCopyVersion' not in base_symbols | set(export_additions[mode]):
+            raise ValueError('An explicit slot-copy capability requires its exact declared or inherited export in both modes.')
         plan['Modes'][mode]=dict(BaseBuild=str(old),NewBuild=str(new),BaseObjects=objects,
             CompileDatabase=database_pin,NinjaCommands=commands_pin,BaseExportDefinition=pin(definition),
             NewExportDefinition=pin(new/'ggml_api_exports.def'),BaseCMakeCache=pin(old/'CMakeCache.txt'),
             NewCMakeCache=pin(new/'CMakeCache.txt'),CompileCommands=compile_commands,LinkCommand=link_argv,
             BaseObjectProvenance={name:{key:value for key,value in item.items() if key!='Origin'} for name,item in provenance.items()},
             Units=units,RebuildDecisions=decisions,FinalObjectPaths=final_objects,NewObjects=new_objects,
-            RecompiledCount=len(new_objects),ReusedCount=len(objects)-len(new_objects),Dumpbin=str(linker.with_name('dumpbin.exe')),
+            RecompiledCount=len(new_objects),ReusedCount=len(objects)-len(new_objects),Dumpbin=dumpbin,
+            BaseExportSymbols=sorted(base_symbols),AllowedAddedExports=export_additions[mode],
             ExpectedCapabilities=expected_capabilities(base[mode+'_constant_capability_queries'],
-                getattr(args, 'expected_glm_adapter_version', None)),BaseArtifacts=base[mode+'_artifacts'])
+                getattr(args, 'expected_glm_adapter_version', None),slot_copy_version),BaseArtifacts=base[mode+'_artifacts'])
     save(out/'incremental-plan.json',plan)
     print(json.dumps(dict(Prepared=True,ChangedOwnedSources=changes,
                          Counts={mode:dict(Recompiled=row['RecompiledCount'],Reused=row['ReusedCount']) for mode,row in plan['Modes'].items()},Output=str(out))))
@@ -817,10 +867,9 @@ def run(args):
             exports=subprocess.check_output([entry['Dumpbin'],'/exports',str(build/'GgmlOps.dll')],text=True,timeout=60)
             old=subprocess.check_output([entry['Dumpbin'],'/exports',str(Path(entry['BaseBuild'])/'GgmlOps.dll')],text=True,timeout=60)
             (out/(mode+'-exports.log')).write_text(exports,'utf-8')
-            if not symbols(exports) or symbols(exports)!=symbols(old):raise ValueError('Native exports differ from the complete pinned base.')
-            if mode=='production' and any('TSGgml_' in symbol and 'Test' in symbol for symbol in symbols(exports)):
-                raise ValueError('Production DLL exposes test hooks.')
-            report[mode+'_exports']=dict(count=len(symbols(exports)),added=[],removed=[])
+            if 'BaseExportSymbols' in entry and sorted(symbols(old))!=entry['BaseExportSymbols']:
+                raise ValueError('The pinned base export symbols changed after preparation.')
+            report[mode+'_exports']=validate_export_set(symbols(exports),symbols(old),entry.get('AllowedAddedExports',[]),mode)
             code='import ctypes,json,os,sys; h=os.add_dll_directory(sys.argv[2]); l=ctypes.CDLL(sys.argv[1]); print(json.dumps({n:getattr(l,n)() for n in json.loads(sys.argv[3])}))'
             actual=json.loads(subprocess.check_output([sys.executable,'-B','-c',code,str(build/'GgmlOps.dll'),
                 args.cuda_bin,json.dumps(entry['ExpectedCapabilities'])],text=True,timeout=60))
@@ -845,6 +894,10 @@ def main():
     prep.add_argument('--force-all-owned',action='store_true',help='Explicit69-TU/modefallback; ggml still stays prebuilt and unchanged.')
     prep.add_argument('--expected-glm-adapter-version',type=int,
                       help='Explicit expected owned ABI change; all other capabilities retain the pinned base values and actual DLL queries must match exactly.')
+    prep.add_argument('--allow-added-export',action='append',default=[],
+                      help='Exact mode:TSGgml_name added symbol. Defaults retain exact base exports; no removals or unlisted additions are accepted.')
+    prep.add_argument('--expected-glm-slot-copy-version',type=int,
+                      help='Explicit new slot-copy constant query. Its exact export must be inherited or declared in both modes; all inherited capability values remain pinned.')
     prep.add_argument('--recompile-owned-target',action='append',default=[],
                       help='Exact recorded owned object target to rebuild. This cannot authorize unproven reuse; all other insufficient dependency proofs still force a complete owned rebuild.')
     execute=sub.add_parser('run');execute.add_argument('--plan',required=True);execute.add_argument('--timeout',type=int,default=600)

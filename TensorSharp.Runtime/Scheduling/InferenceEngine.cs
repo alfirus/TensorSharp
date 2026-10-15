@@ -63,6 +63,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Whether the radix prefix cache serves this loaded model (prefix
         /// caching is on and the model implements the prefix-cache contract).</summary>
         public bool PrefixCacheActive => _executor.RadixPrefixCacheEnabled;
+        /// <summary>Actual session-configured public checkpoint budget, rather
+        /// than the requested environment setting.</summary>
+        public int PublicPrefixCheckpointBudget => PrefixCacheActive
+            ? _scheduler.Config.ResolveExecutionOptions().PrefixCheckpointBudget : 0;
 
         public InferenceEngine(IModelArchitecture model, SchedulerConfig cfg, ILogger? logger = null)
         {

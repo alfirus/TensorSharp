@@ -87,6 +87,22 @@ are separate. Final output is forwarded here (`P+O`), whereas Maya stops before
 forwarding its terminal sample (`P+O-1`). These timings alone do not establish
 equal consumed work or fair performance ratios.
 
+`--capture-final-logits true` copies the complete finite vocabulary vector under
+the model compute lock after the terminal output token has been forwarded. This
+validation-only reflection reads the model buffer, not the sampler's retained
+logits. The resulting binary is little-endian F32. Compare vectors only when the
+entire prompt and consumed output history agree; matching prompt text alone is
+insufficient. Capture happens outside the request timing and is not an
+independent arithmetic or semantic oracle.
+
+For fixed teacher conditioning, `--capture-token-id ID` additionally requires
+`--capture-final-logits true --max-new 1 --task unknown`. It uses the ordinary
+sampler's first-token allowlist and verifies that exactly that non-EOS checkpoint
+token was forwarded. Put any preceding teacher tokens in the raw prompt file.
+This permits identical-history numerical comparisons even when ordinary greedy
+paths would diverge. It cannot qualify answer quality, natural EOS, or decode
+throughput, and does not change the production server or its sampling policy.
+
 `report.json` is written in `finally`, including failures, native/managed/tool
 identities, original model size/mtime, exact budget high-water marks and ledgers
 at completion, engine disposal and session disposal. Large model content is

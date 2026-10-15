@@ -37,6 +37,14 @@ namespace TensorSharp.Models
 
         /// <summary>A new, empty slot, not made active; -1 when the devices are full.</summary>
         int SlotAlloc();
+        /// <summary>Complete exact-head slot copying, independently qualified
+        /// from donation. Unsupported executors keep their existing behavior.</summary>
+        bool SupportsSlotCopy => false;
+        /// <summary>No allocation or active selection change. A failed partial
+        /// copy requires checked reset of the destination before reuse.</summary>
+        bool SlotCopyInto(int sourceSlot, int destinationSlot, int expectedHead) => false;
+        /// <summary>Actual native buffer payload; zero when unsupported.</summary>
+        long SlotBytes(int slot) => 0;
         bool SetActiveSlot(int slot);
         /// <summary>Free a slot's caches; the active slot cannot be freed.</summary>
         bool SlotFree(int slot);
@@ -85,6 +93,10 @@ namespace TensorSharp.Models
         public bool ResetChecked() => GgmlGlmNative.ResetChecked(_handle);
         public bool Rewind(int nPast) => GgmlGlmNative.Rewind(_handle, nPast);
         public int SlotAlloc() => GgmlGlmNative.SlotAlloc(_handle);
+        public bool SupportsSlotCopy => GgmlGlmNative.SupportsSlotCopy();
+        public bool SlotCopyInto(int sourceSlot, int destinationSlot, int expectedHead)
+            => GgmlGlmNative.SlotCopyInto(_handle, sourceSlot, destinationSlot, expectedHead);
+        public long SlotBytes(int slot) => GgmlGlmNative.SlotBytes(_handle, slot);
         public bool SetActiveSlot(int slot) => GgmlGlmNative.SetActiveSlot(_handle, slot);
         public bool SlotFree(int slot) => GgmlGlmNative.SlotFree(_handle, slot);
         public bool SetReclaimableSlots(int[] slots) => GgmlGlmNative.SetReclaimableSlots(_handle, slots);

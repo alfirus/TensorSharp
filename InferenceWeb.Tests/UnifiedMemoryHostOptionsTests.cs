@@ -13,7 +13,8 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
     private readonly Dictionary<string, string> _previous = new();
     public UnifiedMemoryHostOptionsTests()
     {
-        foreach (string name in new[] { "TS_SCHED_PREFILL_CHUNK", "TS_PER_SEQ_FUSED", "TS_BATCHED_FUSED_DECODE" })
+        foreach (string name in new[] { "TS_SCHED_PREFILL_CHUNK", "TS_PER_SEQ_FUSED", "TS_BATCHED_FUSED_DECODE",
+            "TS_SCHED_PREFIX_CACHE", "TS_PREFIX_CHECKPOINTS_MAX" })
         {
             _previous.Add(name, Environment.GetEnvironmentVariable(name));
             Environment.SetEnvironmentVariable(name, null);
@@ -147,5 +148,24 @@ public sealed class UnifiedMemoryHostOptionsTests : IDisposable
         Assert.Equal(new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
                 AdaptiveGlmPrefillChunkTokens = 1024 },
             UnifiedMemorySessionHandle.ResolveHostOptions());
+    }
+
+    [Theory]
+    [InlineData("0", "4", 0)]
+    [InlineData("false", "8", 0)]
+    [InlineData("1", "0", 0)]
+    [InlineData("true", "1", 1)]
+    [InlineData("1", "4", 4)]
+    [InlineData("1", "8", 8)]
+    public void PrefixPlacementHonorsTheActualHostCacheAndOperatorCheckpointBudget(
+        string enabled, string copies, int expected)
+    {
+        Environment.SetEnvironmentVariable("TS_SCHED_PREFIX_CACHE", enabled);
+        Environment.SetEnvironmentVariable("TS_PREFIX_CHECKPOINTS_MAX", copies);
+        var options = UnifiedMemorySessionHandle.ResolveHostOptions();
+        Assert.Equal(expected, options.PrefixCheckpointCount);
+        Environment.SetEnvironmentVariable("TS_PREFIX_CHECKPOINTS_MAX", "2");
+        Assert.Equal(expected, options.PrefixCheckpointCount); // Immutable load forecast.
+        Assert.Equal(enabled, Environment.GetEnvironmentVariable("TS_SCHED_PREFIX_CACHE"));
     }
 }

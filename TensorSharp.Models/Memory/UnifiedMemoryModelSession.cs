@@ -648,33 +648,8 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     }
 
     private void ResizeExpertCache(long bytes, IReadOnlyList<MemoryCharge> limits)
-    {
-        long previous = _experts!.BudgetBytes;
-        if (bytes == previous) return;
-        long Charged() => _native!.AllocationUsage.Where(a => a.Kind == 4)
-            .Sum(a => checked(a.PendingBytes + a.CommittedBytes));
-        if (bytes < previous)
-        {
-            // Free first; every retired child refunds the same persistent
-            // envelope. Then reduce its remaining reservation exactly once.
-            _experts.UpdateBudget(bytes);
-            long remaining = checked(bytes - Charged());
-            if (remaining < 0 || !_expertEnvelope!.TryResizeRemaining([new(DevicePool, remaining)]))
-                throw new InvalidOperationException("Expert trim left allocations above its shared allowance.");
-            return;
-        }
-        long before = Charged();
-        if (!_expertEnvelope!.TryResizeRemaining([new(DevicePool, checked(bytes - before))], limits)) return;
-        try { _experts.UpdateBudget(bytes); }
-        catch
-        {
-            // A failed native update preserves its old ceiling, even when it
-            // already freed some entries. Keep the owner and refund only slack.
-            if (!_expertEnvelope.TryResizeRemaining([new(DevicePool, checked(previous - Charged()))]))
-                throw new InvalidOperationException("Cannot restore the shared expert allowance after a failed update.");
-            throw;
-        }
-    }
+        => UnifiedMemoryExpertCapacity.Resize(_experts!, _expertEnvelope!, DevicePool, bytes,
+            immutableMinimum: 0, limits);
 
     private bool Fits(IReadOnlyList<MemoryCharge> peak, IReadOnlyList<MemoryCharge> limits)
     {

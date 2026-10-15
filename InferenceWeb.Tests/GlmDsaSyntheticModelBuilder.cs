@@ -297,7 +297,8 @@ internal static class GlmDsaSyntheticModelBuilder
     /// past any prompt the tests use (dense attention), a small value makes the pooled selection
     /// run from the first ubatch.</param>
     public static string WriteGlm5NextCudaFixture(string path, int contextLength = 512, int indexerTopK = 2048,
-        string expertSourcePath = null, float? expertSwigluClamp = null, string sourceManifestPath = null)
+        string expertSourcePath = null, float? expertSwigluClamp = null, string sourceManifestPath = null,
+        bool bf16SensitiveProjections = false)
     {
         if (expertSwigluClamp is float value && (!float.IsFinite(value) || value < 0))
             throw new ArgumentOutOfRangeException(nameof(expertSwigluClamp));
@@ -402,6 +403,19 @@ internal static class GlmDsaSyntheticModelBuilder
                 && !t.Name.EndsWith("indexer_compressor_ape.weight", StringComparison.Ordinal))
                 t.Type = GgmlType.Q8_0;
 
+        // This opt-in variant covers the real checkpoint's BF16 recurrent
+        // gates and residual mixers. Historical Q8 fixtures remain byte-identical.
+        if (bf16SensitiveProjections)
+            foreach (var t in tensors)
+                if (t.Name.EndsWith("ssm_f_a.weight", StringComparison.Ordinal)
+                    || t.Name.EndsWith("ssm_f_b.weight", StringComparison.Ordinal)
+                    || t.Name.EndsWith("ssm_g_a.weight", StringComparison.Ordinal)
+                    || t.Name.EndsWith("ssm_g_b.weight", StringComparison.Ordinal)
+                    || t.Name.EndsWith("ssm_beta.weight", StringComparison.Ordinal)
+                    || t.Name.EndsWith("hc_attn_fn.weight", StringComparison.Ordinal)
+                    || t.Name.EndsWith("hc_ffn_fn.weight", StringComparison.Ordinal))
+                    t.Type = GgmlType.BF16;
+
         if (expertSourcePath != null)
         {
             foreach (var crop in GlmDsaQuantizedSourceFixture.Read(expertSourcePath, hidden, expertFfn,
@@ -481,7 +495,7 @@ internal static class GlmDsaSyntheticModelBuilder
         return path;
     }
 
-    private enum GgmlType { F32 = 0, Q8_0 = 8, IQ2_XXS = 16, IQ3_XXS = 18, IQ1_S = 19, IQ4_XS = 23 }
+    private enum GgmlType { F32 = 0, Q8_0 = 8, IQ2_XXS = 16, IQ3_XXS = 18, IQ1_S = 19, IQ4_XS = 23, BF16 = 30 }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -519,6 +533,23 @@ internal static class GlmDsaSyntheticModelBuilder
 
     private static ushort FloatToHalfBits(float f) => BitConverter.HalfToUInt16Bits((Half)f);
     private static float HalfBitsToFloat(ushort h) => (float)BitConverter.UInt16BitsToHalf(h);
+
+    internal static byte[] EncodeBf16Fixture(ReadOnlySpan<float> values)
+    {
+        byte[] raw = new byte[checked(values.Length * sizeof(ushort))];
+        for (int i = 0; i < values.Length; ++i)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(values[i]);
+            // Preserve a quiet NaN instead of rounding a small NaN payload to
+            // infinity. Finite values use IEEE round-to-nearest, ties-to-even.
+            ushort rounded = (bits & 0x7fffffffu) > 0x7f800000u
+                ? (ushort)((bits >> 16) | 0x40u)
+                : (ushort)(unchecked(bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+            raw[2 * i] = (byte)rounded;
+            raw[2 * i + 1] = (byte)(rounded >> 8);
+        }
+        return raw;
+    }
 
     // --- deterministic weights ------------------------------------------------
 
@@ -567,6 +598,8 @@ internal static class GlmDsaSyntheticModelBuilder
             if (RawBytes != null) return RawBytes;
             if (Type == GgmlType.Q8_0)
                 return QuantizeQ8_0(Data, (int)Dims[0]);
+            if (Type == GgmlType.BF16)
+                return EncodeBf16Fixture(Data);
             byte[] raw = new byte[Data.Length * sizeof(float)];
             Buffer.BlockCopy(Data, 0, raw, 0, raw.Length);
             return raw;
@@ -788,6 +821,10 @@ internal static class GlmDsaSyntheticModelBuilder
 
     private static void WriteGguf(Stream fs, List<KvEntry> kv, List<TensorSpec> tensors)
     {
+        // Encode each payload once. The table and data writer must derive byte
+        // extents from the same bytes, including mixed BF16 and raw IQ crops.
+        byte[][] payloads = new byte[tensors.Count][];
+        for (int i = 0; i < tensors.Count; ++i) payloads[i] = tensors[i].Raw();
         using var head = new MemoryStream();
         using (var w = new BinaryWriter(head, Encoding.UTF8, leaveOpen: true))
         {
@@ -803,16 +840,15 @@ internal static class GlmDsaSyntheticModelBuilder
             }
 
             ulong offset = 0;
-            foreach (var t in tensors)
+            for (int i = 0; i < tensors.Count; ++i)
             {
+                var t = tensors[i];
                 WriteStr(w, t.Name);
                 w.Write((uint)t.Dims.Length);
                 foreach (ulong d in t.Dims) w.Write(d);
                 w.Write((uint)t.Type);
                 w.Write(offset);
-                ulong bytes = t.RawBytes != null ? (ulong)t.RawBytes.Length : t.Type == GgmlType.Q8_0
-                    ? (ulong)t.Data.Length / Q8Block * Q8BlockBytes
-                    : (ulong)t.Data.Length * sizeof(float);
+                ulong bytes = (ulong)payloads[i].LongLength;
                 offset += (bytes + Alignment - 1) / Alignment * Alignment;
             }
         }
@@ -823,9 +859,8 @@ internal static class GlmDsaSyntheticModelBuilder
         for (int i = 0; i < pad; i++) fs.WriteByte(0);
 
         var buffer = new byte[Alignment];
-        foreach (var t in tensors)
+        foreach (byte[] raw in payloads)
         {
-            byte[] raw = t.Raw();
             fs.Write(raw, 0, raw.Length);
             int tailPad = (Alignment - raw.Length % Alignment) % Alignment;
             if (tailPad > 0) fs.Write(buffer, 0, tailPad);

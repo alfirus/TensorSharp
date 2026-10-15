@@ -28,7 +28,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         public bool Writer;
         public Exception? Fault;
         public TaskCompletionSource? Transition;
-        public TaskCompletionSource Changed = Signal();
+        public TaskCompletionSource? Changed;
     }
     private readonly object _gate = new();
     private readonly Dictionary<ResourceKey, Entry> _entries = new();
@@ -41,6 +41,11 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
     private bool _stopping;
     private long _clock, _loads, _hits, _evictions, _spills;
     private long _physicalAllocationRefusals;
+    // Per-instance test seam, matching the existing allocation-owner hooks.
+    // No replacement factory or public API is needed for the normal path.
+    internal Action? BeforeLeaseOwnerAllocation { get; set; }
+    internal Action? BeforeEvictionAttemptTracking { get; set; }
+    internal Action? BeforeDemotionLruNodeAllocation { get; set; }
 
     public TieredMemoryScheduler(MemoryBudget budget, IEnumerable<IMemoryBackend> backends,
         BoundedTransfers transfers, SsdSpillStore spillStore, MemoryLocation? demotionHost = null)
@@ -61,8 +66,10 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
     private static void Pulse(Entry entry)
     {
         var changed = entry.Changed;
-        entry.Changed = Signal();
-        changed.TrySetResult();
+        // Only a conflicting acquire enrolls a waiter. Release/cleanup must not
+        // allocate its next notification owner after mutating residency/pins.
+        entry.Changed = null;
+        changed?.TrySetResult();
     }
     private static void EndTransition(Entry entry)
     {
@@ -117,7 +124,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                 if (access == ResourceAccess.Write && !entry.Resource.Mutable) throw new InvalidOperationException("Immutable resource cannot be written.");
                 if (entry.Transition != null) wait = entry.Transition.Task;
                 else if (entry.Writer || (access == ResourceAccess.Write && entry.Replicas.Values.Any(r => r.Readers > 0)))
-                    wait = entry.Changed.Task;
+                    wait = (entry.Changed ??= Signal()).Task;
                 else if (access == ResourceAccess.Read && entry.Replicas.TryGetValue(location, out var hit))
                 {
                     _hits++;
@@ -160,11 +167,32 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                     // data is legal only for a new resource or complete overwrite.
                 }
                 cancellationToken.ThrowIfCancellationRequested();
+                ResourceLease lease;
+                LinkedListNode<(Entry Entry, MemoryLocation Location, Replica Replica)>? lruNode = null;
+                KeyValuePair<MemoryLocation, Replica>[] staleReplicas;
+                lock (_gate)
+                {
+                    // Allocate the future handle before retiring authoritative
+                    // replicas or an SSD snapshot. In particular, an overwrite
+                    // target may still be zero-filled and must not replace the
+                    // old version when handle allocation fails.
+                    long version = access == ResourceAccess.Write ? entry.Version + 1 : entry.Version;
+                    lease = CreateLease(entry, location, target, access, version);
+                    // Preallocate directory/LRU bookkeeping too:
+                    // their OOM must not destroy the old recovery source either.
+                    if (provisional != null)
+                    {
+                        entry.Replicas.EnsureCapacity(checked(entry.Replicas.Count + 1));
+                        lruNode = new((entry, location, provisional));
+                    }
+                    staleReplicas = access == ResourceAccess.Write
+                        ? entry.Replicas.Where(x => x.Key != location).ToArray() : [];
+                }
                 if (access == ResourceAccess.Write)
                 {
                     // All old readers are gone, and the transition excludes new ones.
                     // No stale replica or old SSD snapshot survives a version change.
-                    foreach (var other in entry.Replicas.Where(x => x.Key != location).ToArray())
+                    foreach (var other in staleReplicas)
                     {
                         FreeReplica(entry, other.Value);
                         lock (_gate) entry.Replicas.Remove(other.Key);
@@ -177,12 +205,13 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                     if (provisional != null)
                     {
                         entry.Replicas.Add(location, provisional);
-                        provisional.LruNode = _lru.AddLast((entry, location, provisional));
+                        _lru.AddLast(lruNode!);
+                        provisional.LruNode = lruNode;
                         provisional = null;
                         _loads++;
                     }
                     if (access == ResourceAccess.Write) entry.Version++;
-                    var lease = Lease(entry, location, target, access);
+                    PinLease(entry, target, access);
                     EndTransition(entry);
                     return lease;
                 }
@@ -198,12 +227,20 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
 
     private ResourceLease Lease(Entry entry, MemoryLocation location, Replica replica, ResourceAccess access)
     {
+        var lease = CreateLease(entry, location, replica, access, entry.Version);
+        PinLease(entry, replica, access);
+        return lease;
+    }
+
+    private ResourceLease CreateLease(Entry entry, MemoryLocation location, Replica replica, ResourceAccess access,
+        long version)
+    {
         // Caller holds _gate.
-        replica.LastUse = ++_clock;
-        Touch(replica);
-        if (access == ResourceAccess.Write) entry.Writer = true;
-        else replica.Readers++;
-        return new ResourceLease(entry.Resource, location, entry.Version, access, replica.Buffer, () =>
+        // The closure and handle may allocate. Publish no reader/writer pin
+        // until both exist, so recoverable managed OOM cannot leave a phantom
+        // execution owner which blocks eviction, writers and shutdown forever.
+        BeforeLeaseOwnerAllocation?.Invoke();
+        return new ResourceLease(entry.Resource, location, version, access, replica.Buffer, () =>
         {
             lock (_gate)
             {
@@ -214,6 +251,15 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                 Pulse(entry);
             }
         });
+    }
+
+    private void PinLease(Entry entry, Replica replica, ResourceAccess access)
+    {
+        // Caller holds _gate. All owner allocations precede publication.
+        replica.LastUse = ++_clock;
+        Touch(replica);
+        if (access == ResourceAccess.Write) entry.Writer = true;
+        else replica.Readers++;
     }
 
     private void Touch(Replica replica)
@@ -298,8 +344,14 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
             if (victim != null) victim.Transition = Signal();
         }
         if (victim == null) return false;
-        attempted.Add((victim.Resource.Key, location));
-        try { await EvictAsync(victim, location, replica!, cancellationToken).ConfigureAwait(false); }
+        try
+        {
+            // Tracking may grow the HashSet. Every failure after publishing the
+            // transition must clear it, including recoverable managed OOM here.
+            BeforeEvictionAttemptTracking?.Invoke();
+            attempted.Add((victim.Resource.Key, location));
+            await EvictAsync(victim, location, replica!, cancellationToken).ConfigureAwait(false);
+        }
         catch (MemoryPressureException) { /* A full SSD need not prevent evicting another clean weight. */ }
         finally { lock (_gate) EndTransition(victim); }
         return true;
@@ -322,9 +374,16 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                     lock (_gate)
                     {
                         var demoted = provisional;
+                        // Prepare both directory capacity and the LRU owner
+                        // before publication. Rollback may free only an
+                        // unpublished replica, never a directory-visible one.
+                        entry.Replicas.EnsureCapacity(checked(entry.Replicas.Count + 1));
+                        BeforeDemotionLruNodeAllocation?.Invoke();
+                        var node = new LinkedListNode<(Entry Entry, MemoryLocation Location, Replica Replica)>((entry, _host.Location, demoted));
                         demoted.LastUse = ++_clock;
                         entry.Replicas.Add(_host.Location, demoted);
-                        demoted.LruNode = _lru.AddLast((entry, _host.Location, demoted));
+                        _lru.AddLast(node);
+                        demoted.LruNode = node;
                         provisional = null;
                     }
                 }

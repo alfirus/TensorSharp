@@ -433,7 +433,7 @@ public sealed class GlmAdaptivePrefillAdmissionTests
             Assert.Equal(400 * MiB, envelope.OwnedCharges.Single().Bytes);
         }};
         using var cache = new GgmlHostMoeExpertCacheScope(400 * MiB, 512, 3, native, 3);
-        Assert.True(GlmUnifiedExpertCapacity.Resize(cache, envelope, 200 * MiB, 200 * MiB,
+        Assert.True(UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 200 * MiB, 200 * MiB,
             Charges(1000 * MiB, 1000 * MiB)));
         Assert.Equal(200 * MiB, cache.BudgetBytes);
         Assert.Equal(200 * MiB, envelope.OwnedCharges.Single().Bytes);
@@ -447,10 +447,10 @@ public sealed class GlmAdaptivePrefillAdmissionTests
         using var envelope = budget.Reserve(DeviceCharges(600 * MiB));
         var native = new Native();
         using var cache = new GgmlHostMoeExpertCacheScope(600 * MiB, 512, 3, native, 3);
-        Assert.True(GlmUnifiedExpertCapacity.Resize(cache, envelope, 400 * MiB, 200 * MiB, Charges(1000 * MiB, 1000 * MiB)));
+        Assert.True(UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 400 * MiB, 200 * MiB, Charges(1000 * MiB, 1000 * MiB)));
         using var child = envelope.TryTake(DeviceCharges(300 * MiB))!; child.Commit();
         native.OnUpdate = _ => { Assert.Equal(600 * MiB, envelope.OwnedCharges.Single().Bytes); throw new IOException("native update fault"); };
-        Assert.Throws<IOException>(() => GlmUnifiedExpertCapacity.Resize(cache, envelope, 600 * MiB, 200 * MiB,
+        Assert.Throws<IOException>(() => UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 600 * MiB, 200 * MiB,
             Charges(1000 * MiB, 1000 * MiB)));
         Assert.Equal(400 * MiB, cache.BudgetBytes);
         Assert.Equal(400 * MiB, envelope.OwnedCharges.Single().Bytes);
@@ -464,11 +464,11 @@ public sealed class GlmAdaptivePrefillAdmissionTests
         using var envelope = budget.Reserve(DeviceCharges(600 * MiB));
         var native = new Native();
         using var cache = new GgmlHostMoeExpertCacheScope(600 * MiB, 512, 3, native, 3);
-        GlmUnifiedExpertCapacity.Resize(cache, envelope, 400 * MiB, 200 * MiB, Charges(1000 * MiB, 1000 * MiB));
+        UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 400 * MiB, 200 * MiB, Charges(1000 * MiB, 1000 * MiB));
         using var competitor = budget.Reserve(DeviceCharges(500 * MiB));
         native.Updates = 0;
-        Assert.False(GlmUnifiedExpertCapacity.Resize(cache, envelope, 600 * MiB, 200 * MiB, Charges(1000 * MiB, 1000 * MiB)));
-        Assert.Throws<ArgumentOutOfRangeException>(() => GlmUnifiedExpertCapacity.Resize(cache, envelope, 199 * MiB, 200 * MiB,
+        Assert.False(UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 600 * MiB, 200 * MiB, Charges(1000 * MiB, 1000 * MiB)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 199 * MiB, 200 * MiB,
             Charges(1000 * MiB, 1000 * MiB)));
         Assert.Equal(0, native.Updates);
         Assert.Equal(400 * MiB, envelope.OwnedCharges.Single().Bytes);
@@ -482,7 +482,7 @@ public sealed class GlmAdaptivePrefillAdmissionTests
         using var child = envelope.TryTake(DeviceCharges(300 * MiB))!; child.Commit();
         var native = new Native(); // Simulates a broken native release contract.
         using var cache = new GgmlHostMoeExpertCacheScope(400 * MiB, 512, 3, native, 3);
-        Assert.Throws<InvalidOperationException>(() => GlmUnifiedExpertCapacity.Resize(cache, envelope, 200 * MiB, 200 * MiB,
+        Assert.Throws<InvalidOperationException>(() => UnifiedMemoryExpertCapacity.Resize(cache, envelope, Device, 200 * MiB, 200 * MiB,
             Charges(1000 * MiB, 1000 * MiB)));
         Assert.Equal(400 * MiB, envelope.OwnedCharges.Single().Bytes);
         Assert.Equal(300 * MiB, envelope.LiveChildCharges.Single().Bytes);

@@ -32,11 +32,27 @@ internal static class ProbePolicy
             && !tokens.Take(tokens.Length - 1).Any(eos.Contains);
     public static bool StrictMath(string content, int toolCalls, bool thinkingClosed)
         => content == "42" && toolCalls == 0 && thinkingClosed;
+    public static int? CaptureToken(string? raw, bool captureFinalLogits, int maxNew, string task)
+    {
+        if (raw == null) return null;
+        if (!captureFinalLogits || maxNew != 1 || task != "unknown"
+            || !Regex.IsMatch(raw, @"\A(?:0|[1-9][0-9]*)\z", RegexOptions.CultureInvariant)
+            || !int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out int token))
+            throw new ArgumentException("capture-token-id requires capture-final-logits true, max-new1, unknown task and one nonnegative int32 ID.");
+        return token;
+    }
     public static void SelfTest()
     {
         FinalLogitCapture.SelfTest();
         int checks = 0;
         void Check(bool condition) { checks++; if (!condition) throw new Exception("Self-test " + checks + " failed."); }
+        Check(CaptureToken(null, false, 128, "math42") == null);
+        Check(CaptureToken("0", true, 1, "unknown") == 0);
+        Check(CaptureToken("2147483647", true, 1, "unknown") == int.MaxValue);
+        foreach (string bad in new[] { "", "-1", "01", "١", "2147483648", "1.0" })
+        { bool rejected = false; try { CaptureToken(bad, true, 1, "unknown"); } catch (ArgumentException) { rejected = true; } Check(rejected); }
+        foreach (var (capture, maximum, task) in new[] { (false, 1, "unknown"), (true, 2, "unknown"), (true, 1, "math42") })
+        { bool rejected = false; try { CaptureToken("1", capture, maximum, task); } catch (ArgumentException) { rejected = true; } Check(rejected); }
         Check(!AdaptivePrefill("false", false)); Check(!AdaptivePrefill("false", true)); Check(AdaptivePrefill("true", true));
         foreach (var pair in new[] { ("true", false), ("1", true), ("TRUE", true), ("", true) })
         { bool rejected = false; try { AdaptivePrefill(pair.Item1, pair.Item2); } catch (ArgumentException) { rejected = true; } Check(rejected); }

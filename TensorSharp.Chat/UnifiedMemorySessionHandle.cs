@@ -51,8 +51,11 @@ internal sealed class UnifiedMemorySessionHandle
         // matching native planner admits its serialized selected-expert tier;
         // Qwen ignores this architecture-specific option. Public API defaults
         // stay independent of this Host policy.
+        var scheduler = SchedulerConfig.FromEnvironment();
         var options = new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true,
-            EnableAdaptiveGlmPrefill = true, AdaptiveGlmPrefillChunkTokens = 1024 };
+            EnableAdaptiveGlmPrefill = true, AdaptiveGlmPrefillChunkTokens = 1024,
+            PrefixCheckpointCount = scheduler.EnablePrefixCaching
+                ? (scheduler.ExecutionOptionsOverride ?? ExecutionOptions.FromEnvironment()).PrefixCheckpointBudget : 0 };
         string chunk = Environment.GetEnvironmentVariable(chunkVariable);
         if (chunk != null)
         {

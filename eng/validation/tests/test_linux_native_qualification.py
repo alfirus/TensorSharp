@@ -65,7 +65,7 @@ class LinuxNativeQualificationTests(unittest.TestCase):
     def test_exact_case_counts_and_native16_new_regressions(self):
         self.assertEqual(12, len(tool.cpu_cases()))
         self.assertEqual(21, len(tool.cuda_cases()))
-        self.assertEqual(48, len(tool.glm_cases("/mnt/e/model.gguf")))
+        self.assertEqual(56, len(tool.glm_cases("/mnt/e/model.gguf")))
         names = {c[0]: c[2] for c in tool.cuda_cases()}
         self.assertEqual(["--glm-scalar-file-window"], names["scalar-large-file-q8"])
         self.assertEqual(["--pooled-quota", "--quantization", "iq1_m"], names["pooled-largest-quota-iq1"])
@@ -81,6 +81,38 @@ class LinuxNativeQualificationTests(unittest.TestCase):
                     self.assertEqual(mode == "hooks", "--dispatch-faults" in case[3])
                     quant = [f for f in case[3] if f.startswith("--quantized-source=")]
                     self.assertEqual(["--quantized-source=/mnt/e/model with spaces.gguf"] if kind == "iq" else [], quant)
+
+    def test_bf16_sensitive_matrix_appends_eight_distinct_cases_without_changing_historical_48(self):
+        cases = tool.glm_cases('/mnt/e/model.gguf')
+        self.assertEqual(48, len([case for case in cases if '--bf16-sensitive' not in case[3]]))
+        self.assertTrue(all('--bf16-sensitive' not in case[3] for case in cases[:48]))
+        self.assertEqual(8, len(cases[48:]))
+        for mode in ('production', 'hooks'):
+            for kind in ('q8', 'iq'):
+                for rows in (512, 809):
+                    case = next(case for case in cases if case[0] == f'{mode}-{kind}-bf16-sensitive-rows{rows}')
+                    self.assertIn('--bf16-sensitive', case[3])
+                    self.assertIn(f'--prefill-rows={rows}', case[3])
+                    self.assertEqual(mode == 'hooks', '--dispatch-faults' in case[3])
+                    self.assertEqual(kind == 'iq', any(flag.startswith('--quantized-source=') for flag in case[3]))
+
+    def test_bf16_sensitive_flag_requires_actual_tensor_type_count_in_both_reports(self):
+        actual, comparison = evidence(True)
+        actual['prefill_rows'] = 809
+        flags = ['--selected-experts', '--bf16-sensitive', '--prefill-rows=809']
+        with self.assertRaises(RuntimeError): self.accept(actual, comparison, flags)
+        for report in (actual, comparison):
+            report.update(bf16_sensitive_projections=True, bf16_sensitive_tensor_count=18)
+        self.accept(actual, comparison, flags)
+        for report_name in ('actual', 'comparison'):
+            for key, value in [('bf16_sensitive_projections', False), ('bf16_sensitive_projections', 1),
+                               ('bf16_sensitive_tensor_count', True), ('bf16_sensitive_tensor_count', 17),
+                               ('bf16_sensitive_tensor_count', 19)]:
+                reports = {'actual': copy.deepcopy(actual), 'comparison': copy.deepcopy(comparison)}
+                reports[report_name][key] = value
+                with self.subTest(report=report_name, key=key, value=value), self.assertRaises(RuntimeError):
+                    self.accept(reports['actual'], reports['comparison'], flags)
+        with self.assertRaises(RuntimeError): self.accept(actual, comparison, ['--selected-experts', '--prefill-rows=809'])
 
     def test_explicit_case_filter_is_subset_coverage_and_rejects_unknown_names(self):
         base = ["--mode", "glm", "--native-root", "/mnt/e/native", "--output", "/mnt/e/new",

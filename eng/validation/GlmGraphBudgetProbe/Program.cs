@@ -6,17 +6,20 @@ using System.Runtime.InteropServices;
 using InferenceWeb.Tests;
 using TensorSharp.GGML;
 using TensorSharp.Memory;
+using TensorSharp.Runtime;
 
-if (args.Length is < 2 or > 8 || args[0] is not ("CPU" or "CUDA")
-    || args.Skip(2).Any(flag => flag is not ("--shared-graphs" or "--dispatch-faults" or "--selected-experts" or "--swiglu-clamp")
+if (args.Length is < 2 or > 10 || args[0] is not ("CPU" or "CUDA")
+    || args.Skip(2).Any(flag => flag is not ("--shared-graphs" or "--dispatch-faults" or "--selected-experts" or "--swiglu-clamp" or "--bf16-sensitive" or "--slot-copy")
         && !flag.StartsWith("--quantized-source=", StringComparison.Ordinal) && !flag.StartsWith("--prefill-rows=", StringComparison.Ordinal)))
-    throw new ArgumentException("Usage: GlmGraphBudgetProbe CPU|CUDA <new-output-directory> [--shared-graphs] [--dispatch-faults] [--selected-experts] [--swiglu-clamp] [--quantized-source=<GLM-GGUF>] [--prefill-rows=1..1024]");
+    throw new ArgumentException("Usage: GlmGraphBudgetProbe CPU|CUDA <new-output-directory> [--shared-graphs] [--dispatch-faults] [--selected-experts] [--swiglu-clamp] [--bf16-sensitive] [--slot-copy] [--quantized-source=<GLM-GGUF>] [--prefill-rows=1..1024]");
 bool sharedGraphs = args.Skip(2).Contains("--shared-graphs"), testDispatchFaults = args.Skip(2).Contains("--dispatch-faults");
 bool selectedExperts = args.Skip(2).Contains("--selected-experts");
+bool bf16Sensitive = args.Skip(2).Contains("--bf16-sensitive");
+bool testSlotCopy = args.Skip(2).Contains("--slot-copy");
 string? quantizedSource = args.Skip(2).SingleOrDefault(flag => flag.StartsWith("--quantized-source=", StringComparison.Ordinal))?["--quantized-source=".Length..];
 float swigluClamp = args.Skip(2).Contains("--swiglu-clamp") ? 0.0001f : quantizedSource != null ? 10 : 0;
-int vocab = quantizedSource != null ? 256 : 128, fixtureLayers = quantizedSource != null ? 4 : 2;
-int expertGroups = quantizedSource != null ? 3 : 1, seamsPerGraph = quantizedSource != null ? 3 : 2;
+int vocab = quantizedSource != null || bf16Sensitive ? 256 : 128, fixtureLayers = quantizedSource != null || bf16Sensitive ? 4 : 2;
+int expertGroups = quantizedSource != null ? 3 : 1, seamsPerGraph = quantizedSource != null || bf16Sensitive ? 3 : 2;
 string? rowsOption = args.Skip(2).SingleOrDefault(flag => flag.StartsWith("--prefill-rows=", StringComparison.Ordinal));
 int? explicitPrefillRows = rowsOption == null ? null : int.Parse(rowsOption["--prefill-rows=".Length..], System.Globalization.CultureInfo.InvariantCulture);
 if (explicitPrefillRows is < 1 or > 1024) throw new ArgumentOutOfRangeException(nameof(explicitPrefillRows));
@@ -29,12 +32,13 @@ int prefillChunk = explicitPrefillRows ?? 16;
 long expertBudget = prefillChunk > 512 ? 64L << 20 : 32L << 20;
 string backend = args[0], directory = Path.GetFullPath(args[1]);
 if (selectedExperts && backend != "CUDA") throw new ArgumentException("Selected-expert qualification requires actual CUDA.");
+if (testSlotCopy && selectedExperts) throw new ArgumentException("The dedicated exact slot-copy fixture uses resident experts; qualify selected dispatch separately.");
 if (Directory.Exists(directory)) throw new IOException("Use a fresh evidence directory.");
 Directory.CreateDirectory(directory);
 GgmlGlmNative.RequireUnifiedBudgetSupport();
-string model = quantizedSource != null
+string model = quantizedSource != null || bf16Sensitive
     ? GlmDsaSyntheticModelBuilder.WriteGlm5NextCudaFixture(Path.Combine(directory, "tiny-glm5-next.gguf"),
-        context, 8, quantizedSource, swigluClamp, Path.Combine(directory, "source-expert-blocks.json"))
+        context, 8, quantizedSource, swigluClamp, Path.Combine(directory, "source-expert-blocks.json"), bf16Sensitive)
     : GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(Path.Combine(directory, "tiny-glm5-next.gguf"),
     4, true, numLayers: 2, mixedAttention: true, routedExperts: true,
     quantizeExperts: true, contextLength: context, indexerTopK: 8, architecture: "glm5-next", swigluClamp: swigluClamp);
@@ -50,6 +54,17 @@ void Require(bool value, string message)
             .Invoke(null, ["(no native error)"]) as string; } catch { }
         throw new InvalidOperationException(message + " Native: " + nativeError);
     }
+}
+int bf16SensitiveTensorCount = 0;
+if (bf16Sensitive)
+{
+    using var fixture = GgufFile.OpenForMemoryPlanning(model);
+    string[] names = Enumerable.Range(0, 4).SelectMany(layer => new[] { "hc_attn_fn.weight", "hc_ffn_fn.weight" }
+        .Concat(layer % 2 == 0 ? new[] { "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight", "ssm_beta.weight" } : [])
+        .Select(suffix => $"blk.{layer}.{suffix}")).ToArray();
+    Require(names.Length == 18 && names.All(name => fixture.Tensors.TryGetValue(name, out var tensor)
+        && tensor.Type == GgmlTensorType.BF16), "Sensitive fixture does not contain all18 actual BF16 recurrent/mixing tensors.");
+    bf16SensitiveTensorCount = names.Length;
 }
 var nativeModule = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
     .Single(m => m.ModuleName.Contains("GgmlOps", StringComparison.OrdinalIgnoreCase));
@@ -361,6 +376,172 @@ float[] Evaluate(IntPtr handle, GgmlCacheBudgetScope? scope = null, MemoryBudget
         joint?.Dispose(); serial?.Dispose();
     }
 }
+if (testSlotCopy)
+{
+    Require(GgmlGlmNative.SupportsSlotCopy(), "Native exact slot-copy capability is unavailable.");
+    SlotCopyFault? copyFault = testDispatchFaults ? Marshal.GetDelegateForFunctionPointer<SlotCopyFault>(
+        NativeLibrary.GetExport(hookLibrary, "TSGgml_GlmTestSlotCopyFault")) : null;
+    SlotAllocFault? allocFault = testDispatchFaults ? Marshal.GetDelegateForFunctionPointer<SlotAllocFault>(
+        NativeLibrary.GetExport(hookLibrary, "TSGgml_GlmTestSlotAllocFault")) : null;
+    SlotCompare? compareSlots = testDispatchFaults ? Marshal.GetDelegateForFunctionPointer<SlotCompare>(
+        NativeLibrary.GetExport(hookLibrary, "TSGgml_GlmTestSlotCompare")) : null;
+    var copyBudget = new MemoryBudget([new("ram", 1L << 30), new("cuda", 1L << 30)]);
+    var copyEvidence = new List<object>();
+    int continuationVectors = 0, completeStateComparisons = 0;
+    long completeStateBytes = 0, allocatedSlotBytes = 0;
+    using (var copyScope = new GgmlCacheBudgetScope(copyBudget,
+        backend == "CUDA" ? new[] { new[] { "cuda" }, new[] { "ram" } } : new[] { new[] { "ram" } },
+        includeGraphBuffers: true, hostPools: ["ram"]))
+    {
+        using var serialOwner = copyBudget.Reserve([new("ram", 256L << 20), new("cuda", 256L << 20)]);
+        using var graphOwner = copyBudget.Reserve([new("ram", 256L << 20), new("cuda", 256L << 20)]);
+        using var zeroOwner = copyBudget.Reserve([new("ram", 0), new("cuda", 0)]);
+        copyScope.SetSharedJointEnvelope(graphOwner);
+        IntPtr handle = Load();
+        try
+        {
+            Require(handle != IntPtr.Zero, "Slot-copy model did not load.");
+            Require(GgmlGlmNative.ConfigureGraphCache(handle, 1), "Slot-copy graph limit refused.");
+            if (sharedGraphs) Require(GgmlGlmNative.ConfigureSharedGraphOwner(handle, true), "Slot-copy shared graph owner refused.");
+            int[] slots = [0, -1, -1, -1];
+            using (copyScope.EnterExecution(serialOwner))
+                for (int i = 1; i < slots.Length; ++i) slots[i] = GgmlGlmNative.SlotAlloc(handle);
+            Require(slots.All(slot => slot >= 0) && slots.Distinct().Count() == 4, "Slot-copy requires four independent preallocated slots.");
+            allocatedSlotBytes = GgmlGlmNative.SlotBytes(handle, slots[0]);
+            Require(allocatedSlotBytes > 0 && slots.All(slot => GgmlGlmNative.SlotBytes(handle, slot) == allocatedSlotBytes)
+                && GgmlGlmNative.SlotBytes(handle, -1) == 0, "Actual complete slot-byte query is inconsistent.");
+            var ownedSlotCharges = copyScope.AllocationUsage.Where(row => row.Kind == 2).Sum(row => row.CommittedBytes);
+            Require(ownedSlotCharges >= allocatedSlotBytes * 4, "Four live slot payloads are absent from physical accounting.");
+            (string, long, long)[] Charges() => copyBudget.Snapshot().Select(row => (row.Pool, row.Committed, row.Reserved)).ToArray();
+            int Head(int slot)
+            {
+                Require(GgmlGlmNative.SetActiveSlot(handle, slot), "Copy fixture slot selection failed.");
+                return GgmlGlmNative.NPast(handle);
+            }
+            float[] Forward(int slot, int[] tokens)
+            {
+                Head(slot);
+                var logits = new float[vocab];
+                using (copyScope.EnterExecution(serialOwner))
+                    Require(GgmlGlmNative.Forward(handle, tokens, logits), "Slot-copy continuation failed.");
+                Require(logits.All(float.IsFinite), "Slot-copy continuation is nonfinite.");
+                return logits;
+            }
+            void Reset(int slot)
+            {
+                Head(slot);
+                using (copyScope.EnterExecution(serialOwner))
+                    Require(GgmlGlmNative.ResetChecked(handle), "Copy destination checked reset failed.");
+                Require(Head(slot) == 0, "Checked reset did not clear destination head.");
+            }
+            void Equal(float[] left, float[] right)
+            {
+                Require(left.Select(BitConverter.SingleToInt32Bits).SequenceEqual(right.Select(BitConverter.SingleToInt32Bits)),
+                    "Full continuation logits differ from independently prefilling the same history.");
+                ++continuationVectors;
+            }
+            void CompleteStateEqual(int left, int right)
+            {
+                if (compareSlots == null) return;
+                Require(compareSlots(handle, left, right, out long bytes, out int tensors) == 1 && bytes > 0 && tensors >= 4,
+                    "Complete MLA/indexer/KDA cache bytes differ after copy or independent continuation.");
+                ++completeStateComparisons; completeStateBytes += bytes;
+            }
+            bool Copy(int source, int target, int head)
+            {
+                var before = Charges(); int allocations = copyScope.ActiveAllocations;
+                bool copied;
+                using (copyScope.EnterExecution(zeroOwner)) copied = GgmlGlmNative.SlotCopyInto(handle, source, target, head);
+                Require(before.SequenceEqual(Charges()) && allocations == copyScope.ActiveAllocations,
+                    "Preallocated slot copy allocated or refunded a native payload/graph.");
+                return copied;
+            }
+            if (allocFault != null)
+                for (int stage = 1; stage <= 3; ++stage)
+                {
+                    var before = Charges(); int allocations = copyScope.ActiveAllocations;
+                    allocFault(stage);
+                    using (copyScope.EnterExecution(serialOwner))
+                        Require(GgmlGlmNative.SlotAlloc(handle) == -1, "Injected slot construction OOM crossed ABI or returned a live slot.");
+                    Require(before.SequenceEqual(Charges()) && allocations == copyScope.ActiveAllocations && copyScope.CallbackError == null,
+                        "Slot construction failure leaked an unpublished payload or refunded a live owner.");
+                    copyEvidence.Add(new { allocation_fault_stage = stage, rejected_without_payload_leak = true });
+                }
+            int[] prefix = Enumerable.Range(0, 64).Select(i => 3 + i * 11 % 90).ToArray();
+            var sourcePrefix = Forward(slots[0], prefix);
+            Forward(slots[3], prefix.Take(7).ToArray());
+            Head(slots[3]);
+            Require(Copy(slots[0], slots[1], 64) && GgmlGlmNative.NPast(handle) == 7,
+                "Exact copy failed or changed the unrelated active selection.");
+            Require(Head(slots[0]) == 64 && Head(slots[1]) == 64, "Exact copy changed source or failed to publish destination head.");
+            CompleteStateEqual(slots[0], slots[1]);
+            Equal(sourcePrefix, Forward(slots[2], prefix));
+            CompleteStateEqual(slots[0], slots[2]);
+            Require(!Copy(slots[0], slots[0], 64) && !Copy(slots[0], slots[1], 63) && !Copy(-1, slots[1], 64),
+                "Invalid identity or nonexact source head was accepted.");
+            Require(Head(slots[1]) == 64, "Preflight refusal changed destination head.");
+            int next = 17;
+            void ContinueAll()
+            {
+                var original = Forward(slots[0], [next]);
+                Equal(original, Forward(slots[1], [next]));
+                Equal(original, Forward(slots[2], [next]));
+                CompleteStateEqual(slots[0], slots[1]); CompleteStateEqual(slots[0], slots[2]);
+                ++next;
+            }
+            for (int i = 0; i < 4; ++i) ContinueAll();
+            if (copyFault != null)
+                foreach (int stage in new[] { 1, 2, 3 })
+                    foreach (int kind in new[] { 1, 2 })
+                    {
+                        Reset(slots[1]);
+                        int head = Head(slots[0]); Head(slots[3]);
+                        copyFault(stage, kind);
+                        Require(!Copy(slots[0], slots[1], head) && GgmlGlmNative.NPast(handle) == 7,
+                            "Injected copy failure escaped ABI, published success or changed active selection.");
+                        Require(Head(slots[1]) == 0 && Head(slots[0]) == head, "Failed copy published a destination head or changed source head.");
+                        CompleteStateEqual(slots[0], slots[2]);
+                        if (stage >= 2)
+                        {
+                            Head(slots[1]);
+                            var sentinel = Enumerable.Repeat(123456f, vocab).ToArray();
+                            using (copyScope.EnterExecution(serialOwner))
+                                Require(!GgmlGlmNative.Forward(handle, [21], sentinel), "Partially copied destination executed before reset.");
+                            Require(sentinel.All(value => value == 123456f) && Head(slots[1]) == 0,
+                                "Poisoned destination published logits/head after failed copy.");
+                            Require(!Copy(slots[0], slots[1], head), "Poisoned destination accepted another copy before reset.");
+                        }
+                        Reset(slots[1]);
+                        Require(Copy(slots[0], slots[1], head), "Copy did not recover after checked destination reset.");
+                        CompleteStateEqual(slots[0], slots[1]);
+                        ContinueAll();
+                        copyEvidence.Add(new { copy_fault_stage = stage, kind, source_unchanged = true,
+                            destination_head_unpublished = true, partial_copy_reset_required = stage >= 2,
+                            checked_reset_recovery = true, reported_or_recoverable_only = true });
+                    }
+        }
+        finally { if (handle != IntPtr.Zero) GgmlGlmNative.Free(handle); }
+        copyScope.SetSharedJointEnvelope(null);
+        serialOwner.Dispose(); graphOwner.Dispose(); zeroOwner.Dispose();
+        Require(copyScope.ActiveAllocations == 0 && copyScope.CallbackError == null
+            && copyBudget.Snapshot().All(row => row.Reserved + row.Committed == 0), "Slot-copy teardown leaked physical payload ownership.");
+    }
+    var copyNative = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
+        .Where(module => module.ModuleName.Contains("GgmlOps", StringComparison.OrdinalIgnoreCase))
+        .Select(module => new { path = module.FileName, sha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(module.FileName))).ToLowerInvariant() }).ToArray();
+    Require(copyNative.Length == 1, "Slot-copy fixture loaded an ambiguous native module.");
+    File.WriteAllText(Path.Combine(directory, "report.json"), JsonSerializer.Serialize(new {
+        passed = true, backend, checks, slot_copy_tested = true, fault_hooks_tested = testDispatchFaults,
+        native = copyNative, fixture_sha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(model))).ToLowerInvariant(),
+        actual_allocated_slot_bytes = allocatedSlotBytes, complete_state_comparisons = completeStateComparisons,
+        complete_state_bytes_compared = completeStateBytes, full_continuation_vectors = continuationVectors,
+        complete_cache_bytes_checked = compareSlots != null, fault_cases = copyEvidence, final_budget = copyBudget.Snapshot(),
+        scope = "Four preallocated mixed KDA/MLA slots; allocation-free exact-head state copies, independent complete-logit continuation, checked reset and physical teardown. Hook builds additionally compare every cache byte and inject three construction / six copy faults. No real-model TTFT, MTP/TP, other-device or OS-hard-cap acceptance."
+    }, new JsonSerializerOptions { WriteIndented = true }));
+    if (hookLibrary != IntPtr.Zero) NativeLibrary.Free(hookLibrary);
+    Console.WriteLine($"PASS {checks} exact slot-copy checks; complete-state comparisons={completeStateComparisons}, continuation vectors={continuationVectors}");
+    return;
+}
 float[] reference;
 IntPtr first = Load();
 try { reference = Evaluate(first); }
@@ -402,7 +583,8 @@ var comparedRows = Enumerable.Range(0, reference.Length / vocab).Select(row => {
     return new { row, max_abs = delta.Skip(row * vocab).Take(vocab).Max(), reference_argmax = Argmax(reference), actual_argmax = Argmax(actual) };
 }).ToArray();
 File.WriteAllText(Path.Combine(directory, "logit-comparison.json"), JsonSerializer.Serialize(new {
-    passed = bitExact, selectedExperts, swigluClamp, quantizedSource, expertGroups, prefill_rows = explicitPrefillRows, checks, logit_elements = actual.Length,
+    passed = bitExact, selectedExperts, swigluClamp, quantizedSource, expertGroups, prefill_rows = explicitPrefillRows,
+    bf16_sensitive_projections = bf16Sensitive, bf16_sensitive_tensor_count = bf16SensitiveTensorCount, checks, logit_elements = actual.Length,
     differing_elements = reference.Zip(actual).Count(pair => BitConverter.SingleToInt32Bits(pair.First) != BitConverter.SingleToInt32Bits(pair.Second)),
     max_abs = delta.Max(), rmse = Math.Sqrt(delta.Average(d => d * d)), rows = comparedRows,
     logits_sha256 = Hash(encoded), reference_sha256 = Hash(referenceBytes), executions
@@ -417,6 +599,7 @@ File.WriteAllText(Path.Combine(directory, "report.json"), JsonSerializer.Seriali
 {
     passed = true, backend, checks, refusals, shared_graph_owner = sharedGraphs, dispatch_faults_tested = testDispatchFaults,
     selected_experts_tested = selectedExperts,
+    bf16_sensitive_projections = bf16Sensitive, bf16_sensitive_tensor_count = bf16SensitiveTensorCount,
     swiglu_clamp = swigluClamp,
     quantized_source = quantizedSource, expert_groups = expertGroups,
     prefill_rows = explicitPrefillRows,
@@ -433,3 +616,10 @@ if (hookLibrary != IntPtr.Zero) NativeLibrary.Free(hookLibrary);
 
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 delegate void BatchedDispatchFault(int stage, int kind);
+
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+delegate void SlotCopyFault(int stage, int kind);
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+delegate void SlotAllocFault(int stage);
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+delegate int SlotCompare(IntPtr handle, int sourceSlot, int destinationSlot, out long bytes, out int tensors);

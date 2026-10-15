@@ -187,6 +187,15 @@ namespace TensorSharp.GGML
         private static extern int TSGgml_GlmSlotAlloc(IntPtr handle);
 
         [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmSlotCopyVersion();
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmSlotCopyInto(IntPtr handle, int sourceSlot, int destinationSlot, int expectedHead);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern long TSGgml_GlmSlotBytes(IntPtr handle, int slotId);
+
+        [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmSetActiveSlot(IntPtr handle, int slotId);
 
         [DllImport(DllName, CallingConvention = Conv)]
@@ -318,6 +327,30 @@ namespace TensorSharp.GGML
         /// <summary>Allocate a sequence slot (own KV caches, shared weights);
         /// -1 on failure.</summary>
         public static int SlotAlloc(IntPtr handle) => TSGgml_GlmSlotAlloc(handle);
+
+        /// <summary>Whether this DLL exposes the complete, allocation-free exact
+        /// slot-copy contract. Model/backend qualification remains the caller's
+        /// responsibility; older ordinary deployments retain donate-only reuse.</summary>
+        public static bool SupportsSlotCopy()
+        {
+            try { return TSGgml_GlmSlotCopyVersion() == 1; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        /// <summary>Copy complete MLA/indexer/KDA (and loaded draft) state into
+        /// an already admitted independent slot, at exactly the source's head.
+        /// Does not select a slot or allocate payloads. A partial failure keeps
+        /// the destination unusable until checked reset; source stays unchanged.</summary>
+        public static bool SlotCopyInto(IntPtr handle, int sourceSlot, int destinationSlot, int expectedHead)
+            => TSGgml_GlmSlotCopyInto(handle, sourceSlot, destinationSlot, expectedHead) == 1;
+
+        /// <summary>Actual allocated native buffer payload for this slot, or
+        /// zero for an unavailable/unknown slot. Geometry is only a forecast.</summary>
+        public static long SlotBytes(IntPtr handle, int slotId)
+        {
+            try { return TSGgml_GlmSlotBytes(handle, slotId); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
 
         /// <summary>Select the slot Forward / Reset / NPast act on.</summary>
         public static bool SetActiveSlot(IntPtr handle, int slotId) => TSGgml_GlmSetActiveSlot(handle, slotId) != 0;

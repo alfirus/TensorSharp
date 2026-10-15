@@ -53,6 +53,55 @@ class ImmutableClosureTests(unittest.TestCase):
                 MODULE.expected_capabilities(original, bad)
         with self.assertRaises(ValueError): MODULE.expected_capabilities({'OtherPinnedCapability': 4}, 7)
 
+    def test_additive_exports_require_exact_explicit_mode_and_symbol(self):
+        names = ['TSGgml_GlmSlotBytes', 'TSGgml_GlmSlotCopyInto', 'TSGgml_GlmSlotCopyVersion']
+        hooks = ['TSGgml_GlmTestSlotAllocFault', 'TSGgml_GlmTestSlotCompare', 'TSGgml_GlmTestSlotCopyFault']
+        declarations = ['production:' + name for name in names] + ['hooks:' + name for name in names + hooks]
+        expected = dict(production=sorted(names), hooks=sorted(names + hooks))
+        self.assertEqual(expected, MODULE.declared_added_exports(declarations))
+        self.assertEqual(dict(production=[], hooks=[]), MODULE.declared_added_exports([]))
+        for bad in (['other:TSGgml_GlmSlotBytes'], ['production:TSGgml_GlmTestSlotCompare'],
+                    ['hooks:ggml_upstream'], ['hooks:TSGgml_*'], ['hooks:TSGgml_Name:Extra'],
+                    ['hooks:TSGgml_Name\n'], ['hooks:TSGgml_Name;command'],
+                    ['hooks:TSGgml_Name'] * 2, [None], None,
+                    ['hooks:TSGgml_Name' + str(i) for i in range(33)]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError): MODULE.declared_added_exports(bad)
+
+    def test_default_export_validation_preserves_complete_base_exactness(self):
+        base = {'ggml_unmodified_export', 'TSGgml_GlmForward'}
+        self.assertEqual(dict(count=2, added=[], removed=[]), MODULE.validate_export_set(base, base, [], 'production'))
+        for actual in (base | {'TSGgml_Unexpected'}, base - {'TSGgml_GlmForward'}, set()):
+            with self.subTest(actual=actual), self.assertRaises(ValueError):
+                MODULE.validate_export_set(actual, base, [], 'production')
+
+    def test_added_export_validation_refuses_removals_missing_extra_and_already_base(self):
+        base = {'ggml_unmodified_export', 'TSGgml_GlmForward'}
+        extra = ['TSGgml_GlmSlotBytes']
+        self.assertEqual(dict(count=3, added=extra, removed=[]),
+            MODULE.validate_export_set(base | set(extra), base, extra, 'production'))
+        for actual, additions, mode in (
+            (base, extra, 'production'), (base | set(extra) | {'TSGgml_Unlisted'}, extra, 'production'),
+            ((base - {'TSGgml_GlmForward'}) | set(extra), extra, 'production'),
+            (base, ['TSGgml_GlmForward'], 'production'),
+            (base | set(extra), extra * 2, 'production'),
+            (base | {'TSGgml_GlmTestSlotCompare'}, ['TSGgml_GlmTestSlotCompare'], 'production'),
+            (base | set(extra), extra, 'unknown'),
+            (base | set(extra), [], 'hooks'), (base | set(extra), extra, 'Production'),
+        ):
+            with self.subTest(actual=actual, additions=additions, mode=mode), self.assertRaises(ValueError):
+                MODULE.validate_export_set(actual, base, additions, mode)
+
+    def test_new_slot_copy_constant_query_is_bounded_and_inherited_values_stay_pinned(self):
+        base = {'TSGgml_GlmSelectedExpertAdapterVersion': 7, 'OtherPinnedCapability': 4}
+        self.assertEqual(base | {'TSGgml_GlmSlotCopyVersion': 1}, MODULE.expected_capabilities(base, 7, 1))
+        self.assertEqual(base, MODULE.expected_capabilities(base))
+        self.assertNotIn('TSGgml_GlmSlotCopyVersion', base)
+        inherited = base | {'TSGgml_GlmSlotCopyVersion': 1}
+        self.assertEqual(inherited, MODULE.expected_capabilities(inherited, None, 1))
+        for bad in (0, -1, 101, True, '1', 2):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                MODULE.expected_capabilities(inherited, None, bad)
+
     def test_changed_header_or_other_translation_unit_refuses_reuse(self):
         base={MODULE.CACHE:'old','TensorSharp.GGML.Native/owned.h':'same',
               'TensorSharp.GGML.Native/tests/fixture.inc':'fixture'}

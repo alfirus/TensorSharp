@@ -65,7 +65,7 @@ internal static class Program
         }
         string[] allowed = ["output", "model", "tokens-file", "context", "max-new", "prefill", "expert-prefill-rows",
             "host-bytes", "device-bytes", "expert-bytes", "selected", "deadline-seconds", "cpu-threads", "task",
-            "model-identity", "native-sha256", "repetitions", "cache-telemetry", "cache-token-snapshots", "adaptive-prefill", "capture-final-logits"];
+            "model-identity", "native-sha256", "repetitions", "cache-telemetry", "cache-token-snapshots", "adaptive-prefill", "capture-final-logits", "capture-token-id"];
         if (arguments.Keys.Except(allowed).Any()) throw new ArgumentException("Unknown option.");
         string output = Path.GetFullPath(arguments["output"]);
         if (Directory.Exists(output) || File.Exists(output)) throw new ArgumentException("Fresh output directory required.");
@@ -128,6 +128,11 @@ internal static class Program
             report["Rounds"] = rounds; report["CacheSnapshots"] = cacheSnapshots;
             int context = Integer("context", 1024), maxNew = Integer("max-new", 128),
                 prefill = Integer("prefill", 32, 1, adaptivePrefill ? 1024 : 512);
+            int? captureToken = ProbePolicy.CaptureToken(arguments.GetValueOrDefault("capture-token-id"), captureFinalLogits, maxNew, task);
+            report["DiagnosticForcedCaptureToken"] = captureToken;
+            report["DiagnosticForcedCaptureScope"] = captureToken.HasValue
+                ? "Validation only: a single allowed output token completes identical teacher conditioning; no sampled-answer semantic/EOS or throughput acceptance."
+                : "No forced output token; ordinary greedy generation.";
             int threads = Integer("cpu-threads", 8, 1, 1024), deadline = Integer("deadline-seconds", 1200, 1, 86400);
             string modelPath = Path.GetFullPath(arguments.GetValueOrDefault("model",
                 "E:/models/GLM-5.3-Flash-GGUF/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf"));
@@ -205,6 +210,8 @@ internal static class Program
             tokenizer = model.Tokenizer;
             if (model.Config.Architecture is not ("glm5next" or "glm5-next")) throw new InvalidOperationException("Require GLM5Next architecture.");
             if (prompt.Any(t => t >= model.Tokenizer.VocabSize)) throw new InvalidDataException("Prompt exceeds vocabulary.");
+            if (captureToken.HasValue && (captureToken.Value >= model.Tokenizer.VocabSize || model.Tokenizer.EosTokenIds.Contains(captureToken.Value)))
+                throw new ArgumentException("Diagnostic capture token must be a non-EOS checkpoint token.");
             string promptText = model.Tokenizer.Decode(prompt.ToList()); report["DecodedPrompt"] = promptText;
             report["MathPromptMatches"] = ProbePolicy.MathPromptMatches(promptText);
             report["CheckpointEosIds"] = model.Tokenizer.EosTokenIds;
@@ -255,8 +262,10 @@ internal static class Program
                 ["StartedUtc"] = DateTime.UtcNow, ["PublicationObservations"] = publicationObservations,
                 ["Status"] = "starting", ["Passed"] = false };
             rounds.Add(roundReport); report["ActiveRound"] = round;
+            var sampling = SamplingConfig.Greedy;
+            if (captureToken.HasValue) sampling.FirstTokenAllowList = [captureToken.Value];
             sequence = new SequenceState("glm-unified-" + Guid.NewGuid().ToString("N"), prompt, maxNew, engine.PoolStats.blockSize,
-                SamplingConfig.Greedy, cacheBreakpoints: Array.Empty<int>());
+                sampling, cacheBreakpoints: Array.Empty<int>());
             report["RequestId"] = sequence.RequestId;
             roundReport["RequestId"] = sequence.RequestId;
             roundReport["BudgetBeforeSubmit"] = Ledger(budget);
@@ -280,6 +289,8 @@ internal static class Program
             requestWall.Stop(); completed = true;
             if (captureFinalLogits)
             {
+                if (captureToken.HasValue && !sequence.OutputTokens.SequenceEqual(new[] { captureToken.Value }))
+                    throw new InvalidDataException("Diagnostic capture did not consume the exact forced token.");
                 // Validation-only snapshot at a quiescent single-request boundary.
                 // This is after forwarding the terminal sampled token (P+O),
                 // not the prefill-only prediction or SequenceState.LastLogits.

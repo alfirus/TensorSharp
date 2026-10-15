@@ -408,12 +408,36 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         try
         {
             string key = _tree.MintKey();
+            // Every publication/rollback object exists before the model owns
+            // the copied payload. Optional metadata OOM must not strand a copy.
+            BeforeCheckpointPublicationAllocation?.Invoke();
+            string[] rollback = [key];
+            var payload = new EndStatePayload
+            {
+                Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
+                Origin = PayloadOrigin.CaptureCopy, DeviceDirty = false,
+            };
             bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
             if (!captured && ReleaseOldestScopedPayload())
                 captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
             if (!captured) return;
-            if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
-                SaveCheckpoint(sequence, key, length);
+            payload.Footprint = footprint;
+            bool published;
+            try { published = Publish(node, payload, length); }
+            catch
+            {
+                // Publication may be fully attached if a later validation
+                // fails. Never release a payload while its exact tree entry
+                // still advertises it. No reclaim-queue growth during rollback.
+                if (node.EndState?.Key == key)
+                    _tree.DetachEndState(node, ReleaseReason.Invalidated, enqueue: false);
+                _cacheModel.ReleasePayloads(rollback, ReleaseReason.Invalidated);
+                // A refused physical free remains model-owned and charged; no
+                // predicted bytes are credited here. It can be retried later.
+                throw;
+            }
+            // Persisting an already committed checkpoint is a separate action.
+            if (published && publicBoundary) SaveCheckpoint(sequence, key, length);
         }
         finally { _tree.Release(ref publication); }
         Trim();
@@ -491,19 +515,26 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         else _tree.CollectIfEmpty(node);
     }
 
+    internal Action? BeforeCheckpointPublicationAllocation { get; set; } // Native-free OOM qualification hook.
+
     private bool Publish(RadixNode node, string key, PayloadFootprint footprint, int length, PayloadOrigin origin)
+        => Publish(node, new EndStatePayload
+        {
+            Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
+            Origin = origin, Footprint = footprint, DeviceDirty = origin != PayloadOrigin.CaptureCopy,
+        }, length);
+
+    private bool Publish(RadixNode node, EndStatePayload payload, int length)
     {
+        string key = payload.Key;
+        PayloadFootprint footprint = payload.Footprint;
         if (footprint.Tokens != length)
         {
             _tree.Reclaim.Enqueue(key, ReleaseReason.Invalidated, footprint.Bytes);
             _tree.CollectIfEmpty(node);
             return false;
         }
-        var result = _tree.AttachEndState(node, new EndStatePayload
-        {
-            Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
-            Origin = origin, Footprint = footprint, DeviceDirty = origin != PayloadOrigin.CaptureCopy,
-        });
+        var result = _tree.AttachEndState(node, payload);
         if (result == AttachResult.Refused)
         {
             _tree.Reclaim.Enqueue(key, ReleaseReason.Invalidated, footprint.Bytes);

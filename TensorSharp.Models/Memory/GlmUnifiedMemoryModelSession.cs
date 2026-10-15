@@ -28,6 +28,8 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
     private readonly GlmUnifiedVisionMemoryGeometry? _vision;
     private readonly long _hostCeiling, _deviceCeiling, _hostHeadroom, _deviceHeadroom;
     private readonly int _context, _prefill;
+    private readonly int _prefixCopies;
+    private int _effectivePrefixCopies;
     private GgmlCacheBudgetScope? _native;
     private HostAllocationBudgetScope? _host;
     private BudgetReservation? _joint;
@@ -42,6 +44,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
     private GlmUnifiedGraphShape? _lastGraphShape;
     private BudgetReservation? _executingRequest;
     private SequenceState? _executingSequence;
+    private int _prefixCaptureDiagnostics;
     private sealed class PrefillState(int cap)
     {
         internal int Cap = cap;
@@ -61,7 +64,27 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         _hostCeiling = Math.Min(options.MaximumHostBytes, Math.Max(0, host.Available - _hostHeadroom));
         _deviceCeiling = Math.Min(options.MaximumDeviceBytes, Math.Max(0, hardware.DeviceAvailable - _deviceHeadroom));
         if (_hostCeiling <= 0 || _deviceCeiling <= 0) throw new MemoryPressureException("No GLM RAM/commit/CUDA capacity remains after headroom.");
-        var plan = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, options, context, _deviceCeiling, vision?.DeviceWeightBytes ?? 0);
+        var prefix = UnifiedMemoryPrefixCapacity.Select(GgmlGlmNative.SupportsSlotCopy()
+            ? options.PrefixCheckpointCount : 0, geometry.SlotBytes(context), _deviceCeiling);
+        GlmSelectedExpertMemoryPlan plan;
+        while (true)
+        {
+            try
+            {
+                plan = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, options, context, _deviceCeiling,
+                    checked((vision?.DeviceWeightBytes ?? 0) + prefix.PlacementReserveBytes
+                        // Fresh clone destinations coexist with the idle primary.
+                        // Count it rather than assuming a donation consumes it.
+                        + (prefix.RetainedCopies > 0 ? geometry.SlotBytes(context) : 0)));
+                break;
+            }
+            catch (MemoryPressureException) when (prefix.RetainedCopies > 0)
+            {
+                int copies = prefix.RetainedCopies - 1;
+                prefix = new(copies, copies > 0 ? checked((long)copies * geometry.SlotBytes(context)) : 0);
+            }
+        }
+        _prefixCopies = prefix.RetainedCopies;
         _prefill = plan.PrefillRows;
         _cpuLayers = plan.CpuExpertLayers;
         _expertCacheBytes = plan.CacheCapacityBytes;
@@ -77,6 +100,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         $"[unified-memory] enabled: {_geometry.Architecture}, native GGML CUDA; context={_context}, prefill={_prefill}, active-request-limit={_options.MaximumRunningRequests}\n" +
         $"[unified-memory] allocation ceilings: RAM={_hostCeiling / 1048576.0:F0} MiB, CUDA={_deviceCeiling / 1048576.0:F0} MiB; CPU-expert-leading-layers={_cpuLayers}/{_geometry.Layers}\n" +
         "[unified-memory] on: native weight/constant/slot/graph accounting, host tensor/upload accounting, physical RAM/commit/VRAM headroom, request admission, native joint decode, bounded donation of exact terminal-state conversation prefixes, admitted still-image preparation\n" +
+        $"[unified-memory] public prefix capacity: planned={_prefixCopies}, effective={_effectivePrefixCopies}; retained complete-state copies are placed, optional capture-before-eviction requires live spare capacity, no recurrent rewind or disk persistence\n" +
         (_experts == null
             ? (_options.EnableGlmSelectedExperts && _cpuLayers == 0
                 ? "[unified-memory] GLM experts: all routed weights are resident on CUDA; a compact selected-expert tier is unnecessary for this capacity plan\n"
@@ -95,7 +119,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         if (backend != BackendType.GgmlCuda || options.MaximumRunningRequests is < 1 or > 8
             || options.PrefillChunkTokens is < 1 or > 512 || options.ContextTokens < 0
             || options.MaximumHostBytes <= 0 || options.MaximumDeviceBytes <= 0 || options.MaximumExpertCacheBytes < 0
-            || options.RetainedConversationCount is < 0 or > 8)
+            || options.RetainedConversationCount is < 0 or > 8 || options.PrefixCheckpointCount is < 0 or > 8)
             throw new NotSupportedException("Unified GLM requires GGML CUDA and valid single-device request geometry.");
         if (Environment.GetEnvironmentVariable("TS_GLM_NATIVE") == "0" || SpeculationOptions.FromEnvironment().Enabled)
             throw new NotSupportedException("Unified GLM requires its native, non-speculative executor.");
@@ -140,7 +164,10 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
             };
             owner._model = (GlmDsaModel)ModelBase.Create(path, backend, 1, null!, null!, 1, null!, policy);
             if (owner._model.MaxContextLength != context) throw new InvalidOperationException("Native GLM changed an explicit unified context.");
-            owner._model.ConfigureUnifiedMemory(options.RetainedConversationCount);
+            owner._model.ConfigureUnifiedMemory(checked(options.RetainedConversationCount + owner._prefixCopies));
+            if (owner._prefixCopies > 0)
+                owner._model.ConfigureUnifiedPrefixCopies(geometry.SlotBytes(context), owner.EnterPrefixCapture,
+                    owner.PrefixCloneSpareBytes);
             if (owner._expertCacheBytes > 0)
             {
                 owner._expertGroups = owner._model.UnifiedExpertGroups;
@@ -174,10 +201,12 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         if (requested.Speculation.Enabled || requested.KvSnapshots != null || requested.MemoryAdmission != null)
             throw new NotSupportedException("Unified GLM cannot combine with independent speculation or snapshot/admission adapters.");
         int block = requested.BlockSize > 0 ? requested.BlockSize : SchedulerConfig.DefaultBlockSize;
+        _effectivePrefixCopies = requested.EnablePrefixCaching
+            ? Math.Min(_prefixCopies, (requested.ExecutionOptionsOverride ?? ExecutionOptions.FromEnvironment()).PrefixCheckpointBudget) : 0;
         return new SchedulerConfig
         {
             BlockSize = block, NumBlocks = checked((_context + block - 1) / block *
-                (_options.MaximumRunningRequests + _options.RetainedConversationCount + 1)),
+                (_options.MaximumRunningRequests + _options.RetainedConversationCount + _effectivePrefixCopies + 1)),
             MaxNumRunningSequences = _options.MaximumRunningRequests, MaxNumBatchedTokens = _prefill,
             MaxPrefillChunkSize = _prefill, SoloPrefillChunkSize = _prefill, PrefillChunkTokenLimit = _prefill,
             EnablePrefixCaching = requested.EnablePrefixCaching, StopRepetition = requested.StopRepetition,
@@ -186,7 +215,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
             {
                 BatchedPathDisabled = true, PerSeqFusedEnabled = true, BatchedFusedDecodeEnabled = true,
                 RetainedFusedCacheBudget = requested.EnablePrefixCaching ? _options.RetainedConversationCount : 0,
-                PrefixCheckpointBudget = 0, KvHolderPoolMax = 0
+                PrefixCheckpointBudget = _effectivePrefixCopies, KvHolderPoolMax = 0
             },
             MemoryAdmission = new RequestMemoryAdmission(Budget, EstimateRequest)
             {
@@ -215,7 +244,11 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         // A Submit estimate always includes a new full slot. At the fenced
         // materialization boundary the model can reuse an actual idle primary
         // or donated holder. Existing child ownership is never revoked.
-        long slot = materializing && CanReuseSlotFor(seq) ? 0 : _geometry.SlotBytes(_context);
+        // Copy materialization initially uses a new independent slot. Unlike a
+        // donation it must not consume/reset a primary still advertised by the
+        // radix tree. Its complete allocation is admitted before adoption.
+        bool reusable = _effectivePrefixCopies > 0 ? HasNativeSlot(seq) : CanReuseSlotFor(seq);
+        long slot = materializing && reusable ? 0 : _geometry.SlotBytes(_context);
         return new(staging.Host, slot);
     }
     private bool HasNativeSlot(SequenceState seq) => _model!.CanReuseUnifiedSlot(seq.RequestId, includeIdlePrimary: false);
@@ -399,14 +432,14 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
             // The completed lookup confirmed no usable state for this request.
             // Only idle terminal holders are eligible; active slots and every
             // pending prefill promise remain charged throughout the retry.
-            _model!.TrimUnifiedRetainedSlots(); _lastGraphShape = null;
+            _model!.TrimUnifiedRetainedSlots(terminalOnly: true); _lastGraphShape = null;
             physical = ObservePhysicalConstraints();
             if (!Select()) throw new MemoryPressureException("GLM adaptive prefill failed its fresh physical check after idle terminal-state reclamation.");
         }
         if (_experts != null && selected.ExpertTargetBytes < _experts.BudgetBytes)
         {
             long previous = _experts.BudgetBytes;
-            GlmUnifiedExpertCapacity.Resize(_experts, _expertEnvelope!, selected.ExpertTargetBytes,
+            UnifiedMemoryExpertCapacity.Resize(_experts, _expertEnvelope!, DevicePool, selected.ExpertTargetBytes,
                 _expertMinimumBytes, physical.Limits);
             // Native release does not prove equivalent physical availability.
             physical = ObservePhysicalConstraints();
@@ -451,7 +484,7 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         long target = Math.Min(_experts.MaximumBudgetBytes, checked(previous + increase));
         target = Math.Max(previous, target / (1L << 20) * (1L << 20));
         if (target - previous < (512L << 20)) return;
-        if (GlmUnifiedExpertCapacity.Resize(_experts, _expertEnvelope!, target, _expertMinimumBytes, physical.Limits))
+        if (UnifiedMemoryExpertCapacity.Resize(_experts, _expertEnvelope!, DevicePool, target, _expertMinimumBytes, physical.Limits))
             Console.WriteLine($"[unified-memory] released request workspace: expert-cache ceiling {previous / 1048576.0:F0} -> {target / 1048576.0:F0} MiB within live reservations; retained tables grow only for an admitted route/shape requirement");
     }
 
@@ -564,13 +597,68 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         => GlmUnifiedPhysicalObservation.Create(InferenceHardwareMemory.CaptureCuda(), Budget.Snapshot(),
             _hostCeiling, _deviceCeiling, _hostHeadroom, _deviceHeadroom);
     private MemoryCharge[] PhysicalConstraints() => ObservePhysicalConstraints().Limits;
+    private long PrefixCloneSpareBytes()
+        => _executingRequest?.Charges.Single(c => c.Pool == DevicePool).Bytes
+            ?? Budget.Snapshot().Single(p => p.Pool == DevicePool).Available;
+    private IDisposable? EnterPrefixCapture(int tokens)
+    {
+        var sequence = _executingSequence;
+        if (_effectivePrefixCopies <= 0 || sequence == null || tokens <= 0
+            || !sequence.PublicCheckpointBoundaries.Contains(tokens)
+            || _model!.RetainedCopiedSlotCount >= _effectivePrefixCopies + 1)
+            return null;
+        var request = _executingRequest ?? throw new InvalidOperationException("GLM prefix capture requires its executing request envelope.");
+        // Prefix materialization runs before binding the actual native slot.
+        // An idle primary may therefore have satisfied the slot forecast without
+        // consuming this request's allowance. Settle that unused Device credit
+        // now, preserving physical children and all Host/staging and joint-graph
+        // promises. This is a ledger adjustment, not a physical memory refund.
+        if (!HasNativeSlot(sequence)) return null;
+        long previousDevice = request.OwnedCharges.Single(c => c.Pool == DevicePool).Bytes;
+        bool settled = OwnedAllocationScope.ReleaseUnusedPoolReservation(request, DevicePool);
+        long releasedDevice = previousDevice - request.OwnedCharges.Single(c => c.Pool == DevicePool).Bytes;
+        if (settled && _options.EnableAdaptiveGlmPrefill && tokens < sequence.PromptTokens.Count)
+        {
+            // The completed forward has advanced the sequence before this
+            // checkpoint. Its old wide-prefill promise no longer describes the
+            // remaining tail. Reuse the ordinary atomic admission transaction,
+            // retaining physical children, replacement graphs and every other
+            // pending prefill promise. Snapshot the current admitted cohort:
+            // siblings recorded at this request's start can omit newer decoders.
+            if (sequence.NumComputedTokens != tokens)
+                throw new InvalidOperationException("GLM checkpoint state does not match its admitted request head.");
+            var siblings = UnifiedMemoryAdmissionCohort.SnapshotOtherAdmitted(
+                _requestPrefill.Select(entry => entry.Key), sequence);
+            try { _ = PrepareAdaptiveAdmission(sequence, siblings, materialized: true); }
+            catch (MemoryPressureException) { return null; } // A discretionary cache must not reject this request.
+        }
+        var charges = Charges(new(0, _geometry.SlotBytes(_context)));
+        var physical = ObservePhysicalConstraints();
+        var envelope = settled ? OwnedAllocationScope.TryReserveOptional(Budget, charges, physical.Limits) : null;
+        try
+        {
+            if (System.Threading.Interlocked.Increment(ref _prefixCaptureDiagnostics) <= 8)
+            {
+                Console.WriteLine($"[unified-memory] public prefix capture: boundary={tokens}, prompt={sequence.PromptTokens.Count}, remaining={sequence.PromptTokens.Count - tokens}, " +
+                    $"reservation={(envelope != null ? "admitted" : settled ? "unavailable" : "unsettled")}, unused-device-credit-released={releasedDevice}, " +
+                    $"request-owned={Bytes(request.OwnedCharges)}, request-children={Bytes(request.LiveChildCharges)}, " +
+                    $"joint-owned={Bytes(_joint!.OwnedCharges)}, joint-children={Bytes(_joint.LiveChildCharges)}, " +
+                    $"expert-ceiling={_experts?.BudgetBytes ?? 0}; before-optional-admission: {physical.Describe(charges)}");
+            }
+            if (envelope == null) return null; // Optional cache misses must not reject the user request.
+            // Closing the root refunds slack, while each actual native child
+            // keeps its checkpoint charged until its physical buffer is freed.
+            return OwnedAllocationScope.Enter(envelope, () => _native!.EnterAllocationOwner(envelope));
+        }
+        catch { envelope?.Dispose(); throw; }
+    }
     private IDisposable EnterVisionPreparation(GlmVisionPreparationPlan plan)
     {
         var limits = PhysicalConstraints();
         var needed = Charges(new(plan.HostPeakBytes, plan.DevicePeakBytes));
         if (!Fits(needed, limits)) { _model!.TrimUnifiedGraphs(); _model.TrimUnifiedRetainedSlots(); limits = PhysicalConstraints(); }
         var envelope = Budget.TryReserve(needed, limits) ?? throw new MemoryPressureException("GLM image preparation exceeds the shared budget.");
-        try { return new OwnedExecution(EnterAllocations(envelope), envelope); }
+        try { return OwnedAllocationScope.Enter(envelope, () => EnterAllocations(envelope)); }
         catch { envelope.Dispose(); throw; }
     }
     private IDisposable EnterAllocations(BudgetReservation envelope)

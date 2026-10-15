@@ -78,6 +78,13 @@ def glm_cases(quantized_source):
                 cases.append((mode + "-" + kind + "-rows" + str(rows), mode, "CUDA",
                               ["--selected-experts"] + ([quant] if kind == "iq" else [])
                               + ["--prefill-rows=" + str(rows)] + faults))
+    for mode in ("production", "hooks"):
+        for kind in ("q8", "iq"):
+            for rows in (512, 809):
+                cases.append((f"{mode}-{kind}-bf16-sensitive-rows{rows}", mode, "CUDA",
+                              ["--selected-experts", "--bf16-sensitive", f"--prefill-rows={rows}"]
+                              + ([quant] if kind == "iq" else [])
+                              + (["--dispatch-faults"] if mode == "hooks" else [])))
     return cases
 
 
@@ -158,6 +165,14 @@ def validate_glm_report(actual, comparison, native, native_sha, backend, flags):
     selected, faults = "--selected-experts" in flags, "--dispatch-faults" in flags
     if actual.get("selected_experts_tested") is not selected or actual.get("dispatch_faults_tested") is not faults:
         raise RuntimeError("Selected-expert/fault coverage does not match requested mode.")
+    bf16 = '--bf16-sensitive' in flags
+    if (actual.get('bf16_sensitive_projections', False) is not bf16
+            or type(actual.get('bf16_sensitive_tensor_count', 0)) is not int
+            or actual.get('bf16_sensitive_tensor_count', 0) != (18 if bf16 else 0)
+            or comparison.get('bf16_sensitive_projections', False) is not bf16
+            or type(comparison.get('bf16_sensitive_tensor_count', 0)) is not int
+            or comparison.get('bf16_sensitive_tensor_count', 0) != (18 if bf16 else 0)):
+        raise RuntimeError('Requested actual BF16 recurrent/mixing fixture tensor coverage is missing or contradictory.')
     if selected and faults:
         id_failures = [row for row in actual.get('executions', []) if 'selected_ids_download_failure' in row]
         if len(id_failures) != 1 or id_failures[0].get('selected_ids_download_failure') is not True \
@@ -167,7 +182,7 @@ def validate_glm_report(actual, comparison, native, native_sha, backend, flags):
                 or id_failures[0].get('heads_unpublished') is not True:
             raise RuntimeError('Selected-ID reported download error must stop before expert cache mutation or logits publication.')
         drain_failures = [row for row in actual.get('executions', []) if 'selected_final_drain_failure' in row]
-        expected_seams = 3 if any(f.startswith('--quantized-source=') for f in flags) else 2
+        expected_seams = 3 if bf16 or any(f.startswith('--quantized-source=') for f in flags) else 2
         if len(drain_failures) != 1:
             raise RuntimeError('Missing or duplicated last selected-seam reported drain failure proof.')
         drain = drain_failures[0]
