@@ -7180,11 +7180,15 @@ TSG_EXPORT int TSGgml_GlmSelectedExpertMinimumBudget(void* handle, int rows, int
             if (segment.n_ff != m->hp.n_ff_exp)
                 throw std::runtime_error("GLM pooled groups require their declared uniform expert geometry");
             const auto key = tsg::host_moe_expert_group_key(segment);
-            if (std::any_of(groups.begin(), groups.end(), [&](const auto& group) { return group.key == key; })) continue;
+            // Every layer of a group adds its share of per-token expert reads.
+            const size_t expert_bytes = (size_t) ((segment.gate_bytes + segment.up_bytes + segment.down_bytes)
+                / std::max(1, segment.num_experts));
+            auto existing = std::find_if(groups.begin(), groups.end(), [&](const auto& group) { return group.key == key; });
+            if (existing != groups.end()) { existing->weight += expert_bytes; continue; }
             size_t narrow = 0, wide = 0;
             if (!tsg::host_moe_expert_cache_minimum_phase_plan(segment, rows, m->n_ubatch, m->backends[0], narrow, wide))
                 throw std::runtime_error("GLM compact expert layout or exact-width graph cannot be planned");
-            groups.push_back({key, narrow, wide});
+            groups.push_back({key, narrow, wide, expert_bytes});
         }
         // Only one serialized helper is wide at a time. Its whole union and
         // the other groups' narrow floors define the measured phase minimum.

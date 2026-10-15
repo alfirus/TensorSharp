@@ -574,6 +574,27 @@ namespace tsg
         } g_prefetch;
         void drain_decode_prefetch(bool publish) { g_prefetch.drain(publish); }
 
+        bool g_last_phase_wide = false;
+        // Caller holds g_cache_mutex. Erased tables are recreated lazily by the
+        // next narrow call of their group, each at min(weighted share, room left).
+        void rebalance_pooled_tables_locked(std::size_t budget, ggml_backend_t backend)
+        {
+            drain_decode_prefetch(false);
+            for (auto it = g_entries.begin(); it != g_entries.end();) {
+                const auto& entry = **it;
+                if (!entry.pooled || entry.backend != backend) { ++it; continue; }
+                const auto quota = g_phase_plan->quota(group_key(entry), budget, false);
+                const auto margin = quota / 8;
+                if (quota == 0 || (entry.bytes + margin >= quota && entry.bytes <= quota + margin)) { ++it; continue; }
+                const auto bytes = entry.bytes;
+                if (diagnostics()) std::fprintf(stderr,
+                    "[HOSTMOE-REBALANCE] layer=%d slots=%d bytes=%zu decode_quota=%zu\n",
+                    entry.layer, entry.capacity, bytes, quota);
+                it = g_entries.erase(it);
+                g_reserved -= bytes;
+            }
+        }
+
         bool valid_layout(const HostMoeSegment& hm, std::size_t (&stride)[3], int max_rows, bool explicit_model = false)
         {
             if (hm.seq_len <= 0 || hm.seq_len > max_rows
@@ -1582,6 +1603,14 @@ namespace tsg
         if (!valid_layout(hm, stride, joint ? std::max(settings.max_rows, settings.max_decode_rows)
                 : settings.max_rows, explicit_model)) return decline("expert type, strides, dimensions, biases or row bound is unsupported");
         const bool phase_wide = explicit_model && std::strcmp(kernel_name, "glm5-next bulk expert prefill") == 0;
+        // Bulk prefill leaves pooled group tables sized for its phase: the
+        // active group's whole union and the others' leftovers, in visiting
+        // order. When narrow calls resume, rebuild every table that is far from
+        // its weighted decode share so decode does not inherit that split.
+        if (explicit_model && hm.pooled_model_experts > 0 && g_phase_plan) {
+            if (!phase_wide && g_last_phase_wide) rebalance_pooled_tables_locked(budget, backend);
+            g_last_phase_wide = phase_wide;
+        }
         const std::size_t quota = g_phase_plan
             ? (hm.pooled_model_experts > 0 && backend == g_group_backend
                 ? g_phase_plan->cold_quota(host_moe_expert_group_key(hm), budget, g_reserved, phase_wide) : 0)

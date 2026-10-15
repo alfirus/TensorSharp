@@ -6,6 +6,10 @@ namespace tsg {
 struct HostMoePhaseGroupMinimum {
     HostMoeGroupKey key;
     std::size_t narrow_bytes = 0, wide_bytes = 0;
+    // Relative decode traffic: layers in the group x bytes of one expert. Spare
+    // budget beyond the floors is shared in this proportion, so a group serving
+    // most layers is not starved by one serving a few. Zero: share equally.
+    std::size_t weight = 0;
 };
 
 // Serialized helper phases may reclaim inactive groups. The minimum protects
@@ -14,6 +18,16 @@ struct HostMoePhaseGroupMinimum {
 class HostMoePhaseQuotaPlan {
     std::vector<HostMoePhaseGroupMinimum> groups_;
     std::size_t narrow_total_ = 0, minimum_ = 0;
+    std::size_t weight_total_ = 0; // zero unless every group has a weight
+    // Share of `amount` for group i: by weight, else equally.
+    std::size_t share(std::size_t i, std::size_t amount) const noexcept {
+        if (weight_total_ == 0)
+            return amount / groups_.size() + (i < amount % groups_.size() ? 1 : 0);
+        // 128-bit-free proportional split: amount and weights stay far below
+        // 2^63, and the quotient is computed in long double for safety.
+        const long double part = static_cast<long double>(amount) * groups_[i].weight / weight_total_;
+        return static_cast<std::size_t>(part);
+    }
 public:
     explicit HostMoePhaseQuotaPlan(std::vector<HostMoePhaseGroupMinimum> groups)
         : groups_(std::move(groups)) {
@@ -30,6 +44,12 @@ public:
                 throw std::overflow_error("GLM phase floors exceed shared-budget range");
             narrow_total_ += group.narrow_bytes;
         }
+        bool weighted = true;
+        for (const auto& group : groups_) {
+            if (group.weight == 0 || group.weight > limit - weight_total_) { weighted = false; break; }
+            weight_total_ += group.weight;
+        }
+        if (!weighted) weight_total_ = 0;
         for (const auto& group : groups_) {
             const auto others = narrow_total_ - group.narrow_bytes;
             if (others > limit - group.wide_bytes)
@@ -64,8 +84,7 @@ public:
         if (!admits(budget)) return 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) if (groups_[i].key == key) {
             if (wide) return budget - (narrow_total_ - groups_[i].narrow_bytes);
-            const auto surplus = budget - narrow_total_;
-            return groups_[i].narrow_bytes + surplus / groups_.size() + (i < surplus % groups_.size() ? 1 : 0);
+            return groups_[i].narrow_bytes + share(i, budget - narrow_total_);
         }
         return 0;
     }
@@ -81,9 +100,7 @@ public:
                 // these cold limits is exactly budget, so early groups cannot
                 // fill most of the pool and evict otherwise affordable peers.
                 for (std::size_t i = 0; i < groups_.size(); ++i) if (groups_[i].key == key) {
-                    const auto spare = budget - all_wide;
-                    return groups_[i].wide_bytes + spare / groups_.size()
-                        + (i < spare % groups_.size() ? 1 : 0);
+                    return groups_[i].wide_bytes + share(i, budget - all_wide);
                 }
                 return 0;
             }
