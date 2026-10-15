@@ -30,6 +30,42 @@ public sealed class HostCommitPlanningTests
         Assert.Contains("ancestors unverified", actual.CommitConstraintScope!);
     }
 
+    [Theory]
+    [InlineData(new[] { @"?:\pagefile.sys" }, 96L)]           // automatic on every volume: 3 x RAM
+    [InlineData(new[] { @"C:\pagefile.sys" }, 96L)]           // system-managed on the volume
+    [InlineData(new[] { @"C:\pagefile.sys 0 0" }, 96L)]
+    [InlineData(new[] { @"C:\pagefile.sys 8192 20480" }, 20L)] // explicit maximum (MB)
+    [InlineData(new[] { @"D:\pagefile.sys 0 0" }, -1L)]        // other volume: unrecognized here
+    [InlineData(new string[0], -1L)]
+    public void PagefileMaximumFollowsWindowsConfiguration(string[] configured, long expectedGiB)
+    {
+        long? maximum = HostMemoryInfo.ConfiguredPagefileMaximum(configured, @"C:\", 32 * GiB, 1000 * GiB);
+        Assert.Equal(expectedGiB < 0 ? null : expectedGiB * GiB, maximum);
+    }
+
+    [Fact]
+    public void SystemManagedPagefileCapIsAnEighthOfTheVolume()
+        => Assert.Equal(64 * GiB, HostMemoryInfo.ConfiguredPagefileMaximum([@"?:\pagefile.sys"], @"C:\", 32 * GiB, 512 * GiB));
+
+    [Theory]
+    [InlineData(96, 14, 64, 1000, 14)]   // free space minus a 50 GiB (5%) reserve
+    [InlineData(96, 14, 400, 1000, 82)]  // bounded by the maximum size
+    [InlineData(96, 14, 40, 1000, 0)]    // reserve exceeds free space
+    [InlineData(20, 24, 400, 1000, 0)]   // already at its configured maximum
+    [InlineData(96, 0, 30, 200, 14)]     // 16 GiB floor on a small volume
+    public void PagefileGrowthKeepsAVolumeReserve(long maximum, long current, long free, long total, long expected)
+        => Assert.Equal(expected * GiB, HostMemoryInfo.PagefileGrowth(maximum * GiB, current * GiB, free * GiB, total * GiB));
+
+    [Fact]
+    public void PagefileGrowthIsReportedInTheCommitScope()
+    {
+        var grown = HostMemoryInfo.FromWindowsCounters(32, 17, 40 + 8, 12 + 8, 8UL << 20);
+        Assert.Equal(48, grown.CommitLimit);
+        Assert.Equal(20, grown.CommitAvailable);
+        Assert.Contains("system-managed pagefile growth", grown.CommitConstraintScope!);
+        Assert.DoesNotContain("growth", HostMemoryInfo.FromWindowsCounters(32, 17, 40, 12).CommitConstraintScope!);
+    }
+
     [Fact]
     public void JobIntersectionNeverGrantsMoreThanSystemAllowance()
     {

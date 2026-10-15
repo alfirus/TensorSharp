@@ -74,6 +74,18 @@ public sealed class QwenUnifiedMemoryGeometryTests : IDisposable
         Assert.Throws<ArgumentOutOfRangeException>(() => geometry.RequestPeak(512, 513));
         Assert.Throws<NotSupportedException>(() => geometry.RequestPeak(512, 8, 1));
         Assert.Throws<OverflowException>(() => (geometry with { PleStateBytes = long.MaxValue }).RequestPeak(512, 8));
+
+        // A layer-major forward keeps every chunk's residual on the host, but
+        // runs each chunk at the admitted width: device peak is unchanged.
+        var chunked = geometry.RequestPeak(512, 64);
+        var layerMajor = geometry.RequestPeak(512, 64, forwardTokens: 512);
+        Assert.Equal(chunked.Device, layerMajor.Device);
+        Assert.True(layerMajor.Host > chunked.Host);
+        Assert.Equal(chunked, geometry.RequestPeak(512, 64, forwardTokens: 64));
+        // Its masks are bounded by the budget the model enforces per group.
+        var huge = geometry.RequestPeak(65536, 512, forwardTokens: 65536);
+        var unbounded = 2L * 65536 * 65536;
+        Assert.True(huge.Host < unbounded);
     }
 
     [Fact]

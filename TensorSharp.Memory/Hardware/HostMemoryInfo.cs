@@ -46,8 +46,9 @@ public static partial class HostMemoryInfo
         if (OperatingSystem.IsWindows())
         {
             var status = ReadWindowsStatus();
+            ulong growth = (ulong)WindowsPagefileGrowthBytes(checked((long)status.TotalPhysical), checked((long)status.TotalPageFile));
             return ConstrainWindowsJob(FromWindowsCounters(status.TotalPhysical, status.AvailablePhysical,
-                status.TotalPageFile, status.AvailablePageFile));
+                status.TotalPageFile + growth, status.AvailablePageFile + growth, growth));
         }
         var physical = Capture();
         return new(physical.Total, physical.Available);
@@ -68,15 +69,21 @@ public static partial class HostMemoryInfo
     }
 
     internal static HostMemorySnapshot FromWindowsCounters(ulong physicalTotal, ulong physicalAvailable,
-        ulong commitLimit, ulong commitAvailable)
+        ulong commitLimit, ulong commitAvailable, ulong pagefileGrowth = 0)
     {
         var physical = Validate(physicalTotal, physicalAvailable);
         // ullTotalPageFile is the smaller of the system/process commit limits;
         // ullAvailPageFile is the amount this process can currently commit.
         // These are neither the on-disk pagefile size nor extra physical RAM.
+        // pagefileGrowth (already included) is what a system-managed pagefile
+        // can still add on demand; see WindowsPagefileGrowthBytes.
         var commit = Validate(commitLimit, commitAvailable);
         return new(physical.Total, physical.Available, commit.Total, commit.Available)
-        { CommitConstraintScope = "Windows process allowance reported by GlobalMemoryStatusEx" };
+        {
+            CommitConstraintScope = pagefileGrowth > 0
+                ? $"Windows process allowance reported by GlobalMemoryStatusEx plus {pagefileGrowth >> 20} MiB of system-managed pagefile growth"
+                : "Windows process allowance reported by GlobalMemoryStatusEx"
+        };
     }
 
     internal static (long Total, long Available) Validate(ulong total, ulong available)

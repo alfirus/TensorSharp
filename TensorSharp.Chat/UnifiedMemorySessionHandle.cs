@@ -64,6 +64,15 @@ internal sealed class UnifiedMemorySessionHandle
                 throw new ArgumentException("--unified-memory requires TS_SCHED_PREFILL_CHUNK (--prefill-chunk-size) to be an integer from 1 through 512.");
             options = options with { PrefillChunkTokens = rows, AdaptiveGlmPrefillChunkTokens = rows };
         }
+        string layerMajor = Environment.GetEnvironmentVariable("TS_UNIFIED_LAYER_MAJOR_TOKENS");
+        if (layerMajor != null)
+        {
+            // 0 restores chunk-major prefill at the admitted width.
+            if (!int.TryParse(layerMajor, NumberStyles.None, CultureInfo.InvariantCulture, out int tokens)
+                || tokens > 65536)
+                throw new ArgumentException("TS_UNIFIED_LAYER_MAJOR_TOKENS must be an integer from 0 through 65536.");
+            options = options with { LayerMajorPrefillTokens = tokens };
+        }
         foreach (string variable in new[] { "TS_PER_SEQ_FUSED", "TS_BATCHED_FUSED_DECODE" })
         {
             string value = Environment.GetEnvironmentVariable(variable);

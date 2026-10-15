@@ -31,6 +31,12 @@ public sealed record UnifiedMemoryModelOptions
     public long MaximumDeviceBytes { get; init; } = long.MaxValue;
     public long MaximumExpertCacheBytes { get; init; } = long.MaxValue;
     public bool EnableAsyncExpertPrefill { get; init; } = false;
+    /// <summary>Prompt tokens per prefill Forward when routed experts stream
+    /// from file. The model runs the forward layer-major in chunks of the
+    /// admitted width, so each layer's experts are read once per forward rather
+    /// than once per chunk; device peaks stay per chunk. 0 keeps chunk-major
+    /// prefill at the admitted width.</summary>
+    public int LayerMajorPrefillTokens { get; init; } = 8192;
     public bool EnableExpertCacheCapacityGrowth { get; init; } = false;
     /// <summary>Experimental GLM5Next selected-expert CUDA tier. Requires its
     /// matching native planner and remains off until real-model qualification.</summary>
@@ -81,8 +87,10 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     private BudgetReservation? _expertEnvelope;
     private Qwen4ExpModel? _model;
     private readonly Dictionary<string, SequenceState> _requestOwners = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, (int Capacity, int Prefill, bool IsPrefill)> _requestShapes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (int Capacity, int Prefill, bool IsPrefill, int Forward)> _requestShapes = new(StringComparer.Ordinal);
     private readonly Dictionary<SequenceState, int> _requestPrefillCaps = new();
+    // Prompt tokens per Forward; above _prefillTokens only with layer-major prefill.
+    private readonly int _forwardTokens;
     private bool _disposed;
 
     private UnifiedMemoryModelSession(UnifiedMemoryModelOptions options, Qwen4ExpUnifiedGeometry geometry,
@@ -90,6 +98,7 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     {
         _options = options; _geometry = geometry; _vision = vision; _contextTokens = contextTokens;
         _prefillTokens = Math.Min(options.PrefillChunkTokens, contextTokens);
+        _forwardTokens = Math.Max(_prefillTokens, Math.Min(options.LayerMajorPrefillTokens, contextTokens));
         var hostCapacity = hardware.HostAllocationCapacity();
         _hostHeadroom = Math.Max(512L << 20, Math.Min(hostCapacity.Total, options.MaximumHostBytes) / 16);
         _deviceHeadroom = Math.Max(768L << 20, Math.Min(hardware.DeviceTotal, options.MaximumDeviceBytes) / 16);
@@ -244,9 +253,9 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             BlockSize = block, NumBlocks = Math.Max(1, checked(((_contextTokens + block - 1) / block)
                 * (_options.MaximumRunningRequests + (requested.EnablePrefixCaching
                     ? _options.PrefixCheckpointCount + _options.RetainedConversationCount : 0)))),
-            MaxNumRunningSequences = _options.MaximumRunningRequests, MaxNumBatchedTokens = _prefillTokens,
-            MaxPrefillChunkSize = _prefillTokens, SoloPrefillChunkSize = _prefillTokens,
-            PrefillChunkTokenLimit = _prefillTokens, EnablePrefixCaching = requested.EnablePrefixCaching,
+            MaxNumRunningSequences = _options.MaximumRunningRequests, MaxNumBatchedTokens = _forwardTokens,
+            MaxPrefillChunkSize = _forwardTokens, SoloPrefillChunkSize = _forwardTokens,
+            PrefillChunkTokenLimit = _forwardTokens, EnablePrefixCaching = requested.EnablePrefixCaching,
             StopRepetition = requested.StopRepetition, DecodeQuantumTokens = requested.DecodeQuantumTokens,
             Speculation = SpeculationOptions.Disabled,
             ExecutionOptionsOverride = new ExecutionOptions
@@ -262,7 +271,7 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
                 UsePerSequenceHolders = true,
                 BeforeAdmissionWithRunning = PrepareRequestCapacity,
                 AfterPrefixMaterialization = CompletePrefixMaterialization,
-                PrefillTokenLimit = AdmittedPrefillLimit,
+                PrefillTokenLimit = ForwardPrefillLimit,
                 RevalidateExecution = RevalidateSequenceAllocations,
                 AfterPrefill = CompletePrefill,
                 AfterSequenceMemoryRelease = RecoverReleasedSequenceCapacity,
@@ -275,6 +284,27 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
 
     private int AdmittedPrefillLimit(SequenceState sequence)
         => _requestPrefillCaps != null && _requestPrefillCaps.TryGetValue(sequence, out int rows) ? rows : _prefillTokens;
+
+    /// <summary>Tokens one prefill Forward may carry. A layer-major forward
+    /// keeps chunks at the admitted device width; narrower admissions route
+    /// too few tokens per chunk to repay staging complete expert stacks.</summary>
+    private int ForwardPrefillLimit(SequenceState sequence)
+    {
+        int rows = AdmittedPrefillLimit(sequence);
+        return LayerMajor(sequence, rows) ? _forwardTokens : rows;
+    }
+
+    // Media prompts keep chunk-major forwards: the model runs image slices
+    // (M-RoPE positions, injected embeddings) only through ordinary spans.
+    private bool LayerMajor(SequenceState sequence, int rows) => sequence.MediaSpans.Count == 0 && LayerMajor(rows);
+
+    private bool LayerMajor(int rows) => _forwardTokens > rows && rows >= Qwen4ExpModel.LayerMajorMinimumChunkTokens;
+
+    // Host scratch of the largest Forward this request can still issue.
+    private int ForwardTokensForPeak(SequenceState sequence, int rows)
+        => sequence.NumComputedTokens < sequence.PromptTokens.Count && LayerMajor(sequence, rows)
+            ? Math.Max(rows, Math.Min(_forwardTokens, sequence.PromptTokens.Count - sequence.NumComputedTokens))
+            : rows;
 
     private InferenceMemoryBytes RequestPeak(SequenceState seq) => RequestPeakForRows(seq, AdmittedPrefillLimit(seq));
 
@@ -301,7 +331,7 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             // tensors remain charged children; decode growth must not pretend
             // every immutable checkpoint grows with the active KV holder.
             checkpointCopies: seq.NumComputedTokens < seq.PromptTokens.Count ? _checkpointCopies : 0,
-            independentHolder: true, requestId: seq.RequestId);
+            independentHolder: true, requestId: seq.RequestId, forwardTokens: ForwardTokensForPeak(seq, rows));
         if (seq.NumComputedTokens >= seq.PromptTokens.Count && seq.MemoryEnvelope != null)
         {
             // The root can own previously published copies, pooled blocks or
@@ -327,10 +357,13 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     private static int RequiredContext(SequenceState sequence)
         => Math.Max(sequence.PromptTokens.Count, checked(sequence.NumComputedTokens + 1));
 
-    private (int Capacity, int Prefill, bool IsPrefill) RequestShape(SequenceState sequence)
-        => (_model!.GetUnifiedMemoryCapacity(RequiredContext(sequence), requestId: sequence.RequestId),
-            ForecastPrefillRows(sequence, AdmittedPrefillLimit(sequence)),
-            sequence.NumComputedTokens < sequence.PromptTokens.Count);
+    // Forward is the host scratch width: a revoked prefix can widen it again.
+    private (int Capacity, int Prefill, bool IsPrefill, int Forward) RequestShape(SequenceState sequence)
+    {
+        int rows = ForecastPrefillRows(sequence, AdmittedPrefillLimit(sequence));
+        return (_model!.GetUnifiedMemoryCapacity(RequiredContext(sequence), requestId: sequence.RequestId),
+            rows, sequence.NumComputedTokens < sequence.PromptTokens.Count, ForwardTokensForPeak(sequence, rows));
+    }
 
     private IReadOnlyList<MemoryCharge> EstimateRequest(SequenceState seq) => IncrementalPeak(RequestPeak(seq));
 
@@ -707,7 +740,24 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
     private IDisposable EnterSequenceAllocations(SequenceState sequence)
     {
         EnsureSequenceCapacity(sequence, allowReclamation: true);
-        return EnterAllocations(sequence.MemoryEnvelope!);
+        var allocations = EnterAllocations(sequence.MemoryEnvelope!);
+        // A Forward longer than the admitted width runs layer-major at that
+        // width, only inside this request's own allocation scope.
+        int rows = AdmittedPrefillLimit(sequence);
+        var model = _model!;
+        model.LayerMajorPrefillChunkTokens = LayerMajor(sequence, rows) ? rows : 0;
+        return new ScopeExit(allocations, () => model.LayerMajorPrefillChunkTokens = 0);
+    }
+
+    private sealed class ScopeExit(IDisposable inner, Action exit) : IDisposable
+    {
+        private bool _disposed;
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try { exit(); } finally { inner.Dispose(); }
+        }
     }
 
     private void RevalidateSequenceAllocations(SequenceState sequence)
@@ -833,7 +883,8 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             || options.ExpertCachePrefillRows is < 1 or > 128
             || options.MaximumRunningRequests is < 1 or > 8 || options.PrefixCheckpointCount is < 0 or > 8
             || options.RetainedConversationCount is < 0 or > 8
-            || options.MaximumHostBytes <= 0 || options.MaximumDeviceBytes <= 0 || options.MaximumExpertCacheBytes < 0)
+            || options.MaximumHostBytes <= 0 || options.MaximumDeviceBytes <= 0 || options.MaximumExpertCacheBytes < 0
+            || options.LayerMajorPrefillTokens is < 0 or > 65536)
             throw new ArgumentOutOfRangeException(nameof(options));
     }
 }

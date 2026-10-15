@@ -49,6 +49,7 @@
 #include "ggml-cuda.h"
 #endif
 
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
@@ -175,6 +176,128 @@ namespace
             g_moe_file_stream_backend = nullptr;
         }
         struct FileStreamAllocationRefused {};
+        // Layer-major prefill (TSGgml_HostMoeSetLayerResidency). While a caller
+        // runs every prompt chunk through one layer before moving to the next,
+        // a wide file-backed seam keeps that layer's COMPLETE expert stack on
+        // the device and reuses it for the following chunks: a prompt then reads
+        // and uploads each layer's experts once instead of once per chunk. One
+        // layer at a time, charged as graph memory, guarded by
+        // g_moe_file_cpu_mutex. The key is the three host source pointers that
+        // identify the layer's expert stacks.
+        struct MoeLayerResidency {
+            bool enabled = false;
+            ggml_backend_buffer_t buffer = nullptr;
+            ggml_backend_t backend = nullptr;
+            std::size_t capacity = 0;
+            std::array<const void*, 3> key{};
+            std::uint64_t hits = 0, loads = 0, load_bytes = 0;
+            bool matches(const void* gate, const void* up, const void* down) const {
+                return key[0] != nullptr && key[0] == gate && key[1] == up && key[2] == down;
+            }
+            void release() {
+                key = {};
+                if (buffer) {
+                    if (backend) sync_backend(backend);
+                    graph_budget_free_buffer(buffer);
+                }
+                buffer = nullptr; backend = nullptr; capacity = 0;
+            }
+            // Returns the device base for `bytes`, growing the single buffer.
+            // Growth frees the old buffer first so both are never charged.
+            std::uint8_t* ensure(std::size_t bytes) {
+                if (buffer && (backend != g_backend || capacity < bytes)) release();
+                if (!buffer) {
+                    buffer = graph_budget_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend), bytes, g_active_rank);
+                    if (!buffer) return nullptr;
+                    backend = g_backend;
+                    capacity = bytes;
+                }
+                return static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buffer));
+            }
+        };
+        MoeLayerResidency g_moe_layer_residency;
+        // Pinned host staging for one complete layer, and a background read of
+        // the NEXT layer (TSGgml_HostMoeLayerResidencyHint) while the current
+        // layer's chunks compute. g_moe_file_cpu_mutex guards every field; the
+        // worker only writes the staging bytes, and every reader joins it first.
+        struct MoeLayerStaging {
+            ggml_backend_buffer_t buffer = nullptr;
+            std::shared_ptr<SharedCacheCharge> charge;
+            std::size_t capacity = 0;
+            std::array<const void*, 3> key{};   // layer the staging holds or receives
+            HostMoeFileBatch batch;             // complete-layer plan for `key`
+            std::thread worker;
+            std::exception_ptr error;
+            std::array<const void*, 3> hint{};
+            std::array<std::size_t, 3> hint_bytes{};
+            int hint_experts = 0;
+            std::uint64_t prefetches = 0, prefetch_hits = 0;
+
+            std::uint8_t* data() const {
+                return buffer ? static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buffer)) : nullptr;
+            }
+            void join() { if (worker.joinable()) worker.join(); }
+            // Process exit: never destroy a joinable thread; buffers die with the process.
+            ~MoeLayerStaging() { join(); }
+            // Dropping the plan also closes its file sources.
+            void forget() { join(); key = {}; error = nullptr; batch = HostMoeFileBatch{}; }
+            void release() {
+                forget();
+                hint = {};
+                if (buffer) ggml_backend_buffer_free(buffer);
+                buffer = nullptr; capacity = 0; charge.reset();
+            }
+            // Pinned, host-accounted capacity; false keeps the pageable arena path.
+            bool ensure(std::size_t bytes) {
+                if (buffer && capacity >= bytes) return true;
+                forget();
+                if (buffer) { ggml_backend_buffer_free(buffer); buffer = nullptr; capacity = 0; charge.reset(); }
+#if defined(TSG_GGML_USE_CUDA)
+                auto reserved = SharedCacheCharge::reserve(0, 3, bytes);
+                if (!reserved || !reserved->is_accounted()) return false;
+                ggml_backend_buffer_t allocated = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), bytes);
+                if (!allocated) return false;
+                if (!reserved->commit(bytes)) { ggml_backend_buffer_free(allocated); return false; }
+                buffer = allocated; charge = std::move(reserved); capacity = bytes;
+                return true;
+#else
+                return false;
+#endif
+            }
+        };
+        MoeLayerStaging g_moe_layer_staging;
+
+        // Begin reading the hinted layer into staging. Called after the staging
+        // contents were consumed; failures only cost the prefetch.
+        void moe_layer_start_prefetch() {
+            auto& s = g_moe_layer_staging;
+            if (s.hint[0] == nullptr || s.worker.joinable() || s.key == s.hint) return;
+            try {
+                HostMoeFileBatch batch;
+                const void* pointers[] = { s.hint[0], s.hint[1], s.hint[2] };
+                const std::int64_t totals[] = { static_cast<std::int64_t>(s.hint_bytes[0]),
+                    static_cast<std::int64_t>(s.hint_bytes[1]), static_cast<std::int64_t>(s.hint_bytes[2]) };
+                if (host_moe_file_batch_sources(pointers, totals, batch.sources) <= 0) return;
+                batch.plan_layer(s.hint_experts, s.hint_bytes);
+                if (!s.ensure(batch.payload)) return;
+                s.forget();
+                s.key = s.hint;
+                s.batch = std::move(batch);
+                ++s.prefetches;
+                std::uint8_t* destination = s.data();
+                const std::size_t capacity = s.capacity;
+                s.worker = std::thread([destination, capacity] {
+                    auto& staging = g_moe_layer_staging;
+                    try { staging.batch.read_into(destination, capacity); }
+                    catch (...) { staging.error = std::current_exception(); }
+                });
+            } catch (...) { s.forget(); }
+        }
+
+        bool moe_residency_timing() {
+            static const bool value = [] { const char* e = std::getenv("TS_HOST_MOE_TIMING"); return e && e[0] == '1'; }();
+            return value;
+        }
         bool allocate_file_stream_graph(ggml_cgraph* graph) {
             if (g_moe_file_stream_gallocr && g_moe_file_stream_backend != g_backend)
                 throw std::runtime_error("Host MoE file stream backend changed without quiescent cleanup");
@@ -523,6 +646,9 @@ namespace
         // the caller from MoeCpuOffloadConfig.IsLayerOnCpu(layer).
         bool run_on_cpu = false;
         const HostMoeFileBatch* file_batch = nullptr;
+        // The file batch spans the layer's complete expert stack and the
+        // weights bind to g_moe_layer_residency instead of graph memory.
+        bool layer_resident = false;
 
         // Whether run_on_cpu may be satisfied by streaming the experts to the
         // accelerator for one graph instead of computing them on the host (see
@@ -1014,6 +1140,15 @@ namespace
                     && !batch.duplicate_routes && SharedCacheCharge::graph_accounting_attached();
                 compact.file_batch = &batch;
                 std::lock_guard<std::mutex> file_lock(g_moe_file_cpu_mutex);
+                // Layer-major prefill: stage the whole layer once and keep it for
+                // the next chunks. Original route IDs then index the full stack.
+                if (compact.allow_device_stream && g_moe_layer_residency.enabled) {
+                    batch.use_all_experts(p.selected_experts, p.seq_len, p.n_used, p.num_experts);
+                    compact.num_experts = p.num_experts;
+                    compact.selected_experts = batch.ids.data();
+                    compact.gate_total_bytes = batch.bytes[0]; compact.up_total_bytes = batch.bytes[1]; compact.down_total_bytes = batch.bytes[2];
+                    compact.layer_resident = true;
+                }
                 try {
                     int result;
                     try { result = moe_ffn_prefill_graph_impl(compact); }
@@ -1022,6 +1157,18 @@ namespace
                         // or compute was submitted: rebuild entirely on CPU,
                         // still from registered files under its host quota.
                         compact.allow_device_stream = false;
+                        if (compact.layer_resident) {
+                            // The CPU path reads only the routed experts, into its
+                            // own arena: return the staging charge first.
+                            g_moe_layer_staging.release();
+                            g_moe_layer_residency.release();
+                            batch.plan(p.selected_experts, p.routing_weights, p.seq_len, p.n_used, p.num_experts,
+                                {static_cast<std::size_t>(totals[0]), static_cast<std::size_t>(totals[1]), static_cast<std::size_t>(totals[2])});
+                            compact.num_experts = static_cast<int>(batch.experts.size());
+                            compact.selected_experts = batch.ids.data();
+                            compact.gate_total_bytes = batch.bytes[0]; compact.up_total_bytes = batch.bytes[1]; compact.down_total_bytes = batch.bytes[2];
+                            compact.layer_resident = false;
+                        }
                         result = moe_ffn_prefill_graph_impl(compact);
                     }
                     if (!result) { clear_file_stream_gallocr(); g_moe_file_weights.clear(); g_moe_file_work.clear(); }
@@ -1485,12 +1632,13 @@ namespace
         // times faster end to end. `stream_experts` picks the second; the branch
         // below (taken before any accelerator binding) is the first.
         const int stream_threshold = moe_offload_stream_batch_threshold(p.file_batch != nullptr);
+        // A resident layer has no upload left to amortize: any chunk width,
+        // including a short prompt tail, runs on the device stack.
         const bool stream_experts =
             p.run_on_cpu &&
             p.allow_device_stream &&
-            stream_threshold > 0 &&
-            seq_len >= stream_threshold &&
-            g_backend != nullptr;
+            g_backend != nullptr &&
+            (p.layer_resident || (stream_threshold > 0 && seq_len >= stream_threshold));
 
         if (p.run_on_cpu && !stream_experts)
         {
@@ -1563,18 +1711,49 @@ namespace
         // calls), falling back to host-ptr mapping or deferred upload.
         // `stream_experts` skips both shortcuts (see bind_readonly_weight_3d)
         // and records the tensor for the streamed upload below.
-        bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
-            static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers,
-            stream_experts);
-        if (!fused_gate_up && !single_projection_activation)
+        // Layer-major residency binds the complete stacks to the retained
+        // buffer (gallocr skips tensors that already have storage). A matching
+        // key means a previous chunk of this layer already uploaded them.
+        const bool layer_resident = stream_experts && p.layer_resident && p.file_batch && up_w != nullptr;
+        bool resident_hit = false;
+        if (layer_resident)
         {
-            bind_readonly_weight_3d(ctx, g_backend, dev, up_data,
-                static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers,
+            const HostMoeFileBatch& fb = *p.file_batch;
+            if (ggml_nbytes(gate_w) != fb.bytes[0] || ggml_nbytes(up_w) != fb.bytes[1] || ggml_nbytes(down_w) != fb.bytes[2])
+                throw std::runtime_error("Host MoE layer residency: expert stack size mismatch");
+            // The backend's allocation size includes CUDA's quantized row padding
+            // (ne0 not a multiple of 512); tensor_alloc zero-fills that padding.
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+            const std::size_t alignment = ggml_backend_buft_get_alignment(buft);
+            const auto align = [alignment](std::size_t v) { return (v + alignment - 1) / alignment * alignment; };
+            ggml_tensor* stacks[3] = { gate_w, up_w, down_w };
+            std::size_t offsets[3] = {}, end = 0;
+            for (int part = 0; part < 3; ++part) {
+                offsets[part] = end;
+                end = align(end + ggml_backend_buft_get_alloc_size(buft, stacks[part]));
+            }
+            std::uint8_t* base = g_moe_layer_residency.ensure(end);
+            if (base == nullptr) throw FileStreamAllocationRefused{};
+            resident_hit = g_moe_layer_residency.matches(gate_data, up_data, down_data);
+            for (int part = 0; part < 3; ++part)
+                if (ggml_backend_tensor_alloc(g_moe_layer_residency.buffer, stacks[part], base + offsets[part]) != GGML_STATUS_SUCCESS)
+                    throw std::runtime_error("Host MoE layer residency: cannot bind expert stack");
+        }
+        else
+        {
+            bind_readonly_weight_3d(ctx, g_backend, dev, gate_data,
+                static_cast<std::size_t>(gate_total_bytes), gate_w, uploads, ephem_buffers,
+                stream_experts);
+            if (!fused_gate_up && !single_projection_activation)
+            {
+                bind_readonly_weight_3d(ctx, g_backend, dev, up_data,
+                    static_cast<std::size_t>(up_total_bytes), up_w, uploads, ephem_buffers,
+                    stream_experts);
+            }
+            bind_readonly_weight_3d(ctx, g_backend, dev, down_data,
+                static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers,
                 stream_experts);
         }
-        bind_readonly_weight_3d(ctx, g_backend, dev, down_data,
-            static_cast<std::size_t>(down_total_bytes), down_w, uploads, ephem_buffers,
-            stream_experts);
 
         // Allocate any tensors not bound above (hidden in/out fallback, ids,
         // weights, biases, and all per-graph intermediates) into the persistent,
@@ -1614,7 +1793,7 @@ namespace
         FileStreamDrain file_drain{file_stream ? g_backend : nullptr};
         bool file_pipeline = false;
 #if defined(TSG_GGML_USE_CUDA)
-        if (file_stream && ggml_backend_is_cuda(g_backend)) {
+        if (file_stream && !layer_resident && ggml_backend_is_cuda(g_backend)) {
             // Explicit scopes isolate a model session from process-static
             // environment settings. Unscoped callers retain legacy behavior.
             const auto legacy_enabled = [] {
@@ -1642,7 +1821,60 @@ namespace
             }
         }
 #endif
-        if (file_stream && !file_pipeline) {
+        if (layer_resident && !resident_hit) {
+            // Invalidate first: a failed read or upload leaves no stale key.
+            g_moe_file_pipeline.clear();
+            g_moe_layer_residency.key = {};
+            const auto t_read = std::chrono::steady_clock::now();
+            // Prefer the background read of this layer; otherwise read now,
+            // into pinned staging when it is admitted, else the pageable arena.
+            auto& staging = g_moe_layer_staging;
+            const std::array<const void*, 3> layer_key{ gate_data, up_data, down_data };
+            const std::uint8_t* source = nullptr;
+            bool prefetched = false;
+            if (staging.key == layer_key) {
+                staging.join();
+                prefetched = !staging.error && staging.batch.payload == p.file_batch->payload
+                    && staging.batch.offset == p.file_batch->offset && staging.batch.bytes == p.file_batch->bytes;
+                if (prefetched) { source = staging.data(); ++staging.prefetch_hits; }
+                else staging.forget();
+            }
+            if (source == nullptr) {
+                staging.forget();
+                if (staging.ensure(p.file_batch->payload)) {
+                    p.file_batch->read_into(staging.data(), staging.capacity);
+                    source = staging.data();
+                } else {
+                    p.file_batch->read(g_moe_file_weights);
+                    source = g_moe_file_weights.data();
+                }
+            }
+            const auto t_read_end = std::chrono::steady_clock::now();
+            ggml_tensor* stacks[3] = { gate_w, up_w, down_w };
+            const auto errors = g_ggml_error_count.load(std::memory_order_acquire);
+            for (int part = 0; part < 3; ++part)
+                ggml_backend_tensor_set(stacks[part], source + p.file_batch->offset[part], 0, p.file_batch->bytes[part]);
+            // The upload above completed: staging is free for the next layer.
+            staging.key = {};
+            if (moe_residency_timing()) {
+                const auto t_up = std::chrono::steady_clock::now();
+                const double read_ms = std::chrono::duration<double, std::milli>(t_read_end - t_read).count();
+                const double up_ms = std::chrono::duration<double, std::milli>(t_up - t_read_end).count();
+                const double mib = p.file_batch->payload / 1048576.0;
+                std::fprintf(stderr, "[HOSTMOE-RESIDENT] load %.0f MiB %s=%.1f ms upload=%.1f ms (%.2f GB/s) staging=%s\n",
+                    mib, prefetched ? "prefetch-wait" : "read", read_ms, up_ms, mib / 1024.0 / (up_ms / 1000.0),
+                    source == staging.data() && staging.buffer ? ggml_backend_buffer_name(staging.buffer) : "pageable-arena");
+            }
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors
+                || g_backend_compute_failed.load(std::memory_order_acquire))
+                throw std::runtime_error("Host MoE layer residency upload failed");
+            g_moe_layer_residency.key = { gate_data, up_data, down_data };
+            ++g_moe_layer_residency.loads;
+            g_moe_layer_residency.load_bytes += p.file_batch->payload;
+            moe_layer_start_prefetch();
+        } else if (layer_resident) {
+            ++g_moe_layer_residency.hits;
+        } else if (file_stream && !file_pipeline) {
             g_moe_file_pipeline.clear();
             p.file_batch->read(g_moe_file_weights);
             // Deferred binding only recorded metadata. Replace every expert
@@ -2030,9 +2262,57 @@ namespace tsg
         *retained_ring_bytes = static_cast<std::int64_t>(g_moe_file_pipeline.retained_bytes());
         return 1;
     }
+    // Layer-major prefill scope. Enabling drops the file-stream allocator so its
+    // next reservation excludes expert weights (they move to the residency
+    // buffer); disabling frees the retained layer and that allocator.
+    TSG_EXPORT int TSGgml_HostMoeSetLayerResidency(int enable) {
+        try {
+            clear_last_error();
+            if (enable != 0 && enable != 1) throw std::invalid_argument("Layer residency flag must be 0 or 1");
+            std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+            if (g_moe_layer_residency.enabled == (enable != 0)) return 1;
+            clear_file_stream_gallocr();
+            g_moe_file_weights.clear(); g_moe_file_work.clear();
+            g_moe_layer_staging.release();
+            g_moe_layer_residency.release();
+            g_moe_layer_residency.enabled = enable != 0;
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { try { set_last_error("Host MoE layer residency change failed"); } catch (...) {} return 0; }
+    }
+    // The layer whose experts the caller will run next. After the current
+    // layer is staged on the device, its complete stacks are read in the
+    // background while the current layer computes. Null clears the hint.
+    TSG_EXPORT int TSGgml_HostMoeLayerResidencyHint(const void* gate, const void* up, const void* down,
+        std::int64_t gate_bytes, std::int64_t up_bytes, std::int64_t down_bytes, int experts) {
+        try {
+            clear_last_error();
+            std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+            auto& staging = g_moe_layer_staging;
+            if (!g_moe_layer_residency.enabled || gate == nullptr) { staging.hint = {}; return 1; }
+            if (!up || !down || gate_bytes <= 0 || up_bytes <= 0 || down_bytes <= 0 || experts <= 0)
+                throw std::invalid_argument("Layer residency hint requires three expert stacks and an expert count");
+            staging.hint = { gate, up, down };
+            staging.hint_bytes = { static_cast<std::size_t>(gate_bytes), static_cast<std::size_t>(up_bytes),
+                static_cast<std::size_t>(down_bytes) };
+            staging.hint_experts = experts;
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { try { set_last_error("Host MoE layer residency hint failed"); } catch (...) {} return 0; }
+    }
+    TSG_EXPORT int TSGgml_HostMoeLayerResidencyStats(std::int64_t* loads, std::int64_t* hits, std::int64_t* load_bytes) {
+        if (!loads || !hits || !load_bytes) return 0;
+        std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+        *loads = static_cast<std::int64_t>(g_moe_layer_residency.loads);
+        *hits = static_cast<std::int64_t>(g_moe_layer_residency.hits);
+        *load_bytes = static_cast<std::int64_t>(g_moe_layer_residency.load_bytes);
+        return 1;
+    }
     void host_moe_cpu_staging_release() {
         std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
         clear_file_stream_gallocr();
+        g_moe_layer_staging.release();
+        g_moe_layer_residency.release();
         g_moe_file_work.clear(); g_moe_file_weights.clear();
     }
     void read_expert_files(std::vector<ExpertReadTask>& tasks,
@@ -2372,7 +2652,10 @@ namespace tsg
             const char* e = std::getenv("TS_HOST_MOE_EXPERT_CACHE_BRIDGE");
             return e == nullptr || e[0] != '0';
         }();
-        if (allow_device_stream && staged == nullptr && s_cache_device_inputs)
+        // Layer-major prefill bypasses the decode expert cache: the seam's wide
+        // stream path keeps the whole layer resident across the prompt chunks.
+        const bool use_cache = allow_device_stream && !g_moe_layer_residency.enabled;
+        if (use_cache && staged == nullptr && s_cache_device_inputs)
         {
             static const bool s_cache_device_outputs = [] {
                 const char* e = std::getenv("TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE");
@@ -2402,7 +2685,7 @@ namespace tsg
             staged->weights = s_weights.data();
         }
 
-        const int cached = allow_device_stream ? host_moe_cached_experts(hm, s_moe_in.data(), s_ids.data(),
+        const int cached = use_cache ? host_moe_cached_experts(hm, s_moe_in.data(), s_ids.data(),
             s_weights.data(), out.data(), kernel_name, explicit_backend) : 0;
         if (cached != 0)
             return cached > 0;

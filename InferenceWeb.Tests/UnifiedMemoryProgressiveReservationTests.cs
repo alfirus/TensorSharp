@@ -34,6 +34,29 @@ public sealed class UnifiedMemoryProgressiveReservationTests
     }
 
     [Fact]
+    public void LayerMajorForwardWidthIsGrantedOnlyToTextPromptsAndPricedOnTheHost()
+    {
+        var model = MetadataModel(); var session = UninitializedSession(model);
+        Set(session, "_forwardTokens", 8192);
+        var limit = typeof(UnifiedMemoryModelSession).GetMethod("ForwardPrefillLimit", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var prompt = Enumerable.Repeat(1, 3000).ToArray();
+        var text = new SequenceState("text", prompt, 64, 256, SamplingConfig.Greedy);
+        var image = new SequenceState("image", prompt, 64, 256, SamplingConfig.Greedy,
+            mediaSpans: [new PromptMediaSpan(10, 400, "img")]);
+        Assert.Equal(8192, (int)limit.Invoke(session, [text])!);
+        Assert.Equal(512, (int)limit.Invoke(session, [image])!);
+        // The device chunk keeps the admitted width; only host scratch widens.
+        Assert.Equal((3000, 512), Shape(session, text));
+        var chunked = model.GetUnifiedMemoryRequestPeak(3000, 512, checkpointCopies: 7, independentHolder: true, requestId: "text");
+        Assert.Equal(chunked.Device, Peak(session, text).Device);
+        Assert.True(Peak(session, text).Host > chunked.Host);
+        Assert.Equal(chunked.Host, Peak(session, image).Host);
+        // A narrow admission never routes a layer-major forward.
+        Set(session, "_requestPrefillCaps", new Dictionary<SequenceState, int> { [text] = 32 });
+        Assert.Equal(32, (int)limit.Invoke(session, [text])!);
+    }
+
+    [Fact]
     public void TwentyThousandOutputAllowanceDoesNotReserveUnusedGenerationUpfront()
     {
         var model = MetadataModel();
@@ -390,7 +413,7 @@ public sealed class UnifiedMemoryProgressiveReservationTests
             .Invoke(session, [request])!;
     private static (int, int) Shape(UnifiedMemoryModelSession session, SequenceState request)
     {
-        var shape = ((int Capacity, int Prefill, bool IsPrefill))typeof(UnifiedMemoryModelSession)
+        var shape = ((int Capacity, int Prefill, bool IsPrefill, int Forward))typeof(UnifiedMemoryModelSession)
             .GetMethod("RequestShape", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(session, [request])!;
         Assert.Equal(request.NumComputedTokens < request.PromptTokens.Count, shape.IsPrefill);
         return (shape.Capacity, shape.Prefill);

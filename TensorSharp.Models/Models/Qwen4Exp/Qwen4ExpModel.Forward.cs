@@ -347,6 +347,8 @@ namespace TensorSharp.Models
 
         private float[] ForwardCoreInner(int[] tokens)
         {
+            if (_layerMajorChunkTokens > 0 && tokens.Length > _layerMajorChunkTokens)
+                return LayerMajorPrefillEligible(tokens.Length) ? ForwardLayerMajor(tokens) : ForwardAdmittedChunks(tokens);
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;

@@ -85,6 +85,22 @@ struct HostMoeFileBatch {
             payload = host_moe_checked_add(payload, host_moe_align(bytes[part]));
         }
     }
+    // After plan() validated the routes: widen the batch to the layer's complete
+    // expert stack with the original route IDs, so one upload serves any later
+    // chunk of the same layer (layer-major prefill residency).
+    void use_all_experts(const std::int32_t* original, int rows, int used, int count) {
+        const auto n = host_moe_checked_mul(static_cast<std::size_t>(rows), used);
+        if (!original || ids.size() != n || count <= 0) throw std::invalid_argument("Invalid host MoE full-layer batch");
+        experts.resize(static_cast<std::size_t>(count));
+        for (int e = 0; e < count; ++e) experts[static_cast<std::size_t>(e)] = e;
+        ids.assign(original, original + n);
+        payload = 0;
+        for (int part = 0; part < 3; ++part) {
+            bytes[part] = host_moe_checked_mul(stride[part], experts.size());
+            offset[part] = payload;
+            payload = host_moe_checked_add(payload, host_moe_align(bytes[part]));
+        }
+    }
     // No gaps, projection boundaries, or alignment padding enter a read. The
     // source and compact destination are both contiguous within each run.
     template<class Visit> void for_each_read_range(Visit&& visit) const {
@@ -108,15 +124,46 @@ struct HostMoeFileBatch {
             }
         }
     }
+    // Complete stacks of `count` experts, planned before any route is known
+    // (layer-major prefetch of the next layer). Same layout as use_all_experts.
+    void plan_layer(int count, const std::array<std::size_t, 3>& totals) {
+        if (count <= 0) throw std::invalid_argument("Invalid host MoE layer plan");
+        experts.resize(static_cast<std::size_t>(count));
+        for (int e = 0; e < count; ++e) experts[static_cast<std::size_t>(e)] = e;
+        ids.clear();
+        duplicate_routes = false;
+        payload = 0;
+        for (int part = 0; part < 3; ++part) {
+            if (!totals[part] || totals[part] % count) throw std::invalid_argument("Invalid expert stack extent");
+            extent[part] = totals[part];
+            stride[part] = totals[part] / count;
+            bytes[part] = host_moe_checked_mul(stride[part], experts.size());
+            offset[part] = payload;
+            payload = host_moe_checked_add(payload, host_moe_align(bytes[part]));
+        }
+    }
     void read(HostMoeCpuArena& arena) const {
+        arena.reserve(payload);
+        read_into(arena.data(), arena.capacity());
+    }
+    // Read into caller-owned memory of at least `payload` bytes.
+    void read_into(std::uint8_t* destination, std::size_t capacity) const {
         for (int part = 0; part < 3; ++part)
             if (!sources[part] || sources[part]->bytes() != extent[part])
                 throw std::runtime_error("Host MoE expert source extent changed");
-        arena.reserve(payload);
+        if (!destination || capacity < payload) throw std::runtime_error("Host MoE expert staging is too small");
+        std::uint8_t* const base = destination;
         std::vector<ExpertReadTask> tasks;
         tasks.reserve(host_moe_checked_mul(experts.size(), 3));
+        // Merged runs of adjacent experts can span hundreds of MB. Split them so
+        // every reader of the pool keeps a request in flight; one thread per
+        // projection leaves an NVMe queue mostly idle.
+        constexpr std::size_t kPiece = std::size_t(8) << 20;
         for_each_read_range([&](int part, std::size_t source, std::size_t destination, std::size_t length) {
-            tasks.push_back({sources[part].get(), source, arena.data() + destination, length});
+            for (std::size_t done = 0; done < length; done += kPiece) {
+                const std::size_t piece = (std::min)(kPiece, length - done);
+                tasks.push_back({sources[part].get(), source + done, base + destination + done, piece});
+            }
         });
         read_expert_files(tasks, [](std::size_t) {});
     }

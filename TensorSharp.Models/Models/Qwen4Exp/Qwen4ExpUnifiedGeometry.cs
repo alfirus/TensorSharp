@@ -176,8 +176,12 @@ internal sealed record Qwen4ExpUnifiedGeometry
         }
     }
 
+    /// <summary>Host bytes the layer-major masks may hold at once; the model
+    /// splits a longer forward into separate layer-major groups.</summary>
+    internal const long LayerMajorMaskBudgetBytes = 256L << 20;
+
     internal InferenceMemoryBytes RequestPeak(int capacityTokens, int prefillTokens, int elementBytes = 2,
-        int checkpointCopies = 0)
+        int checkpointCopies = 0, int forwardTokens = 0)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacityTokens);
         ArgumentOutOfRangeException.ThrowIfNegative(checkpointCopies);
@@ -206,8 +210,14 @@ internal sealed record Qwen4ExpUnifiedGeometry
                 + expertStream.ExpertWeightBytes + expertStream.AllocationSlackBytes;
             // A retained decode graph can coexist with prefill and live state.
             long decodeGraph = (64L << 20) + Layers * perRow + state;
-            long hostScratch = (16L << 20) + prefillTokens * (4L * (3L * Hidden + HyperHidden) + 12)
-                + 2L * capacityTokens * prefillTokens + 8L * Vocab;
+            // A layer-major forward keeps the residual, embedding and PLE rows
+            // of every chunk in host memory, plus one causal mask per chunk.
+            long forward = Math.Max(prefillTokens, forwardTokens);
+            long masks = forward > prefillTokens
+                ? Math.Min(LayerMajorMaskBudgetBytes, 2L * capacityTokens * forward)
+                : 2L * capacityTokens * prefillTokens;
+            long hostScratch = (16L << 20) + forward * (4L * (3L * Hidden + HyperHidden) + 12)
+                + masks + 8L * Vocab;
             // An exact-state checkpoint is a separate host-authoritative copy.
             // Reserve it in addition to the old/new holder growth allowance;
             // its tensor allocations remain charged after the request ends.
@@ -379,14 +389,14 @@ public partial class Qwen4ExpModel
     }
 
     internal InferenceMemoryBytes GetUnifiedMemoryRequestPeak(int contextTokens, int prefillTokens,
-        int checkpointCopies = 0, bool independentHolder = false, string? requestId = null)
+        int checkpointCopies = 0, bool independentHolder = false, string? requestId = null, int forwardTokens = 0)
     {
         if (contextTokens <= 0 || contextTokens > _maxContextLength || prefillTokens <= 0
             || prefillTokens > contextTokens || (MemoryPolicy != null && prefillTokens > MemoryPolicy.PrefillChunkTokens))
             throw new ArgumentOutOfRangeException(nameof(contextTokens));
         long capacity = GetUnifiedMemoryCapacity(contextTokens, independentHolder, requestId);
         return UnifiedMemoryGeometry.RequestPeak(checked((int)capacity), prefillTokens,
-            _kvCacheDtype == KvCacheDtype.F16 ? 2 : 4, checkpointCopies);
+            _kvCacheDtype == KvCacheDtype.F16 ? 2 : 4, checkpointCopies, forwardTokens);
     }
 
     internal int GetUnifiedMemoryCapacity(int requiredTokens, bool independentHolder = true, string? requestId = null)
