@@ -4538,7 +4538,8 @@ FF7 只对齐取消前缀，时间简史只对齐串行 512-token 窗口，未�
 | --- | --- | --- |
 | Qwen 准入、真实合批、取消恢复、内存前缀 | 有真实 N3/N2 与 HTTP 资格 | 更长上下文、多小时公平性、更多实际请求及安静多轮性能 |
 | 启动与短请求 | 默认前缀丢失已修复，N2/N3 已实际预热 | 约 112 s 启动成本、冷短请求及首次形状变更进一步优化 |
-| 异步专家流水线、缓存扩容 | 代码与独立数值/组件资格已有，默认关闭 | 实际 Server 共享预算、完整模型扩容性能、跨平台压力验收 |
+| 异步专家流水线 | 代码与独立数值/组件资格已有，默认关闭 | 实际 Server 共享预算、跨平台压力验收 |
+| 专家缓存扩容与削减压缩 | 2026-10-14 起 `--unified-memory` host 默认开启扩容，削减保留热槽；本机 Qwen 实测 decode 9.5→约 14 tok/s | Linux/其他 GPU 与长时间多请求压力验收；每次削减约 0.3 s 固定开销 |
 | GLM 完整模型 | Native16 组件全词表 logits 对照与完整统一 session 数学请求通过，短请求 ABBA 已完成 | 冷 TTFT/prefill 仍过慢；稳态 decode、完整 HTTP、多任务/图像质量及等价预算 Maya 对照 |
 | 物理归属、等价硬限 | 分配 owner、平台观测和 fail-closed 契约部分完成 | GC/tokenizer/mmap/page-cache/vendor/driver 纳管；CLI 未自动安装完整 OS 硬限 |
 | 自动余量、全局回收 | 边界观测、保留余量、共享 pool 协同回收已有 | 全局成本策略及多个实际引擎；GGML 仍单活动 scope |
@@ -5266,6 +5267,112 @@ Maya 源码固定 clean `6af7f8d8d3c4524c05f609232f93369c60a5755e`；Native18 �
 87 个发布文件仍逐一符合部署收据，12 个 GLM 原进程退出；各局部门与图片质量
 未通过项分别保留，见 `master-merge-20261013/final-delivery-v1.json`。该收据是
 证据和身份绑定，不是新增模型验收或整个统一内存体系完成证明。
+
+#### 2026-10-14：逐层预填充、专家缓存压缩与 GLM 分组配额
+
+本轮只在一台 Windows 11 笔记本上实测：RTX 3080 Laptop 16 GB（WDDM）、32 GB RAM、
+i7-11800H、C 盘 NVMe 顺序读约 3.2–3.8 GB/s；模型为 C 盘 Qwen3.8-Flash-Next
+UD-IQ1_M（专家 39 GiB，512 专家 top-10，48 层）与 GLM-5.3-Flash UD-IQ1_S（专家
+80.5 GiB，288 专家 top-8，42 个 MoE 层）。ggml 固定未修改的
+`3612c0af93f2cfc8f048295300a61187723b12ae`。代码在分支
+`codex/unified-memory-scheduler` 的 `07b5390d`…`2776ed51`。没有 Linux、其他 GPU
+或多卡复测；llama.cpp b10636 不支持 qwen4exp/glm5-next，因此没有同模型外部基线。
+所有数字来自 `eng/validation/unified-perf-bench.py` 的自有 server、Ollama 接口、
+greedy、`think:false`，单次或少量重复，未控制页缓存冷热，不是稳定性能分布。
+
+**Qwen 逐层预填充（`07b5390d`）。** 根因是宽于 32 行的文件专家预填充绕过 decode
+缓存，每个 512 token 块都把几乎整套路由专家从 NVMe 重新读入并上传一遍（读→可分页
+H2D→计算串行）；同一 1896 token 提示用 256 行块需 58 s、512 行块 35 s，证实成本
+按块数增长。现在统一会话一次 forward 最多 8192 个提示 token
+（`LayerMajorPrefillTokens`，`TS_UNIFIED_LAYER_MAJOR_TOKENS=0` 恢复旧顺序），模型
+逐层跑完全部块再进入下一层；native seam 把该层完整专家栈放在一个计账的设备缓冲
+中供所有块复用，并用后台线程把下一层读入 pinned staging。设备峰值仍按准入块宽，
+只有主机 scratch 变宽并单独定价；媒体提示与被拒的宽 forward 保持按块顺序。CUDA
+对 `ne0 % 512 != 0` 的量化行有尾部填充，驻留缓冲必须用
+`ggml_backend_buft_get_alloc_size` 而非 `ggml_nbytes` 计算（否则 `GGML_ASSERT`）。
+实测（`--no-prefix-cache`）：1896/2156/2213 token 35.3/44.1/42.7 s →
+20.2/19.1/19.9 s，4509 token 约 90 s → 25.6 s；五个提示的 greedy 文本不变。
+
+**WDDM 提交额度。** WDDM 下设备分配计入进程 commit；本机桌面程序约占 30 GB
+commit（上限约 45 GB），`min(physical, commit)` 只剩约 1.2 GB，server 对第二个
+提示返回 503。现把系统托管 pagefile 的剩余可增长量（受 Windows 上限与卷空闲保留
+约束，`HostMemoryInfo.WindowsPagefile.cs`）计入 commit 余量。
+
+**GLM 逐层预填充（`cfd85302`）。** trunk 图可只覆盖一个层区间：不从第 0 层开始时
+以 hyper-connection 残差流为输入，不到 head 时输出它；
+`TSGgml_GlmForwardLayerMajor` 以显式位置逐层跑完所有块，最后才推进槽位头，使
+pooled 专家缓存用第一块已加载的并集服务后续块。1872/2110/2174 token
+81.2/84.1/84.0 s → 39.8/41.1/40.5 s；2174 token 提示在相同 755 行块下，逐层与
+按块两种顺序的首 token logits 完全一致（max |diff| 0）。同时修正
+`LayerMajorPrefillTokens=0` 在准入宽度小于加载宽度时未真正关闭的问题。
+
+**decode 定位（`f76f730b`、`4ce717e7`）。** Qwen 单 token 约 480 次专家使用中约
+100 次未命中（145–167 MB），以约 4.2–4.4 GB/s 读取，占 66–70 ms token 的
+33–38 ms；重复相同 decode 读速不变，说明受带宽/延迟限制而非页缓存。下一层专家
+预测（`TS_HOST_MOE_PREDICT_DIAG=1`）在 top-10/16/24/32 的召回为
+0.68/0.82/0.88/0.91（9.4 万路由）。可选预取（`TS_HOST_MOE_DECODE_PREFETCH=1`）
+把命中率从 79% 提到约 87–90%、输出不变，但只有 33–47% 的预取被使用，额外字节
+使本机 decode 从 13.7 降到 7.7–10.4 tok/s，故默认关闭。把未命中读取拆成 256 KiB
+没有加速，只增加上传次数，已撤回。
+
+**GLM 分组配额（`328fc56f`，`2776ed51` 修订）。** pooled 表按量化组划分，过去
+按首个调用到达时的剩余预算定大小：bulk 预填充后 28 层的组只有 100 槽，而 3 层的
+组占 312 槽。组最低额度现带流量权重（层数×单专家字节），超出最低额度的预算按权重
+分配：28 层组 100 → 461 槽，专家未命中流量 1822 → 1250 MB/token，但 decode 仍为
+约 2.3 tok/s，因为剩余未命中来自 NVMe 而非页缓存。`328fc56f` 的再平衡在宽→窄
+切换时删除所有偏离 decode 份额 ±1/8 的表，破坏了 `--phase-quotas` 夹具“负担得起
+的完整并集不得在相切换时被丢弃”的契约（失败原样记录）。修订后只在严重失衡时触发：
+有表超过其份额 2 倍，且有组低于份额一半，或缺席组的半份额之和超过剩余预算（累计
+计算）；触发后先删偏斜表，再按超额从大到小删除，直到缺席组的完整份额能放下。
+`--phase-quotas`/`--group-quotas`/`--split-lifecycle` 均通过且不触发再平衡。实际
+模型上中间版本门控（逐组判断）未触发，decode 2.38 tok/s；**最终累计判断的门控尚未
+在实际 GLM 模型上复测**（GPU 被另一个用户 server 占用），不能计为通过。
+
+**专家缓存压缩、默认扩容与容量回填（`2776ed51`）。** 默认 Qwen server（前缀缓存
+开启）每个请求两次削减专家缓存预算（请求边界的物理重采样 + 一次准入边界回收，如
+9434 → 8404 → 6531 MiB），prefill 完成/序列释放时再恢复。旧
+`host_moe_expert_cache_trim_locked` 删除所有超过新单层份额的表，即全部 48 个
+Qwen 表；host 又从未启用 `EnableExpertCacheCapacityGrowth`，因此每个提示后 decode
+从冷启动开始，预算恢复后表也不再变大。修复：
+- 削减时为普通单层表按新份额重建，并按未命中路径自身的淘汰顺序（空槽优先）保留
+  最有价值的槽，合并成连续 D2D 段复制；元数据、LFU 频次与 LRU 年龄随槽迁移。
+  old+new 临时额度被拒时由一张最久未用表让出（`TS_HOST_MOE_EXPERT_CACHE_SHRINK_COPY=0`
+  恢复删除）。
+- `--unified-memory` host 默认开启容量扩容（`TS_UNIFIED_EXPERT_CACHE_GROWTH=0`
+  关闭）。审查发现：开启后，联合 decode 的路由并集超过压缩表容量且 old+new 无法
+  共存时会每次退回 CPU；现回落到旧的“退役后重建”路径。
+- Qwen 表容量按实测超出量回填，不再直接降到 3/4：此前较大量化的一半层只有 81 槽，
+  实际可放 107 槽。
+
+| 默认 server（前缀缓存开启） | 修复前 | 修复后 |
+|---|---:|---:|
+| ~2k token 预填充后紧接 decode tok/s | 7.40 | 10.34 / 10.08 / 8.70 |
+| 短提示 decode tok/s | 9.52 | 13.97 / 13.33 |
+| 1896/2156/2213 token 预填充 s | 20.3 / – / – | 19.85 / 19.61 / 21.09 |
+
+全部请求的 greedy 文本前缀与修复前一致（bench 现同时记录完整回复的 SHA-1）。
+每压缩一张表约 6.5 ms，其中约 5 ms 是新 cudaMalloc 首次写入的 WDDM 驻留成本
+（cudaMalloc 本身约 0.2 ms），每次削减 48 层约 0.3 s，延迟扩容另约 0.3 s；这是
+每个请求的固定开销，不能视为免费。
+
+**验证。** 新原生用例 `GgmlOpsHostMoeExpertCacheTest --shrink-compaction`
+（Q8_0、IQ1_M+LFU、IQ2_XXS）检查热槽保留且无源上传、CUDA 结果逐位一致、冷未命中、
+LRU 让出额度，以及不可共存的必需扩容会重建而非拒绝；已登记到 CTest 与两个资格脚本。
+审查前全量 32 个专家缓存模式与 6 个 split lifecycle 模式在最终修复前通过（其中
+`--phase-quotas` 先失败、修订再平衡后通过）；审查修订后重跑 21 个专家缓存模式与
+5 个 split lifecycle 模式。`--wide-prefill` 在用户 server 运行期间 2 次以 rc=1 结束
+（失败输出未保存，其中一次停在 selected=64 检查前），其后 42 次连续通过；该路径
+不经过本轮改动，推测为另一进程占用 VRAM 时的物理准入拒绝，但未证实，不计为通过。托管相关测试 **995 通过 / 0 失败 / 94 跳过**。
+`local-model-preflight.py --zero-runs-mib 32` 读完 C/D/E 盘全部 33 个 GGUF：结构
+完整、非稀疏、无 ≥32 MiB 全零段；Qwen3.8 分片旁的 `.part.ranges` 是陈旧下载记录。
+这不是 SHA-256 完整性证明。E 盘约 400 MB/s、D 盘约 45 MB/s，远低于 C 盘。
+
+**未解决。** decode 仍受 NVMe 带宽限制（Qwen 约 14 tok/s、GLM 约 2.3 tok/s）；
+server 内 pinned H2D 仅约 8.5 GB/s，而独立测试为 21–23 GB/s，原因未明；GLM 最终
+门控、Linux/其他 GPU 及前缀缓存下的 GLM 均未复测。证据在忽略的
+`artifacts/perf/`（如 `qwen-layermajor-reviewed-v1`、`glm-layermajor-v1`、
+`glm-logits-v3`、`qwen-decode-prefetch-v3`、`qwen-default-startup-v1`、
+`qwen-default-growth-v2`、`glm-decode-gated-rebalance-v1`）与 `artifacts/preflight/`。
 
 ### 15.2 手工 API、独立 KV 快照配置与硬件探针
 
