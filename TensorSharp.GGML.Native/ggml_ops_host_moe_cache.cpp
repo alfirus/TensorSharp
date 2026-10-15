@@ -1756,6 +1756,9 @@ namespace tsg
                         host_moe_cache_direct_read_phase(bulk_prefill, execution_rows, hm.independent_decode_rows));
                 } else {
                 g_file_read_buffer.reserve(miss_bytes);
+                // One task per projection: splitting a scalar token's few misses
+                // into smaller reads measured no faster from the page cache or
+                // NVMe, and each extra piece costs its own upload launch.
                 std::vector<ExpertReadTask> tasks;
                 tasks.reserve(misses.size() * 3);
                 std::size_t offset = 0;
@@ -1765,10 +1768,14 @@ namespace tsg
                     offset += entry.stride[part];
                 }
                 std::vector<int> copied_parts(misses.size(), 0);
+                if (g_cache_timing) HostMoeCacheTiming::add(g_cache_timing->file_windows, 1);
+                CacheStageTimer read_timing(g_cache_timing, CacheStage::file_pipeline);
                 read_expert_files(tasks, [&](std::size_t index) {
                     const auto i = index / 3, part = index % 3;
                     const auto& task = tasks[index];
                     entry.file_read_bytes += task.bytes;
+                    if (g_cache_timing) HostMoeCacheTiming::add(g_cache_timing->file_bytes, task.bytes);
+                    CacheStageTimer upload_timing(g_cache_timing, CacheStage::upload_enqueue);
                     ggml_backend_tensor_set_async(entry.backend, entry.weight[part], task.destination,
                         static_cast<std::size_t>(misses[i].first) * entry.stride[part], task.bytes);
                     if (++copied_parts[i] == 3) entry.publish_slot(misses[i].first, misses[i].second);

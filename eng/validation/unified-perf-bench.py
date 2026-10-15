@@ -56,6 +56,9 @@ PLANS = {
         ("prefill-a", "corpus", 0, 9000, "Summarize the document above in five sentences.", 32),
         ("decode-a", None, 0, 0, "Write a long, detailed essay about the history of the Roman Empire, from its founding to its fall.", 128),
     ],
+    "decode": [
+        ("decode-a", None, 0, 0, "Write a long, detailed essay about the history of the Roman Empire, from its founding to its fall.", 256),
+    ],
     "long": [
         ("prefill-4k", "spec", 0, 18000, "Summarize the document above in five sentences.", 64),
         ("decode-a", None, 0, 0, "Write a long, detailed essay about the history of the Roman Empire, from its founding to its fall.", 256),
