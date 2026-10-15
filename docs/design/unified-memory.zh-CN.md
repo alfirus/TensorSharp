@@ -5374,6 +5374,49 @@ server 内 pinned H2D 仅约 8.5 GB/s，而独立测试为 21–23 GB/s，原因
 `glm-logits-v3`、`qwen-decode-prefetch-v3`、`qwen-default-startup-v1`、
 `qwen-default-growth-v2`、`glm-decode-gated-rebalance-v1`）与 `artifacts/preflight/`。
 
+#### 2026-10-15：真实 Web UI 会话暴露的 GLM 视觉占位、无效启动预热与并发上限
+
+本节来自用户在同一台 16 GB 笔记本上用 Web UI 运行的真实会话（服务端文件日志
+`TensorSharp.Server.Host/bin/logs/*.jsonl` 记录每个请求的 chat.start/chat.complete/
+generation.timings），并在用户退出 server 后以相同配置复测。ggml 仍为未修改的
+`3612c0af93f2cfc8f048295300a61187723b12ae`。
+
+**GLM 视觉塔把文本预填充压到 10 行（`81e38be0`）。** 用户以
+`--mmproj mmproj-F16.gguf --unified-memory` 运行 GLM-5.3-Flash：启动日志显示
+`prefill=10`，1336 token 的启动预热用了 754 s，随后 3495 token 的回答 decode 仅
+1.63 tok/s。原因是 `GlmNextVisionEncoder` 把每个 mmproj 张量反量化为 F32（1.1 GB 的
+F16 文件变为 2371 MiB），会话构造时把这一整塔从专家缓存规划中永久扣除；自适应规划
+随之缩小预填充行数直到选中专家的不可变相位下限放得下。离线复现（14229 MiB CUDA
+上限，`GlmMemoryPlanProbe` + `GLM_PROBE_CEILING_MIB`）：带 mmproj 时 1 个前缀副本
+10 行、无副本 30 行；不带 mmproj 时 784 / 1024 行。修复为新的原生导出
+`TSGgml_GlmVisionEncoderStreamedF32`：隐藏状态与 RoPE 表放在本次调用的一块计账缓冲，
+每个 block 单独一张图，权重作为该图的普通输入上传，由一个计账 gallocr 复用；
+调用结束后不在设备上保留任何视觉字节，计账被拒时调用失败而不是落入未计账内存。
+统一模式下使用该路径，规划只扣除空闲执行预留装不下一张最小图像的差额（本机为 0），
+图像在到达时以“单 block + 最大 per-op 投影权重”（225 MiB）准入。`3ff1d472` 同时把
+图像注意力预测从完整的 4·heads·patches² 改为两个约 256 MiB 的查询分块（CUDA/Vulkan
+原生路径的实际分块），1080p 照片的预测从约 11.7 GB 降到 3 GB 以下。实测（同配置，
+前缀缓存开启）：`prefill=784`，就绪 17 s，1872 token 预填充 41.4 s（45 tok/s），
+decode 1.8–2.0 tok/s；“4821” 图像 OCR 2/2 正确，单次编码 2.76 s（1104 patch → 276
+token），第二次命中嵌入缓存；整卡峰值 14.3 GB。合成两 block 塔上 streamed 与整图编码
+在 CUDA 上相对 L2 ≤ 1e-5 且重复完全一致。较大图像在 3 个请求同时解码时可能被干净地
+拒绝（503），不再有永久保留的视觉空间。
+
+**无法恢复的启动预热（`42dcf38a`）。** 用户不加 `--unified-memory` 运行 GLM 时，启动
+依次预热 thinking 开/关两种 1336 token 提示，各 190 s（7 tok/s），6.5 分钟后才开放
+端口，而第一条 Web UI 请求仍然 `0/1340 tokens ... no resumable radix prefix`，TTFT
+183 s。glm5next 的 KDA 状态既不能复制检查点也不能回退，预热结束位置超过共享前缀，
+任何新会话都无法恢复它。现在对“不能复制且不能截断”的模型在非统一模式下也只做
+内核初始化预热（统一模式原本如此）。该模式 decode 为 0.9 tok/s，远低于统一模式；
+统一模式仍需显式开启，未自动切换。
+
+**两路并发 decode 的上限。** 用户的两个并发 Qwen3.8 长回答各约 10 tok/s 的归因
+速率但 wall 时间翻倍。用 `unified-perf-bench.py --plan decode-pair --concurrent` 复测：
+两条不同主题请求并发合计 11.4 tok/s，串行合计 11.7 tok/s；联合 2 行步每步专家未命中
+541 MB（单路 186 MB，2.9 倍），因为两组工作集在共享的每层缓存中互相淘汰，未命中路径
+约 6 GB/s。即本机 decode 受读带宽限制，主题不同的并发会话分享一条流的吞吐；这不是
+联合路径的缺陷，只有更大的专家缓存或更快的存储能提高它。
+
 ### 15.2 手工 API、独立 KV 快照配置与硬件探针
 
 以下配置面向已适配相应契约的模型和显式调用方，不应叠加到上面的 `--unified-memory` Qwen4Exp 会话。
