@@ -1150,7 +1150,10 @@ namespace TensorSharp.GGML
         /// Whole GLM-5.3-Flash vision encoder (24 GLM-OCR ViT blocks) as one
         /// device-resident GGML graph: RMS norms, fused qkv + per-head q/k RMS
         /// norms, 2D vision RoPE, SDPA, and the SwiGLU-clamp MLP per block.
-        /// Weights are cached device-resident across encodes.
+        /// Weights are cached device-resident across encodes, unless
+        /// <paramref name="streamWeights"/> runs one graph per block with
+        /// weights uploaded for that graph only, all charged to the active
+        /// budget and freed when the call returns (budgeted sessions).
         /// </summary>
         public static unsafe bool GlmVisionEncoder(
             Tensor hidden, float eps, float attnScale, float swigluLimit,
@@ -1160,7 +1163,7 @@ namespace TensorSharp.GGML
             Tensor[] qnW, Tensor[] knW,
             Tensor[] outW, Tensor[] outB, Tensor[] ln2W,
             Tensor[] gateW, Tensor[] gateB,
-            Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB)
+            Tensor[] upW, Tensor[] upB, Tensor[] downW, Tensor[] downB, bool streamWeights = false)
         {
             if (!HasNativeBufferStorage(hidden))
                 return false;
@@ -1203,7 +1206,7 @@ namespace TensorSharp.GGML
                     lnDim,
                     qkvNe0, qkvNe1, qkvBytes,
                     outNe0, outNe1, outBytes,
-                    ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes);
+                    ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes, streamWeights);
             }
         }
 

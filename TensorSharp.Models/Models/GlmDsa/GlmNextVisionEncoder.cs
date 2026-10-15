@@ -64,6 +64,11 @@ namespace TensorSharp.Models
         public int PatchSize => _patchSize;
         public int SpatialMergeSize => _spatialMergeSize;
         internal bool RequireWholeEncoderFused { get; set; }
+        /// <summary>Run the native encoder one block graph at a time with
+        /// weights uploaded for that graph only, all charged to the active
+        /// budget. Budgeted sessions then keep no vision bytes on the device
+        /// between images.</summary>
+        internal bool StreamBlockWeights { get; set; }
 
         /// <summary>Only host weight allocations still needed by the admitted
         /// whole encoder path. Originals, combined patch and merger linear
@@ -432,7 +437,7 @@ namespace TensorSharp.Models
                     1f / MathF.Sqrt(headDim), _swigluLimit,
                     numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
                     ln1W, qkvW, qkvB, qnW, knW, outW, outB, ln2W,
-                    gateW, gateB, upW, upB, downW, downB);
+                    gateW, gateB, upW, upB, downW, downB, StreamBlockWeights);
                 if (!ok && !RequireWholeEncoderFused)
                     _fusedEncoderUnavailable = true;
                 return ok;

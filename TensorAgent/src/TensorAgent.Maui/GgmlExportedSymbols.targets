@@ -181,6 +181,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GlmTrimMappedResidency" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmUnifiedBudgetVersion" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmVisionEncoderF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GlmVisionEncoderStreamedF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GlmVocabSize" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssAttentionLayerPrefill" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GptOssInvalidateKvCache" SymbolType="Function" />

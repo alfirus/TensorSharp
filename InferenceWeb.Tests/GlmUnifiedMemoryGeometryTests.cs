@@ -167,6 +167,9 @@ public sealed class GlmUnifiedMemoryGeometryTests : IDisposable
         long bytes = (64 * 192 + 4 * 64 * 32) * 4L, allowance = 2 * (64L << 10), copies = 3L * 4 * 64 * 32 * 4;
         Assert.Equal(bytes + allowance + copies, geometry.DeviceWeightBytes);
         Assert.Equal(2 * (bytes + allowance) + copies, geometry.HostWeightBytes);
+        // A budgeted encode holds one block and one per-op projector weight.
+        Assert.Equal(bytes + allowance, geometry.StreamedWeightBytes);
+        Assert.Equal(geometry.StreamedWeightBytes, geometry.ImageWeightBytes);
         Assert.True(geometry.ExecutionPeak(56, 56).Device > geometry.ExecutionPeak(28, 28).Device);
         Assert.Throws<ArgumentOutOfRangeException>(() => geometry.ExecutionPeak(29, 28));
     }
@@ -181,6 +184,37 @@ public sealed class GlmUnifiedMemoryGeometryTests : IDisposable
         Assert.Equal(0, GlmUnifiedMemoryGeometry.SelectExpertCacheCapacity(10 * gib, 6 * gib, 3 * gib, 2 * gib, long.MaxValue));
         Assert.Equal(0, GlmUnifiedMemoryGeometry.SelectExpertCacheCapacity(long.MaxValue, long.MaxValue, long.MaxValue, 0, long.MaxValue));
         Assert.Throws<ArgumentOutOfRangeException>(() => GlmUnifiedMemoryGeometry.SelectExpertCacheCapacity(14 * gib, 6 * gib, 3 * gib, 0, -1));
+    }
+
+    [Fact]
+    public void StreamedImageAdmissionChargesOneBlockAndThePlanWithholdsOnlyItsShortfall()
+    {
+        var whole = new GlmUnifiedVisionMemoryGeometry(14, 2, 64, 128, 4, 32, 1024, 1L << 30, 128);
+        var streamed = whole with { StreamedWeightBytes = 1L << 20 };
+        Assert.Equal(1L << 30, whole.ImageWeightBytes);
+        Assert.Equal(1L << 20, streamed.ImageWeightBytes);
+        string path = Path.Combine(_directory, "streamed.png"); File.WriteAllBytes(path, PngHeader(56, 56));
+        var wholePlan = GlmVisionPreparationPlan.Create([path], 10, 1, 1024, whole);
+        var streamedPlan = GlmVisionPreparationPlan.Create([path], 10, 1, 1024, streamed);
+        Assert.Equal((1L << 30) - (1L << 20), wholePlan.DevicePeakBytes - streamedPlan.DevicePeakBytes);
+        Assert.Equal(wholePlan.HostPeakBytes, streamedPlan.HostPeakBytes);
+        long minimum = streamed.MinimumImageDevicePeak();
+        Assert.True(minimum > streamed.ImageWeightBytes);
+        Assert.Equal(0, GlmUnifiedVisionMemoryGeometry.PlacementBytes(null, 0));
+        Assert.Equal(0, GlmUnifiedVisionMemoryGeometry.PlacementBytes(streamed, minimum));
+        Assert.Equal(7, GlmUnifiedVisionMemoryGeometry.PlacementBytes(streamed, minimum - 7));
+        Assert.Equal(minimum, GlmUnifiedVisionMemoryGeometry.PlacementBytes(streamed, -1));
+    }
+
+    private static byte[] PngHeader(int width, int height)
+    {
+        byte[] header = new byte[24];
+        new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }.CopyTo(header, 0);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(8), 13);
+        "IHDR"u8.CopyTo(header.AsSpan(12));
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(16), (uint)width);
+        BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(20), (uint)height);
+        return header;
     }
 
     [Fact]

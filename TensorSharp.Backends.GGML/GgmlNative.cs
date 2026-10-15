@@ -1881,6 +1881,26 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GlmVisionEncoderStreamedF32(
+            GgmlTensorView2D hidden,
+            int blockCount, float eps, float attnScale, float swigluLimit,
+            int numPatches, int numHeads, int headDim, int halfDim,
+            IntPtr cosTable, IntPtr sinTable,
+            IntPtr[] ln1W,
+            IntPtr[] qkvW, IntPtr[] qkvB,
+            IntPtr[] qnW, IntPtr[] knW,
+            IntPtr[] outW, IntPtr[] outB,
+            IntPtr[] ln2W,
+            IntPtr[] gateW, IntPtr[] gateB,
+            IntPtr[] upW, IntPtr[] upB,
+            IntPtr[] downW, IntPtr[] downB,
+            int lnDim,
+            int qkvNe0, int qkvNe1, long qkvBytes,
+            int outNe0, int outNe1, long outBytes,
+            int ffnNe0, int ffnNe1, long ffnUpBytes, long ffnDownBytes);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_FusedGemma4VisionBlockF32(
             GgmlTensorView2D hidden, float eps,
             IntPtr ln1W,
@@ -4926,18 +4946,29 @@ internal enum GgmlIndexReductionOp
             int lnDim,
             int qkvNe0, int qkvNe1, long qkvBytes,
             int outNe0, int outNe1, long outBytes,
-            int ffnNe0, int ffnNe1, long ffnUpBytes, long ffnDownBytes)
+            int ffnNe0, int ffnNe1, long ffnUpBytes, long ffnDownBytes, bool streamWeights = false)
         {
-            int rc = TSGgml_GlmVisionEncoderF32(hidden,
-                blockCount, eps, attnScale, swigluLimit,
-                numPatches, numHeads, headDim, halfDim,
-                cosTable, sinTable,
-                ln1W, qkvW, qkvB, qnW, knW, outW, outB, ln2W,
-                gateW, gateB, upW, upB, downW, downB,
-                lnDim,
-                qkvNe0, qkvNe1, qkvBytes,
-                outNe0, outNe1, outBytes,
-                ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes);
+            int rc = streamWeights
+                ? TSGgml_GlmVisionEncoderStreamedF32(hidden,
+                    blockCount, eps, attnScale, swigluLimit,
+                    numPatches, numHeads, headDim, halfDim,
+                    cosTable, sinTable,
+                    ln1W, qkvW, qkvB, qnW, knW, outW, outB, ln2W,
+                    gateW, gateB, upW, upB, downW, downB,
+                    lnDim,
+                    qkvNe0, qkvNe1, qkvBytes,
+                    outNe0, outNe1, outBytes,
+                    ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes)
+                : TSGgml_GlmVisionEncoderF32(hidden,
+                    blockCount, eps, attnScale, swigluLimit,
+                    numPatches, numHeads, headDim, halfDim,
+                    cosTable, sinTable,
+                    ln1W, qkvW, qkvB, qnW, knW, outW, outB, ln2W,
+                    gateW, gateB, upW, upB, downW, downB,
+                    lnDim,
+                    qkvNe0, qkvNe1, qkvBytes,
+                    outNe0, outNe1, outBytes,
+                    ffnNe0, ffnNe1, ffnUpBytes, ffnDownBytes);
             return rc != 0;
         }
 

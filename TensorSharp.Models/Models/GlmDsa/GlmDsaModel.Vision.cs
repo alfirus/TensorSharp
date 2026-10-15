@@ -65,7 +65,11 @@ namespace TensorSharp.Models
             catch (GlmVisionConstructionCleanupException failure) { VisionEncoder = failure.UnreleasedEncoder; throw; }
             if (MemoryPolicy != null && VisionEncoder.ProjectionDim != Config.HiddenSize)
                 throw new InvalidOperationException("GLM vision projection does not match its text model.");
-            if (MemoryPolicy != null) VisionEncoder.RequireWholeEncoderFused = true;
+            if (MemoryPolicy != null)
+            {
+                VisionEncoder.RequireWholeEncoderFused = true;
+                VisionEncoder.StreamBlockWeights = true;
+            }
         }
 
         /// <summary>

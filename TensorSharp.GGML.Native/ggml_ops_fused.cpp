@@ -3554,6 +3554,170 @@ static int fused_glm_vision_encoder_f32_impl(
     return 1;
 }
 
+// Memory-scoped variant of the encoder above for budgeted (unified) sessions.
+// The hidden state and RoPE tables live in one charged buffer for this call;
+// every block runs as its own graph whose weights are ordinary graph inputs
+// uploaded for that graph. No device copy outlives the call, so an idle
+// session holds no vision bytes, and every byte is charged to the active
+// budget: a refused charge fails the call rather than spilling into memory
+// nobody accounted for. Same subgraph builders and F32 weights as above.
+static int fused_glm_vision_encoder_streamed_f32_impl(
+    const TensorView2DDesc& hidden_desc,
+    int block_count, float eps, float attn_scale, float swiglu_limit,
+    int num_patches, int num_heads, int head_dim, int half_dim,
+    const float* cos_table, const float* sin_table,
+    const float* const* ln1_w,
+    const float* const* qkv_w, const float* const* qkv_b,
+    const float* const* qn_w, const float* const* kn_w,
+    const float* const* out_w, const float* const* out_b,
+    const float* const* ln2_w,
+    const float* const* gate_w, const float* const* gate_b,
+    const float* const* up_w,  const float* const* up_b,
+    const float* const* down_w, const float* const* down_b,
+    int ln_dim,
+    int qkv_ne0, int qkv_ne1, std::size_t qkv_bytes,
+    int out_ne0, int out_ne1, std::size_t out_bytes,
+    int ffn_ne0, int ffn_ne1, std::size_t ffn_up_bytes, std::size_t ffn_down_bytes)
+{
+    if (!ensure_backend()) return 0;
+    if (!validate_desc(hidden_desc, "hidden")) return 0;
+    if (block_count <= 0 || block_count > 128) { set_last_error("glm_vision_encoder_streamed: bad block_count"); return 0; }
+
+    const int rows = hidden_desc.dim0;
+    const int hidden = hidden_desc.dim1;
+    const int dff = ffn_ne1;
+    const std::size_t cos_sin_elems = static_cast<std::size_t>(num_patches) * half_dim;
+
+    PooledContextHandle state_context;
+    if (!state_context.init(ggml_tensor_overhead() * 8)) { set_last_error("glm_vision_encoder_streamed: ctx init failed."); return 0; }
+    ggml_context* sctx = state_context.value;
+    TensorBinding hidden_binding = create_standard_binding(sctx, hidden_desc);
+    ggml_tensor* cos_t = ggml_new_tensor_1d(sctx, GGML_TYPE_F32, cos_sin_elems);
+    ggml_tensor* sin_t = ggml_new_tensor_1d(sctx, GGML_TYPE_F32, cos_sin_elems);
+    if (!hidden_binding.storage || !cos_t || !sin_t) { set_last_error("glm_vision_encoder_streamed: state tensors failed."); return 0; }
+    struct StateBuffer {
+        ggml_backend_buffer_t buffer = nullptr;
+        ~StateBuffer() { if (buffer) tsg::graph_budget_free_buffer(buffer); }
+    } state;
+    struct Allocator {
+        ggml_gallocr_t allocator = nullptr;
+        ~Allocator() { if (allocator) tsg::graph_budget_gallocr_free(allocator); }
+    } galloc;
+    // Free only after the device stops reading: an error path may leave a
+    // queued graph behind.
+    struct Drain { ~Drain() { sync_backend(g_backend); } } drain;
+    state.buffer = tsg::alloc_ctx_tensors_budgeted(sctx, g_backend);
+    if (!state.buffer) { set_last_error("glm_vision_encoder_streamed: state allocation refused."); return 0; }
+    upload_binding(hidden_binding, hidden_desc.data, hidden_binding.raw_bytes);
+    ggml_backend_tensor_set(cos_t, cos_table, 0, cos_sin_elems * sizeof(float));
+    ggml_backend_tensor_set(sin_t, sin_table, 0, cos_sin_elems * sizeof(float));
+    // One allocator for every block: identical shapes reuse its buffer.
+    galloc.allocator = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), g_active_rank);
+    if (!galloc.allocator) { set_last_error("glm_vision_encoder_streamed: allocator creation failed."); return 0; }
+
+    struct HostBinding { ggml_tensor* tensor; const void* data; std::size_t bytes; };
+    std::vector<HostBinding> uploads;
+    for (int b = 0; b < block_count; b++)
+    {
+        PooledContextHandle block_context;
+        if (!block_context.init(static_cast<std::size_t>(8) * 1024 * 1024)) { set_last_error("glm_vision_encoder_streamed: block ctx init failed."); return 0; }
+        ggml_context* ctx = block_context.value;
+        uploads.clear();
+        auto bind_w = [&](ggml_tensor* t, const void* data, std::size_t bytes) {
+            if (t == nullptr || data == nullptr) return;
+            ggml_set_input(t);
+            uploads.push_back({ t, data, bytes });
+        };
+        ggml_tensor* ln1w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
+        ggml_tensor* qkvw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, qkv_ne0, qkv_ne1);
+        ggml_tensor* qkvb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, qkv_ne1);
+        ggml_tensor* qnw_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor* knw_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_tensor* outw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_ne0, out_ne1);
+        ggml_tensor* outb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_ne1);
+        ggml_tensor* ln2w_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ln_dim);
+        ggml_tensor* gatew_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn_ne0, ffn_ne1);
+        ggml_tensor* gateb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ffn_ne1);
+        ggml_tensor* upw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn_ne0, ffn_ne1);
+        ggml_tensor* upb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ffn_ne1);
+        ggml_tensor* downw_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ffn_ne1, ffn_ne0);
+        ggml_tensor* downb_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ffn_ne0);
+        if (!ln1w_t || !qkvw_t || !outw_t || !ln2w_t || !gatew_t || !upw_t || !downw_t)
+        { set_last_error("glm_vision_encoder_streamed: block tensor alloc failed."); return 0; }
+
+        bind_w(ln1w_t, ln1_w[b], static_cast<std::size_t>(ln_dim) * sizeof(float));
+        bind_w(qkvw_t, qkv_w[b], qkv_bytes);
+        bind_w(qkvb_t, qkv_b[b], static_cast<std::size_t>(qkv_ne1) * sizeof(float));
+        bind_w(qnw_t, qn_w[b], static_cast<std::size_t>(head_dim) * sizeof(float));
+        bind_w(knw_t, kn_w[b], static_cast<std::size_t>(head_dim) * sizeof(float));
+        bind_w(outw_t, out_w[b], out_bytes);
+        bind_w(outb_t, out_b[b], static_cast<std::size_t>(out_ne1) * sizeof(float));
+        bind_w(ln2w_t, ln2_w[b], static_cast<std::size_t>(ln_dim) * sizeof(float));
+        bind_w(gatew_t, gate_w[b], ffn_up_bytes);
+        bind_w(gateb_t, gate_b[b], static_cast<std::size_t>(ffn_ne1) * sizeof(float));
+        bind_w(upw_t, up_w[b], ffn_up_bytes);
+        bind_w(upb_t, up_b[b], static_cast<std::size_t>(ffn_ne1) * sizeof(float));
+        bind_w(downw_t, down_w[b], ffn_down_bytes);
+        bind_w(downb_t, down_b[b], static_cast<std::size_t>(ffn_ne0) * sizeof(float));
+
+        ggml_tensor* cur = build_glm_vision_attn_subgraph(ctx, hidden_binding.tensor, ln1w_t, eps,
+            qkvw_t, qkvb_t, qnw_t, knw_t, outw_t, outb_t, cos_t, sin_t,
+            rows, hidden, num_heads, head_dim, half_dim, attn_scale);
+        cur = build_glm_vision_mlp_subgraph(ctx, cur, ln2w_t, eps,
+            gatew_t, gateb_t, upw_t, upb_t, downw_t, downb_t, rows, hidden, dff, swiglu_limit);
+        ggml_tensor* output = ggml_cpy(ctx, cur, hidden_binding.tensor);
+        if (!output) { set_last_error("glm_vision_encoder_streamed: output cpy failed."); return 0; }
+        ggml_set_output(output);
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, 512, false);
+        if (!graph) { set_last_error("glm_vision_encoder_streamed: graph creation failed."); return 0; }
+        ggml_build_forward_expand(graph, output);
+        if (!tsg::graph_budget_gallocr_alloc_graph(galloc.allocator, graph))
+        { set_last_error("glm_vision_encoder_streamed: block graph allocation refused."); return 0; }
+        for (auto& u : uploads)
+            ggml_backend_tensor_set(u.tensor, resolve_upload_source(u.data), 0, u.bytes);
+        ggml_status status = tsg::compute_graph(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS) { set_last_error("glm_vision_encoder_streamed: graph compute failed."); return 0; }
+        // The next block's uploads reuse this allocator's buffer.
+        sync_backend(g_backend);
+    }
+    ggml_backend_tensor_get(hidden_binding.storage, hidden_desc.data, 0, hidden_binding.raw_bytes);
+    clear_last_error();
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_GlmVisionEncoderStreamedF32(
+    TensorView2DDesc hidden,
+    int block_count, float eps, float attn_scale, float swiglu_limit,
+    int num_patches, int num_heads, int head_dim, int half_dim,
+    const float* cos_table, const float* sin_table,
+    const float* const* ln1_w,
+    const float* const* qkv_w, const float* const* qkv_b,
+    const float* const* qn_w, const float* const* kn_w,
+    const float* const* out_w, const float* const* out_b,
+    const float* const* ln2_w,
+    const float* const* gate_w, const float* const* gate_b,
+    const float* const* up_w, const float* const* up_b,
+    const float* const* down_w, const float* const* down_b,
+    int ln_dim,
+    int qkv_ne0, int qkv_ne1, int64_t qkv_bytes,
+    int out_ne0, int out_ne1, int64_t out_bytes,
+    int ffn_ne0, int ffn_ne1, int64_t ffn_up_bytes, int64_t ffn_down_bytes)
+{
+    try
+    {
+        return fused_glm_vision_encoder_streamed_f32_impl(hidden, block_count, eps, attn_scale, swiglu_limit,
+            num_patches, num_heads, head_dim, half_dim, cos_table, sin_table,
+            ln1_w, qkv_w, qkv_b, qn_w, kn_w, out_w, out_b, ln2_w,
+            gate_w, gate_b, up_w, up_b, down_w, down_b,
+            ln_dim,
+            qkv_ne0, qkv_ne1, static_cast<std::size_t>(qkv_bytes),
+            out_ne0, out_ne1, static_cast<std::size_t>(out_bytes),
+            ffn_ne0, ffn_ne1, static_cast<std::size_t>(ffn_up_bytes), static_cast<std::size_t>(ffn_down_bytes));
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return 0; }
+    catch (...) { set_last_error("glm_vision_encoder_streamed: unknown error"); return 0; }
+}
+
 TSG_EXPORT int TSGgml_GlmVisionEncoderF32(
     TensorView2DDesc hidden,
     int block_count, float eps, float attn_scale, float swiglu_limit,

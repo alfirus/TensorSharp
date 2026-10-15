@@ -56,6 +56,28 @@ object Placement(long execution, long? observedCeiling = null)
     catch (Exception refused) when (refused is TensorSharp.Memory.MemoryPressureException or OverflowException)
     { return new { fits = false, cpu_expert_leading_layers = (int?)null, refusal = refused.Message }; }
 }
+// The unified GLM session's adaptive prefill width for each retained prefix
+// copy count, as the --unified-memory host configures it (prefix cache on).
+// GLM_PROBE_CEILING_MIB replays a ceiling a server log reported.
+long planCeiling = Environment.GetEnvironmentVariable("GLM_PROBE_CEILING_MIB") is { Length: > 0 } ceilingMib
+    ? checked(long.Parse(ceilingMib, CultureInfo.InvariantCulture) << 20) : ceiling;
+var hostOptions = new UnifiedMemoryModelOptions { EnableGlmSelectedExperts = true, EnableAdaptiveGlmPrefill = true,
+    AdaptiveGlmPrefillChunkTokens = 1024, PrefixCheckpointCount = 4 };
+var adaptive = new List<object>();
+var prefixCapacity = UnifiedMemoryPrefixCapacity.Select(hostOptions.PrefixCheckpointCount, geometry.SlotBytes(context), planCeiling);
+for (int copies = prefixCapacity.RetainedCopies; copies >= 0; copies--)
+{
+    long reserved = checked(GlmUnifiedMemoryModelSession.VisionPlacementBytes(geometry, vision, hostOptions, context)
+        + copies * geometry.SlotBytes(context)
+        + (copies > 0 ? geometry.SlotBytes(context) : 0));
+    try
+    {
+        var plan = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, hostOptions, context, planCeiling, reserved);
+        adaptive.Add(new { copies, reserved_bytes = reserved, prefill_rows = plan.PrefillRows, cpu_expert_layers = plan.CpuExpertLayers,
+            cache_capacity_bytes = plan.CacheCapacityBytes, cache_minimum_forecast_bytes = plan.CacheMinimumForecastBytes });
+    }
+    catch (MemoryPressureException refused) { adaptive.Add(new { copies, reserved_bytes = reserved, refusal = refused.Message }); }
+}
 Directory.CreateDirectory(Path.GetDirectoryName(report)!);
 var evidence = new
 {
@@ -68,6 +90,8 @@ var evidence = new
     graph_cache_entries = GlmDsaModel.UnifiedGraphCacheCapacity, replacement_generations = 2,
     solo_graph_peak = solo, prefill_graph_peak = prefill, joint_graph_peak = joint,
     former_execution_reserve_bytes = former, corrected_execution_reserve_bytes = corrected,
+    adaptive_plan_ceiling_bytes = planCeiling, adaptive_prefill_by_prefix_copies = adaptive,
+    vision_streamed_weight_bytes = vision?.StreamedWeightBytes ?? 0, vision_minimum_image_device_peak_bytes = vision?.MinimumImageDevicePeak() ?? 0,
     recovered_device_allowance_bytes = former - corrected, former_placement = Placement(former), corrected_placement = Placement(corrected),
     hypothetical_fully_free_device_placement = new { ceiling_bytes = deviceTotal - headroom, former = Placement(former, deviceTotal - headroom), corrected = Placement(corrected, deviceTotal - headroom) },
     hardware = new { host, device_total_bytes = deviceTotal, device_free_bytes = deviceFree, device_headroom_bytes = headroom, device_ceiling_bytes = ceiling, nvidia_smi_raw = output },

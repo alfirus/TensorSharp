@@ -11,6 +11,13 @@ namespace TensorSharp.Models;
 internal sealed record GlmUnifiedVisionMemoryGeometry(int Patch, int Merge, int Hidden, int Intermediate,
     int Heads, int Projection, long HostWeightBytes, long DeviceWeightBytes, long LoadingTemporaryBytes)
 {
+    /// <summary>Device weight bytes one budgeted encode holds at once: the
+    /// streamed encoder uploads one block at a time, and the projector's
+    /// per-op linears upload one weight per op. 0 = unknown, in which case
+    /// the whole tower is forecast.</summary>
+    internal long StreamedWeightBytes { get; init; }
+    internal long ImageWeightBytes => StreamedWeightBytes > 0 ? StreamedWeightBytes : DeviceWeightBytes;
+
     internal static GlmUnifiedVisionMemoryGeometry Read(string path)
     {
         using var file = GgufFile.OpenForMemoryPlanning(path);
@@ -22,11 +29,17 @@ internal sealed record GlmUnifiedVisionMemoryGeometry(int Patch, int Merge, int 
             if (n == 0 || n > int.MaxValue) throw new NotSupportedException("Invalid GLM vision metadata: " + name);
             return (int)n;
         }
-        long weights = 0, temporary = 0, extra = 0;
+        long weights = 0, temporary = 0, extra = 0, singleMaximum = 0;
+        var blocks = new Dictionary<int, long>();
         foreach (var tensor in file.Tensors.Values)
         {
             long bytes = checked(tensor.NumElements * 4);
             weights = checked(weights + bytes + (64L << 10));
+            string[] parts = tensor.Name.Split('.');
+            if (parts.Length > 2 && parts[0] == "v" && parts[1] == "blk" && int.TryParse(parts[2], out int block))
+                blocks[block] = checked(blocks.GetValueOrDefault(block) + bytes + (64L << 10));
+            else
+                singleMaximum = Math.Max(singleMaximum, checked(bytes + (64L << 10)));
             temporary = Math.Max(temporary, checked(bytes + file.GetTensorFileRegion(tensor.Name).ByteLength));
             if (tensor.Name is "v.patch_embd.weight" or "mm.patch_merger.weight") extra = checked(extra + 3 * bytes);
         }
@@ -37,9 +50,26 @@ internal sealed record GlmUnifiedVisionMemoryGeometry(int Patch, int Merge, int 
         long device = checked(weights + extra);
         int hidden = Int("embedding_length", 1024), heads = Int("attention.head_count", 16);
         if (hidden % heads != 0) throw new NotSupportedException("Invalid GLM vision head width.");
+        long largestBlock = 0;
+        foreach (long bytes in blocks.Values) largestBlock = Math.Max(largestBlock, bytes);
         return new(Int("patch_size", 14), Int("spatial_merge_size", 2), hidden,
-            Int("feed_forward_length", 4096), heads, Int("projection_dim", 4096), host, device, temporary);
+            Int("feed_forward_length", 4096), heads, Int("projection_dim", 4096), host, device, temporary)
+            { StreamedWeightBytes = checked(largestBlock + singleMaximum) };
     }
+
+    /// <summary>Device peak of the smallest image GLM admits (16 merged tokens).</summary>
+    internal long MinimumImageDevicePeak()
+    {
+        int side = Patch * Merge * 4;
+        return checked(16L * Projection * 4 + ExecutionPeak(side, side).Device + ImageWeightBytes);
+    }
+
+    /// <summary>Device bytes a session plan must withhold from its expert
+    /// cache for vision: only what its idle execution reservation cannot
+    /// already hold for one minimum image. Each image is admitted, with its
+    /// streamed weights, against the live budget when it arrives.</summary>
+    internal static long PlacementBytes(GlmUnifiedVisionMemoryGeometry? vision, long idleExecutionBytes)
+        => vision == null ? 0 : Math.Max(0, vision.MinimumImageDevicePeak() - Math.Max(0, idleExecutionBytes));
 
     internal InferenceMemoryBytes ExecutionPeak(int height, int width)
     {
@@ -93,7 +123,7 @@ internal sealed record GlmVisionPreparationPlan(IReadOnlyList<QwenVisionImagePla
             deviceWork = Math.Max(deviceWork, execution.Device);
         }
         return new(images, checked((int)expanded), checked(preparation + retained + hostWork + (pendingHostWeightBytes ?? geometry.HostWeightBytes)),
-            checked(retained + deviceWork + geometry.DeviceWeightBytes));
+            checked(retained + deviceWork + geometry.ImageWeightBytes));
     }
     internal void ValidateFilesUnchanged()
     {

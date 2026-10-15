@@ -68,13 +68,14 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         if (_hostCeiling <= 0 || _deviceCeiling <= 0) throw new MemoryPressureException("No GLM RAM/commit/CUDA capacity remains after headroom.");
         var prefix = UnifiedMemoryPrefixCapacity.Select(GgmlGlmNative.SupportsSlotCopy()
             ? options.PrefixCheckpointCount : 0, geometry.SlotBytes(context), _deviceCeiling);
+        long visionPlacement = VisionPlacementBytes(geometry, vision, options, context);
         GlmSelectedExpertMemoryPlan plan;
         while (true)
         {
             try
             {
                 plan = GlmSelectedExpertMemoryPlan.SelectForSession(geometry, options, context, _deviceCeiling,
-                    checked((vision?.DeviceWeightBytes ?? 0) + prefix.PlacementReserveBytes
+                    checked(visionPlacement + prefix.PlacementReserveBytes
                         // Fresh clone destinations coexist with the idle primary.
                         // Count it rather than assuming a donation consumes it.
                         + (prefix.RetainedCopies > 0 ? geometry.SlotBytes(context) : 0)));
@@ -95,6 +96,17 @@ public sealed class GlmUnifiedMemoryModelSession : IUnifiedMemoryModelSession
         _executionReserveBytes = plan.ExecutionReserveBytes;
         Budget = new MemoryBudget([new(HostPool, _hostCeiling), new(DevicePool, _deviceCeiling)]);
     }
+    /// <summary>The streamed encoder holds no vision bytes between images, so
+    /// the adaptive plan withholds only what its idle execution reservation
+    /// cannot hold for one minimum image. Withholding the whole F32 tower
+    /// (2.37 GB for GLM-5.3's F16 projector) collapsed text prefill on a 16 GB
+    /// GPU from 784 to 10 rows.</summary>
+    internal static long VisionPlacementBytes(GlmUnifiedMemoryGeometry geometry, GlmUnifiedVisionMemoryGeometry? vision,
+        UnifiedMemoryModelOptions options, int context)
+        => vision == null ? 0 : options.EnableAdaptiveGlmPrefill
+            ? GlmUnifiedVisionMemoryGeometry.PlacementBytes(vision,
+                geometry.AdaptiveExecutionPlacementReserve(context, options.MaximumRunningRequests))
+            : vision.DeviceWeightBytes;
     public ModelBase? Model => _model;
     public MemoryBudget Budget { get; }
     public int ContextTokens => _context;
