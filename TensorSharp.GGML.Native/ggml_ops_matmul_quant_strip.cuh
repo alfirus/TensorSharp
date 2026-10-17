@@ -5,6 +5,8 @@
 // is reused unchanged; unowned virtual row tiles do not read weights or write
 // output. This prevents a shape-dependent gate/up rounding difference from
 // crossing the down projection's activation quantization boundary.
+// Activations are explicitly quantized to Q8_1, so both the host launch
+// configuration and device tile arithmetic must select GGML_PREC_Q8.
 #pragma once
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmid.cuh"
@@ -27,13 +29,13 @@ struct quant_strip_args {
 };
 
 template<ggml_type type, int J>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false), ggml_cuda_mmq_get_occupancy(type, J, false))
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8), ggml_cuda_mmq_get_occupancy(type, J, false, GGML_PREC_Q8))
 __global__ void quant_strip_main(quant_strip_args a) {
     if (blockIdx.y) { a.weights=a.weights2; a.out=a.out2; a.partial=a.partial2; }
-    constexpr int I=ggml_cuda_mmq_get_I(type,J,false);
+    constexpr int I=ggml_cuda_mmq_get_I(type,J,false,GGML_PREC_Q8);
     constexpr int warp=ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps=ggml_cuda_mmq_get_nthreads(type,J,false)/warp;
-    constexpr int per_iter=ggml_cuda_mmq_get_K_vram(type,J,false)/ggml_cuda_type_traits<type>::qk;
+    constexpr int nwarps=ggml_cuda_mmq_get_nthreads(type,J,false,GGML_PREC_Q8)/warp;
+    constexpr int per_iter=ggml_cuda_mmq_get_K_vram(type,J,false,GGML_PREC_Q8)/ggml_cuda_type_traits<type>::qk;
     extern __shared__ int selected[];
     const int tiles=(a.full_rows/I)*a.ntx.z*a.experts;
     int begin=int64_t(blockIdx.x+a.first_block)*tiles*a.blocks.z/a.virtual_blocks;
@@ -58,10 +60,10 @@ __global__ void quant_strip_main(quant_strip_args a) {
             const int xo=expert*a.expert_stride+local_row*a.row_stride;
             const int yo=(low+jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
             if(partial)
-                mul_mat_q_process_tile<type,J,false,true>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,
+                mul_mat_q_process_tile<type,J,false,true,GGML_PREC_Q8>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,
                     a.row_stride,a.selected_rows,a.rows,a.rows-local_row-1,columns-jt*J-1,kb,stop);
             else
-                mul_mat_q_process_tile<type,J,false,false>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,
+                mul_mat_q_process_tile<type,J,false,false,GGML_PREC_Q8>(a.weights,xo,a.input+yo,selected,a.out+local_row,a.partial,nullptr,
                     a.row_stride,a.selected_rows,a.rows,a.rows-local_row-1,columns-jt*J-1,kb,stop);
         }
         begin+=stop-kb;
@@ -69,13 +71,13 @@ __global__ void quant_strip_main(quant_strip_args a) {
 }
 
 template<ggml_type type,int J>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(type,J,false)/2,1)
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type,J,false,GGML_PREC_Q8)/2,1)
 __global__ void quant_strip_fixup(quant_strip_args a) {
     if (blockIdx.z) { a.out=a.out2; a.partial=a.partial2; }
-    constexpr int I=ggml_cuda_mmq_get_I(type,J,false);
+    constexpr int I=ggml_cuda_mmq_get_I(type,J,false,GGML_PREC_Q8);
     constexpr int warp=ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps=(ggml_cuda_mmq_get_nthreads(type,J,false)/2)/warp;
-    constexpr int per_iter=ggml_cuda_mmq_get_K_vram(type,J,false)/ggml_cuda_type_traits<type>::qk;
+    constexpr int nwarps=(ggml_cuda_mmq_get_nthreads(type,J,false,GGML_PREC_Q8)/2)/warp;
+    constexpr int per_iter=ggml_cuda_mmq_get_K_vram(type,J,false,GGML_PREC_Q8)/ggml_cuda_type_traits<type>::qk;
     const int tiles=(a.full_rows/I)*a.ntx.z*a.experts;
     int begin=int64_t(blockIdx.x+a.first_block)*tiles*a.blocks.z/a.virtual_blocks;
     int end=int64_t(blockIdx.x+a.first_block+1)*tiles*a.blocks.z/a.virtual_blocks;
@@ -113,7 +115,7 @@ int quant_strip_width(ggml_type type, int tokens, int device) {
     const auto & info = ggml_cuda_info().devices[device];
     int width = 0, tiles = INT_MAX;
     for (int j = 8; j <= 128 && tiles > 1; j += 8) {
-        const auto config = ggml_cuda_mmq_get_config(type, j, false, info.cc);
+        const auto config = ggml_cuda_mmq_get_config(type, j, false, info.cc, GGML_PREC_Q8);
         if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, info.cc) > info.smpbo) continue;
         const int count = (tokens + j - 1) / j;
         if (count < tiles) { width = j; tiles = count; }
@@ -147,7 +149,7 @@ int quant_strip_active_blocks(quant_strip_args & a, const ggml_cuda_mmq_config &
 template<ggml_type type, int J>
 void launch_quant_strip(int device, cudaStream_t stream, quant_strip_args a) {
     const int cc = ggml_cuda_info().devices[device].cc;
-    const auto config = ggml_cuda_mmq_get_config(type, J, false, cc);
+    const auto config = ggml_cuda_mmq_get_config(type, J, false, cc, GGML_PREC_Q8);
     GGML_ASSERT(config.type != GGML_TYPE_COUNT && config.stream_k);
     const int blocks = quant_strip_active_blocks(a, config, device);
     const int tiles = (a.full_rows / config.I) * a.ntx.z * a.experts;

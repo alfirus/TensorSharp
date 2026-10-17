@@ -177,7 +177,7 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     const int tokens = int(x->ne[2]), used = int(ids->ne[0]), selected_rows = tokens * used;
     const int width = quant_strip_width(w->type, tokens, state->device);
     const int cc = ggml_cuda_info().devices[state->device].cc;
-    const auto config = ggml_cuda_mmq_get_config(w->type, width, false, cc);
+    const auto config = ggml_cuda_mmq_get_config(w->type, width, false, cc, GGML_PREC_Q8);
     const int padded = GGML_PAD(x->ne[0], MATRIX_ROW_PADDING);
     const auto align = [](size_t n) { return (n + 255) / 256 * 256; };
     const size_t input_offset = 0;
@@ -187,8 +187,11 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     // MMQ loads a complete J tile even when the final sorted expert slice
     // has fewer columns. Reserve upstream's tail padding outside the fixup
     // scratch so these loads neither overrun nor race with partial writes.
+    const size_t load_chunk = size_t(config.nthreads) * sizeof(int);
+    const size_t quant_padding = ((size_t(width) * sizeof(block_q8_1_mmq) + load_chunk - 1) / load_chunk)
+        * load_chunk;
     const size_t quant_bytes = size_t(selected_rows) * padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ
-        + ggml_cuda_mmq_get_J_max(w->type, false, cc, tokens) * sizeof(block_q8_1_mmq);
+        + quant_padding;
     const size_t partial_offset = quant_offset + align(quant_bytes);
     quant_strip_args a{static_cast<const char *>(w->data), nullptr, nullptr, nullptr,
         static_cast<float *>(dst->data), nullptr, desc->i0, desc->i1, int(w->ne[1]),
@@ -266,7 +269,7 @@ bool tsg_matmul_id_quant_strip_supported(ggml_backend_t backend, const ggml_tens
         !ggml_cuda_should_use_mmq(w->type, cc, tokens, w->ne[2])) return false;
     const int width = quant_strip_width(w->type, int(tokens), device);
     if (!width) return false;
-    const auto config = ggml_cuda_mmq_get_config(w->type, width, false, cc);
+    const auto config = ggml_cuda_mmq_get_config(w->type, width, false, cc, GGML_PREC_Q8);
     const int64_t tiles = (full_rows / config.I) * ((tokens + width - 1) / width) * w->ne[2];
     // Nonaligned layouts and non-stream-K architectures remain on the
     // existing upstream route; those configurations need separate qualification.
