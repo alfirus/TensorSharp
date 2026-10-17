@@ -94,6 +94,24 @@ and uses up to eight concurrent 1 MiB reads. This reduces
 small page faults on network-backed model storage without loading the complete
 checkpoint into host memory. `TS_LTX25_CUDA_PREFAULT=0` disables these reads.
 `TS_LTX25_CUDA_PREFAULT_WORKERS=1` selects sequential reads.
+
+Every backend also reads weights ahead of their use, in the order the layers run,
+within a 4 GiB window: the Gemma encoder, the prompt connectors and the first
+CUDA denoiser upload. The upscaler, video decoder and audio VAE are read one
+stage before their first use. Safetensors and GGUF files store tensors
+alphabetically (layers 0, 1, 10, …). Without the read-ahead, a cold mapping
+faults pages in at 0.9 GiB/s on an M5 Pro SSD, against 12 GiB/s for one
+sequential reader. On an A40 pod's network volume it reaches 0.3 GiB/s,
+against 2.3 GiB/s for sixteen concurrent readers. Chunks already in the file
+cache are skipped.
+
+When RAM, or the container's memory limit, is below the text encoder plus the
+denoiser plus 16 GiB, the encoder's cached pages are released after each new
+prompt, so they do not compete with the denoiser. A later new prompt reads them
+again. `TS_VIDEO_READAHEAD=0` disables both the read-ahead and the release.
+`TS_VIDEO_READAHEAD_WORKERS` (1–32) sets the readers: 16 on Linux, 1 elsewhere.
+The conditioning log line reports the bytes read, the bytes already resident
+and whether the cache is released.
 CUDA self-attention tiles queries and heads within a 256 MiB score workspace,
 including the 10,752-token Ingredients recipe. Each query attends to the complete
 key sequence with pedantic Float32 GEMM; independent large-sequence numerical
@@ -408,7 +426,44 @@ while keeping subsequent uncached prompts bounded.
 
 ### Latest exact performance work
 
-Current source runs Gemma prompt BF16 rounding and split-half RoPE on CUDA/MLX
+The 2026-10-17 work removed weight loading and host overheads from the default
+1024×1024×17 recipe (seed 42). Every output is unchanged. The M5 Pro rows use
+the end-to-end probe, comparing raw Float32 RGB and both PCM channels with
+`ltx25-compare-native-generations.py --require-bitwise`. The A40 rows use
+complete CLI processes in two alternating rounds; their decoded RGB and PCM
+were identical in all four runs. Model files started cold on the M5 Pro and
+were uncontrolled on the A40.
+
+| Host / backend | Before | After | Output |
+|---|---:|---:|---|
+| M5 Pro `mlx`, new process | 168.9 s | 108.0 s | Bitwise RGB and PCM |
+| M5 Pro `mlx`, a second, uncached prompt in the same process | 142.8 s | 110.3 s | Bitwise RGB and PCM |
+| A40 `ggml_cuda` (direct CUDA), CLI process | 163.9 s | 72.9 s | Identical decoded RGB and PCM |
+
+The changes:
+
+- **Read-ahead in compute order** (see [Video decoders](#video-decoders) and
+  the weight-reading paragraph above). On the M5 Pro, text-encode went from
+  42.3 to 5.5 s in a new process and from 30.6 to 5.2 s for a second prompt.
+  On the A40 pod's network volume it went from 61.7–65.2 to 13.0–13.5 s. The
+  A40's first-pass denoise, which includes the first denoiser upload, went from
+  39–44 to 15–19 s.
+- **Prompt connectors.** RoPE tables are now computed once with the same
+  expressions, and the connector weights are read ahead in layer order. On the
+  A40 the connectors went from 12.3 to 1.8 s.
+- **Video VAE and upsampler weights.** Weights are widened across cores, and
+  CUDA host buffers are written without first reading back their never-written
+  device copy. On the A40, upsampling went from 9.0–11.6 to 2.5 s and video
+  decoding from 12.7–15.4 to 6.9 s; on the M5 Pro, upsampling went from 2.3 to
+  0.5 s.
+- **Gemma cache release.** On a 48 GB Mac, releasing Gemma's cached pages
+  after each new prompt keeps 22 GiB of stale pages from slowing the first
+  1024×1024 denoise step. Together with the read-ahead, the M5 Pro's first-pass
+  denoise in a new process went from 64.8 to 43.5 s.
+- **Weight-widening loops.** These now compile straight to optimized code and
+  use block copies.
+
+The previous exact performance work: current source runs Gemma prompt BF16 rounding and split-half RoPE on CUDA/MLX
 devices while retaining the original host-computed trigonometric values and
 arithmetic order. `TS_LTX25_DEVICE_PROMPT_MATH=0` selects the host control.
 CUDA also fuses the existing per-head `2 * sigmoid(logit)` gating without

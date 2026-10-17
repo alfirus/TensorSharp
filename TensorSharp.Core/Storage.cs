@@ -52,6 +52,14 @@ namespace TensorSharp
 
         public abstract IntPtr PtrAtElement(long index);
 
+        /// <summary>
+        /// Host pointer for a caller that writes EVERY element of this storage and
+        /// reads none of its previous contents. A device-backed storage may then skip
+        /// refreshing its host mirror from the device; the written host data is
+        /// uploaded before the next device use, as after <see cref="PtrAtElement"/>.
+        /// </summary>
+        public virtual IntPtr PtrAtElementForOverwrite(long index) => PtrAtElement(index);
+
 
         public abstract int[] GetElementsAsInt(long index, int length);
         public abstract void SetElementsAsInt(long index, int[] value);

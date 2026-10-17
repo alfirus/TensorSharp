@@ -32,6 +32,46 @@ each new prompt. `TrimIdleMemory` releases all retained components. Prompt weigh
 stream per projection, and video decoder weights per convolution. Complete-generation memory
 and cache behavior must be measured separately from component measurements.
 
+## Exact weight read-ahead and host overheads (2026-10-17)
+
+Evidence is in ignored `artifacts/perf/local/final-ltx-e2e/`,
+`artifacts/perf/local/ltx-prompt/` and `artifacts/perf/local/ltx-coldwarm/`, and
+in `/workspace/perf/final-ltx/` on the A40 pod. Before every M5 Pro arm, the model
+files were evicted with `eng/validation/file-cache.py evict ...`, which also
+reports cached bytes and measures cold read throughput with `read --readers N`.
+
+**Gates.**
+
+- **M5 Pro:** the HEAD (3f422687) and final `Ltx25EndToEndProbe` builds each
+  ran 1024×1024×17 at seed 42, with a second, uncached prompt in the same
+  process. They were then compared with:
+
+  ```sh
+  python3 eng/validation/ltx25-compare-native-generations.py \
+    --before head.json --after final.json --output compare.json --require-bitwise
+  ```
+
+  Raw RGB and both PCM channels were bitwise-equal in both executions.
+  Generation time went from 168.9 to 108.0 s (new process) and from 142.8 to
+  110.3 s (second prompt).
+- **A40:** frozen base and final CLIs ran in two alternating rounds. The decoded
+  RGB and PCM sha256 were identical in all four runs. Process time went from
+  163.9 / 164.0 s to 74.5 / 71.3 s.
+- **Prompt conditioning:** `Ltx25PromptProbe --device-math-rounds 1,1` kept the
+  video and audio context hashes `da30bda33b2ec0aa` / `8d2832ae6a1f31e9` through
+  every change.
+
+**Tests.** `MappedFileReadAheadTests` covers planned bytes, the stage window, the
+resident skip, stop, release and the switch. The LTX test filters passed on both
+hosts; the M5 Pro skipped the CUDA tests, and the A40 skipped the MLX tests and
+the absent real-adapter, tokenizer and PyAV fixtures.
+
+**Limitations.** This round covered t2v at 1024×1024×17 only. Image guides,
+keyframes, Ingredients, the diffusion video decoder and long clips were not
+re-run. The A40 file cache was uncontrolled; that pod's 50 GB cgroup counts page
+cache, and audio decode there still pays direct reclaim (4–6 s, against 0.6 s on
+the M5 Pro).
+
 ## Complete generation and application probes
 
 `Ltx25EndToEndProbe` calls the real architecture registry and generation model,
@@ -452,6 +492,9 @@ the warm-up decode, prompt conditioning, denoising, audio and media encoding.
 
 ## Tools
 
+- `file-cache.py report|evict|read` reports a file's cached bytes, drops them
+  (macOS msync invalidate, Linux `POSIX_FADV_DONTNEED`) and measures cold read
+  throughput with N concurrent 8 MiB readers, for cold-arm benchmarks.
 - `ltx25-download-remote.py` resolves pinned official companion metadata using
   local cached Hugging Face authentication. Temporary signed download locations
   travel through SSH stdin; tokens and locations are excluded from argv and
