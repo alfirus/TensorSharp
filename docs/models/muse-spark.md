@@ -116,8 +116,11 @@ Full-model inference and timing were not rerun on the repaired library.
 
 ## Launching the sharded model
 
-Keep every shard of the selected quantization in one directory and pass the
-first shard (`UD-Q4_K_XL` has twelve; `UD-Q3_K_XL` has ten).
+Keep every shard of the selected quantization in one directory and pass any
+shard (`UD-Q4_K_XL` has twelve; `UD-Q3_K_XL` has ten). TensorSharp resolves
+shard 1 for the architecture, tokenizer and model settings, then loads the
+tensors from the complete set. Later shards contain only split metadata;
+they are not standalone models.
 The following Q3 configuration is the explicit F16 evaluation profile for five
 A40 GPUs, each with 46,068 MiB total memory and 45,490 MiB initially usable,
 a 233.762 GiB container memory limit and a CPU quota of

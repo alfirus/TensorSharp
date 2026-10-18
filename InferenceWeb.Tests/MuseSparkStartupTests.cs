@@ -1,6 +1,5 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
-using System.Text;
 using TensorSharp;
 using TensorSharp.Runtime.Scheduling;
 
@@ -10,10 +9,12 @@ namespace InferenceWeb.Tests;
 public sealed class MuseSparkStartupTests
 {
     [Theory]
-    [InlineData(KvCacheDtype.F32, true)]
-    [InlineData(KvCacheDtype.F16, false)]
-    public async Task MetadataOnlyFirstShardLoadsThroughFactoryAndDeclaresActualRuntimeModes(
-        KvCacheDtype dtype, bool paged)
+    [InlineData(KvCacheDtype.F32, true, false)]
+    [InlineData(KvCacheDtype.F32, true, true)]
+    [InlineData(KvCacheDtype.F16, false, false)]
+    [InlineData(KvCacheDtype.F16, false, true)]
+    public async Task AnySplitShardLoadsThroughFactoryAndDeclaresActualRuntimeModes(
+        KvCacheDtype dtype, bool paged, bool enterFromLastShard)
     {
         string directory = Path.Combine(Path.GetTempPath(), "ts-spark-startup-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
@@ -28,38 +29,39 @@ public sealed class MuseSparkStartupTests
             for (int i = 0; i < names.Length; i++) Environment.SetEnvironmentVariable(names[i], values[i]);
             KvCacheDtypeConfig.Set(dtype);
             var fixture = new MuseSparkSyntheticModelBuilder();
-            string first = Path.Combine(directory, "spark-00001-of-00002.gguf");
-            fixture.Write(Path.Combine(directory, "spark-00002-of-00002.gguf"));
-            var metadata = new MuseSparkSyntheticModelBuilder();
-            metadata.Weights.Clear();
-            metadata.Write(first);
-
-            // Reproduce the published layout: no tensors and no alignment pad in
-            // shard 1; every tensor belongs to a sibling file.
-            long tableEnd;
+            string[] paths = fixture.WriteSplit(directory);
+            string first = paths[0], last = paths[1];
+            string entry = paths[enterFromLastShard ? 1 : 0];
             using (var probe = GgufFile.OpenWithoutSiblingShards(first))
             {
                 Assert.Empty(probe.Tensors);
-                tableEnd = probe.GetRequiredLength(out _);
+                Assert.Equal("muse-spark", probe.Metadata["general.architecture"]);
+                Assert.True(probe.Metadata.ContainsKey("tokenizer.ggml.tokens"));
+                Assert.Equal((ushort)0, probe.Metadata["split.no"]);
+                Assert.Equal((ushort)2, probe.Metadata["split.count"]);
+                Assert.Equal(fixture.Weights.Count, probe.Metadata["split.tensors.count"]);
+                Assert.Equal(new FileInfo(first).Length, probe.GetRequiredLength(out _));
             }
-            byte[] header = File.ReadAllBytes(first);
-            ulong metadataCount = BitConverter.ToUInt64(header, 16);
-            using (var file = new FileStream(first, FileMode.Open, FileAccess.Write))
-            using (var writer = new BinaryWriter(file, Encoding.UTF8))
+            using (var probe = GgufFile.OpenWithoutSiblingShards(last))
             {
-                file.Position = 16; writer.Write(metadataCount + 1);
-                file.Position = tableEnd;
-                byte[] key = Encoding.UTF8.GetBytes("split.count");
-                writer.Write((ulong)key.Length); writer.Write(key); writer.Write(4u); writer.Write(2u);
-                file.SetLength(file.Position);
+                Assert.Equal(3, probe.Metadata.Count);
+                Assert.False(probe.Metadata.ContainsKey("general.architecture"));
+                Assert.False(probe.Metadata.ContainsKey("tokenizer.ggml.tokens"));
+                Assert.Equal((ushort)1, probe.Metadata["split.no"]);
+                Assert.Equal((ushort)2, probe.Metadata["split.count"]);
+                Assert.Equal(fixture.Weights.Count, probe.Metadata["split.tensors.count"]);
+                Assert.Equal(fixture.Weights.Count, probe.Tensors.Count);
+                Assert.Equal(last, Assert.Single(probe.FilePaths));
             }
-            using (var merged = new GgufFile(first))
+            using var loaded = ModelBase.Create(entry, BackendType.Cpu);
+            using (var merged = new GgufFile(entry))
             {
                 merged.ThrowIfTruncated();
                 Assert.Equal(fixture.Weights.Count, merged.Tensors.Count);
                 Assert.Equal(2, merged.FilePaths.Count);
+                Assert.Equal(first, merged.FilePaths[0]);
+                Assert.Equal("muse-spark", merged.Metadata["general.architecture"]);
             }
-            using var loaded = ModelBase.Create(first, BackendType.Cpu);
             var model = Assert.IsType<MuseSparkModel>(loaded);
             Assert.Equal(16, model.MaxContextLength);
             Assert.Equal(64, model.Config.DeclaredContextLength);

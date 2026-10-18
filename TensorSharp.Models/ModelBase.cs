@@ -2897,7 +2897,9 @@ namespace TensorSharp.Models
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
-            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
+            // Direct executors enumerate physical shards themselves and need the
+            // canonical first path just as the metadata probe does.
+            var context = new ModelCreateContext(probe.FilePaths[0], backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
             architecture.ApplyNativeTunables?.Invoke(context);
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);

@@ -56,8 +56,32 @@ internal sealed class MuseSparkSyntheticModelBuilder
     }
 
     internal string Write(string path, bool halfMatrices = false)
+        => WriteFile(path, halfMatrices, CreateMetadata(), Weights);
+
+    internal string[] WriteSplit(string directory, bool halfMatrices = false)
     {
-        var metadata = new Dictionary<string, object>
+        string[] paths = [Path.Combine(directory, "spark-00001-of-00002.gguf"),
+            Path.Combine(directory, "spark-00002-of-00002.gguf")];
+        var firstMetadata = CreateMetadata();
+        firstMetadata["split.no"] = (ushort)0;
+        firstMetadata["split.count"] = (ushort)2;
+        firstMetadata["split.tensors.count"] = Weights.Count;
+        var lastMetadata = new Dictionary<string, object>
+        {
+            ["split.no"] = (ushort)1,
+            ["split.count"] = (ushort)2,
+            ["split.tensors.count"] = Weights.Count,
+        };
+        // Published Muse Spark splits put all architecture/tokenizer metadata in
+        // the tensor-free first shard and only split metadata in later shards.
+        WriteFile(paths[0], halfMatrices, firstMetadata, new Dictionary<string, (ulong[] Shape, float[] Data)>());
+        WriteFile(paths[1], halfMatrices, lastMetadata, Weights);
+        return paths;
+    }
+
+    private static Dictionary<string, object> CreateMetadata()
+    {
+        return new Dictionary<string, object>
         {
             ["general.architecture"] = "muse-spark",
             ["muse-spark.block_count"] = (uint)Layers,
@@ -93,12 +117,17 @@ internal sealed class MuseSparkSyntheticModelBuilder
             ["tokenizer.ggml.eos_token_id"] = 0u,
             ["tokenizer.ggml.add_bos_token"] = false,
         };
+    }
+
+    private static string WriteFile(string path, bool halfMatrices, IReadOnlyDictionary<string, object> metadata,
+        IReadOnlyDictionary<string, (ulong[] Shape, float[] Data)> weights)
+    {
         using var file = File.Create(path);
         using var w = new BinaryWriter(file, Encoding.UTF8);
-        w.Write(0x46554747u); w.Write(3u); w.Write((ulong)Weights.Count); w.Write((ulong)metadata.Count);
+        w.Write(0x46554747u); w.Write(3u); w.Write((ulong)weights.Count); w.Write((ulong)metadata.Count);
         foreach (var (key, value) in metadata) { WriteString(w, key); WriteValue(w, value); }
         ulong offset = 0;
-        foreach (var (key, (shape, data)) in Weights)
+        foreach (var (key, (shape, data)) in weights)
         {
             WriteString(w, key); w.Write((uint)shape.Length);
             foreach (ulong d in shape) w.Write(d);
@@ -106,8 +135,9 @@ internal sealed class MuseSparkSyntheticModelBuilder
             w.Write(half ? 1u : 0u); w.Write(offset);
             offset += ((ulong)data.Length * (half ? 2u : 4u) + 31) / 32 * 32;
         }
+        if (weights.Count == 0) return path; // Metadata-only shards have no tensor alignment padding.
         while (file.Position % 32 != 0) w.Write((byte)0);
-        foreach (var (_, (shape, data)) in Weights)
+        foreach (var (_, (shape, data)) in weights)
         {
             foreach (float x in data)
                 if (halfMatrices && shape.Length > 1) w.Write(BitConverter.HalfToUInt16Bits((System.Half)x)); else w.Write(x);
@@ -121,7 +151,9 @@ internal sealed class MuseSparkSyntheticModelBuilder
     {
         switch (value)
         {
+            case ushort x: w.Write(2u); w.Write(x); break;
             case uint x: w.Write(4u); w.Write(x); break;
+            case int x: w.Write(5u); w.Write(x); break;
             case float x: w.Write(6u); w.Write(x); break;
             case bool x: w.Write(7u); w.Write(x); break;
             case string x: w.Write(8u); WriteString(w, x); break;

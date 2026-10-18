@@ -13,7 +13,7 @@ internal static class MuseSparkArchitecture
         Aliases = new[] { "muse-spark", "muse_spark" },
         Factory = c => new MuseSparkModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
         MultiGpu = MultiGpuMode.LayerSplit,
-        MultiGpuLimitation = "Muse Spark implements whole-layer GPU placement; tensor-parallel sharding is not implemented.",
+        MultiGpuLimitation = "muse-spark implements whole-layer GPU placement; tensor-parallel sharding is not implemented.",
         SupportsDistributedTensorParallel = false,
         ProjectorFileHints = new[] { "*mmproj*Muse*Spark*.gguf", "*mmproj*.gguf" },
     };
