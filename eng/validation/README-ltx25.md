@@ -141,6 +141,29 @@ video with muxed audio and the original-length 48 kHz stereo WAV. CoreCLR tests
 alone do not cover Apple AOT: MLX native callbacks use static Cdecl entry points
 because runtime-generated delegate trampolines are unavailable there.
 
+For a fresh native download check, start `tensoragent-download-watch.py` with the
+app's private `--connection`, a catalog `--model` ID and a fresh `--output` JSON
+path **before** pressing Download in the native Models page. It records progress
+and hashes completed files. Optional `--reference` directories only reclaim disk
+space after a complete download independently matches a reference's SHA-256;
+they never seed partial files or replace the app's transfer path. The observer
+requires an empty model directory inside an isolated validation root.
+
+`tensoragent-media-chat-probe.py` measures the already activated native app's
+normal chat route with `--family ltx-2.5` or `--family qwen-image`, `--prompt`, a
+fresh `--output` folder and optional `--reference` image. It checks the published
+recipe, retrieves media, and verifies conversation persistence. Native controls,
+visual quality and complete video/audio decoding require separate checks. Keep
+download/build activity out of benchmark samples and retain binary provenance
+for the actual app bundle. Neither observer exports its private loopback cookie.
+
+Mac Catalyst uses the same installed FFmpeg/libx264 transform as the desktop host
+for LTX image/keyframe guides (discovered through `TS_FFMPEG`, PATH or the standard
+Homebrew locations). AVFoundation still exports the generated video and audio.
+An OS H.264 bitrate encoder cannot substitute for this CRF-18 preprocessing step.
+Without libx264 the app keeps temporal guides unavailable; iOS cannot spawn this
+tool and is not covered by the Mac implementation or validation.
+
 The Mac Catalyst app sets `MLX_ENABLE_TF32=0` in both managed and native
 environments at its entry point when the variable is unset. MLX caches this
 choice on its first GEMM, so setting it only when LTX is selected is too late

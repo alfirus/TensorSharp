@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise an isolated actual MAUI app's native Use action and LTX HTTP jobs.
 
-Launch the app with TENSORAGENT_VALIDATION_ROOT containing the four pinned cache
+Launch the app with TENSORAGENT_VALIDATION_ROOT containing the five pinned cache
 assets, then pass its private connection.json. This tool never exports the cookie.
 """
 import argparse
