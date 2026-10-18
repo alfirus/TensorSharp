@@ -100,9 +100,9 @@ public static class StudioEndpoints
             try { return Results.Json(await studio.Service.ImportPackageAsync(ctx.Request.Body, ctx.RequestAborted), StudioJson.Options); }
             catch (Exception e) when (e is not OperationCanceledException) { return Error(e); }
         });
-        routes.MapGet("/thumbnail/{projectId}/{assetId}", async (string projectId, string assetId, StudioHostBoundary studio, CancellationToken ct) =>
+        routes.MapGet("/thumbnail/{projectId}/{assetId}", async (HttpContext ctx, string projectId, string assetId, StudioHostBoundary studio, CancellationToken ct) =>
         {
-            try { return Results.File(await studio.Service.GetThumbnailAsync(projectId, assetId, ct), "image/jpeg"); }
+            try { return Results.File(await studio.Service.GetThumbnailAsync(projectId, assetId, StudioHostBoundary.ThumbnailOfLastFrame(ctx.Request.Query["frame"].ToString()), ct), "image/jpeg"); }
             catch (Exception e) when (e is not OperationCanceledException) { return Error(e); }
         });
         routes.MapGet("/waveform/{projectId}/{assetId}", async (string projectId, string assetId, StudioHostBoundary studio, CancellationToken ct) =>

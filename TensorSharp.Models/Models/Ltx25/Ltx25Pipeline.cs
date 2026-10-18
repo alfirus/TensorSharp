@@ -60,7 +60,10 @@ internal static class Ltx25Pipeline
             bool identity = parameters.Mode == "ref";
             bool twoStage = settings.TwoStage;
             var first = twoStage ? settings.HalfResolution() : settings;
-            var images = identity ? Array.Empty<VideoImageCondition>() : Ltx25ImageConditioning.Resolve(parameters, settings.Frames);
+            // Identity references may start on a pinned first frame (a chain's previous segment); no other guide joins them.
+            IReadOnlyList<VideoImageCondition> images = identity
+                ? Ltx25ReferenceConditioning.ResolveFirstFrameGuide(parameters) is { } firstFrame ? new[] { firstFrame } : Array.Empty<VideoImageCondition>()
+                : Ltx25ImageConditioning.Resolve(parameters, settings.Frames);
             float? effectiveFirstStageStrength = ResolveFirstStageImageStrength(parameters, twoStage, images, firstStageImageStrength);
             // Recompress each original once; both stages resize the same conditioned
             // source independently, as the publisher's image loader does.
@@ -96,6 +99,8 @@ internal static class Ltx25Pipeline
                 RgbImage sheet = Ltx25ReferenceConditioning.BuildSheet(sources.Select(source => source.ResolveImage(preserveAlpha: true)).ToArray(), settings.Width, settings.Height);
                 encodedReference = model.EncodeStaticReferenceVideo(sheet.Pixels, settings.Frames, settings.Height, settings.Width, parameters.CancellationToken);
                 Trim(); EndPhase("reference-encode");
+                // One full-size pass, so the first-frame guide is encoded once, at the output size.
+                encodedImages = EncodeImages(settings, "image-encode", "image-encode");
             }
             else
             {
@@ -142,10 +147,13 @@ internal static class Ltx25Pipeline
                 input = identity ? Ltx25ReferenceConditioning.Apply(input, stage, encodedReference,
                     stage.LatentFrames, stage.LatentHeight, stage.LatentWidth)
                     : Ltx25ImageConditioning.Apply(input, stage, stageImages, rawNoise, noiseScale);
+                // The guide and the references occupy disjoint tokens (canvas frame 0, the appended tail), so pinning frame 0
+                // after the references equals upstream's images-then-references order.
+                if (identity && stageImages.Count > 0) input = Ltx25ImageConditioning.ApplyFirstFrame(input, stage, stageImages[0]);
                 Report("denoise", $"{(priorVideo == null ? twoStage ? "first pass" : "single pass" : "refinement pass")} at {stage.Width}x{stage.Height}: {stage.VideoTokens} video + {guideTokens} guide, {stage.AudioTokens} audio, {conditioning.Tokens} prompt tokens, " +
                     (stage.Ancestral ? Ltx25GenerationSettings.AncestralSampler
                         : $"{Ltx25GenerationSettings.EulerSampler} (requested; the publisher samples LTX 2.5 with {Ltx25GenerationSettings.AncestralSampler})") +
-                    (identity || stageImages.Count == 0 ? "" : "; temporal guide strengths: " + string.Join(", ", stageImages.Select(image =>
+                    (stageImages.Count == 0 ? "" : (identity ? "; first-frame guide strength: " : "; temporal guide strengths: ") + string.Join(", ", stageImages.Select(image =>
                         $"frame {image.FrameIndex}={image.Strength.ToString("R", CultureInfo.InvariantCulture)}"))));
                 Ltx25SamplingOutput result = model.Sample(input, stage, (step, total) =>
                     {

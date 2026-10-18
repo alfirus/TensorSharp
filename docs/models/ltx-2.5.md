@@ -270,7 +270,7 @@ The model API offers the following inputs:
 | --- | --- |
 | `Image`, `ImageBytes`, `ImagePath` | First frame; decoded image takes precedence over bytes, then path. |
 | `EndImage`, `EndImagePath` | Last output frame. |
-| `ReferenceImagePaths` | Ordered, evenly spaced keyframes by default; identity sheet panels in `Mode = "ref"`. Cannot be combined with the other image inputs. |
+| `ReferenceImagePaths` | Ordered, evenly spaced keyframes by default; identity sheet panels in `Mode = "ref"`. Cannot be combined with the other image inputs, except one frame-0 `ImageConditions` guide in `Mode = "ref"` ([starting on a first frame](#starting-on-a-first-frame)). |
 | `ImageConditions` | `VideoImageCondition` entries with an image, `FrameIndex`, and `Strength`. `-1` selects the last frame. |
 
 ```csharp
@@ -392,6 +392,54 @@ LoRA, but its input path remains unimplemented here. Reference video, retake and
 generated keyframe workflows also remain unsupported. See the official
 [conditioning documentation](https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/docs/conditioning.md)
 for these distinctions.
+
+### Starting on a first frame
+
+An Ingredients request can also start on a pinned frame: the composition the
+publisher's IC-LoRA pipeline runs when it is given images and reference
+conditioning together. Video Studio does **not** offer it (see the validation
+result below and [Keep a character across segments](../video-studio.md#keep-a-character-across-segments));
+it is reachable through the video API. Add one `ImageConditions` entry at
+`FrameIndex = 0`. In `Mode = "ref"`, `Image`
+and `ImagePath` remain a single identity image, not a frame.
+
+```csharp
+var request = new VideoGenerationParams
+{
+    Mode = "ref", Width = 768, Height = 448, Frames = 121, Fps = 24, Seed = 42,
+    ReferenceImagePaths = new[] { "character.png" },
+    ImageConditions = new[]
+    {
+        new VideoImageCondition { ImagePath = "previous-last-frame.png", FrameIndex = 0, Strength = 1 },
+    },
+};
+```
+
+The recipe stays one full-size pass. The guide goes through the same CRF 18
+preprocessing as the other image guides, so it needs FFmpeg with libx264, and is
+encoded once at the output size. It is pinned at its strength: canvas latent
+frame 0 takes the clean guide latent with denoise mask 1 − strength, adding no
+tokens. The reference sheet's tokens are appended after the canvas as before.
+Because the guide and the references occupy disjoint tokens, applying the guide
+after the references equals upstream's images-then-references order. The
+upstream equivalent is
+`ICLoraPipeline(stages=(ICLoraStageConfig(1, True, DISTILLED_SIGMA_VALUES),))(images=[(frame, 0, 1.0)], video_conditioning=[(sheet, 1.0)])`.
+At most one guide is accepted, and only at frame 0. A last-frame image or timed
+guides beside references are refused: no publisher workflow uses them. The
+denoise log line reports the guide (`first-frame guide strength: frame 0=1`).
+The composition matches the unchanged upstream functions bit for bit at strength 1
+(`FrameZeroGuideBesideReferenceVideoMatchesUnchangedOfficialImagesThenReferences`,
+fixture from `eng/validation/generate-ltx25-reference-first-frame-oracle.py`).
+
+The publisher trained Ingredients with `first_frame_conditioning_p` 0.0, so the
+adapter never saw a pinned first frame in training, and the publisher has not
+validated this use. On 2026-10-17 (Q4_K_M, MLX, 768×448×121, seed 42) every take
+that started on a frame cut away from it at its second frame: frame 0 matched the
+pinned frame (27–29 dB PSNR), frame 1 was 9.6–9.7 dB from frame 0 and showed the
+reference sheet's composition, with a portrait reference letterboxed on the sheet
+and with a full-width one alike. A plain Ingredients take with the portrait
+reference reproduced the letterboxed sheet too. See the
+[validation record](../video-studio-validation.md#video-chains-and-character-references-2026-10-17).
 
 ## Native graph and memory
 

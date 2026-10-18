@@ -122,7 +122,8 @@ var video = model.GenerateVideo("The woman smiles and blows a kiss.", request);
 ```
 
 最多 16 张图，位置必须唯一且位于片段内；强度为有限的 0–1，1 保留编码引导潜变量。
-`ReferenceImagePaths` 不可与其他图像输入混用。
+`ReferenceImagePaths` 不可与其他图像输入混用；唯一例外是 `Mode = "ref"` 下的一个第 0 帧
+`ImageConditions` 引导（见[从首帧开始](#从首帧开始)）。
 时间线图像按发布方 LTX 2.5 的流程预处理：先去掉底部/右侧的奇数边缘以满足偶数尺寸，
 使用 libx264、CRF 18、`veryfast`、`yuv420p` 再压缩；随后对完整图像做 Float32
 双线性缩放（`align_corners=False`），最后中心裁剪到各阶段尺寸，保留缩放产生的小数像素。
@@ -170,6 +171,25 @@ IC-LoRA 对 AV Transformer 施加独立低秩更新，不替换生成首帧。
 保留身份与遵循动作是两个独立质量要求，当前没有多人物广泛验证。
 MotionTrack、Union depth/canny/pose、layout、inpainting、HDR、AlphaGen 等官方工作流
 需要各自管线/适配器/解码器，不能当作通用图片参考使用。
+
+### 从首帧开始
+
+Ingredients 请求也可以从固定的首帧开始，即发布方 IC-LoRA 管线同时接收图像与参考条件时的组合。
+Video Studio **不提供**此功能（原因见下方验证结果与[跨片段保持人物](../video-studio.md#keep-a-character-across-segments)，英文），
+可通过视频 API 使用。
+做法是加一个 `FrameIndex = 0` 的 `ImageConditions` 条目；`Mode = "ref"` 下 `Image` / `ImagePath`
+仍是单张身份图，而不是帧。仍为单次全尺寸流程：该引导与其他图像引导一样经 CRF 18 预处理（因此需要带
+libx264 的 FFmpeg），按输出尺寸只编码一次，并按其强度固定——画布第 0 个潜变量帧取干净引导潜变量，
+去噪掩码为 1 − strength，不增加 token；参考板 token 照常追加在画布之后。两者占用互不重叠的 token，
+所以先参考后引导与上游"先图像后参考"的顺序等价，对应上游
+`ICLoraPipeline(stages=(ICLoraStageConfig(1, True, DISTILLED_SIGMA_VALUES),))(images=[(frame, 0, 1.0)], video_conditioning=[(sheet, 1.0)])`。
+最多一个引导且只能在第 0 帧；参考旁的尾帧或带时间位置的引导会被拒绝。去噪日志会写出
+`first-frame guide strength: frame 0=1`。该组合在强度 1 时与未修改的上游函数逐位一致
+（`FrameZeroGuideBesideReferenceVideoMatchesUnchangedOfficialImagesThenReferences`）。发布方训练 Ingredients 时
+`first_frame_conditioning_p` 为 0.0，训练中从未见过固定首帧，也未验证这种用法。2026-10-17
+（Q4_K_M、MLX、768×448×121、seed 42）的实测中，每个从首帧开始的镜头都在第二帧切走：第 0 帧与固定首帧一致
+（PSNR 27–29 dB），第 1 帧与第 0 帧相差 9.6–9.7 dB，呈现参考板的构图（竖幅参考在板上加黑边、宽幅参考铺满时均如此）。
+用竖幅参考的普通 Ingredients 镜头同样复现了加黑边的参考板。
 
 ## 视频解码器与清晰度
 

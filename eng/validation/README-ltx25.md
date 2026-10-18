@@ -431,7 +431,12 @@ tested samples; multiple identity views can preserve the sheet layout.
 
 `generate-ltx25-reference-conditioning-oracle.py` generates an independent
 official fixture for full reference latents, coordinates, masks, noise and
-masked Euler. The synthetic encoder reference supports `--static-frame --shape
+masked Euler. `generate-ltx25-reference-first-frame-oracle.py` adds one frame-0
+image guide (strengths 1.0 and 0.6) on the same geometry, running the original
+`combined_image_conditionings`, then `VideoConditionByReferenceLatent`, through
+`create_noised_state` in ICLoraPipeline's per-stage order; it also checks that
+the reverse order gives a bitwise-identical official state. Its fixture is
+`reference-first-frame-conditioning.json`. The synthetic encoder reference supports `--static-frame --shape
 121 16 32` to verify genuine 121-frame RGB encoding against the original
 temporal network, and the same fixture checks the static specialization.
 Use the encoder probe's `--static 1 --frames 121` with one RGB frame as input

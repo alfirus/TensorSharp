@@ -116,7 +116,7 @@ public sealed class StudioMedia(StudioOptions options)
             args.AddRange(["-protocol_whitelist", "file,pipe", "-format_whitelist", Formats]);
             if (asset.Kind == "image") args.AddRange(["-loop", "1", "-framerate", fps]);
             args.AddRange(["-i", path]);
-            var d = N(p.FrameRate.Seconds(clip.DurationFrames)); var start = N(p.FrameRate.Seconds(clip.StartFrame)); var source = N(p.FrameRate.Seconds(clip.SourceStartFrame));
+            var d = N(p.FrameRate.Seconds(clip.DurationFrames)); var source = N(p.FrameRate.Seconds(clip.SourceStartFrame));
             var fadeIn = N(p.FrameRate.Seconds(clip.FadeInFrames)); var fadeOut = N(p.FrameRate.Seconds(clip.FadeOutFrames)); var fadeStart = N(p.FrameRate.Seconds(clip.DurationFrames - clip.FadeOutFrames));
             if (show)
             {
@@ -129,7 +129,13 @@ public sealed class StudioMedia(StudioOptions options)
                 graph.Append($"[{input}:v]fps=fps={fps}:start_time=0:round=near,trim=start_frame={clip.SourceStartFrame}:end_frame={checked(clip.SourceStartFrame + clip.DurationFrames)},setpts=PTS-STARTPTS,{scale},setsar=1,format=yuva420p");
                 if (clip.FadeInFrames > 0) graph.Append($",fade=t=in:st=0:d={fadeIn}:alpha=1");
                 if (clip.FadeOutFrames > 0) graph.Append($",fade=t=out:st={fadeStart}:d={fadeOut}:alpha=1");
-                graph.Append($",setpts=PTS+{start}/TB[v{input}];[base{visual}][v{input}]overlay=eof_action=pass:repeatlast=0:enable='gte(t,{start})*lt(t,{N(p.FrameRate.Seconds(clip.StartFrame + clip.DurationFrames))})'[base{visual + 1}];");
+                // Frame-exact placement. Seconds printed to nine decimals round: 22/24 s became 0.916666667, later than the
+                // base frame at 22/24 s, so a clip starting there lost its first frame to the black base, and 8/24 s became
+                // 0.333333333, which truncated the offset a frame early and skipped the clip's first source frame. The offset
+                // is rounded to whole ticks, and the overlay is bounded half a frame either side of its first and last frames.
+                // Not by frame number: before FFmpeg 7.0 a timeline expression also ran on the overlay input's own frames,
+                // whose n restarts at 0, which dropped a clip that does not start at frame 0 after its first frame.
+                graph.Append($",setpts=PTS+round({clip.StartFrame}*{p.FrameRate.Denominator}/{p.FrameRate.Numerator}/TB)[v{input}];[base{visual}][v{input}]overlay=eof_action=pass:repeatlast=0:enable='{FrameWindow(p.FrameRate, clip.StartFrame, clip.DurationFrames)}'[base{visual + 1}];");
                 visual++;
             }
             if (hear)
@@ -149,8 +155,7 @@ public sealed class StudioMedia(StudioOptions options)
             var name = $"caption_{input}.png";
             StudioCaptionBitmap.Write(Path.Combine(workDirectory, name), caption.Text, p.Width, p.Height);
             args.AddRange(["-loop", "1", "-framerate", fps, "-i", Path.Combine(workDirectory, name)]);
-            var start = N(p.FrameRate.Seconds(caption.StartFrame)); var end = N(p.FrameRate.Seconds(caption.StartFrame + caption.DurationFrames));
-            graph.Append($"[base{visual}][{input}:v]overlay=enable='gte(t,{start})*lt(t,{end})':eof_action=pass[base{visual + 1}];");
+            graph.Append($"[base{visual}][{input}:v]overlay=enable='{FrameWindow(p.FrameRate, caption.StartFrame, caption.DurationFrames)}':eof_action=pass[base{visual + 1}];");
             visual++; input++;
         }
         graph.Append($"[base{visual}]trim=duration={duration},format=yuv420p[outv];");
@@ -163,6 +168,11 @@ public sealed class StudioMedia(StudioOptions options)
         args.AddRange(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-frames:v", p.DurationFrames.ToString(CultureInfo.InvariantCulture), "-t", duration, "-movflags", "+faststart", "-fs", options.MaxImportBytes.ToString(CultureInfo.InvariantCulture), "-progress", "pipe:1", "-nostats", Path.Combine(workDirectory, "output.mp4")]);
         return new StudioRenderPlan(p.Revision, p.DurationFrames, graph.ToString(), args);
     }
+
+    /// <summary>A timeline enable expression true on frames start..start+duration-1 of the project clock: half a frame
+    /// either side, in exact rational seconds, so no rounding of either bound can drop or add a frame.</summary>
+    static string FrameWindow(StudioFrameRate rate, long start, long duration) =>
+        $"gte(t,({start}-0.5)*{rate.Denominator}/{rate.Numerator})*lt(t,({checked(start + duration)}-0.5)*{rate.Denominator}/{rate.Numerator})";
 
     public async Task<string> RenderAsync(StudioProject p, Func<string, string> assetPath, string workDirectory, IProgress<StudioProgress> progress, CancellationToken ct)
     {

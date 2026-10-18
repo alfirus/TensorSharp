@@ -507,10 +507,14 @@ implementation. Generate starts from a description; a first frame and a last
 frame are each optional and are picked from the library's thumbnails, and the
 filled slots set the mode (none is t2v, a first frame i2v, a last frame alone or
 with a first fl2v). Timed keyframes and identity references (ref) are the other
-uses of photos. What can be used follows the loaded checkpoint. Desktop
-composition uses operator-installed FFmpeg. Where Studio runs without media
-subprocesses (iOS, and Mac Catalyst, which .NET reports as iOS), it says that
-generation, import and export are unavailable and keeps project review and editing. See the [user guide](../docs/video-studio.md#generation-modes) and
+uses of photos. What can be used follows the loaded checkpoint. A long video is
+made as a chain (**Continue from last frame**, then **Add after**), and reference
+photos beside the frame slots keep a character in a new shot (no installed model
+also starts on a pinned frame with them, and the form says why). Desktop composition and frame stills use
+operator-installed FFmpeg. Where Studio runs without media subprocesses (iOS,
+and Mac Catalyst, which .NET reports as iOS), it says that generation, taking
+frames from videos, import and export are unavailable and keeps project review
+and editing. See the [user guide](../docs/video-studio.md#generation-modes) and
 [actual validation and limitations](../docs/video-studio-validation.md).
 
 **Videos.** With MiniMax-H3 loaded, a message describes a short clip, and an attached
