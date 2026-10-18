@@ -596,7 +596,9 @@ file-backed store, keeping at most two files per model; it is what makes the fir
 message after a launch as fast as the second. The server attaches it for its startup
 model under `prefix-cache/<model-file-stem>-<hash>/` beside the binary (moved with
 `TENSORSHARP_PREFIX_CACHE_DIR`, turned off with `--no-prefix-cache`) and warms the
-shared prompt before it accepts requests; TensorAgent attaches one per model in the
+Web UI's shared prompt before it accepts requests. `--no-webui` skips this prompt
+prefill while retaining model kernel warmup and normal API prefix reuse.
+TensorAgent attaches one per model in the
 app's cache directory. The CLI keeps checkpoints in memory only.
 
 

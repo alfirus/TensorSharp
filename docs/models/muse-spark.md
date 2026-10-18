@@ -1,0 +1,447 @@
+# Muse Spark
+
+[Back to model index](README.md)
+
+TensorSharp recognizes the `muse-spark` GGUF architecture used by
+[Unsloth's Muse-Spark-Open-816B-A42B release](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF).
+The decoder, MoE integration and multimodal wiring live in TensorSharp-owned
+code; the fetched ggml dependency remains unchanged.
+
+| Property | Implementation |
+|---|---|
+| Architecture | `muse-spark`, alias `muse_spark` |
+| Decoder | [MuseSparkModel](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.cs) |
+| Expert path | [MuseSparkModel.Moe.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Moe.cs), native `TSGgml_MuseSparkMoEFFNQuantF32` |
+| Images | Matching Spark mmproj, shared Muse-Glimmer vision encoder |
+| Audio | Not implemented; an audio tower in the projector does not enable audio inference |
+| GPU placement | Whole-layer placement through `--layer-split`; tensor-parallel sharding is not implemented |
+| Expert offload | `--n-cpu-moe N` keeps the first N layers' routed expert weights in host memory |
+| KV cache | F32/F16 linear GQA caches, truncation and prefix snapshots; block-quantized KV is rejected |
+| Continuous batching | Packed, paged text forward with F32 KV; F16 and image requests use the ordinary sequence path |
+| Speculation | Generic n-gram drafter through `--spec --spec-type ngram`; no learned Muse Spark draft model is assumed |
+
+## Measured status
+
+The completed v4r2 F16 campaign on the Q3 checkpoint passed 13 selected quality
+fixtures, a separate thinking check and all nine timing-case content checks.
+The quality fixtures cover short English/Chinese answers, JSON/schema/Unicode,
+tool and agent workflows, images/chart OCR, conversation memory and parallel
+request isolation. They comprise 22 measured turns plus a warmup, not a broad
+model-quality evaluation. Thinking captured a separate reasoning stream as well
+as the expected final answer. All 35 requests across the three phases, including
+their excluded warmups, reported integer zero cached tokens.
+
+**The requested performance target is not met.** In the equal-work 512-token
+decode comparison, TensorSharp's median client wall time was **111.743 seconds**
+versus **80.631 seconds** for llama.cpp. The reference/candidate median wall ratio
+is **0.721574**, below the frozen acceptance threshold of **0.95** (a 5%
+speed-ratio tolerance). These are three repeats on one hardware/profile
+combination, not a statistical equivalence claim.
+
+| Scenario, three repeats | TensorSharp median wall seconds | llama.cpp median wall seconds | Prompt tokens; output TensorSharp/reference | Interpretation |
+|---|---:|---:|---|---|
+| Short answer | 6.598 | 13.738 | 156; 1/2 | Descriptive task latency only: raw output work differs |
+| Fixed decode | 111.743 | 80.631 | 171; 512/512 | Equal-work performance target failed |
+| Long retrieval | 294.907 | 441.550 | 7812; 31/32 | Descriptive task latency only: raw output work differs |
+
+Raw completion counts are preserved, including different EOS accounting.
+The overall strict comparison is inconclusive because short/long output counts
+differ; that does not erase the eligible decode failure. Both reference
+long-request KV-space retries remain in its timings. Model load, explicit CPU
+expert-page preparation and warmups are excluded. Both measured performance
+phases had zero server physical-read bytes and major faults. F16 used the
+ordinary sequence path, not packed F32 batching.
+
+The separate F32 packed-batching campaign has an **unresolved quality failure**:
+the staggered long response returned drafting commentary instead of a hash-table
+explanation and stopped at 189 tokens, failing its exact 512-token requirement.
+An exact serial replay on the same F32 process also returned a non-answer,
+stopping at 179 tokens. Concurrency alone therefore does not explain the failure;
+these observations do not isolate precision, a kernel, or an optimization as
+its cause. Saved traces show the actual end-of-turn token after the planning
+prose. The serial SSE stream contains content deltas and a normal stop, with no
+hidden final answer or separate reasoning delta. The successful F16 decode request also differs in its validation tag
+and prompt-token count, so it is not a controlled F16/F32 causal comparison.
+
+Fresh scheduler records prove actual `BatchedPaged` execution: three copy
+requests were served together, and staggered admission produced five mixed
+prefill/decode steps with up to four served requests. Plain/parallel copies and
+all three late JSON responses passed. Three separate no-speculation regression
+fixtures also passed: edited copy, a following exact answer and an exact output
+budget. These successes do not regrade the failed staggered case. The original
+nine requests plus the serial replay and three regression fixtures all reported
+zero cached tokens. An explicit failed-campaign cleanup preserves failed quality.
+The independently audited four-request n-gram continuation passed output parity
+against the unchanged successful no-speculation baselines. It recorded 138
+accepted tokens from 225 drafts, 34 verification steps and 17 rollbacks. The
+edited-copy case exercised 15 rollbacks; the following request returned the
+expected one-token answer, and the final budget case stopped at exactly 17
+tokens with `finish_reason=length`. This used `TS_SPEC_ADAPTIVE=0` and a separate
+F32 mechanism configuration. It establishes those mechanism checks, not an
+isolated speculation speedup or a repair of the failed staggered answer.
+The separate F16 displaced-prefix probe passed independent stopped-campaign
+audit. All four requests, including the warmup, returned exact answers. The first
+request had 222 prompt/5 output tokens and no reuse, an unrelated displacement
+had 156/1 and no reuse, and the continuation had 248/16 with 224 cached tokens.
+Fresh telemetry confirmed restoration from radix pages and a first prefill
+position of 224, leaving 24 new prompt tokens. The restored prefix exceeds the
+displacement request's 157 total tokens. This proves the tested cross-request
+cache reuse, without claiming a cache speedup or changing the failed F32 result.
+
+The reference passed 12 of the 13 bounded quality fixtures; its adversarial
+schema response was literal `OVERRIDE` and failed. Cooperative JSON output is
+not evidence of enforced schema grammar. Neither engine's fixture count
+establishes general model-quality parity or superiority.
+
+The generated evidence includes the
+[F16 campaign and unchanged paired analysis](../validation/muse-spark/q3-final-v4r2-performance-complete/independent-audit.json),
+[resource and actual-use summary](../validation/muse-spark/q3-final-v4r2-performance-complete/completed-campaign-summary.json),
+[failed F32 campaign, serial replay and cleanup](../validation/muse-spark/q3-f32-nospec-failed-cleanup-v4r2-complete/SUMMARY.md),
+[independent n-gram continuation](../validation/muse-spark/recovery-ngram-offline-audit.json),
+and [displaced-prefix reuse](../validation/muse-spark/recovery-prefix-offline-audit.json).
+These ignored reports are produced by validation and may be absent from a fresh
+source checkout. The recorded source manifest is
+`f8615e93fb90286076ce21e4db15c516735d722b457fb562beaaa7a46f940f56`;
+the native library SHA256 is
+`9e7e7153a65a3fdf8ef4499a39c8c9a46a15d2a8b83c313dcdd1c19684fb8e71`.
+A later, independently validated repair clears paged-attention sessions owned
+by the calling thread before backend teardown/recreation. It is not part of
+these full-model benchmark binaries. Those fresh-process model runs did not
+recreate their backend, so this lifecycle finding does not explain the F32
+non-answer. Workers on other threads must still drain before backend teardown;
+the repair does not claim to clear every thread's cache. See the
+[isolated lifecycle audit](../validation/muse-spark/lifecycle-completed-review/accepted-audit.json) and
+[final applied-source receipt](../validation/muse-spark/final-applied-source/receipt.json).
+Full-model inference and timing were not rerun on the repaired library.
+
+## Launching the sharded model
+
+Keep every shard of the selected quantization in one directory and pass the
+first shard (`UD-Q4_K_XL` has twelve; `UD-Q3_K_XL` has ten).
+The following Q3 configuration is the explicit F16 evaluation profile for five
+A40 GPUs, each with 46,068 MiB total memory and 45,490 MiB initially usable,
+a 233.762 GiB container memory limit and a CPU quota of
+40.8 cores. It places the first 32 expert layers on the CPU (182 GiB of expert
+weights), uses 32 CPU worker threads and assigns decoder layers as
+`35,7,7,7,6`. The shared KV pool holds 16,384 tokens total, with at most four
+active requests and a 16,384-token ceiling per request. It does not reserve
+four simultaneous 16K contexts. The six optimization switches below are opt-ins
+for this profile; their implementation defaults remain off. Prefix caching and
+speculation are disabled to control the matched performance workload. The
+completed F16 results above use this profile; they do not establish general
+quality parity, and the measured equal-work decode target failed.
+
+```bash
+MAX_CONTEXT=16384 TS_KV_INITIAL_TOKENS=2048 \
+TS_SCHED_NUM_BLOCKS=1024 TS_SCHED_BLOCK_SIZE=16 TS_SCHED_MAX_RUNNING_SEQS=4 \
+TS_SCHED_MAX_BATCHED_TOKENS=256 TS_SCHED_PREFILL_CHUNK=256 \
+TS_SCHED_SOLO_PREFILL_CHUNK=256 TS_MUSE_SPARK_PREFILL_CHUNK=256 \
+TS_MUSE_SPARK_LAYER_SPLIT=35,7,7,7,6 TS_MUSE_SPARK_STREAM_EXPERTS=0 \
+TS_MUSE_SPARK_RELEASE_GPU_SOURCE_PAGES=1 TS_MUSE_SPARK_FUSE_RESIDUALS=1 \
+TS_MUSE_SPARK_FUSE_QK_PREP=1 TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=1 \
+TS_MUSE_SPARK_KV_UPLOAD_2D=1 TS_MUSE_SPARK_REUSE_NORM_SCRATCH=1 \
+TS_GGML_CPU_THREADS=32 TS_CPU_MOE_THREADS=32 OMP_NUM_THREADS=32 \
+DOTNET_PROCESSOR_COUNT=40 TS_CODE_EXEC=0 TS_HOST_MOE_TIMING=0 \
+dotnet run --project TensorSharp.Server.Host -c Release -- \
+  --model /workspace/models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
+  --mmproj /workspace/models/muse-spark/mmproj-Q8_0.gguf \
+  --backend ggml_cuda --layer-split 5 --n-cpu-moe 32 --cpu-moe-threads 32 \
+  --kv-cache-dtype f16 --host 127.0.0.1 --port 8083 --max-tokens 512 \
+  --no-webui --no-skills --no-multi-agent --sampling-precedence request \
+  --no-prefix-cache --no-spec
+```
+
+This command is a configuration example. Reproducible campaigns launch the
+exact tested server DLL and native library from an isolated build and retain
+their hashes; rebuilding with `dotnet run` does not reproduce that binary
+identity. F16 can serve overlapping HTTP requests through the ordinary sequence
+scheduler. That does not execute the packed F32 `ForwardBatch` path, and request
+overlap alone is not proof of packed continuous batching.
+
+For matched evaluation, the HTTP harness also sends `skills: []`,
+`skills_discovery: false` and `multi_agent: false` to TensorSharp, while retaining
+caller-declared tools. These request settings prevent extra server-provided
+skill/delegation instructions from changing the prompt; they do not change the
+decoder. No-cache measurements additionally send `cache_prompt: false`, disable
+prefix caching at server launch as above, and verify the observed reuse count.
+
+Use `--kv-cache-dtype f32 --continuous-batching` when evaluating the packed
+paged text path, and reduce all four batch/prefill row limits above from 256 to
+128 for the bounded F32 validation profile. That mechanism-test profile also
+sets `MAX_CONTEXT=8192` and `TS_SCHED_NUM_BLOCKS=512`: an 8192-token ceiling and
+8192-token shared pool leave more space for compute scratch on this machine;
+they do not provide four simultaneous 8K contexts. Explicitly set
+`TS_MUSE_SPARK_KV_UPLOAD_2D=0`, because that option applies to the ordinary F16
+attention path. Keep streaming disabled for the base profile. Packed batches
+require F32 KV and text-only requests; pending image embeddings select the
+ordinary path. This exact F32 mechanism profile produced the packed scheduler
+records and the unresolved staggered/serial quality failures described above.
+It must not be treated as a validated replacement for the F16 profile. The separate n-gram continuation passed its bounded mechanism checks;
+the separate F16 displaced-prefix probe also passed independent acceptance.
+
+F32 KV uses twice the storage of F16. Keep each comparison's cache precision,
+context and scheduler configuration identical across engines. For the F16
+profile above, llama.cpp's `--ctx-size 16384 --kv-unified
+--kv-unified-per-slot 16384 --parallel 4` preserves the same aggregate capacity
+and request ceiling. Its whole-layer split includes the output projection, so
+the corresponding settings are `--split-mode layer --tensor-split 35,7,7,7,7`.
+The llama.cpp option name does not mean TensorSharp implements tensor-parallel
+matrix sharding.
+
+Use the process/container memory limit when budgeting host experts. The Q4
+profile with 42 offloaded layers needs approximately 334 GiB for those expert
+weights alone; it cannot keep them resident in this 233.762 GiB container even
+if the host reports 504 GiB RAM. Its full-model attempt was stopped before HTTP
+readiness after severe paging and is not a passing inference test.
+`eng/validation/sample-inference-hardware.py` records cgroup limits separately
+from host capacity. `eng/validation/muse-spark-launch-plan.py` estimates placement
+from complete shard headers and explicit KV, projector, runtime and streaming
+reserves; an estimated fit still requires measured memory peaks.
+
+For images, pass the matching Spark release's `--mmproj` as shown above.
+Its projector type is `muse-glimmer`, but its output width must match the Spark
+decoder (8192). A Muse-Glimmer-30B projector has a different output width and is
+rejected. OpenAI-compatible requests can include `image_url` content parts.
+Image spans are retained across internal prefill chunks, injected before the
+embedding RMSNorm, and consumed through the normal attention path.
+
+Use `--spec --spec-type ngram --spec-draft 8` to request weight-free speculation.
+This replaces `--no-spec` in the example. A bounded F32 mechanism probe may set
+`TS_SPEC_ADAPTIVE=0` to keep the adaptive governor from disabling speculation;
+that is a test configuration and does not validate the default adaptive policy.
+Acceptance depends on repeated text in the prompt/output. Verify actual draft
+proposals and accepted tokens before claiming that speculation accelerated a
+workload; an enabled flag alone does not establish a speedup.
+
+`TS_MUSE_SPARK_LAYER_SPLIT` optionally supplies a positive layer count for each
+GPU, with counts summing to 62. Without it, TensorSharp balances contiguous
+layer groups by resident weight bytes, accounting for CPU expert offload and
+the embedding/output matrices. KV cache, image encoder and compute scratch
+need additional memory. Layer placement executes successive layer groups on
+different devices; it does not shard one matrix multiplication across GPUs.
+
+## Architecture and numerical ordering
+
+The released metadata declares 62 blocks, hidden width 8192, 128 query heads,
+16 KV heads, head dimension 64, 256 experts with top-8 routing, and expert
+latent/intermediate widths of 4096. Its maximum advertised context is
+1,048,576 tokens; that metadata value is not evidence that the current
+implementation or a particular machine has been validated at that context.
+The configured operational context should fit the actual memory budget.
+
+Each block follows this order:
+
+1. Pre-attention RMSNorm, Q/K/V and attention-gate projections, per-head Q/K
+   RMSNorm. Apply adjacent-pair RoPE only on layers marked sliding in the GGUF
+   boolean pattern; global layers use NoPE.
+2. GQA causal attention with a 2048-token window on sliding layers. Normalize
+   the attention output per head, multiply by the sigmoid gate, project back
+   to the residual width, and apply the unweighted post-attention RMSNorm.
+3. Combine the residual and branch using the GGUF's per-channel alpha/beta
+   weights. These coefficients are already converted from the source gates.
+4. Normalize the FFN input. The router reads this full-width stream while a
+   separate projection and norm move expert inputs into the latent space.
+5. Select experts using `sigmoid(router_logits) + correction_bias`. The
+   correction bias affects selection only. Normalize the selected unbiased
+   sigmoid scores, with the same lower bound as the reference implementation,
+   and apply the configured routing scale.
+6. Run each selected expert's SwiGLU projections. Multiply each expert's output
+   by the post-expert scale and RMS-normalize it **before** multiplying by its
+   routing weight and summing experts. Moving this norm after the sum changes
+   the model.
+7. Project out of the latent space, multiply by the FFN post-norm scale, apply
+   RMSNorm, and combine with the FFN residual using its alpha/beta weights.
+
+Input token/image embeddings receive an unweighted RMSNorm. The final stream
+receives a learned RMSNorm and output projection, followed by logit scaling
+(`0.17677669` for the release) and tanh softcapping at 20. Block post-norms use
+the separate GGUF post-norm epsilon. Delta norm weights and Q MetaP scaling
+are already folded into the GGUF tensors and must not be applied again.
+
+## Optimizations and current limits
+
+The native expert graph batches selected experts with `mul_mat_id` and performs
+the order-sensitive expert norm, routing multiply and reduction in one graph.
+Offloaded experts run on the CPU by default. The experimental
+`TS_MUSE_SPARK_STREAM_EXPERTS=1` option lets prefills of at least
+`TS_HOST_MOE_DEVICE_MIN_BATCH` rows (default 128) stream selected experts to
+the layer's GPU. It supports layer splitting and checks the measured full
+expert-stack graph allocation against actual free VRAM plus its reusable
+buffer before choosing the GPU. A `[muse-spark-stream]` diagnostic records the
+decision and memory sizes; insufficient headroom keeps the work on the CPU.
+Synthetic native tests cover the streaming mechanism, but full-checkpoint
+streamed quality and performance remain unestablished. The F16 profile above
+keeps this option disabled. The managed fallback groups routed tokens by expert
+to batch GEMMs.
+
+`TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=1` opts into retaining one CPU graph arena
+for Spark's offloaded experts across layers and chunks. Set it in the process
+environment before loading the native library. Caller-owned weights and
+activations remain externally bound; each call uploads fresh routes, biases
+and norm weights. The arena is protected by the host compute mutex and freed
+before backend teardown. Other models keep their existing allocation path.
+A first-success diagnostic reports actual allocated bytes; the native
+`TSGgml_GetMuseSparkCpuMoeScratchState` query reports retained bytes and successful
+arena dispatches. This option is off by default. Completed CPU/CUDA component
+tests and an actual Q3 layer-0 CPU comparison with synthetic activations/routes
+check its numerical behavior; the latter is not a full-decoder throughput test.
+Actual use was also recorded in the combined F16 campaign; its result does not
+isolate this option's end-to-end contribution.
+
+On Linux CUDA, `TS_MUSE_SPARK_RELEASE_GPU_SOURCE_PAGES=1` opts into advising
+away source-file pages after a successful upload and an exact resident-device
+copy check. It retains the GGUF mappings, host pointers and cache keys for
+fallback or re-upload. CPU/streamed experts, CPU embedding gathers and copied
+fusion buffers are excluded. The advice covers only complete pages within
+each tensor, using the original shard handle. Diagnostics count newly advised
+weights and whole-page bytes once per weight; advice is not a guarantee of
+physical eviction. This option remains off by default. The F16 campaign recorded
+277 weights and 193,806,282,752 bytes cumulatively advised, along with measured
+memory and I/O evidence. Those observations do not prove that every advised page
+was evicted or isolate a throughput gain from this option.
+
+`TS_MUSE_SPARK_FUSE_RESIDUALS=1` opts into a single GGML graph for each
+post-normalization gated residual on CPU and CUDA, including packed batches.
+The FFN channel scale stays before normalization; alpha and beta stay on the
+two residual branches. A diagnostic confirms the first successful dispatch.
+Other backends retain the original operations. This option remains off by
+default. The completed combined F16 profile recorded successful use; it is not
+an isolated residual-fusion speed comparison.
+
+`TS_MUSE_SPARK_FUSE_QK_PREP=1` combines per-head Q/K normalization and the
+sliding layers' RoPE in one GGML graph on CPU and CUDA. It requires the fused
+Q/K/V/gate projection; separate projections and other backends retain their
+existing path. Global layers preserve NoPE. Q/K preparation and fused residual
+graphs reuse device-local scratch with fresh inputs on every call. A diagnostic
+confirms the first successful Q/K dispatch. This option is off by default.
+Successful use was recorded in the completed combined F16 campaign; a separate
+controlled comparison would be needed to attribute a performance gain to it.
+
+`TS_MUSE_SPARK_KV_UPLOAD_2D=1` uses two strided GGML transfers for Spark's F16
+K/V attention window, replacing separate transfers for each KV head. It keeps
+the same host-authoritative cache, transferred bytes, window offsets and cache
+lifecycle. GGML CPU and CUDA support this option; other models and the paged
+F32 path retain their existing transfers. A diagnostic confirms the first
+successful dispatch. This option is off by default. Completed component checks
+include CPU, CUDA and two-device cases, plus tiny-model chunking, prefix
+restoration and speculative rollback. Actual F16 use and whole-campaign timing
+are recorded above, without an isolated performance claim for this option.
+
+`TS_MUSE_SPARK_REUSE_NORM_SCRATCH=1` opts into Spark-only RMS normalization
+scratch reuse on GGML CPU and CUDA, and combines attention-output per-head
+normalization with its sigmoid gate. The learned scales remain after RMSNorm;
+other backends and the default configuration retain the original operations.
+The shared arena follows the existing serialized compute contract, and all
+results are copied back before the next operation can reuse its storage.
+Successful reuse and successful head norm/gate execution have separate first-use
+diagnostics. If reuse allocation fails, a fresh allocation is used and logged
+as fallback, not as executed reuse. This option is off by default. Completed
+CPU, CUDA and two-device numerical/lifecycle tests and tiny-model equivalence
+checks validate the tested paths, including backend recreation from rank 1.
+The combined F16 campaign also recorded both successful-use diagnostics and
+passed its bounded quality fixtures. Neither those fixtures nor the component
+checks establish general quality parity or an isolated normalization speedup.
+
+Across the six enabled optimization options, the completed F16 log contains
+seven successful-use records: Q/K preparation, residual fusion, F16 2D KV upload,
+CPU expert scratch, source-page advice, weighted RMS scratch and head norm/gate
+scratch. The last two belong to one option. Streaming is separately disabled;
+it is not a seventh enabled optimization. A first-use record establishes at
+least one successful use, not dispatch frequency or an isolated speedup.
+
+Attention uses fused GGML attention operations; F16 and paged sliding layers
+submit only the live key window. Prefill chunks bound activation memory. Prefix snapshots
+and speculative rollback preserve the accepted linear KV prefix. The model
+does not yet have a captured whole-decoder CUDA graph. Host router transfers,
+per-operation dispatch and the host-backed paged path remain performance costs.
+
+## Reproducing validation
+
+The completed frozen v4r2 component run used unchanged upstream ggml revision
+`a05c9922613c6a2230dbb1d0de679519ecafb4f0` and the same isolated native/managed
+binaries across its component, microbenchmark and regression checks:
+
+| Check | Observed result | Scope |
+|---|---|---|
+| Native CTest suite | 24 passed, zero failed/skipped | CPU, CUDA and two-device cases, including norm/gate teardown and recreation |
+| Selected managed CPU lane | 95 passed with CPU expert arena off; the same 95 passed with it on | Component/tiny-model checks; actual opt-in execution is asserted |
+| Selected managed CUDA lane | 23 passed with CPU expert arena off; the same 23 passed with it on | Component/tiny-model checks including two-device cases; zero skips |
+| Broad managed regression | 1,524 passed, zero failed, seven explicitly skipped | Six unavailable model/tokenizer fixtures and one Windows-only platform test are not passes |
+| Backend/CLI/warmup supplement | 25 cases passed in each CPU/CUDA lane, zero failed/skipped | 25 distinct cases executed twice, not 50 distinct tests |
+
+All four selected managed lanes had zero failures/skips. They contain 118
+distinct result names and 236 executions; do not count repeated arena modes as
+additional distinct tests or add overlapping component and broad suites into
+one coverage total. The Q3 expert
+microbenchmark compared arena off/on in separate processes in both orders for
+layer 0, 32 threads and 1/128/256 rows. Output hashes matched exactly and measured
+repeats had zero process read bytes and major faults. It used synthetic
+activations/routes and does not establish whole-model or llama.cpp performance.
+
+The later isolated lifecycle proof reproduced retained sessions in the original
+CPU/CUDA/two-GPU lanes, then verified cleanup after three recreations and three
+shutdowns per fixed lane. Fixed CPU and two-GPU lanes each passed 15 numerical
+graphs and 60 corruption controls; the CUDA lane passed 9 graphs and 36 controls.
+The broader fixed-library suite passed 27 native cases and fresh managed lanes
+of CPU Muse 95, CPU backend/lifecycle 25, CUDA Muse 23 and CUDA backend/lifecycle
+25, with no failures or skips. These repeat existing component cases and are
+not added to the earlier coverage totals. The original absolute-error failure,
+bounded CUDA rounding diagnosis and console-only loader-audit failure remain
+preserved in the [isolated proof](../validation/muse-spark/lifecycle-completed-review/accepted-audit.json).
+The native libraries used a scoped partial relink; continuations rebuilt only
+the fixture and reused those exact libraries. This was component validation,
+not a post-repair full-model run.
+The final reusable validation tool requires all 27 native cases, including the
+three lifecycle lanes; 27 local Python guard tests separately verified that
+selection. Those tooling tests are not additional device tests.
+
+`eng/validation/validate-muse-spark-final-candidate.sh` reproduces the isolated
+build, native/component gates and CPU arena comparison from a supplied applied
+source manifest. It refuses active full servers and reused evidence directories.
+Use its matching source revision and preserve its raw logs and receipts; the
+separate broad and backend regression results are not implied by invoking this
+script alone. The separate completed F16 campaign covers this checkpoint on
+five GPUs, its selected quality fixtures and matched timing cases. Actual packed
+F32 scheduling has runtime evidence but an unresolved answer-quality failure.
+The separately continued n-gram full-model checks passed, including verified
+acceptance and rollback. The separate F16 displaced-prefix probe also passed.
+Component passes cannot substitute for these independently recorded runtime
+checks.
+
+The test project builds a tiny deterministic model with both sliding and global
+layers, GQA, routing correction, latent experts, nonuniform post-expert scales,
+residual gates and output softcapping. Its independent scalar decoder checks
+every output logit, chunked prefill/decode, KV restoration, and image embedding
+spans. This proves those tested numerical paths; it does not measure the 816B
+model's semantic quality or production throughput.
+
+`eng/validation/muse-spark-llama-reference.cpp` links to an unchanged llama.cpp
+build and exports all logits for exact token IDs. Compare it with the managed
+and scalar-oracle exports using `eng/validation/compare-muse-spark-logits.py`.
+The initial F32 CPU comparison covered 8 positions × 256 logits with reference
+chunk sizes 1 and 5; the maximum TensorSharp/reference difference was below
+`6.4e-7`, with matching greedy choices at every position.
+
+`eng/muse-spark-validate.py` runs strict HTTP fixtures for short/long prompts,
+JSON/schema/Unicode output, tool round trips, dependent agent workflows,
+image layouts, request isolation, cache-token reuse and staggered arrivals.
+The optional `image_chart` scenario also checks two bar rankings and visible
+four-digit OCR codes using deterministic fixtures.
+It emits JSON plus Markdown, distinguishes unavailable scenarios from passes,
+and refuses a parity verdict when model hashes, hardware/settings, request
+coverage or token counts differ, or an actual engine launch
+has not been established. Conversation latency uses the same client's monotonic
+wall clock; different engine-internal timers do not prevent that comparison.
+Engine decode-rate comparisons require a common timing definition. Inspect its `--help` for the
+provenance manifest and matching-engine commands. Internal batching,
+speculative acceptance, CPU offload and multi-GPU execution need additional
+runtime evidence; HTTP overlap alone does not prove their implementation.
+The completed campaign evidence above distinguishes actual packed execution,
+failed answer quality and passing independent n-gram and displaced-prefix
+checks.
+
+Generated logs/reports belong in ignored `docs/validation/muse-spark/` or
+`artifacts/`. The recorded evidence does not establish general model-quality
+parity, and the measured equal-work decode performance target is not met.
+Architecture support, synthetic numerical tests and passing bounded fixtures
+must not be presented as proof of general quality or performance superiority.

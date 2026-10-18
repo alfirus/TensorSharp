@@ -34,6 +34,9 @@ namespace TensorSharp.Models
         public IMultimodalInjector MultimodalInjector { get; }
         public IBackendExecutionPlan ExecutionPlan { get; }
 
+        /// <summary>Every GGUF file opened for this checkpoint, including sibling shards.</summary>
+        public IReadOnlyList<string> ModelFilePaths => _gguf?.FilePaths ?? Array.Empty<string>();
+
         protected readonly GgufFile _gguf;
         private readonly GgmlContext _ggmlContext;
         // False when the context belongs to a caller-supplied tensor-parallel group, which
