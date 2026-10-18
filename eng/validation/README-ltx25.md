@@ -19,9 +19,10 @@ retake/refinement, specialized control pipelines and multi-GPU remain unsupporte
 
 `config/ltx-2.5-distilled.json` pins five verified files and starts at 1024×1024
 output (512×512 first pass), 17 frames, 24 fps. TensorAgent enables Download/Use for
-`ltx-2.5-distilled-q4km`. The conservative 48 GB catalog tier is not an established
-minimum for arbitrary shapes. Both downloaders support current-host Hugging Face
-credentials for gated official files; tokens never go to mirrors/CDN redirects.
+`ltx-2.5-distilled-q4kxl`, using Unsloth's distilled UD-Q4_K_XL and its ungated,
+byte-identical companion mirrors (43.08 GB total). The conservative 48 GB catalog
+tier is not an established minimum for arbitrary shapes. Optional Ingredients
+and diffusion-decoder downloads still require publisher access.
 The preset/catalog test keeps all five names, URLs and hashes aligned.
 
 Prompt conditioning caches at most four final context pairs. The model retains
@@ -31,6 +32,55 @@ weight caches are retained; prompt connector device weights are released after
 each new prompt. `TrimIdleMemory` releases all retained components. Prompt weights
 stream per projection, and video decoder weights per convolution. Complete-generation memory
 and cache behavior must be measured separately from component measurements.
+
+## Unsloth distilled GGUF validation (2026-10-18)
+
+Generated evidence is under ignored `docs/validation/unsloth-repoint-20261018/`.
+On a 48 GB M5 Pro, the mixed Q2_K/Q3_K/BF16 tensors originally expanded to dense
+F32 on MLX: peak physical footprint was 56.0 GB. TensorSharp-owned Metal kernels
+now dequantize these mapped weights to exact F32 in bounded 64 MiB slices per
+projection. The native dequant tests compare every value with the independent
+CPU implementation and exercise multiple slices and cache eviction/reload.
+
+`Ltx25EndToEndProbe`, 1024×1024×17, seed 42, two-stage 8+3 sampling, two different
+prompts in one process; an eviction was requested before each arm:
+
+| File / code | First / second generation | Peak physical footprint | MLX peak |
+|---|---:|---:|---:|
+| Unsloth UD-Q4_K_XL before the fix | 131.7 / 125.5 s | 56.0 GB | 35.3 GB |
+| Unsloth UD-Q4_K_XL with the fix | 109.7 / 107.1 s | 17.6 GB | 17.8 GB |
+| Previous Abiray Q4_K_M, same fixed code | 115.3 / 115.2 s | 27.0 GB | 22.05 GB |
+
+Both raw RGB arrays and both PCM channels remain bitwise equal across the code
+change for both files. These are one process per arm, with two prompt lifecycles;
+they are not an estimate of statistical variance. The config path was also run
+with the audio VAE missing: it downloaded and hash-verified the ungated mirror.
+The TensorAgent probe hash-verified all five files, activated the real catalog
+entry and generated video/audio through HTTP/SSE and media download routes.
+A 1280×704×121 clip took 513.5 s of generation and 36.2 s of codec work, with a
+20.2 GB MLX peak. This is one long-clip sample.
+
+Dependencies stayed unchanged: TensorSharp ggml `a05c9922613c6a2230dbb1d0de679519ecafb4f0`,
+MLX `1f8e74e3f12f31365464a6867c6579f0e9b29d85`, mlx-c pinned by `MLX_C_VERSION`.
+The newly added kernels live in TensorSharp's C# MLX integration and compile at
+runtime. CUDA was unavailable for this update; existing CUDA skips are not passes.
+Native MAUI controls and iOS were not exercised by the CoreCLR HTTP probes.
+
+Reproduce generation with the existing probe (see build instructions below):
+
+```sh
+MLX_ENABLE_TF32=0 dotnet path/to/Ltx25EndToEndProbe.dll \
+  --model models/ltx25/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf \
+  --backend Mlx --output artifacts/ltx25/unsloth.json \
+  --width 1024 --height 1024 --frames 17 --fps 24 --seed 42 --audio 1
+
+python3 eng/validation/ltx25-compare-native-generations.py \
+  --before artifacts/ltx25/before.json --after artifacts/ltx25/unsloth.json \
+  --output artifacts/ltx25/comparison.json --require-bitwise
+```
+
+The comparison requires matching checkpoint paths, prompts, inputs and settings;
+use the same command for both builds, changing only the output report path.
 
 ## Exact weight read-ahead and host overheads (2026-10-17)
 

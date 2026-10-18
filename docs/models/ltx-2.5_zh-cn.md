@@ -4,17 +4,22 @@
 
 TensorSharp 原生实现 LTX 2.5 Distilled 的文生视频、图像条件视频及联合生成的
 **48 kHz 立体声音频**。TensorAgent 的实验条目为
-**LTX 2.5 Distilled — Q4_K_M + BF16**，Download 下载五个固定文件，Use 激活模型。
+**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**，Download 下载五个固定文件，Use 激活模型。
 48 GB 目录档位是保守起点，并非已证明的最低要求或任意分辨率/时长保证。
 
 ## 文件与启动
 
 [config/ltx-2.5-distilled.json](../../config/ltx-2.5-distilled.json)
-按提交和 SHA-256 固定五份文件，共 **44,764,412,884 字节（44.76 GB）**：
-Q4_K_M 去噪器、带投影的专用 Gemma 4 编码器、卷积视频 VAE、x2 空间潜变量上采样器、
-音频 VAE。官方伴随文件需要先获得发布方 Hugging Face 仓库访问许可。
-可设置 `HF_TOKEN`、`HUGGING_FACE_HUB_TOKEN`，或使用 Hugging Face CLI token 缓存；
-凭证只附在 HTTPS `huggingface.co` 请求上，CDN 重定向不携带凭证。
+按提交和 SHA-256 固定五份文件，共 **43,077,008,276 字节（43.08 GB）**：
+UD-Q4_K_XL 去噪器、带投影的专用 Gemma 4 编码器、卷积视频 VAE、x2 空间潜变量上采样器、
+音频 VAE。全部来自无访问限制的 [Unsloth 仓库](https://huggingface.co/unsloth/LTX-2.5-GGUF)，
+固定修订为 `ac3c540c6025903784336e99b2dc179385c4c3b7`，无需 Hugging Face 账号。
+伴随文件与 Lightricks 原文件逐字节相同，配置还保留受限的官方地址作为备用。
+
+应下载 `distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf`，直接放在 `ltx25/` 下与伴随文件夹并列。
+仓库根目录的 **dev** 检查点使用另一套配方（30 步、CFG 3）；TensorSharp 拒绝文件名标注 dev 的文件，
+改名无法将其转换为蒸馏检查点。TensorAgent 新条目为 `ltx-2.5-distilled-q4kxl`，
+使用默认模型缓存时，启动迁移保留旧条目中完整的伴随文件与用户添加的适配器文件夹。
 
 配置在 `${TENSORSHARP_MODELS:-../models}/ltx25` 下查找文件。
 手动安装可用 `TS_VIDEO_TEXT_ENCODER`、`TS_VIDEO_VAE`、`TS_VIDEO_AUDIO_VAE`、
@@ -40,6 +45,19 @@ dotnet run --project TensorSharp.Cli -- \
 不支持 Vulkan 或多 GPU。GPU 测量不证明 CPU 吞吐。
 桌面 MP4 音轨需要 `PATH` 上的 FFmpeg 或 `TS_FFMPEG`，CLI 另写原始 PCM WAV；
 Mac 应用通过 AVFoundation 编码。
+
+## Unsloth 预设实测（2026-10-18）
+
+48 GB M5 Pro、MLX、`MLX_ENABLE_TF32=0`、1024×1024×17 两阶段生成、seed 42，
+同一进程的两条不同提示词分别耗时 109.7 / 107.1 秒，旧 Abiray 文件为 115.3 / 115.2 秒。
+新文件的进程峰值占用为 17.6 GB，旧文件 27.0 GB。混合 Q2_K/Q3_K/BF16 权重现在保持映射，
+逐次投影精确解量化到 F32；修复前一次性展开会导致 56 GB 占用。修复前后原始视频与音频逐比特相同。
+
+以更高精度的 Unsloth Q8_0 为参考，狐狸/灯塔两条样本的 PSNR 为 26.6/30.8 dB，旧量化为
+25.1/23.0 dB。这两条样本支持当前选择，但不能证明通用质量排名。
+1280×704×121 样本生成耗时 513.5 秒、编码 36.2 秒，MLX 分配峰值为 20.2 GB。
+CLI 配置下载与真实 TensorAgent HTTP/SSE 生成、媒体下载路径已验证；本轮未重测 CUDA、iOS
+或原生 MAUI 控件。工具与限制见[验证说明](../../eng/validation/README-ltx25.md#unsloth-distilled-gguf-validation-2026-10-18)。
 
 ## 两阶段生成与限制
 

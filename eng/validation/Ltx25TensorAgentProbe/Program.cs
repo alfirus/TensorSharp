@@ -14,7 +14,7 @@ string assets=Path.GetFullPath(Arg("--assets")),backend=Arg("--backend","mlx");
 string workspace=Path.GetFullPath(Arg("--workspace",Path.Combine("artifacts","ltx25","tensoragent-e2e-"+Guid.NewGuid().ToString("N"))));
 string output=Path.GetFullPath(Arg("--output",Path.Combine(workspace,"report.json")));
 string mode=Arg("--mode");bool identityMode=mode=="ref";
-int width=int.Parse(Arg("--width",identityMode?"768":"512")),height=int.Parse(Arg("--height",identityMode?"448":"512")),frames=int.Parse(Arg("--frames",identityMode?"121":"17")),fps=int.Parse(Arg("--fps","24"));
+int width=int.Parse(Arg("--width",identityMode?"768":"1024")),height=int.Parse(Arg("--height",identityMode?"448":"1024")),frames=int.Parse(Arg("--frames",identityMode?"121":"17")),fps=int.Parse(Arg("--fps","24"));
 long seed=long.Parse(Arg("--seed","42"));string prompt=Arg("--prompt","A small red fox walks through a quiet grassy meadow, natural daylight, gentle camera motion.");
 bool verify=bool.Parse(Arg("--verify-hashes","true"));
 int repeats=int.Parse(Arg("--repeats","1"));
@@ -32,7 +32,7 @@ var executions=new List<object>();
 object? chatExecution=null;
 try
 {
-CatalogModel entry=ModelCatalog.Find("ltx-2.5-distilled-q4km")??throw new InvalidOperationException("Missing LTX catalog entry.");
+CatalogModel entry=ModelCatalog.Find("ltx-2.5-distilled-q4kxl")??throw new InvalidOperationException("Missing LTX catalog entry.");
 if(!entry.IsAvailable)throw new NotSupportedException(entry.UnavailableReason);
 if(backend is not ("mlx" or "cuda"))throw new ArgumentException("This real generation probe requires mlx or cuda.");
 Directory.CreateDirectory(workspace);
@@ -41,7 +41,7 @@ string destination=Path.Combine(paths.ModelsDirectory,entry.Id);Directory.Create
 var installed=new List<object>();
 foreach(CatalogFile file in entry.Files)
 {
-    string subdirectory=file.Role switch{CatalogFileRole.TextEncoder=>"text_encoders",CatalogFileRole.Vae or CatalogFileRole.AudioVae=>"vae",_=>""};
+    string subdirectory=file.Role switch{CatalogFileRole.TextEncoder=>"text_encoders",CatalogFileRole.Vae or CatalogFileRole.AudioVae=>"vae",CatalogFileRole.LatentUpscaler=>"latent_upscale_models",_=>""};
     string source=Path.Combine(assets,subdirectory,file.FileName);
     using(var stream=File.OpenRead(source))
     {
@@ -179,7 +179,7 @@ if(chatTurn)
     JsonElement videoFrame=chatEvents.LastOrDefault(e=>e.TryGetProperty("videoUrl",out var url)&&url.ValueKind==JsonValueKind.String);
     if(videoFrame.ValueKind!=JsonValueKind.Object||!chatEvents.Any(e=>e.TryGetProperty("done",out var done)&&done.ValueKind==JsonValueKind.True))
         throw new InvalidDataException("Normal chat did not finish with a generated video.");
-    foreach(var expected in new[]{("width",identityMode?768:512),("height",identityMode?448:512),("frames",identityMode?121:17),("fps",24)})
+    foreach(var expected in new[]{("width",identityMode?768:1024),("height",identityMode?448:1024),("frames",identityMode?121:17),("fps",24)})
         if(videoFrame.GetProperty(expected.Item1).GetInt32()!=expected.Item2)throw new InvalidDataException("The normal chat did not apply the LTX recipe: "+expected.Item1);
     if(!videoFrame.GetProperty("hasAudio").GetBoolean()||videoFrame.GetProperty("audioUrl").ValueKind!=JsonValueKind.Null)
         throw new InvalidDataException("Normal chat must deliver its generated soundtrack inside the MP4.");

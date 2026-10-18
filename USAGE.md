@@ -526,7 +526,7 @@ script gets that error instead of watching a setting be ignored.
 | `--qwen-image-vae <path>` | Override the resolved Qwen-Image-2.1 VAE companion (default: the `qwen_image_2.1_vae*.safetensors` file next to the DiT GGUF). Env: `TS_QWEN_IMAGE_VAE`. |
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
-| `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds. The GGUFs carry no metadata and Turbo has the base checkpoint's tensors, so the host declares it: `turbo` samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1, refuses other step counts and refuses step-distillation `--lora` plug-ins. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so; any other is `base`. Refused with any other model. Env: `TS_QWEN_IMAGE_VARIANT`. See [Qwen-Image-2.1-Turbo](docs/models/qwenimage21.md#qwen-image-21-turbo). |
+| `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds. The GGUFs name at most their architecture and Turbo has the base checkpoint's tensors, so the host declares it: `turbo` samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1, refuses other step counts and refuses step-distillation `--lora` plug-ins. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so; any other is `base`. Refused with any other model. Env: `TS_QWEN_IMAGE_VARIANT`. See [Qwen-Image-2.1-Turbo](docs/models/qwenimage21.md#qwen-image-21-turbo). |
 | `--lora <path>` | LoRA plug-in for Qwen-Image-2.1 or MiniMax-H3 (FL2VA). Qwen-Image-2.1: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)); repeat to stack LoRAs. MiniMax-H3: one `minimax-h3-lora` config only, `config/lora/minimax-h3-fl2v-turbo-8step.json` or `-4step.json`, which locks `--diffusion-steps`, `--flow-shift`, `--sampler` and `--cfg` to its recipe and is refused on the Ref2VA checkpoint. Applied unmerged on top of the quantized transformer. A plug-in the model does not take is refused at startup, before the plug-in downloads; when a `--config` still has to download the model, the model's family is checked right after that download (a contradicting sampling flag is refused before it). Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins) and [MiniMax-H3 Turbo plug-ins](#minimax-h3-turbo-plug-ins). |
 | `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. MiniMax-H3 refuses a negative strength: its Turbo schedule is distilled at 1, and 0 keeps the adapter's terms with zero up factors. |
 | `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. A MiniMax-H3 plug-in config here must name the preceding `--lora`'s weights file in its `"weights"` entry, and its recipe stays locked. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
@@ -1277,9 +1277,9 @@ grids, how the adapter is applied, the backends and what has been validated.
 ## Video generation with audio (LTX 2.5 Distilled)
 
 LTX 2.5 jointly generates video and 48 kHz stereo audio from text, a first/last
-frame, or timed image keyframes. Use the pinned five-file preset (44.76 GB);
-its official companions require approved Hugging Face access and `HF_TOKEN`,
-`HUGGING_FACE_HUB_TOKEN` or the Hugging Face CLI token cache.
+frame, or timed image keyframes. The pinned five-file preset uses Unsloth's distilled
+UD-Q4_K_XL and byte-identical companion mirrors (43.08 GB), with no account or token
+needed. The optional Ingredients adapter and diffusion decoder still require publisher access.
 
 ```bash
 # NVIDIA; override --backend mlx on Apple Silicon (launch with MLX_ENABLE_TF32=0).

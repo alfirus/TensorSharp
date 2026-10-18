@@ -4,7 +4,7 @@
 
 TensorSharp implements native text-to-video and image-conditioned video with jointly
 generated 48 kHz stereo audio for the LTX 2.5 Distilled checkpoint. The experimental TensorAgent entry is
-**LTX 2.5 Distilled — Q4_K_M + BF16**; Download installs all five pinned files,
+**LTX 2.5 Distilled — UD-Q4_K_XL + BF16**; Download installs all five pinned files,
 and Use activates the video model.
 
 ## Files and startup
@@ -12,11 +12,18 @@ and Use activates the video model.
 [`config/ltx-2.5-distilled.json`](../../config/ltx-2.5-distilled.json) pins the
 denoiser, dedicated Gemma 4 text encoder/projections, convolutional video VAE,
 x2 spatial latent upscaler and audio VAE by commit and SHA-256. They total
-44,764,412,884 bytes. The official
-companions require approved access to the publisher's Hugging Face repository.
-Set `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`, or use the Hugging Face CLI token cache.
-Credentials are attached only to HTTPS `huggingface.co` requests, and are stripped
-from redirected CDN requests.
+43,077,008,276 bytes (43.08 GB), all from the ungated
+[Unsloth repository](https://huggingface.co/unsloth/LTX-2.5-GGUF), revision
+`ac3c540c6025903784336e99b2dc179385c4c3b7`. No Hugging Face account is needed.
+The companions are byte-identical to the Lightricks files; the config also lists
+their gated originals as fallback URLs.
+
+Use `distilled/ltx-2.5-22b-distilled-UD-Q4_K_XL.gguf`, installed directly in
+`ltx25/` beside its companion folders. The repository root holds the **dev**
+checkpoint, which needs a different sampler recipe (30 steps, CFG 3).
+TensorSharp refuses dev-named files; renaming one does not turn it into a distilled model.
+TensorAgent's current id is `ltx-2.5-distilled-q4kxl`. For the default model cache, launch migration preserves
+the previous entry's complete companions and user-added adapter folders.
 
 The config resolves files under `${TENSORSHARP_MODELS:-../models}/ltx25`.
 Manual installations can instead set `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`,
@@ -40,6 +47,24 @@ CPU implementation; GPU generation measurements do not establish CPU throughput.
 Vulkan and multi-GPU execution are unsupported. Desktop MP4 audio requires
 FFmpeg on `PATH` or `TS_FFMPEG`; the CLI also writes the original PCM as a WAV.
 The Mac app encodes audio/video through AVFoundation.
+
+## Measured Unsloth preset (2026-10-18)
+
+On a 48 GB M5 Pro, MLX with `MLX_ENABLE_TF32=0`, two-stage 1024×1024×17,
+seed 42, the new UD-Q4_K_XL took 109.7 / 107.1 seconds for two different prompts
+in one process, versus 115.3 / 115.2 seconds with the previous Abiray file.
+Peak process footprint was 17.6 GB versus 27.0 GB. The mixed Q2_K/Q3_K/BF16
+weights stay mapped and dequantize to F32 per projection; expanding them all at
+load had caused a 56 GB footprint. This fix preserves every raw video and audio bit.
+
+Against Unsloth Q8_0 as a higher-precision reference, the fox/lighthouse samples
+scored 26.6/30.8 dB PSNR, versus 25.1/23.0 dB with the previous quantization.
+These two samples support this preset choice, not a universal quality ranking.
+A 1280×704×121 sample completed in 513.5 seconds plus 36.2 seconds of encoding,
+with a 20.2 GB MLX allocation peak. CLI config downloads and the real TensorAgent
+HTTP/SSE generation and media download paths were exercised. CUDA, iOS and the
+native MAUI controls were not revalidated in this update. See the
+[validation tools and limits](../../eng/validation/README-ltx25.md#unsloth-distilled-gguf-validation-2026-10-18).
 
 ## Generation recipe and limits
 
@@ -203,7 +228,8 @@ equality between Studio and chat is a separate check from anatomy quality.
 Remaining differences from the publisher's default ComfyUI workflow: TensorSharp
 decodes with the convolutional VAE by default (the diffusion decoder is opt-in),
 passes the prompt through without the optional image-aware enhancer, and the
-preset denoiser is a third-party Q4_K_M quantization. The new shorthand image
+preset denoiser is Unsloth's mixed UD-Q4_K_XL quantization (the earlier captures
+below used Abiray Q4_K_M). The new shorthand image
 strengths match the [official ComfyUI image-to-video example](https://docs.ltx.io/open-source-model/usage-guides/image-to-video);
 the other differences remain comparison dimensions, not proven fixes for extra
 fingers. The GGUF publisher's own ComfyUI workflow uses the same model file.
