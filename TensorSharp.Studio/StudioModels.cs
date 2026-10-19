@@ -453,6 +453,9 @@ public sealed class StudioOptions
     public int MaxHistory { get; set; } = 40;
     public long MaxTimelineFrames { get; set; } = 24 * 60 * 60;
     public long MinimumFreeDiskBytes { get; set; } = 256L * 1024 * 1024;
-    public bool EnableExternalProcesses { get; set; } = !OperatingSystem.IsIOS() && !OperatingSystem.IsTvOS() && !OperatingSystem.IsAndroid();
+    // .NET also reports the Mac Catalyst desktop app as iOS. It runs ordinary
+    // desktop media tools; only the mobile Apple hosts prohibit subprocesses.
+    public bool EnableExternalProcesses { get; set; } =
+        (!OperatingSystem.IsIOS() || OperatingSystem.IsMacCatalyst()) && !OperatingSystem.IsTvOS() && !OperatingSystem.IsAndroid();
     public string? CaptionFontPath { get; set; }
 }

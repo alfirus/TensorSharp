@@ -15,6 +15,14 @@ these tools or install models. Review the
 [dependency notes](video-studio-design.md#dependency-and-licensing-decisions)
 before redistributing a media-tool build.
 
+The TensorAgent Mac Catalyst app supports the same local media pipeline as the
+desktop server. Finder launches also discover installed tools in
+`/opt/homebrew/bin` and `/usr/local/bin`; `TS_FFMPEG` and `TS_FFPROBE` can select
+explicit executables. Studio verifies a small H.264/AAC MP4 before enabling
+generation and export. On Mac desktop it prefers VideoToolbox and falls back to
+libx264 when the installed hardware encoder cannot start. Successful checks are
+cached; failed checks can recover after the tools become available.
+
 ```sh
 dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj
 TS_STUDIO_DIRECTORY="$PWD/artifacts/my-studio" \
@@ -566,6 +574,15 @@ python3 eng/studio/validate.py --connection artifacts/studio-agent/connection.js
 # With a real video model already loaded; no test double or download is used.
 python3 eng/studio/validate.py --url http://127.0.0.1:8187 \
   --generate --output artifacts/studio-native-check
+
+# Against an actual Mac Catalyst app launched with TENSORAGENT_VALIDATION_ROOT,
+# with the pinned LTX catalog assets in its isolated Cache/models directory.
+# Exercises native model selection, Studio import, real 1024x1024 joint video/audio
+# generation, thumbnails/waveforms, timeline insertion and fully decoded export.
+python3 eng/studio/validate_maui.py \
+  --connection artifacts/studio-mac-app/connection.json \
+  --app TensorAgent/src/TensorAgent.Maui/bin/Release/net10.0-maccatalyst/maccatalyst-arm64/TensorAgent.app \
+  --output artifacts/studio-mac-check
 ```
 
 After stopping/restarting the same host against the same data root, pass

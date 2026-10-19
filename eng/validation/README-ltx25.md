@@ -132,6 +132,34 @@ hits. `Ltx25TensorAgentProbe` separately activates the real catalog entry throug
 MP4/WAV through the real upload routes, using isolated pinned cache symlinks.
 Fixture download tests exercise all four roles without redownloading 43.77 GB.
 
+`Ltx25TensorAgentProbe --studio true` runs the real Studio HTTP workflow instead
+of the chat/SSE workflow: capability preflight, byte-preserving image import,
+queued native generation, library ingestion, video preview thumbnail, lossless
+last-frame extraction, timeline insertion and captured-revision H.264/AAC export.
+It fully decodes both MP4s, checks frame count and stereo audio geometry, then
+compares export pixels and PCM with the unedited generated clip. For example,
+after publishing the probe, run:
+
+```sh
+MLX_ENABLE_TF32=0 \
+TENSORSHARP_MLX_LIBRARY_DIR="$PWD/TensorSharp.Backends.MLX/Native/dist" \
+dotnet artifacts/ltx25/tensoragent-probe/Ltx25TensorAgentProbe.dll \
+  --assets /absolute/path/to/ltx25 --backend mlx --studio true \
+  --workspace artifacts/ltx25/studio-http \
+  --output artifacts/ltx25/studio-http/report.json \
+  --width 1024 --height 1024 --frames 17 --fps 24 --seed 42
+```
+
+The asset directory uses the model's `text_encoders/`, `vae/` and
+`latent_upscale_models/` layout. Hash verification defaults on. Studio mode runs
+one workflow (`--repeats 1`, `--chat-turn false`); `--image` and `--end-image`
+import real keyframes. `--reference-images` defaults to Ingredients `ref` mode,
+requiring its pinned adapter and defaulting to 768×448×121. Every report describes
+its actual coverage: these HTTP checks exclude native MAUI controls, iOS, CUDA
+when MLX is selected, long clips and subjective perceptual quality. Their timings
+include model hashing, encoding and media ingestion, with uncontrolled file/JIT
+caches, so they are functional evidence rather than matched inference benchmarks.
+
 `ltx25-maui-probe.py` exercises the actual Release Mac Catalyst app: the native
 Models page Use action, its loopback HTTP/SSE route and downloaded MP4/WAV. Launch
 with an isolated `TENSORAGENT_VALIDATION_ROOT` containing the verified cache,
