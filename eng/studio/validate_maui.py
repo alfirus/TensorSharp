@@ -5,6 +5,7 @@ Launch with TENSORAGENT_VALIDATION_ROOT and the pinned LTX catalog files linked
 into Cache/models/ltx-2.5-distilled-q4kxl. The private connection file is never
 copied into the report. Requires installed ffmpeg/ffprobe; no model doubles.
 Evidence must be written below ignored artifacts/ or docs/validation/.
+Use --image-conditioning to run image-to-video with the imported synthetic frame.
 """
 import argparse
 import array
@@ -57,6 +58,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--frames", type=int, default=17)
+    parser.add_argument("--image-conditioning", action="store_true", help="Animate the imported synthetic image as the first frame.")
     args = parser.parse_args()
     repository = Path(__file__).resolve().parents[2]
     output = args.output.resolve()
@@ -153,10 +155,14 @@ def main():
             report["executions"].append(execution)
             save()
             before = time.monotonic()
-            job = api("jobs/generate", {"projectId": project["id"], "modelId": model["modelId"],
+            generation = {"projectId": project["id"], "modelId": model["modelId"],
                       "requestId": uuid.uuid4().hex, "prompt": "A red toy car drives slowly along a quiet road in warm afternoon light.",
                       "width": 1024, "height": 1024, "frameCount": args.frames, "fps": 24,
-                      "steps": 8, "cfgScale": 1, "seed": 42, "generateAudio": True})
+                      "steps": 8, "cfgScale": 1, "seed": 42, "generateAudio": True}
+            if args.image_conditioning:
+                generation.update(mode="i2v", conditioningAssetId=project["assets"][0]["id"])
+            execution["generation_request"] = generation
+            job = api("jobs/generate", generation)
             execution["generation_job"] = wait_job(project["id"], job)
             execution["whole_generation_job_seconds"] = time.monotonic() - before
             project = api("projects/get", {"projectId": project["id"]})

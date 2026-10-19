@@ -425,6 +425,19 @@ public sealed partial class StudioService
     sealed class InlineProgress(Action<StudioProgress> callback) : IProgress<StudioProgress> { public void Report(StudioProgress value) => callback(value); }
     /// <summary>The job-directory name of a take's lossless last frame.</summary>
     internal const string LastFrameFile = "last-frame.png";
+    internal static string FailureDiagnostic(StudioJob job, Exception error)
+    {
+        var diagnostic = new StringBuilder($"Studio job {job.Id} ({job.Kind}) failed during {job.Stage}.");
+        // The job document retains the user-facing error. The durable host log adds the call sites without copying
+        // exception messages, which adapters or media tools may populate with prompts, file names or command lines.
+        for (Exception? cause = error; cause != null; cause = cause.InnerException)
+        {
+            diagnostic.AppendLine().Append(cause.GetType().FullName);
+            if (cause is StudioException studio) diagnostic.Append(" [").Append(studio.Code).Append(']');
+            if (cause.StackTrace is { } stack) diagnostic.AppendLine().Append(stack);
+        }
+        return diagnostic.ToString();
+    }
     // An adapter's output must be a regular file inside the job's own work directory.
     static string ManagedOutput(string path, string workDirectory)
     {
@@ -511,6 +524,8 @@ public sealed partial class StudioService
                 }
                 catch (Exception e)
                 {
+                    try { Options.LogJobFailure?.Invoke(FailureDiagnostic(record.Job, e)); }
+                    catch (Exception) { /* A diagnostic sink must not stop this worker or prevent the durable job save. */ }
                     lock (jobSync) { Finish(record.Job, "failed", DateTimeOffset.UtcNow); record.Job.Error = e is OutOfMemoryException ? "Insufficient memory. Release other loaded models or explicitly choose lower settings, then retry." : e.Message; SaveJob(record); }
                 }
                 finally

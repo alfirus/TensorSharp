@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using TensorSharp.Chat.Studio;
 using TensorSharp.Server.Hosting;
 using TensorSharp.Server.ProtocolAdapters;
@@ -24,7 +25,10 @@ public static class StudioEndpoints
         services.AddSingleton(sp =>
         {
             var chat = sp.GetRequiredService<WebUiAdapter>().Chat;
-            var service = new StudioService(root, new NativeStudioGenerationAdapter(sp.GetRequiredService<ModelService>(), chat), StudioHostOptions.Create(sp.GetRequiredService<ServerHostingOptions>().UploadMaxFileBytes));
+            var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TensorSharp.Studio");
+            var service = new StudioService(root, new NativeStudioGenerationAdapter(sp.GetRequiredService<ModelService>(), chat),
+                StudioHostOptions.Create(sp.GetRequiredService<ServerHostingOptions>().UploadMaxFileBytes,
+                    diagnostic => logger.LogError("{Diagnostic}", diagnostic)));
             chat.Studio = service;
             return service;
         });

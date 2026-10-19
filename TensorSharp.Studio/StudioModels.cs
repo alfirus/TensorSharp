@@ -458,4 +458,8 @@ public sealed class StudioOptions
     public bool EnableExternalProcesses { get; set; } =
         (!OperatingSystem.IsIOS() || OperatingSystem.IsMacCatalyst()) && !OperatingSystem.IsTvOS() && !OperatingSystem.IsAndroid();
     public string? CaptionFontPath { get; set; }
+    /// <summary>Receives failed-job identifiers, stages, exception types and stack traces. Generation requests,
+    /// progress details and exception messages are omitted because they can contain private prompts or media names.
+    /// A diagnostic sink's failure does not stop the job worker.</summary>
+    public Action<string>? LogJobFailure { get; set; }
 }

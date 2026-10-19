@@ -50,6 +50,12 @@ namespace TensorSharp
         /// </summary>
         public virtual void EnsureDeviceCurrent() { }
 
+        /// <summary>
+        /// Supplies allocation metadata to backends whose device dimensions have
+        /// a smaller range than the storage's total element count.
+        /// </summary>
+        protected internal virtual void SetTensorMetadata(ReadOnlySpan<long> sizes, ReadOnlySpan<long> strides) { }
+
         public abstract IntPtr PtrAtElement(long index);
 
         /// <summary>
