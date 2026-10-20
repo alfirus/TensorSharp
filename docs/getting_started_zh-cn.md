@@ -151,7 +151,7 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 
 ## 新视频、嵌入与技能工作流
 
-- [LTX 2.5 Distilled](models/ltx-2.5_zh-cn.md)：五文件预设共 44.76 GB，需要获批发布方访问权限。实验性 48 GB 档位默认使用 1024×1024×17 帧与 8+3 步两阶段配方，联合生成 48 kHz 立体声音频。
+- [LTX 2.5 Distilled](models/ltx-2.5_zh-cn.md)：五个基础文件共 43.08 GB，来自公开仓库；可选 Ingredients IC-LoRA 增加 1.31 GB，需先获 Hugging Face 授权。实验性 48 GB 档位默认使用 1024×1024×17 帧与 8+3 步两阶段配方，联合生成 48 kHz 立体声音频。
 - [MiniMax-H3](models/minimax-h3_zh-cn.md)：首帧动画选择 FL2VA，身份参考选择 Ref2VA。二者均生成 32 kHz 立体声音频；当前精度与基准说明取代旧速度结论。
 - [EmbeddingGemma 2](embeddings_zh-cn.md)：使用 `--embeddings`，媒体输入另加 `--mmproj`。已实现六个后端，任务前缀、维数与测试限制随模型而异。
 - [Agent Skills](agent_skills.md)（英文）：桌面 CLI / 服务端随附 17 个技能。`find-skills` 可达且开启 `--skills-allow-network` 时，原生工具可搜索、检查、按固定版本安装并在同一请求中使用；运行脚本仍需执行权限与依赖。

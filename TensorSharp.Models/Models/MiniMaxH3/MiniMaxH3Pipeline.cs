@@ -32,6 +32,7 @@ namespace TensorSharp.Models.MiniMaxH3
     {
         private readonly MiniMaxH3Model _model;
         private MiniMaxH3DiT _dit;
+        private MiniMaxH3Partition? _ditPartition;
         private MiniMaxH3VideoVae _vae;
         private MiniMaxH3AudioVae _audioVae;
         private bool _disposed;
@@ -89,15 +90,18 @@ namespace TensorSharp.Models.MiniMaxH3
         public GeneratedVideo Generate(string prompt, VideoGenerationParams p)
         {
             p ??= new VideoGenerationParams();
+            p = p.ResolveVideoContinuations();
             // The LoRA plug-in is read once: the model swaps it only between clips.
-            MiniMaxH3LoraSet lora = _model.Loras;
+            MiniMaxH3Partition partition = _model.PartitionFor(p);
+            MiniMaxH3LoraSet configuredLora = _model.Loras;
+            MiniMaxH3LoraSet lora = configuredLora?.Partition == partition ? configuredLora : null;
             MiniMaxH3SamplingRecipe recipe = lora?.Recipe;
             ValidateSamplingParameters(p, recipe);
             var total = Stopwatch.StartNew();
 
             // The mode decides what an image MEANS, and so whether it may size the canvas:
             // a keyframe is a frame of the clip, a reference is not.
-            var mode = MiniMaxH3ModeResolver.Resolve(p, _model.Partition);
+            var mode = MiniMaxH3ModeResolver.Resolve(p, partition);
             RequirePluginMode(recipe, mode);
 
             // A KEYFRAME is conditioned twice, and both halves matter.
@@ -142,7 +146,7 @@ namespace TensorSharp.Models.MiniMaxH3
             System.Threading.Tasks.Task<double> prefault = null;
             if (PrefaultMode == 2)
             {
-                string ditPath = _model.DiTPath;
+                string ditPath = _model.DenoiserPathFor(partition);
                 long avail = AvailablePhysicalBytes();
                 prefault = System.Threading.Tasks.Task.Run(
                     () => MiniMaxH3Model.PrefaultWeightFile(ditPath, avail));
@@ -158,6 +162,15 @@ namespace TensorSharp.Models.MiniMaxH3
             var textClock = Stopwatch.StartNew();
             var teOpenClock = Stopwatch.StartNew();
             double teRunSeconds = 0;
+            // A CUDA upload warms the encoder's mapped pages by touching them (eight
+            // workers, one fault per page), which on an A40 pod's network volume read the
+            // 15.5 GB at ~1 GB/s: 16 s of an 18 s trunk. Concurrent 8 MiB reads reach
+            // ~2.3 GiB/s there, and the touches then find the pages cached. Metal binds the
+            // same mapped pages zero-copy and reads them from a local SSD, so it needs none.
+            using var teRead = _model.Backend == BackendType.GgmlCuda
+                ? MappedFileReadAhead.TryStart(_model.TextEncoderPath, MappedFileReadAhead.WholeFile(_model.TextEncoderPath),
+                    message => Console.WriteLine("  [h3] warning: text-encoder " + message), long.MaxValue)
+                : null;
             using (var te = _model.CreateTextEncoder())
             {
                 teOpenClock.Stop();
@@ -197,6 +210,11 @@ namespace TensorSharp.Models.MiniMaxH3
                 textHidden = te.Encode(ids, promptImages);
                 teRunClock.Stop();
                 teRunSeconds = teRunClock.Elapsed.TotalSeconds;
+                if (teRead != null)
+                {
+                    teRead.Stop();
+                    if (PhaseTiming) Console.WriteLine($"  [h3] .. text-encoder {teRead.Describe()}");
+                }
                 // The trunk is finished with, so the denoiser read can start now and run
                 // alongside the encoder's teardown. Releasing 551 per-tensor device
                 // buffers is ~2 s of driver work (cudaFree measures 1.15 ms apiece on this
@@ -206,7 +224,7 @@ namespace TensorSharp.Models.MiniMaxH3
                 // read places - which is exactly the join below.
                 if (PrefaultMode == 1 || PrefaultMode == 3)
                 {
-                    string ditPath = _model.DiTPath;
+                    string ditPath = _model.DenoiserPathFor(partition);
                     long avail = AvailablePhysicalBytes();
                     prefault = System.Threading.Tasks.Task.Run(
                         () => MiniMaxH3Model.PrefaultWeightFile(ditPath, avail));
@@ -248,7 +266,12 @@ namespace TensorSharp.Models.MiniMaxH3
 
 
             var ditClock = Stopwatch.StartNew();
-            _dit ??= _model.CreateDiT();
+            if (_dit == null || _ditPartition != partition)
+            {
+                _dit?.Dispose();
+                _dit = _model.CreateDiT(partition);
+                _ditPartition = partition;
+            }
             ditClock.Stop();
             Console.WriteLine($"  [h3] denoiser loaded in {ditClock.Elapsed.TotalSeconds:F1}s");
 
@@ -1457,6 +1480,7 @@ namespace TensorSharp.Models.MiniMaxH3
             if (_disposed) return;
             _disposed = true;
             _dit?.Dispose();
+            _ditPartition = null;
             _vae?.Dispose();
             _audioVae?.Dispose();
         }

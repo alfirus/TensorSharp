@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using TensorSharp.Cuda;
 using TensorSharp.MLX;
@@ -29,6 +30,7 @@ internal static class Ltx25Pipeline
         Action<Ltx25GenerationSettings, float[], float[]> finalLatents, float? firstStageImageStrength)
     {
         ArgumentNullException.ThrowIfNull(prompt);
+        parameters = (parameters ?? new VideoGenerationParams()).ResolveVideoContinuations(ltxReferenceVideos: true);
         if (firstStageImageStrength is float strength && (!float.IsFinite(strength) || strength < 0 || strength > 1))
             throw new ArgumentOutOfRangeException(nameof(firstStageImageStrength), "Image strength must be finite and in [0,1].");
         var settings = Ltx25GenerationSettings.Resolve(parameters, model.SupportsReferenceConditioning);
@@ -60,14 +62,17 @@ internal static class Ltx25Pipeline
             bool identity = parameters.Mode == "ref";
             bool twoStage = settings.TwoStage;
             var first = twoStage ? settings.HalfResolution() : settings;
-            var images = identity ? Array.Empty<VideoImageCondition>() : Ltx25ImageConditioning.Resolve(parameters, settings.Frames);
+            // Identity references may start on a pinned first frame (a chain's previous segment); no other guide joins them.
+            IReadOnlyList<VideoImageCondition> images = identity
+                ? Ltx25ReferenceConditioning.ResolveFirstFrameGuide(parameters) is { } firstFrame ? new[] { firstFrame } : Array.Empty<VideoImageCondition>()
+                : Ltx25ImageConditioning.Resolve(parameters, settings.Frames);
             float? effectiveFirstStageStrength = ResolveFirstStageImageStrength(parameters, twoStage, images, firstStageImageStrength);
             // Recompress each original once; both stages resize the same conditioned
             // source independently, as the publisher's image loader does.
             var resolvedImages = images.Select(image => Ltx25ImagePreprocessing.PrepareSource(
                 image.ResolveImage(), parameters.CancellationToken)).ToArray();
-            float[] encodedReference = null;
-            int identitySourceCount = 0;
+            var encodedReferences = new List<Ltx25ReferenceConditioning.ReferenceLatent>();
+            int identityImageCount = 0, identityVideoCount = 0;
             // Progress phases follow the hosts' video contract (text-encode, denoise,
             // vae-decode, ...): everything between the two passes reports as denoise, so
             // the step count and ETA keep advancing. Timing lines keep the finer names.
@@ -91,11 +96,63 @@ internal static class Ltx25Pipeline
             if (identity)
             {
                 var sources = Ltx25ReferenceConditioning.ResolveSources(parameters);
-                identitySourceCount = sources.Count;
-                Report("reference-encode", $"encoding {sources.Count} identity images as a {settings.Frames}-frame Ingredients reference sheet");
-                RgbImage sheet = Ltx25ReferenceConditioning.BuildSheet(sources.Select(source => source.ResolveImage(preserveAlpha: true)).ToArray(), settings.Width, settings.Height);
-                encodedReference = model.EncodeStaticReferenceVideo(sheet.Pixels, settings.Frames, settings.Height, settings.Width, parameters.CancellationToken);
+                identityImageCount = sources.Count;
+                if (sources.Count > 0)
+                {
+                    Report("reference-encode", $"encoding {sources.Count} identity images as a {settings.Frames}-frame Ingredients reference sheet");
+                    RgbImage sheet = Ltx25ReferenceConditioning.BuildSheet(sources.Select(source => source.ResolveImage(preserveAlpha: true)).ToArray(), settings.Width, settings.Height);
+                    float[] encodedSheet = model.EncodeStaticReferenceVideo(sheet.Pixels, settings.Frames, settings.Height, settings.Width, parameters.CancellationToken);
+                    encodedReferences.Add(new(encodedSheet, settings.LatentFrames, settings.LatentHeight, settings.LatentWidth));
+                }
+                if (parameters.ReferenceVideoPaths is { Count: > 0 } referenceVideos)
+                {
+                    identityVideoCount = referenceVideos.Count;
+                    for (int i = 0; i < referenceVideos.Count; ++i)
+                    {
+                        parameters.CancellationToken.ThrowIfCancellationRequested();
+                        string path = referenceVideos[i];
+                        Report("reference-encode", $"encoding reference video {i + 1}/{referenceVideos.Count} at {settings.Width}x{settings.Height}");
+                        var (files, sourceFps) = TensorSharp.Models.MediaHelper.ExtractFramesAtRate(path, settings.Fps, maxFrames: settings.Frames);
+                        string extracted = File.Exists(path) && files.Count > 0 ? Path.GetDirectoryName(files[0]) : null;
+                        if (extracted != null && !Path.GetFileName(extracted).StartsWith("refvid_", StringComparison.Ordinal)) extracted = null;
+                        try
+                        {
+                            if (files.Count == 0) throw new ArgumentException($"Reference video '{path}' contains no decodable frames.");
+                            // The causal VAE needs 8n+1 frames and the Ingredients adapter reserves at least 16 latent
+                            // frames. Hold the last decoded frame when a short reference does not fill that window.
+                            int referenceFrames = Math.Max(settings.Frames, 1 + ((files.Count - 1 + 7) / 8) * 8);
+                            var videoPixels = new float[checked(referenceFrames * settings.Height * settings.Width * 3)];
+                            RgbImage last = null;
+                            for (int frame = 0; frame < referenceFrames; ++frame)
+                            {
+                                parameters.CancellationToken.ThrowIfCancellationRequested();
+                                if (frame < files.Count)
+                                {
+                                    RgbImage decoded = TensorSharp.Models.QwenImage.ImageIO.Load(files[frame]);
+                                    last = Ltx25ImagePreprocessing.ResizeAndCenterCrop(decoded, settings.Width, settings.Height);
+                                }
+                                int offset = checked(frame * settings.Height * settings.Width * 3);
+                                last.Pixels.CopyTo(videoPixels, offset);
+                            }
+                            float[] encoded = model.EncodeReferenceVideo(videoPixels, referenceFrames, settings.Height, settings.Width, parameters.CancellationToken);
+                            int latentFrames = (referenceFrames - 1) / 8 + 1;
+                            encodedReferences.Add(new(encoded, latentFrames, settings.LatentHeight, settings.LatentWidth));
+                            Console.WriteLine($"  [ltx25] reference video: {files.Count} frames at {settings.Fps} fps (source {sourceFps:F2} fps) -> {referenceFrames} frames");
+                        }
+                        finally
+                        {
+                            if (extracted != null)
+                            {
+                                try { Directory.Delete(extracted, recursive: true); }
+                                catch (IOException) { }
+                                catch (UnauthorizedAccessException) { }
+                            }
+                        }
+                    }
+                }
                 Trim(); EndPhase("reference-encode");
+                // One full-size pass, so the first-frame guide is encoded once, at the output size.
+                encodedImages = EncodeImages(settings, "image-encode", "image-encode");
             }
             else
             {
@@ -105,7 +162,7 @@ internal static class Ltx25Pipeline
             }
             Report("text-encode", "Gemma 4 and learned AV conditioning");
             Ltx25PromptEncoding conditioning = model.Conditioning(identity
-                ? Ltx25ReferencePrompt.Format(prompt, identitySourceCount) : prompt, parameters.CancellationToken);
+                ? Ltx25ReferencePrompt.Format(prompt, identityImageCount, identityVideoCount) : prompt, parameters.CancellationToken);
             Trim();
             EndPhase("text-encode");
 
@@ -114,7 +171,8 @@ internal static class Ltx25Pipeline
             Ltx25SamplingOutput RunStage(Ltx25GenerationSettings stage, List<Ltx25EncodedImage> stageImages, float[] sigmas,
                 long noiseSeedOffset, int stepOffset, string phaseName, float[] priorVideo, float[] priorAudio)
             {
-                int guideTokens = identity ? stage.VideoTokens : checked(stageImages.Count(image => image.FrameIndex != 0) * stage.LatentHeight * stage.LatentWidth);
+                int guideTokens = identity ? checked(encodedReferences.Sum(reference => reference.Frames * reference.Height * reference.Width))
+                    : checked(stageImages.Count(image => image.FrameIndex != 0) * stage.LatentHeight * stage.LatentWidth);
                 var noise = stage.InitialNoise(guideTokens, priorVideo == null ? 0UL : 1UL);
                 float[] video = noise.Video, audio = noise.Audio, rawNoise = null;
                 float noiseScale = 1;
@@ -139,16 +197,24 @@ internal static class Ltx25Pipeline
                     KeyframeMask = Enumerable.Range(0, checked(stage.VideoTokens + guideTokens))
                         .Select(token => token < stage.LatentHeight * stage.LatentWidth ? 1f : 0f).ToArray(),
                 };
-                input = identity ? Ltx25ReferenceConditioning.Apply(input, stage, encodedReference,
-                    stage.LatentFrames, stage.LatentHeight, stage.LatentWidth)
+                input = identity ? Ltx25ReferenceConditioning.Apply(input, stage, encodedReferences)
                     : Ltx25ImageConditioning.Apply(input, stage, stageImages, rawNoise, noiseScale);
+                // The guide and the references occupy disjoint tokens (canvas frame 0, the appended tail), so pinning frame 0
+                // after the references equals upstream's images-then-references order.
+                if (identity && stageImages.Count > 0) input = Ltx25ImageConditioning.ApplyFirstFrame(input, stage, stageImages[0]);
                 Report("denoise", $"{(priorVideo == null ? twoStage ? "first pass" : "single pass" : "refinement pass")} at {stage.Width}x{stage.Height}: {stage.VideoTokens} video + {guideTokens} guide, {stage.AudioTokens} audio, {conditioning.Tokens} prompt tokens, " +
                     (stage.Ancestral ? Ltx25GenerationSettings.AncestralSampler
                         : $"{Ltx25GenerationSettings.EulerSampler} (requested; the publisher samples LTX 2.5 with {Ltx25GenerationSettings.AncestralSampler})") +
-                    (identity || stageImages.Count == 0 ? "" : "; temporal guide strengths: " + string.Join(", ", stageImages.Select(image =>
+                    (stageImages.Count == 0 ? "" : (identity ? "; first-frame guide strength: " : "; temporal guide strengths: ") + string.Join(", ", stageImages.Select(image =>
                         $"frame {image.FrameIndex}={image.Strength.ToString("R", CultureInfo.InvariantCulture)}"))));
                 Ltx25SamplingOutput result = model.Sample(input, stage, (step, total) =>
                     {
+                        // One stage ahead of each companion's first use: the upscaler
+                        // during the last first-pass step, the video decoder during the
+                        // final pass, the audio decoder during the video decode.
+                        bool finalPass = !twoStage || stepOffset != 0;
+                        if (!finalPass && step == total - 1) model.PrefetchCompanion(Ltx25Model.CompanionFile.Upscaler);
+                        if (finalPass && step == Math.Min(1, total - 1)) model.PrefetchCompanion(Ltx25Model.CompanionFile.VideoDecoder);
                         completed = stepOffset + step;
                         parameters.OnStep?.Invoke(completed, totalSteps);
                         Report("denoise", $"step {completed}/{totalSteps}");
@@ -176,6 +242,7 @@ internal static class Ltx25Pipeline
 
             float[] videoLatents = Ltx25Geometry.UnpackVideo(latents.Video.AsSpan(0, checked(settings.VideoTokens * 128)), settings.VideoTokens, 128);
             finalLatents?.Invoke(settings, videoLatents, latents.Audio);
+            if (parameters.GenerateAudio) model.PrefetchCompanion(Ltx25Model.CompanionFile.AudioDecoder);
             Report("vae-decode", model.UsesDiffusionDecoder ? "diffusion video decoder" : "convolutional video decoder");
             float[] pixels = model.DecodeVideo(videoLatents,
                 settings.LatentFrames, settings.LatentHeight, settings.LatentWidth, settings.Seed, parameters.CancellationToken);
@@ -203,10 +270,11 @@ internal static class Ltx25Pipeline
                 Trim();
                 EndPhase("audio-decode");
             }
+            if (model.StopCompanionPrefetch() is string prefetched) Console.WriteLine($"  [ltx25] companion prefetch: {prefetched}");
             Report("done", $"{settings.Width}x{settings.Height}, {settings.Frames} frames at {settings.Fps} fps");
             return new GeneratedVideo { Frames = frames, Fps = settings.Fps, Seed = settings.Seed, Audio = audio };
         }
-        finally { Trim(); }
+        finally { model.StopCompanionPrefetch(); Trim(); }
     }
 
     // The publisher's two-stage I2V workflow uses .7 at half resolution and 1

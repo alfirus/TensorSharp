@@ -48,6 +48,8 @@ namespace TensorSharp.Models.MiniMaxH3
         internal static Action<MiniMaxH3LoraSet> LoraLoadedHookForTest;
 
         private readonly string _ditPath;
+        private readonly string _firstLastDitPath;
+        private readonly string _referenceDitPath;
         private readonly string _tePath;
         private readonly string _vaePath;
         private readonly string _audioVaePath;
@@ -79,6 +81,27 @@ namespace TensorSharp.Models.MiniMaxH3
                 DitConfig = MiniMaxH3Config.Detect(probe.Tensors);
             }
             Partition = MiniMaxH3Config.PartitionFromFileName(ggufPath);
+            string alternatePath = ResolveAlternateDenoiser(ggufPath, Partition);
+            if (alternatePath != null)
+            {
+                try
+                {
+                    using var alternate = new GgufFile(alternatePath);
+                    MiniMaxH3Config alternateConfig = MiniMaxH3Config.Detect(alternate.Tensors);
+                    if (!SameDenoiserShape(DitConfig, alternateConfig))
+                    {
+                        Console.WriteLine($"MiniMax-H3 alternate denoiser ignored (incompatible tensor shapes): {alternatePath}");
+                        alternatePath = null;
+                    }
+                }
+                catch (Exception e) when (e is IOException or InvalidOperationException or ArgumentException)
+                {
+                    Console.WriteLine($"MiniMax-H3 alternate denoiser ignored ({e.Message}): {alternatePath}");
+                    alternatePath = null;
+                }
+            }
+            _firstLastDitPath = Partition == MiniMaxH3Partition.FirstLastFrame ? ggufPath : alternatePath;
+            _referenceDitPath = Partition == MiniMaxH3Partition.Reference ? ggufPath : alternatePath;
             Config = new ModelConfig { Architecture = ArchitectureId, VocabSize = 0 };
 
             _tePath = ResolveCompanion("TS_VIDEO_TEXT_ENCODER", dir,
@@ -91,7 +114,8 @@ namespace TensorSharp.Models.MiniMaxH3
                 new[] { "minimax_h3_audio_vae_fp32.safetensors" },
                 n => n.Contains("audio_vae") && n.EndsWith(".safetensors"));
 
-            Console.WriteLine($"MiniMax-H3 ({Partition}): DiT={Path.GetFileName(ggufPath)}");
+            Console.WriteLine($"MiniMax-H3 ({Partition}): DiT={Path.GetFileName(ggufPath)}"
+                + (alternatePath == null ? string.Empty : $", alternate={Path.GetFileName(alternatePath)}"));
             Console.WriteLine($"  {DitConfig}");
             Console.WriteLine($"  text-encoder = {_tePath ?? "<missing>"}");
             Console.WriteLine($"  video VAE    = {_vaePath ?? "<missing>"}");
@@ -130,6 +154,38 @@ namespace TensorSharp.Models.MiniMaxH3
                 throw;
             }
         }
+
+        private static string ResolveAlternateDenoiser(string primaryPath, MiniMaxH3Partition primaryPartition)
+        {
+            string directory = Path.GetDirectoryName(Path.GetFullPath(primaryPath));
+            string primaryName = Path.GetFileName(primaryPath);
+            string marker = primaryPartition == MiniMaxH3Partition.Reference ? "ref2va" : "fl2va";
+            int markerAt = primaryName.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (markerAt < 0) return null;
+            string alternateMarker = primaryPartition == MiniMaxH3Partition.Reference ? "fl2va" : "ref2va";
+            string expectedName = primaryName[..markerAt] + alternateMarker + primaryName[(markerAt + marker.Length)..];
+            string expectedPath = Path.Combine(directory, expectedName);
+            if (File.Exists(expectedPath)) return expectedPath;
+
+            // Keep custom quantized pairs usable when they follow the published filename
+            // pattern, while refusing to guess if a folder contains multiple alternatives.
+            string[] candidates = Directory.Exists(directory)
+                ? Directory.EnumerateFiles(directory, "*.gguf", SearchOption.TopDirectoryOnly)
+                    .Where(path => !string.Equals(Path.GetFullPath(path), Path.GetFullPath(primaryPath), StringComparison.Ordinal)
+                        && MiniMaxH3Config.PartitionFromFileName(path) != primaryPartition)
+                    .ToArray()
+                : Array.Empty<string>();
+            return candidates.Length == 1 ? candidates[0] : null;
+        }
+
+        private static bool SameDenoiserShape(MiniMaxH3Config a, MiniMaxH3Config b) =>
+            a.HiddenSize == b.HiddenSize && a.NumLayers == b.NumLayers
+            && a.TokenRefinerLayers == b.TokenRefinerLayers && a.NumAttentionHeads == b.NumAttentionHeads
+            && a.AttentionHeadDim == b.AttentionHeadDim && a.FfnHiddenSize == b.FfnHiddenSize
+            && a.VideoLatentChannels == b.VideoLatentChannels && a.AudioLatentChannels == b.AudioLatentChannels
+            && a.TextDim == b.TextDim && a.RopeInvFreqLength == b.RopeInvFreqLength
+            && a.TimeEmbedding == b.TimeEmbedding && a.TimeEmbedDim == b.TimeEmbedDim
+            && a.AdaLnCurveGrid == b.AdaLnCurveGrid;
 
         // ---- LoRA plug-ins (ILoraPluginHost) ----
 
@@ -247,7 +303,34 @@ namespace TensorSharp.Models.MiniMaxH3
 
         internal MiniMaxH3TextEncoder CreateTextEncoder() => new(_tePath, null, Backend, _allocator);
         internal MiniMaxH3DiT CreateDiT() => new(_ditPath, Backend, _allocator);
+        internal MiniMaxH3DiT CreateDiT(MiniMaxH3Partition partition) => new(DenoiserPathFor(partition), Backend, _allocator);
         internal MiniMaxH3VideoVae CreateVideoVae() => new(_vaePath, Backend, _allocator);
+
+        /// <summary>Whether this installation has the denoiser for a generation mode.</summary>
+        public bool SupportsPartition(MiniMaxH3Partition partition) =>
+            partition == MiniMaxH3Partition.FirstLastFrame ? _firstLastDitPath != null : _referenceDitPath != null;
+
+        /// <summary>Choose the installed denoiser for the supplied mode. The shared text encoder
+        /// and VAEs stay attached to this loaded model; only the denoiser changes between clips.</summary>
+        public MiniMaxH3Partition PartitionFor(VideoGenerationParams parameters)
+        {
+            MiniMaxH3Partition partition = MiniMaxH3ModeResolver.PartitionFor(parameters, Partition);
+            if (!SupportsPartition(partition))
+            {
+                string name = partition == MiniMaxH3Partition.Reference ? "Ref2VA" : "FL2VA";
+                string file = partition == MiniMaxH3Partition.Reference ? "minimax_h3_ref2va_pruned-*.gguf" : "minimax_h3_fl2va_pruned-*.gguf";
+                throw new InvalidOperationException($"MiniMax-H3 {name} conditioning needs {file} beside the loaded denoiser. Download the complete MiniMax-H3 model entry to enable both modes.");
+            }
+            return partition;
+        }
+
+        /// <summary>The installed denoiser path for the requested conditioning partition.</summary>
+        public string DenoiserPathFor(MiniMaxH3Partition partition) => partition switch
+        {
+            MiniMaxH3Partition.FirstLastFrame => _firstLastDitPath ?? _ditPath,
+            MiniMaxH3Partition.Reference => _referenceDitPath ?? _ditPath,
+            _ => throw new ArgumentOutOfRangeException(nameof(partition)),
+        };
 
         /// <summary>Pull a weight file through the OS file cache in one sequential pass.
         ///
@@ -271,41 +354,22 @@ namespace TensorSharp.Models.MiniMaxH3
                 if (!fi.Exists || fi.Length <= 0) return -1;
                 if (availableBytes > 0 && fi.Length > availableBytes) return -1;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                // ONE stream by default, which is the opposite of
-                // GgufReader.PrefaultFileCache and is deliberate. That one runs before any
-                // other work and has the machine to itself, so sixteen streams are free
-                // speed. This one runs CONCURRENTLY with the encoder teardown and with the
-                // denoiser upload it is warming, and aggressive parallel reads take I/O away
-                // from the very copy they exist to help. Measured at 640x384, best of three:
-                // 1 stream 63.9 s, 4 streams 64.9 s, 16 streams 66.6 s - and the encoder
-                // teardown alone went from 2.2 s to 4.0 s at sixteen. Raise it only on a host
-                // where storage is not the contended resource.
-                int threads = 1;
+                // One stream on macOS, which is the opposite of GgufReader.PrefaultFileCache
+                // and is deliberate: this read runs CONCURRENTLY with the encoder teardown and
+                // the denoiser upload it is warming, and one stream already saturates an Apple
+                // SSD. Splitting the file into one region per thread measured worse on a local
+                // disk (640x384, best of three: 1 stream 63.9 s, 4 streams 64.9 s, 16 streams
+                // 66.6 s). Linux model storage is often a network volume that needs concurrency
+                // instead (an A40 pod's: 0.31 GiB/s for one 8 MiB reader, 2.3 GiB/s for sixteen),
+                // so there sixteen readers take consecutive chunks of ONE sweep, staying near the
+                // same position, and skip chunks that are already cached. TS_H3_PREFAULT_THREADS
+                // overrides the reader count.
                 string tenv = Environment.GetEnvironmentVariable("TS_H3_PREFAULT_THREADS");
-                if (!string.IsNullOrEmpty(tenv) && int.TryParse(tenv, out int tset) && tset > 0)
-                    threads = tset;
-                long length = fi.Length;
-                long regionBytes = (length + threads - 1) / threads;
-                System.Threading.Tasks.Parallel.For(0, threads,
-                    new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = threads },
-                    () => new byte[8 << 20],
-                    (region, _, buffer) =>
-                    {
-                        using var handle = File.OpenHandle(
-                            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                        long offset = (long)region * regionBytes;
-                        long end = Math.Min(offset + regionBytes, length);
-                        while (offset < end)
-                        {
-                            int want = (int)Math.Min(buffer.Length, end - offset);
-                            int read = System.IO.RandomAccess.Read(
-                                handle, buffer.AsSpan(0, want), offset);
-                            if (read <= 0) break;
-                            offset += read;
-                        }
-                        return buffer;
-                    },
-                    _ => { });
+                int? threads = !string.IsNullOrEmpty(tenv) && int.TryParse(tenv, out int tset) && tset > 0 ? tset : null;
+                using var read = Video.MappedFileReadAhead.TryStart(path, Video.MappedFileReadAhead.WholeFile(path),
+                    windowBytes: long.MaxValue, workers: threads, honorSwitch: false);
+                if (read == null) return -1;
+                read.Wait();
                 return sw.Elapsed.TotalSeconds;
             }
             catch (IOException) { return -1; }
@@ -314,6 +378,9 @@ namespace TensorSharp.Models.MiniMaxH3
 
         /// <summary>The denoiser GGUF, for prefaulting.</summary>
         internal string DiTPath => _ditPath;
+
+        /// <summary>The text-encoder GGUF, for reading ahead.</summary>
+        internal string TextEncoderPath => _tePath;
 
         /// <summary>The video VAE file, for prefaulting.</summary>
         internal string VideoVaePath => _vaePath;
@@ -371,13 +438,10 @@ namespace TensorSharp.Models.MiniMaxH3
         int IVideoGenerationModel.DefaultPreviewFrames => 22;
         // The joint audio stream is generated either way; only its decode needs the VAE.
         bool IVideoGenerationModel.SupportsAudio => _audioVaePath != null;
-        bool IVideoGenerationModel.SupportsImageConditioning => true;
-        bool IVideoGenerationModel.SupportsEndImageConditioning =>
-            Partition == MiniMaxH3Partition.FirstLastFrame;
-        bool IVideoGenerationModel.SupportsReferenceConditioning =>
-            Partition == MiniMaxH3Partition.Reference;
-        int IVideoGenerationModel.MaxReferenceImages =>
-            Partition == MiniMaxH3Partition.Reference ? MiniMaxH3Geometry.MaxReferences : 0;
+        bool IVideoGenerationModel.SupportsImageConditioning => SupportsPartition(MiniMaxH3Partition.FirstLastFrame);
+        bool IVideoGenerationModel.SupportsEndImageConditioning => SupportsPartition(MiniMaxH3Partition.FirstLastFrame);
+        bool IVideoGenerationModel.SupportsReferenceConditioning => SupportsPartition(MiniMaxH3Partition.Reference);
+        int IVideoGenerationModel.MaxReferenceImages => SupportsPartition(MiniMaxH3Partition.Reference) ? MiniMaxH3Geometry.MaxReferences : 0;
 
         // ---- not an autoregressive model ----
         protected override float[] ForwardCore(int[] tokens) =>

@@ -165,7 +165,7 @@ Use `cpu` for 100% pure C# execution without native inference libraries, or `ggm
 
 ## New video, embedding and skill workflows
 
-- [LTX 2.5 Distilled](models/ltx-2.5.md): the five-file preset downloads 44.76 GB and needs approved publisher access. Its experimental 48 GB tier starts with 1024×1024×17 frames and an 8+3-step two-stage recipe, with 48 kHz stereo audio.
+- [LTX 2.5 Distilled](models/ltx-2.5.md): the five base files total 43.08 GB from an ungated repository; the optional Ingredients IC-LoRA adds 1.31 GB and needs approved Hugging Face access. Its experimental 48 GB tier starts with 1024×1024×17 frames and an 8+3-step two-stage recipe, with 48 kHz stereo audio.
 - [MiniMax-H3](models/minimax-h3.md): choose FL2VA for first-frame animation or Ref2VA for identity references. Both produce 32 kHz stereo audio; their current precision and benchmark notes supersede earlier speed claims.
 - [EmbeddingGemma 2](embeddings.md): use `--embeddings`, optionally `--mmproj` for media. Six backends are implemented; task prompts, dimensions and test limits are model-specific.
 - [Agent Skills](agent_skills.md): desktop CLI/server builds bundle 17 skills. With `find-skills` reachable and `--skills-allow-network`, native tools search, inspect and install a pinned skill for same-request use. Running scripts still requires execution permissions and dependencies.

@@ -630,8 +630,8 @@ namespace TensorSharp.Cli
                     "Qwen3-VL-8B vision projector GGUF, required for image editing. Default: same-directory scan.",
                     "--qwen-image-mmproj mmproj-Qwen3VL-8B-Instruct-F16.gguf"),
                 new OptionHelp("--qwen-image-variant <base|turbo>",
-                    "Which Qwen-Image-2.1 checkpoint the DiT GGUF holds: base or turbo. The GGUFs carry no metadata and Turbo has the " +
-                    "base tensors, so a host declares it; turbo samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1 " +
+                    "Which Qwen-Image-2.1 checkpoint the DiT GGUF holds: base or turbo. Nothing in the GGUFs tells them apart (Turbo has the " +
+                    "base tensors), so a host declares it; turbo samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1 " +
                     "by default, refuses other step counts and refuses step-distillation LoRA plug-ins. Default: none - a file " +
                     "name with the word turbo is assumed to be Turbo (the load says so), any other is base. Refused with " +
                     "another model.",
@@ -746,6 +746,10 @@ namespace TensorSharp.Cli
                     "either way it is resampled onto the model's own 24 fps and its own canvas. Pair a " +
                     "soundtrack with --ref-video-audio.",
                     "--ref-video clip/"),
+                new OptionHelp("--continue-from-video <file>",
+                    "Continue a new MiniMax-H3 or LTX 2.5 take from the exact last frame of a video. " +
+                    "Repeat once to also pin the new take's last frame to a second video's last frame.",
+                    "--continue-from-video previous.mp4"),
                 new OptionHelp("--ref-video-audio <file>",
                     "Soundtrack for the reference video at the SAME position: the first " +
                     "--ref-video-audio pairs with the first --ref-video, and so on. Separate from " +

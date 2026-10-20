@@ -132,10 +132,38 @@ separately trained eight-step FastH3 checkpoints must not be conflated.
 
 ## Performance and precision
 
-The latest before/after comparison uses FL2VA Q4_K, 640×384×22 at 24 fps,
-20 Euler steps, seed 42, CFG 1 and shift 12. Two alternating rounds include
-model loading, generation and codecs. Both frozen binaries use the unchanged
-ggml revision above; file/JIT caches remain uncontrolled.
+The latest before/after comparison (2026-10-17) uses FL2VA Q4_K at 640×384×22
+and 24 fps, with 20 Euler steps, seed 42, CFG 1 and shift 12. It ran four
+alternating rounds per host with `eng/validation/minimax-h3-ab.py`; each run
+includes model loading, generation and codecs. Every pair kept the decoded RGB
+and audio identical. Both frozen binaries on a host were built from the same
+unchanged ggml revision: a05c9922 on the M5 Pro and 03f0267b on the A40. The
+newer upstream ggml no longer builds TensorSharp's DSV4 CUDA kernels. File
+caches were not controlled.
+
+| Backend / host | Baseline median | Candidate median | Preserved output |
+|---|---:|---:|---|
+| M5 Pro `ggml_metal` | 117.920 s | 105.697 s | Exact RGB/audio, 4 pairs; 10.4% lower latency |
+| A40 `ggml_cuda` | 69.363 s | 58.864 s | Exact RGB/audio, 4 pairs; 15.1% lower latency |
+
+Two exact changes account for these results:
+
+- **RoPE rewrite.** In the DiT, text encoder, vision tower and video VAE, RoPE
+  now reads the half-swapped head straight out of the projection. It multiplies
+  that head by a sine table with the sign folded in, built once per graph, because
+  (−a)·b and a·(−b) round identically. A rotation therefore takes five
+  elementwise passes instead of ten, and q, k and v stay views of the fused
+  projection. The median Metal step went from 5.44 to 4.85 s and the median A40
+  step from 1.39 to 1.31 s.
+- **Read-ahead on `ggml_cuda`.** The text-encoder and denoiser files are read
+  ahead by sixteen concurrent 8 MiB readers (`TS_VIDEO_READAHEAD`,
+  `TS_H3_PREFAULT_THREADS`). The upload previously warmed their pages one fault
+  at a time, at ~1 GB/s on the A40 pod's network volume. With the read-ahead,
+  the median encoder trunk went from 13.3 to 6.4 s and the median first denoise
+  step from 11.5 to 7.6 s.
+
+The 2026-10-15 before/after comparison below uses the same recipe with two
+alternating rounds and the ggml revision recorded above.
 
 | Backend / host | Baseline median | Candidate median | Preserved output / scope |
 |---|---:|---:|---|
@@ -360,8 +388,8 @@ server takes no `--cfg` at all — so the model's own defaults apply.
 > tokenizer is not one. Put three files from the `processor/` folder of
 > [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
 > beside it — `vocab.json`, `merges.txt` and `tokenizer_config.json` — or point
-> `TS_VIDEO_TOKENIZER` at the folder holding them. (The TensorAgent Mac app's catalog
-> entries download all three; see [TensorAgent](../../TensorAgent/README.md).) Neither
+> `TS_VIDEO_TOKENIZER` at the folder holding them. (The TensorAgent Mac app's single catalog entry downloads all three; see
+> [TensorAgent](../../TensorAgent/README.md).) Neither
 > published GGUF has any metadata at all, so TensorSharp identifies H3 by its tensors
 > rather than by an architecture string (arch keys `minimax-h3` / `minimax_h3` are
 > accepted when a file does declare one).
@@ -569,7 +597,7 @@ choose plug-ins; send requests without `steps`, as the Web UI does
 ([API examples](../../TensorSharp.Server.Host/API_EXAMPLES.md#minimax-h3--video-and-native-32-khz-stereo-audio)).
 [Video Studio](../video-studio.md#sampling-recipes) shows the recipe, fixes the step
 count and binds each job to it. The [TensorAgent app](../../TensorAgent/README.md)
-offers both plug-ins on its keyframes entry as speed plug-ins, applied per clip in
+offers both plug-ins on the MiniMax-H3 entry for FL2VA clips, applied per clip in
 chat and in Studio, and never sends steps, a flow shift or a sampler.
 
 ### Turbo validation status
@@ -676,20 +704,25 @@ Returns `{ ok, url, audioUrl, audioMuxed, width, height, frames, fps, seed, code
 `audioUrl` is null when the model produced no track; `audioMuxed` says whether the MP4
 carries the soundtrack as well ([below](#audio-output)). The full field set is `prompt`,
 `width`, `height`, `frames`, `steps`, `cfg`, `fps`, `seed`, `flowShift`,
-`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`,
+`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`, `continueFromVideos`,
 `referenceImages`, `referenceVideos`, `referenceAudios`, `referenceVideoAudios`;
 the Wan fields `negativePrompt`, `sampler`, `cfgCacheStride` and `cfg2` are
 accepted and ignored by H3. Most of them are **camelCase only** —
-`videoMode`, `generateAudio`, `endImage` and the four `reference*` lists are the
+`videoMode`, `generateAudio`, `endImage`, `continueFromVideos` and the four `reference*` lists are the
 only ones that also accept a snake_case spelling (`video_mode`, `generate_audio`,
-`end_image`, `reference_images`, …), and camelCase wins when both are present.
+`end_image`, `continue_from_videos`, `reference_images`, …), and camelCase wins when both are present.
 Sending `image_path` or `flow_shift` is silently ignored rather than rejected, so
 prefer camelCase everywhere. `referenceVideoAudios` pairs **by index** with
 `referenceVideos`, the same positional rule `--ref-video-audio` follows. `imagePath` / `endImage` /
 `referenceImages` name files previously uploaded through `/api/upload`; paths
 outside the upload directory are rejected. `/v1/videos/generations` shares the same
-parser, so the same seven fields accept snake_case there too (`video_mode`,
+parser, so the same fields accept snake_case there too (`video_mode`,
 `reference_images`, …); it returns `audio_url` rather than `audioUrl`, and no mux flag.
+
+`continueFromVideos` takes one or two previously uploaded video files and uses their
+exact final frames as the new take's first frame and, optionally, its last frame. The
+first clip starts the take; the second clip's ending pins the take's end. This uses
+FL2VA frame conditioning; `referenceVideos` continues to provide full-clip Ref2VA context.
 
 A model rejection — the wrong checkpoint for the mode, or keyframes together with
 references — comes back as a **400 carrying the model's own message**, not a generic
@@ -821,7 +854,9 @@ but a track that is spectrally plausible and merely wrong.
 | `TS_H3_TRACE=1` | Latent/velocity magnitude diagnostics |
 | `TS_H3_DIT_TRACE_DIR` / `TS_H3_LINEAR_TRACE_FILE` | Synchronizing boundary/projection diagnostics; exclude from formal timings |
 | `TS_H3_PREFAULT` | Denoiser file reading: 0 off, 1 serial, 2 early overlap, 3 default pipelined |
-| `TS_H3_PREFAULT_THREADS` | Prefault streams; default 1 |
+| `TS_H3_PREFAULT_THREADS` | Denoiser-read readers; default 1 on macOS, 16 on Linux (concurrent 8 MiB reads of one sweep, which network volumes need) |
+| `TS_VIDEO_READAHEAD=0` | Disables the `ggml_cuda` text-encoder read-ahead (concurrent reads ahead of the upload's page warming); shared with LTX 2.5 |
+| `TS_VIDEO_READAHEAD_WORKERS` | Readers for that read-ahead, 1–32; default 16 on Linux, 1 elsewhere |
 | `TS_H3_TE_GROUP` | Optional grouped native text-encoder trunk; off by default |
 | `TS_H3_KEEP_RESIDENT=1` | Optional Metal residency policy between clips |
 | `TS_METAL_FLASH_KV_PAD=0` | Turns off the key padding that puts long `ggml_metal` flash attention on the tensor-API kernel ([above](#long-sequence-attention-on-metal)); for A/B runs |

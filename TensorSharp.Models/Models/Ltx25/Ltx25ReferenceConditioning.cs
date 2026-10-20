@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using TensorSharp.Models;
 using TensorSharp.Models.QwenImage;
 using TensorSharp.Models.Video;
 
@@ -17,6 +18,10 @@ public static class Ltx25ReferenceConditioning
 {
     public const int MinimumFrames = 121;
     public const int MaxImages = 16;
+    public const int MaxVideos = 1;
+
+    /// <summary>One normalized reference clip in channel-major [128,T,H,W] layout.</summary>
+    public sealed record ReferenceLatent(float[] ChannelMajor, int Frames, int Height, int Width);
 
     /// <summary>Resolve identity sources without interpreting them as timeline
     /// anchors. Single-image fields and reference-image lists are alternative forms.</summary>
@@ -24,8 +29,9 @@ public static class Ltx25ReferenceConditioning
     {
         ArgumentNullException.ThrowIfNull(parameters);
         if (parameters.Mode != "ref") throw new ArgumentException("Ingredients identity images require mode ref.");
-        if (parameters.EndImage != null || !string.IsNullOrWhiteSpace(parameters.EndImagePath) || parameters.ImageConditions is { Count: > 0 })
-            throw new ArgumentException("Identity references cannot be combined with first/last or timed image guides.");
+        if (parameters.EndImage != null || !string.IsNullOrWhiteSpace(parameters.EndImagePath))
+            throw new ArgumentException("Identity references cannot be combined with a last-frame image.");
+        _ = ResolveFirstFrameGuide(parameters);
         bool single = parameters.Image != null || parameters.ImageBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(parameters.ImagePath);
         if (single && parameters.ReferenceImagePaths is { Count: > 0 })
             throw new ArgumentException("Use a single identity image or a reference-image list, rather than combining both.");
@@ -37,9 +43,30 @@ public static class Ltx25ReferenceConditioning
                 if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("Identity reference paths cannot be empty.");
                 sources.Add(new() { ImagePath = path });
             }
-        if (sources.Count is < 1 or > MaxImages)
-            throw new ArgumentException($"Ingredients mode requires between 1 and {MaxImages} identity reference images.");
+        if (sources.Count > MaxImages)
+            throw new ArgumentException($"Ingredients mode accepts at most {MaxImages} identity reference images.");
+        if (sources.Count == 0 && parameters.ReferenceVideoPaths is not { Count: > 0 })
+            throw new ArgumentException($"Ingredients mode requires at least one identity reference image or video.");
         return sources;
+    }
+
+    /// <summary>The optional first-frame guide of an identity request: at most one image condition, at output frame 0,
+    /// which pins the take's opening (the last frame of the segment a chain continues) while the sheet keeps the
+    /// character. Upstream ICLoraPipeline conditions a stage on its <c>images</c> and its IC-LoRA
+    /// <c>video_conditioning</c> together; a frame-0 image replaces latent frame 0 in place and adds no tokens. Last-frame
+    /// and timed guides beside identity references are refused: no publisher workflow uses them.</summary>
+    public static VideoImageCondition ResolveFirstFrameGuide(VideoGenerationParams parameters)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        if (parameters.ImageConditions is not { Count: > 0 } guides) return null;
+        if (guides.Count > 1 || guides[0] is not { FrameIndex: 0 } guide)
+            throw new ArgumentException("Identity references take at most one image guide, at output frame 0 (the frame a take starts on); " +
+                "last-frame and timed guides cannot be combined with Ingredients references.");
+        if (guide.Image == null && guide.ImageBytes is not { Length: > 0 } && string.IsNullOrWhiteSpace(guide.ImagePath))
+            throw new ArgumentException("The first-frame guide requires an image.");
+        if (!float.IsFinite(guide.Strength) || guide.Strength < 0 || guide.Strength > 1)
+            throw new ArgumentException("Image conditioning strength must be finite and in [0,1].");
+        return guide;
     }
 
     /// <summary>Compose an ordered contact sheet on black, fitting each complete
@@ -105,24 +132,52 @@ public static class Ltx25ReferenceConditioning
     /// caller's input and reference arrays remain unchanged.</summary>
     public static Ltx25DenoiserInput Apply(Ltx25DenoiserInput initial, Ltx25GenerationSettings settings,
         float[] channelMajorReference, int referenceLatentFrames, int referenceLatentHeight, int referenceLatentWidth)
+        => Apply(initial, settings, [new ReferenceLatent(channelMajorReference, referenceLatentFrames, referenceLatentHeight, referenceLatentWidth)]);
+
+    /// <summary>Append clean normalized reference-video latents after the generated canvas. Each clip keeps its own
+    /// causal time positions; clips do not become one artificial continuous timeline.</summary>
+    public static Ltx25DenoiserInput Apply(Ltx25DenoiserInput initial, Ltx25GenerationSettings settings,
+        IReadOnlyList<ReferenceLatent> references)
     {
         ArgumentNullException.ThrowIfNull(initial); ArgumentNullException.ThrowIfNull(settings);
-        ArgumentNullException.ThrowIfNull(channelMajorReference);
-        if (referenceLatentFrames < (MinimumFrames - 1) / 8 + 1 || referenceLatentHeight != settings.LatentHeight || referenceLatentWidth != settings.LatentWidth)
-            throw new ArgumentException("Ingredients requires at least 16 reference latent frames matching the canvas spatial geometry (downscale factor one).");
-        int referenceTokens = checked(referenceLatentFrames * referenceLatentHeight * referenceLatentWidth);
+        ArgumentNullException.ThrowIfNull(references);
+        if (references.Count == 0) throw new ArgumentException("Ingredients needs at least one encoded reference.", nameof(references));
+        int minimumLatentFrames = (MinimumFrames - 1) / 8 + 1;
+        foreach (ReferenceLatent reference in references)
+            if (reference?.ChannelMajor == null || reference.Frames < minimumLatentFrames ||
+                reference.Height != settings.LatentHeight || reference.Width != settings.LatentWidth)
+                throw new ArgumentException("Ingredients requires at least 16 reference latent frames matching the canvas spatial geometry (downscale factor one).");
+        int referenceFrames = checked(references.Sum(reference => reference.Frames));
+        int referenceTokens = checked(referenceFrames * settings.LatentHeight * settings.LatentWidth);
         int tokens = checked(settings.VideoTokens + referenceTokens), canvasValues = checked(settings.VideoTokens * 128);
-        if (channelMajorReference.Length != checked(referenceTokens * 128) || channelMajorReference.Any(value => !float.IsFinite(value)) ||
+        if (references.Any(reference => reference.ChannelMajor.Length != checked(reference.Frames * reference.Height * reference.Width * 128) ||
+                reference.ChannelMajor.Any(value => !float.IsFinite(value))) ||
             initial.VideoTokens != tokens || initial.Video == null || initial.Video.Length != checked(tokens * 128))
             throw new ArgumentException("Initial noise and normalized Ingredients reference latents have inconsistent geometry.");
         var video = (float[])initial.Video.Clone(); var clean = new float[video.Length];
         var mask = new float[tokens]; Array.Fill(mask, 1f, 0, settings.VideoTokens);
         var markers = new float[tokens]; Array.Fill(markers, 1f, 0, checked(settings.LatentHeight * settings.LatentWidth));
+        int spatial = checked(settings.LatentHeight * settings.LatentWidth);
+        var channelMajorReference = new float[checked(referenceTokens * 128)];
+        int timeOffset = 0;
+        foreach (ReferenceLatent reference in references)
+        {
+            int clipValues = checked(reference.Frames * spatial);
+            for (int channel = 0; channel < 128; ++channel)
+                Array.Copy(reference.ChannelMajor, channel * clipValues, channelMajorReference,
+                    (channel * referenceFrames + timeOffset) * spatial, clipValues);
+            timeOffset += reference.Frames;
+        }
         float[] packed = Ltx25Geometry.PackVideo(channelMajorReference, referenceTokens, 128);
         packed.CopyTo(video, canvasValues); packed.CopyTo(clean, canvasValues);
         var positions = new float[checked(tokens * 6)];
         Ltx25Geometry.VideoPositions(settings.LatentFrames, settings.LatentHeight, settings.LatentWidth, settings.Fps).Boundaries.CopyTo(positions, 0);
-        Ltx25Geometry.VideoPositions(referenceLatentFrames, referenceLatentHeight, referenceLatentWidth, settings.Fps).Boundaries.CopyTo(positions, settings.VideoTokens * 6);
+        int tokenOffset = settings.VideoTokens;
+        foreach (ReferenceLatent reference in references)
+        {
+            Ltx25Geometry.VideoPositions(reference.Frames, reference.Height, reference.Width, settings.Fps).Boundaries.CopyTo(positions, tokenOffset * 6);
+            tokenOffset += checked(reference.Frames * reference.Height * reference.Width);
+        }
         return new()
         {
             Video = video, VideoTokens = tokens, Audio = initial.Audio, AudioTokens = initial.AudioTokens,
