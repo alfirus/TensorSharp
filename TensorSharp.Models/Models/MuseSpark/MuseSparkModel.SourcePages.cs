@@ -59,10 +59,78 @@ public partial class MuseSparkModel
         if (_advisedGpuSourceWeights.Count != before) LogGpuSourcePageAdvice($"layer {layer} experts");
     }
 
+    // Runs on the caller after every rank has completed its preload. Never
+    // mutate the advice sets from a rank worker. A resident slice alone does
+    // not justify dropping the complete tensor's mapped source pages.
+    private void ReleaseTensorParallelGpuSourcePages()
+    {
+        if (!IsTensorParallel || !CanReleaseGpuSourcePages(_releaseGpuSourcePages, _backend, false) ||
+            !OperatingSystem.IsLinux()) return;
+        int previousRank = GgmlBasicOps.GetActiveRank();
+        bool previousPin = GgmlBasicOps.PinRank(previousRank);
+        try
+        {
+            foreach (var (name, shards) in _tpQuantWeights)
+            {
+                if (!_gguf.Tensors.TryGetValue(name, out var info) || shards.Length != TpDegree) continue;
+                bool resident = true;
+                long bytes = 0;
+                for (int rank = 0; rank < TpDegree; rank++)
+                {
+                    var shard = shards[rank];
+                    if (shard == null || shard.DevicePreloadTooLarge) { resident = false; break; }
+                    GgmlBasicOps.SetActiveRank(rank);
+                    if (!GgmlBasicOps.HasResidentDeviceCopy(shard.CacheKey, shard.RawBytes))
+                    { resident = false; break; }
+                    bytes = checked(bytes + shard.RawBytes);
+                }
+                if (resident && bytes == _gguf.GetTensorByteCount(info) &&
+                    _gguf.TryGetTensorDataPointer(info, out IntPtr mapped))
+                    AdviseResidentTensorSource(name, info, mapped, bytes);
+            }
+            if (_sparkTpGate == null) return;
+            for (int layer = 0; layer < Config.NumLayers; layer++)
+            {
+                if (MoeCpuOffloadConfig.IsLayerOnCpu(layer) || _sparkTpGate[layer] == null) continue;
+                var collections = new[] { _sparkTpGate[layer], _sparkTpUp[layer], _sparkTpDown[layer] };
+                for (int projection = 0; projection < collections.Length; projection++)
+                {
+                    string name = _prefixes[layer] + ExpertSourceSuffixes[projection];
+                    if (!_stackedExpertWeights.TryGetValue(name, out var source) || !source.IsExternalView ||
+                        !_gguf.Tensors.TryGetValue(name, out var info)) continue;
+                    long bytes = 0;
+                    bool resident = true;
+                    for (int rank = 0; rank < TpDegree; rank++)
+                    {
+                        var shard = collections[projection][rank];
+                        // The intervals must cover the original stacked tensor
+                        // exactly, with neither gaps nor duplicate expert ranges.
+                        if (shard == null || shard.Data != source.Data + (nint)bytes)
+                        { resident = false; break; }
+                        GgmlBasicOps.SetActiveRank(rank);
+                        if (!GgmlBasicOps.HasResidentDeviceCopy(shard.Data, shard.TotalRawBytes))
+                        { resident = false; break; }
+                        bytes = checked(bytes + shard.TotalRawBytes);
+                    }
+                    if (resident && bytes == source.TotalRawBytes)
+                        AdviseResidentTensorSource(name, info, source.Data, bytes);
+                }
+            }
+        }
+        finally { GgmlBasicOps.RestoreRankPin(previousPin, previousRank); }
+        LogGpuSourcePageAdvice("tensor-parallel shards");
+    }
+
     private void TryReleaseGpuSourcePages(string name, IntPtr data, long bytes, IntPtr cacheKey)
     {
         if (_advisedGpuSourceWeights.Contains(name) || !_gguf.Tensors.TryGetValue(name, out var info) ||
             !GgmlBasicOps.HasResidentDeviceCopy(cacheKey, bytes)) return;
+        AdviseResidentTensorSource(name, info, data, bytes);
+    }
+
+    private void AdviseResidentTensorSource(string name, GgufTensorInfo info, IntPtr data, long bytes)
+    {
+        if (_advisedGpuSourceWeights.Contains(name)) return;
         // The GGUF owner verifies pointer identity and full tensor length before
         // advising anything; an external view alone is not proof of a file map.
         if (!_gguf.TryReleaseMappedTensorPages(info, data, bytes, out long advisedBytes)) return;

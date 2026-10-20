@@ -152,6 +152,119 @@ class MuseSparkLaunchObserverTests(unittest.TestCase):
         planned,argv,env=self.ts_profile();env['TS_SCHED_BLOCK_SIZE']='32'
         with self.assertRaises(ValueError):tensorsharp.verify_profile(argv,env,planned)
 
+    def test_tensorsharp_no_spec_rejects_later_case_insensitive_enable_and_inherited_draft(self):
+        for tail in (['--spec'], ['--SPEC']):
+            planned, argv, env = self.ts_profile()
+            with self.subTest(tail=tail), self.assertRaises(ValueError):
+                tensorsharp.verify_profile(argv + tail, env, planned)
+        for key, value in (('TS_SPEC', '1'), ('TS_SPEC', 'true'),
+                           ('TS_SPEC_DRAFT_MODEL', '/model/draft.gguf')):
+            planned, argv, env = self.ts_profile()
+            env[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                tensorsharp.verify_profile(argv, env, planned)
+        planned, argv, env = self.ts_profile()
+        env['TS_SPEC'] = '0'
+        tensorsharp.verify_profile(argv, env, planned)
+
+    def test_reference_no_spec_rejects_cli_and_inherited_activation(self):
+        planned = self.profile()
+        for tail in (['--spec-type', 'ngram-simple'], ['--spec-default'],
+                     ['--spec_type', 'ngram-simple'], ['--model-draft', '/draft.gguf'],
+                     ['-md', '/draft.gguf'], ['--spec-type', 'none', '--spec-type', 'ngram-mod']):
+            with self.subTest(tail=tail), self.assertRaises(ValueError):
+                observer.verify_arguments(self.argv() + tail, planned)
+        for key, value in (('LLAMA_ARG_SPEC_TYPE', 'ngram-simple'),
+                           ('LLAMA_ARG_SPEC_DRAFT_MODEL', '/draft.gguf'),
+                           ('LLAMA_ARG_DRAFT_MAX', '8')):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                observer.verify_no_speculation(self.argv() + ['--spec-type', 'none'], planned, {key:value})
+        observer.verify_no_speculation(self.argv(), planned, {})
+        observer.verify_no_speculation(self.argv() + ['--spec-type', 'none'], planned,
+                                       {'LLAMA_ARG_SPEC_TYPE':'none'})
+
+    def eight_device_profile(self, tensor=False):
+        planned, argv, env = self.ts_profile()
+        ranges = [[0, 19]] + [[20 + i * 6, 25 + i * 6] for i in range(7)]
+        planned['settings'].pop('layer_ranges')
+        planned['settings'].update(gpu_count=8, visible_gpu_devices=[0,1,2,3,4,5,6,8],
+                                   cpu_threads=48, cpu_expert_layer_count=16)
+        distribution = {'mode': 'tensor' if tensor else 'layer', 'degree': 8}
+        if not tensor:distribution['layer_ranges'] = ranges
+        planned['engine_options']['distribution'] = distribution
+        argv[argv.index('--layer-split') + 1] = '8'
+        if tensor:argv[argv.index('--layer-split')] = '--tp'
+        argv[argv.index('--cpu-moe-threads') + 1] = '48'
+        argv[argv.index('--n-cpu-moe') + 1] = '16'
+        env.update(CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,8', TS_CPU_MOE_THREADS='48',
+                   TS_GGML_CPU_THREADS='48', OMP_NUM_THREADS='48')
+        if tensor:env.pop('TS_MUSE_SPARK_LAYER_SPLIT')
+        else:env['TS_MUSE_SPARK_LAYER_SPLIT'] = '20,6,6,6,6,6,6,6'
+        return planned, argv, env
+
+    def test_eight_rank_tensor_and_layer_profiles_keep_common_work_equal(self):
+        layer, layer_argv, layer_env = self.eight_device_profile()
+        tensor, tensor_argv, tensor_env = self.eight_device_profile(tensor=True)
+        self.assertEqual(layer['settings'], tensor['settings'])
+        checked_layer, _ = tensorsharp.verify_profile(layer_argv, layer_env, layer)
+        checked_tensor, _ = tensorsharp.verify_profile(tensor_argv, tensor_env, tensor)
+        self.assertEqual(8, checked_layer['--layer-split'])
+        self.assertEqual(8, checked_tensor['--tp'])
+        self.assertNotIn('layer_ranges', tensor['engine_options']['distribution'])
+
+    def test_nine_rank_profile_allows_uneven_partitions_without_inventing_ranges(self):
+        planned, argv, env = self.eight_device_profile(tensor=True)
+        planned['settings'].update(gpu_count=9, visible_gpu_devices=list(range(9)))
+        planned['engine_options']['distribution']['degree'] = 9
+        argv[argv.index('--tp') + 1] = '9'
+        env['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, range(9)))
+        tensorsharp.verify_profile(argv, env, planned)
+
+    def test_wrong_physical_devices_degree_or_conflicting_modes_fail(self):
+        for mutate in (
+            lambda p,a,e: e.update(CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'),
+            lambda p,a,e: p['engine_options']['distribution'].update(degree=9),
+            lambda p,a,e: a.extend(['--layer-split','8']),
+            lambda p,a,e: e.update(TS_MUSE_SPARK_LAYER_SPLIT='20,6,6,6,6,6,6,6'),
+            lambda p,a,e: e.update(TENSORSHARP_LAYER_SPLIT_DEGREE='8'),
+            lambda p,a,e: p['settings'].update(visible_gpu_devices=[0]*8),
+        ):
+            with self.subTest(mutate=mutate):
+                planned, argv, env = self.eight_device_profile(tensor=True)
+                mutate(planned, argv, env)
+                with self.assertRaises(ValueError):tensorsharp.verify_profile(argv, env, planned)
+
+    def test_partition_gaps_overlap_or_incorrect_cover_fail(self):
+        for ranges in ([[0,19],[19,25]] + [[26+i*6,31+i*6] for i in range(6)],
+                       [[0,19]] + [[20+i*6,25+i*6] for i in range(6)],
+                       [[0,20]] + [[21+i*6,26+i*6] for i in range(7)]):
+            planned, argv, env = self.eight_device_profile()
+            planned['engine_options']['distribution']['layer_ranges'] = ranges
+            with self.assertRaises(ValueError):tensorsharp.verify_profile(argv, env, planned)
+
+    def test_eight_rank_reference_still_counts_output_and_rejects_unobserved_tensor_mode(self):
+        planned, _, _ = self.eight_device_profile()
+        planned['server_url'] = 'http://127.0.0.1:8082'
+        planned['settings']['prefix_cache'] = True
+        argv = self.argv()
+        argv += ['--spec-type', 'none']
+        for flag, value in (('--n-cpu-moe','16'),('--threads','48'),('--threads-batch','48'),
+                            ('--tensor-split','20,6,6,6,6,6,6,7'),
+                            ('--device',','.join(f'CUDA{i}' for i in range(8)))):
+            argv[argv.index(flag)+1] = value
+        checked = observer.verify_arguments(argv, planned)
+        self.assertEqual('20,6,6,6,6,6,6,7', checked['--tensor-split'])
+        planned['engine_options']['distribution'] = {'mode':'tensor','degree':8}
+        with self.assertRaises(ValueError):observer.verify_arguments(argv, planned)
+
+    def test_new_reference_profile_requires_explicit_no_speculation(self):
+        planned = self.profile()
+        planned['engine_options'] = {'distribution': {
+            'mode':'layer', 'degree':5, 'layer_ranges':planned['settings']['layer_ranges']}}
+        with self.assertRaises(ValueError):
+            observer.verify_arguments(self.argv(), planned)
+        observer.verify_arguments(self.argv() + ['--spec-type', 'none'], planned)
+
     def test_binary_changes_are_rejected_without_replacing_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'llama-server';path.write_bytes(b'verified')

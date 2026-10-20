@@ -177,6 +177,12 @@ TSG_EXPORT int TSGgml_MuseSparkPostNormResidualF32(
         auto* normed = ggml_rms_norm(context.value, scaled_input, eps);
         auto* gated_stream = ggml_mul(context.value, residual.tensor, alpha);
         auto* gated_branch = ggml_mul(context.value, normed, beta);
+        // Match the unfused decoder's stored-F32 boundaries. CUDA may otherwise
+        // fuse RMSNorm, beta multiplication and the residual add into one
+        // expression; its different rounding can change the next quantized
+        // projection's activation bins. Keep one graph and reusable allocation.
+        ggml_set_output(normed);
+        ggml_set_output(gated_branch);
         auto* sum = ggml_add(context.value, gated_stream, gated_branch);
         auto* copy = ggml_cpy(context.value, sum, output.tensor);
         ggml_set_output(copy);

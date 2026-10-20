@@ -293,6 +293,11 @@ namespace tsg
     struct DeviceState
     {
         ggml_backend_t backend = nullptr;
+        // Explicit-F32 Spark projections share this rank's CUDA stream while
+        // keeping their private cuBLAS math policy out of the ordinary backend.
+        // The sidecar must be released before backend replacement/teardown.
+        ggml_backend_t spark_float32_backend = nullptr;
+        std::mutex spark_float32_mutex;
         // Index into the ggml device list this slot was initialized from
         // (== the CUDA/Vulkan ordinal). -1 until initialized.
         int device_index = -1;
@@ -1307,6 +1312,9 @@ namespace tsg
     bool alloc_ctx_tensors_reuse(ggml_context* ctx, ggml_cgraph* graph = nullptr);
     // Free the cached reuse buffer (called from TSGgml_Shutdown).
     void free_reuse_compute_buffer();
+
+    void free_spark_float32_backend();
+    void free_spark_float32_backends();
 
     // Allocate a graph's intermediates into a persistent, reused gallocr (grown on
     // demand, never freed per call) — for large multi-token fused graphs (e.g. the

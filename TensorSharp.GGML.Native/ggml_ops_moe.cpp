@@ -1424,10 +1424,10 @@ namespace
 
         if (stream_experts && p.post_expert_norm != nullptr)
         {
-            // Spark's ranks own different complete layers, unlike TP ranks.
-            // Its opt-in path can stream on the pinned layer's device, but a
-            // complete expert stack plus scratch must fit even though uploads
-            // are filtered to the experts actually routed in this batch.
+            // Spark evaluates an offloaded layer once on the pinned device
+            // (rank 0 under TP). Resident TP expert slices never enter this
+            // path. A complete expert stack plus scratch must fit even though
+            // uploads are filtered to the experts routed in this batch.
             MoeStreamMemoryPlan plan;
             stream_experts = plan_moe_stream_memory(graph, plan);
             struct LastDecision { const char* reason = nullptr; std::size_t required = 0, reusable = 0; };
@@ -1773,10 +1773,10 @@ namespace
             tsg::g_device_count.load(std::memory_order_acquire) <= 1;
         if (post_expert_norm != nullptr)
         {
-            // Only the dedicated Muse Spark ABI supplies this weight. Spark
-            // supports layer split, not tensor parallelism: exactly one pinned
-            // rank evaluates each unsharded layer. Keep the other models' TP
-            // prohibition unchanged and require explicit opt-in on all devices.
+            // Only the dedicated Muse Spark ABI supplies this weight. Its
+            // offloaded layers execute once, including under TP; resident
+            // per-rank expert slices use run_on_cpu=false. Keep the other
+            // models' TP prohibition and require explicit Spark opt-in.
             const char* enabled = std::getenv("TS_MUSE_SPARK_STREAM_EXPERTS");
             p.allow_device_stream = enabled != nullptr && std::strcmp(enabled, "1") == 0;
         }

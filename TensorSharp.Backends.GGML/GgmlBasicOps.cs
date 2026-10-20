@@ -566,6 +566,32 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>
+        /// Spark CUDA projection preserving F32 input/weight precision across
+        /// shard and batch shapes. Weight shape is [output,input]. This explicit
+        /// entry point leaves ordinary and quantized matmul policies unchanged.
+        /// </summary>
+        public static void MuseSparkProjectionFloat32(Tensor result, Tensor input, Tensor weight)
+        {
+            if (result?.Storage is not GgmlStorage resultStorage ||
+                resultStorage.Allocator is not GgmlAllocator allocator ||
+                allocator.Context.BackendType != GgmlBackendType.Cuda)
+                throw new NotSupportedException("Spark explicit-F32 projection requires a GGML CUDA result.");
+            if (input == null || weight == null ||
+                result.DimensionCount != 2 || input.DimensionCount != 2 || weight.DimensionCount != 2 ||
+                result.ElementType != DType.Float32 || input.ElementType != DType.Float32 || weight.ElementType != DType.Float32 ||
+                ReferenceEquals(result.Storage, input.Storage) || ReferenceEquals(result.Storage, weight.Storage) ||
+                result.Sizes[0] != input.Sizes[0] || result.Sizes[1] != weight.Sizes[0] || input.Sizes[1] != weight.Sizes[1] ||
+                !result.IsContiguous() || !weight.IsContiguous() ||
+                !TryCreateStandardView(result, out GgmlTensorView2D resultView) ||
+                !TryCreateStandardView(input, out GgmlTensorView2D inputView) ||
+                !TryCreateRawView(weight, out GgmlTensorView2D weightView))
+                throw new ArgumentException("Spark explicit-F32 projection requires distinct row-contiguous F32 tensors and row-major weights.");
+            // Direct calls bypass OpRegistry; preserve an active layer/rank pin.
+            GgmlNative.SetActiveRankIfUnpinned(resultStorage.DeviceId);
+            GgmlNative.MuseSparkProjectionFloat32(resultView, inputView, weightView);
+        }
+
+        /// <summary>
         /// Quantized linear forward: result = m1 * quantizedWeight^T.
         /// The quantized weight data is stored in native GGUF format with GGML type.
         /// ne0 = inDim (shared dimension), ne1 = outDim.

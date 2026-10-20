@@ -12,8 +12,13 @@ internal sealed class MuseSparkSyntheticModelBuilder
     internal const float Eps = 1e-5f, PostEps = 2e-6f, RopeBase = 7777, LogitScale = 0.7f, Softcap = 1.3f;
     internal readonly Dictionary<string, (ulong[] Shape, float[] Data)> Weights = new();
 
-    internal MuseSparkSyntheticModelBuilder()
+    private readonly int _heads, _kvHeads, _headDim, _experts, _used, _latent, _ffn;
+
+    internal MuseSparkSyntheticModelBuilder(int heads = Heads, int kvHeads = KvHeads, int experts = Experts,
+        int used = Used, int headDim = HeadDim, int latent = Latent, int ffn = Ffn)
     {
+        _heads = heads; _kvHeads = kvHeads; _experts = experts; _used = used;
+        _headDim = headDim; _latent = latent; _ffn = ffn;
         Add("token_embd.weight", 0.8f, 0, Hidden, Vocab);
         Add("output_norm.weight", 0.2f, 1, Hidden);
         Add("output.weight", 0.1f, 0, Hidden, Vocab);
@@ -23,22 +28,22 @@ internal sealed class MuseSparkSyntheticModelBuilder
             foreach (string n in new[] { "attn_norm", "ffn_norm", "post_ffw_norm" }) Add(p + n + ".weight", 0.4f, 1, Hidden);
             foreach (string n in new[] { "attn_resid_alpha", "ffn_resid_alpha" }) Add(p + n + ".weight", 0.2f, 0.7f, Hidden);
             foreach (string n in new[] { "attn_resid_beta", "ffn_resid_beta" }) Add(p + n + ".weight", 0.2f, 0.5f, Hidden);
-            Add(p + "attn_q.weight", 0.12f, 0, Hidden, Heads * HeadDim);
-            Add(p + "attn_k.weight", 0.12f, 0, Hidden, KvHeads * HeadDim);
-            Add(p + "attn_v.weight", 0.12f, 0, Hidden, KvHeads * HeadDim);
-            Add(p + "attn_gate.weight", 0.12f, 0, Hidden, Heads * HeadDim);
-            Add(p + "attn_output.weight", 0.12f, 0, Heads * HeadDim, Hidden);
-            Add(p + "attn_q_norm.weight", 0.2f, 0.7f, HeadDim);
-            Add(p + "attn_k_norm.weight", 0.2f, 1, HeadDim);
-            Add(p + "ffn_latent_down.weight", 0.12f, 0, Hidden, Latent);
-            Add(p + "ffn_latent_up.weight", 0.12f, 0, Latent, Hidden);
-            Add(p + "ffn_pre_exp_norm.weight", 0.4f, 1, Latent);
-            Add(p + "ffn_post_exp_norm.weight", 0.8f, 1, Latent);
-            Add(p + "ffn_gate_inp.weight", 0.2f, 0, Hidden, Experts);
-            Add(p + "exp_probs_b.bias", 0.2f, 0, Experts);
-            Add(p + "ffn_gate_exps.weight", 0.2f, 0, Latent, Ffn, Experts);
-            Add(p + "ffn_up_exps.weight", 0.2f, 0, Latent, Ffn, Experts);
-            Add(p + "ffn_down_exps.weight", 0.2f, 0, Ffn, Latent, Experts);
+            Add(p + "attn_q.weight", 0.12f, 0, Hidden, _heads * _headDim);
+            Add(p + "attn_k.weight", 0.12f, 0, Hidden, _kvHeads * _headDim);
+            Add(p + "attn_v.weight", 0.12f, 0, Hidden, _kvHeads * _headDim);
+            Add(p + "attn_gate.weight", 0.12f, 0, Hidden, _heads * _headDim);
+            Add(p + "attn_output.weight", 0.12f, 0, _heads * _headDim, Hidden);
+            Add(p + "attn_q_norm.weight", 0.2f, 0.7f, _headDim);
+            Add(p + "attn_k_norm.weight", 0.2f, 1, _headDim);
+            Add(p + "ffn_latent_down.weight", 0.12f, 0, Hidden, _latent);
+            Add(p + "ffn_latent_up.weight", 0.12f, 0, _latent, Hidden);
+            Add(p + "ffn_pre_exp_norm.weight", 0.4f, 1, _latent);
+            Add(p + "ffn_post_exp_norm.weight", 0.8f, 1, _latent);
+            Add(p + "ffn_gate_inp.weight", 0.2f, 0, Hidden, _experts);
+            Add(p + "exp_probs_b.bias", 0.2f, 0, _experts);
+            Add(p + "ffn_gate_exps.weight", 0.2f, 0, _latent, _ffn, _experts);
+            Add(p + "ffn_up_exps.weight", 0.2f, 0, _latent, _ffn, _experts);
+            Add(p + "ffn_down_exps.weight", 0.2f, 0, _ffn, _latent, _experts);
         }
     }
 
@@ -57,6 +62,9 @@ internal sealed class MuseSparkSyntheticModelBuilder
 
     internal string Write(string path, bool halfMatrices = false)
         => WriteFile(path, halfMatrices, CreateMetadata(), Weights);
+
+    internal string WriteMixedHalf(string path, Func<string, bool> halfWeight)
+        => WriteFile(path, false, CreateMetadata(), Weights, halfWeight);
 
     internal string[] WriteSplit(string directory, bool halfMatrices = false)
     {
@@ -79,7 +87,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
         return paths;
     }
 
-    private static Dictionary<string, object> CreateMetadata()
+    internal Dictionary<string, object> CreateMetadata()
     {
         return new Dictionary<string, object>
         {
@@ -87,22 +95,22 @@ internal sealed class MuseSparkSyntheticModelBuilder
             ["muse-spark.block_count"] = (uint)Layers,
             ["muse-spark.context_length"] = 64u,
             ["muse-spark.embedding_length"] = (uint)Hidden,
-            ["muse-spark.feed_forward_length"] = (uint)Ffn,
-            ["muse-spark.attention.head_count"] = (uint)Heads,
-            ["muse-spark.attention.head_count_kv"] = (uint)KvHeads,
-            ["muse-spark.attention.key_length"] = (uint)HeadDim,
-            ["muse-spark.attention.value_length"] = (uint)HeadDim,
+            ["muse-spark.feed_forward_length"] = (uint)_ffn,
+            ["muse-spark.attention.head_count"] = (uint)_heads,
+            ["muse-spark.attention.head_count_kv"] = (uint)_kvHeads,
+            ["muse-spark.attention.key_length"] = (uint)_headDim,
+            ["muse-spark.attention.value_length"] = (uint)_headDim,
             ["muse-spark.attention.layer_norm_rms_epsilon"] = Eps,
             ["muse-spark.post_norm_epsilon"] = PostEps,
             ["muse-spark.rope.freq_base_swa"] = RopeBase,
             ["muse-spark.rope.freq_base"] = RopeBase,
-            ["muse-spark.rope.dimension_count"] = (uint)HeadDim,
+            ["muse-spark.rope.dimension_count"] = (uint)_headDim,
             ["muse-spark.attention.sliding_window"] = (uint)Window,
             ["muse-spark.attention.sliding_window_pattern"] = new[] { true, false },
-            ["muse-spark.moe_latent_size"] = (uint)Latent,
-            ["muse-spark.expert_feed_forward_length"] = (uint)Ffn,
-            ["muse-spark.expert_count"] = (uint)Experts,
-            ["muse-spark.expert_used_count"] = (uint)Used,
+            ["muse-spark.moe_latent_size"] = (uint)_latent,
+            ["muse-spark.expert_feed_forward_length"] = (uint)_ffn,
+            ["muse-spark.expert_count"] = (uint)_experts,
+            ["muse-spark.expert_used_count"] = (uint)_used,
             ["muse-spark.expert_gating_func"] = 2u,
             ["muse-spark.expert_weights_norm"] = true,
             ["muse-spark.expert_weights_scale"] = 1.7f,
@@ -120,7 +128,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
     }
 
     private static string WriteFile(string path, bool halfMatrices, IReadOnlyDictionary<string, object> metadata,
-        IReadOnlyDictionary<string, (ulong[] Shape, float[] Data)> weights)
+        IReadOnlyDictionary<string, (ulong[] Shape, float[] Data)> weights, Func<string, bool> halfWeight = null)
     {
         using var file = File.Create(path);
         using var w = new BinaryWriter(file, Encoding.UTF8);
@@ -131,16 +139,17 @@ internal sealed class MuseSparkSyntheticModelBuilder
         {
             WriteString(w, key); w.Write((uint)shape.Length);
             foreach (ulong d in shape) w.Write(d);
-            bool half = halfMatrices && shape.Length > 1;
+            bool half = shape.Length > 1 && (halfMatrices || halfWeight?.Invoke(key) == true);
             w.Write(half ? 1u : 0u); w.Write(offset);
             offset += ((ulong)data.Length * (half ? 2u : 4u) + 31) / 32 * 32;
         }
         if (weights.Count == 0) return path; // Metadata-only shards have no tensor alignment padding.
         while (file.Position % 32 != 0) w.Write((byte)0);
-        foreach (var (_, (shape, data)) in weights)
+        foreach (var (name, (shape, data)) in weights)
         {
+            bool half = shape.Length > 1 && (halfMatrices || halfWeight?.Invoke(name) == true);
             foreach (float x in data)
-                if (halfMatrices && shape.Length > 1) w.Write(BitConverter.HalfToUInt16Bits((System.Half)x)); else w.Write(x);
+                if (half) w.Write(BitConverter.HalfToUInt16Bits((System.Half)x)); else w.Write(x);
             while (file.Position % 32 != 0) w.Write((byte)0);
         }
         return path;
@@ -204,35 +213,35 @@ internal sealed class MuseSparkSyntheticModelBuilder
                 for (int t = 0; t < tokens.Length; t++)
                 for (int h = 0; h < heads; h++)
                 {
-                    double[] head = Norm(tensor[t].AsSpan(h * HeadDim, HeadDim).ToArray(), Eps, norm);
+                    double[] head = Norm(tensor[t].AsSpan(h * _headDim, _headDim).ToArray(), Eps, norm);
                     if (layer == 0)
-                        for (int d = 0; d < HeadDim; d += 2)
+                        for (int d = 0; d < _headDim; d += 2)
                         {
-                            double angle = t / Math.Pow(RopeBase, (double)d / HeadDim), a = head[d], b = head[d + 1];
+                            double angle = t / Math.Pow(RopeBase, (double)d / _headDim), a = head[d], b = head[d + 1];
                             head[d] = a * Math.Cos(angle) - b * Math.Sin(angle);
                             head[d + 1] = a * Math.Sin(angle) + b * Math.Cos(angle);
                         }
-                    head.CopyTo(tensor[t], h * HeadDim);
+                    head.CopyTo(tensor[t], h * _headDim);
                 }
             }
-            NormalizeAndRotate(queries, Heads, p + "attn_q_norm.weight");
-            NormalizeAndRotate(keys, KvHeads, p + "attn_k_norm.weight");
+            NormalizeAndRotate(queries, _heads, p + "attn_q_norm.weight");
+            NormalizeAndRotate(keys, _kvHeads, p + "attn_k_norm.weight");
             for (int t = 0; t < tokens.Length; t++)
             {
-                var attention = new double[Heads * HeadDim];
-                for (int h = 0; h < Heads; h++)
+                var attention = new double[_heads * _headDim];
+                for (int h = 0; h < _heads; h++)
                 {
-                    int kv = h / (Heads / KvHeads), first = layer == 0 ? Math.Max(0, t - Window + 1) : 0;
+                    int kv = h / (_heads / _kvHeads), first = layer == 0 ? Math.Max(0, t - Window + 1) : 0;
                     var scores = new double[t + 1];
                     for (int s = first; s <= t; s++)
-                    for (int d = 0; d < HeadDim; d++) scores[s] += queries[t][h * HeadDim + d] * keys[s][kv * HeadDim + d] / Math.Sqrt(HeadDim);
+                    for (int d = 0; d < _headDim; d++) scores[s] += queries[t][h * _headDim + d] * keys[s][kv * _headDim + d] / Math.Sqrt(_headDim);
                     double max = scores.Skip(first).Max();
                     for (int s = first; s <= t; s++) scores[s] = Math.Exp(scores[s] - max);
                     double sum = scores.Skip(first).Sum();
-                    var head = new double[HeadDim];
+                    var head = new double[_headDim];
                     for (int s = first; s <= t; s++)
-                    for (int d = 0; d < HeadDim; d++) head[d] += scores[s] / sum * values[s][kv * HeadDim + d];
-                    Norm(head, Eps).CopyTo(attention, h * HeadDim);
+                    for (int d = 0; d < _headDim; d++) head[d] += scores[s] / sum * values[s][kv * _headDim + d];
+                    Norm(head, Eps).CopyTo(attention, h * _headDim);
                 }
                 var gate = Linear(norms[t], p + "attn_gate.weight");
                 attention = attention.Select((v, i) => v * Sigmoid(gate[i])).ToArray();
@@ -242,9 +251,9 @@ internal sealed class MuseSparkSyntheticModelBuilder
                 var latent = Norm(Linear(full, p + "ffn_latent_down.weight"), Eps, p + "ffn_pre_exp_norm.weight");
                 var probs = Linear(full, p + "ffn_gate_inp.weight").Select(Sigmoid).ToArray();
                 var bias = W(p + "exp_probs_b.bias");
-                var selected = Enumerable.Range(0, Experts).OrderByDescending(e => probs[e] + bias[e]).Take(Used).ToArray();
+                var selected = Enumerable.Range(0, _experts).OrderByDescending(e => probs[e] + bias[e]).Take(_used).ToArray();
                 double denominator = Math.Max(selected.Sum(e => probs[e]), 6.103515625e-5);
-                var mixture = new double[Latent];
+                var mixture = new double[_latent];
                 foreach (int expert in selected)
                 {
                     var g = Linear(latent, p + "ffn_gate_exps.weight", expert);
@@ -252,7 +261,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
                     var activated = g.Select((v, i) => v * Sigmoid(v) * u[i]).ToArray();
                     var down = Linear(activated, p + "ffn_down_exps.weight", expert);
                     var normalized = Norm(Multiply(down, p + "ffn_post_exp_norm.weight"), PostEps);
-                    for (int d = 0; d < Latent; d++) mixture[d] += normalized[d] * probs[expert] / denominator * 1.7;
+                    for (int d = 0; d < _latent; d++) mixture[d] += normalized[d] * probs[expert] / denominator * 1.7;
                 }
                 var projected = Linear(mixture, p + "ffn_latent_up.weight");
                 var post = Norm(Multiply(projected, p + "post_ffw_norm.weight"), PostEps);

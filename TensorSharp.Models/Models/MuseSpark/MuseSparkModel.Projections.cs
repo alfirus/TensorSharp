@@ -14,6 +14,7 @@ public partial class MuseSparkModel
     private void FuseAttentionProjections()
     {
         _fusedAttention = new bool[Config.NumLayers];
+        if (IsTensorParallel) return; // Retain exact independent shard boundaries and quantization types.
         if (Environment.GetEnvironmentVariable("TS_MUSE_SPARK_FUSE_QKVG") == "0") return;
         for (int layer = 0; layer < Config.NumLayers; layer++)
         {

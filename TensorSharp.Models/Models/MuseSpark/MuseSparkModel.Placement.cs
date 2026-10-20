@@ -11,29 +11,12 @@ public partial class MuseSparkModel
 
     private void BuildLayerPlacement()
     {
-        var bytes = new long[Config.NumLayers];
-        long embedding = 0, head = 0;
-        void Count(string name, long size)
-        {
-            // Offloading a leading prefix of experts radically changes the byte
-            // balance. Counting layers would overload the final GPU(s).
-            if (MoeCpuOffloadConfig.IsOffloadedExpertWeightName(name)) return;
-            if (name.StartsWith("blk.", StringComparison.Ordinal))
-            {
-                int dot = name.IndexOf('.', 4);
-                if (dot > 4 && int.TryParse(name.AsSpan(4, dot - 4), out int layer))
-                {
-                    bytes[layer] = checked(bytes[layer] + size);
-                    return;
-                }
-            }
-            if (name.StartsWith("output", StringComparison.Ordinal)) head = checked(head + size);
-            else embedding = checked(embedding + size);
-        }
-        // Per-expert quantized views partition the stacked tensor, so count
-        // these once even though the native operator uploads the stack lazily.
-        foreach (var weight in _quantWeights) Count(weight.Key, weight.Value.RawBytes);
-        foreach (var weight in _weights) Count(weight.Key, weight.Value.Storage.ByteLength);
+        // Plan from headers before LoadWeights can prefault/read payloads. A
+        // stacked expert tensor is one resident allocation, not one allocation
+        // plus another for each of its per-expert views. Fused QKVG replaces its
+        // source matrices with an equal-sized allocation.
+        var bytes = CapacityLayerBytes(MoeCpuOffloadConfig.AllLayers
+            ? Config.NumLayers : MoeCpuOffloadConfig.CpuMoeLayers, out long embedding, out long head);
         _layerRanks = PlanLayerPlacement(bytes, embedding, head, LayerSplitDegree,
             Environment.GetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT"));
         if (LayerSplitDegree <= 1) return;
@@ -47,6 +30,9 @@ public partial class MuseSparkModel
         Console.WriteLine("Muse Spark layer placement: " + string.Join(", ", parts) +
             "; KV, vision and compute scratch need additional memory.");
     }
+
+    internal static long PlacementWeightBytes(GgufTensorInfo info, long rawBytes, BackendType backend)
+        => ShouldStoreWeightQuantized(backend, info) ? rawBytes : checked(info.NumElements * sizeof(float));
 
     // Exact contiguous minimax partition (O(devices*layers^2), only 62 layers).
     // Roots stay on the first/last device. All requested devices own layers.

@@ -274,6 +274,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_bonsai.cpp
     ggml_ops_attention_alloc.cpp
     ggml_ops_attention_precision.cpp
+    ggml_ops_muse_spark_attention.cpp
     ggml_ops_flash_attn_guard.cpp
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
@@ -1009,7 +1010,37 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
 
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
+    # One-shot return/exception injection is present only in native test builds.
+    set_property(SOURCE ggml_ops_matmul.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsAddmmQuantCacheRecoveryTest tests/addmm_quant_cache_recovery_test.cpp)
+    target_link_libraries(GgmlOpsAddmmQuantCacheRecoveryTest PRIVATE GgmlOps)
+    add_test(NAME addmm-quant-cache-recovery-cpu COMMAND GgmlOpsAddmmQuantCacheRecoveryTest cpu)
+    set_tests_properties(addmm-quant-cache-recovery-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME addmm-quant-cache-recovery-cuda COMMAND GgmlOpsAddmmQuantCacheRecoveryTest cuda)
+        set_tests_properties(addmm-quant-cache-recovery-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    endif()
     add_executable(GgmlOpsResidentDeviceCopyTest tests/resident_device_copy_test.cpp)
+    add_executable(GgmlOpsMuseSparkProjectionPrecisionTest tests/muse_spark_projection_precision_test.cpp)
+    add_executable(GgmlOpsMuseSparkAttentionPrecisionTest tests/muse_spark_attention_precision_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkAttentionPrecisionTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-attention-precision-cpu COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cpu)
+    set_tests_properties(muse-spark-attention-precision-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-attention-precision-cuda COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cuda)
+        add_test(NAME muse-spark-attention-precision-cuda-multi COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cuda-multi)
+        set_tests_properties(muse-spark-attention-precision-cuda muse-spark-attention-precision-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240 RUN_SERIAL TRUE)
+    endif()
+    target_link_libraries(GgmlOpsMuseSparkProjectionPrecisionTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-projection-precision-cpu COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cpu)
+    set_tests_properties(muse-spark-projection-precision-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-projection-precision-cuda COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cuda)
+        add_test(NAME muse-spark-projection-precision-cuda-multi COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cuda-multi)
+        set_tests_properties(muse-spark-projection-precision-cuda muse-spark-projection-precision-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
     target_link_libraries(GgmlOpsResidentDeviceCopyTest PRIVATE GgmlOps)
     add_test(NAME resident-device-copy-cpu COMMAND GgmlOpsResidentDeviceCopyTest cpu)
     set_tests_properties(resident-device-copy-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)

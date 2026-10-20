@@ -1535,6 +1535,7 @@ static int tsg_multi_device_init(int backendType, const int* deviceIndices, int 
                 if (g_backend != nullptr)
                 {
                     tsg::sync_backend(g_backend);
+                    tsg::free_spark_float32_backend();
                     ggml_backend_free(g_backend);
                 }
                 g_backend = replacement;
@@ -1549,6 +1550,7 @@ static int tsg_multi_device_init(int backendType, const int* deviceIndices, int 
             {
                 // Re-init after a previous group was torn down.
                 tsg::sync_backend(g_backend);
+                tsg::free_spark_float32_backend();
                 ggml_backend_free(g_backend);
                 g_backend = nullptr;
             }
@@ -1629,6 +1631,7 @@ TSG_EXPORT int TSGgml_TensorParallelInitLoopback(int backendType, int count)
             if (g_backend != nullptr)
             {
                 tsg::sync_backend(g_backend);
+                tsg::free_spark_float32_backend();
                 ggml_backend_free(g_backend);
                 g_backend = nullptr;
             }
@@ -1832,7 +1835,7 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceHost(float** buffers, int rankCount
 // the result once per rank. Only a win when the collective is materially faster
 // than the host sum — that is, on multi-GPU boxes with NVLink or working P2P and
 // large payloads. Returns 0 when unavailable so the caller can use the host path.
-TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, int64_t count)
+static int tsg_allreduce_host_buffers_on_device(float** buffers, int rankCount, int64_t count, bool exact_f32)
 {
     try
     {
@@ -1872,7 +1875,9 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCou
                 tensors[static_cast<std::size_t>(r)] = t;
             }
 
-            if (!tsg::tp_device_allreduce(tensors.data()))
+            if (!(exact_f32
+                ? tsg::tp_reduce_segment(tensors.data(), rankCount, true)
+                : tsg::tp_device_allreduce(tensors.data())))
                 return 0;
 
             for (int r = 0; r < rankCount; ++r)
@@ -1891,4 +1896,18 @@ TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCou
         tsg::set_last_error(ex.what());
         return 0;
     }
+}
+
+TSG_EXPORT int TSGgml_TensorParallelAllReduceDevice(float** buffers, int rankCount, int64_t count)
+{
+    return tsg_allreduce_host_buffers_on_device(buffers, rankCount, count, false);
+}
+
+// Preserve F32 partials through the collective. The upstream CUDA/NCCL
+// collective may otherwise narrow large prefill payloads to BF16. Reuse the
+// TensorSharp-owned exact transport and its exact chunked/host fallback;
+// the fetched ggml tree remains unchanged.
+TSG_EXPORT int TSGgml_TensorParallelAllReduceDeviceF32(float** buffers, int rankCount, int64_t count)
+{
+    return tsg_allreduce_host_buffers_on_device(buffers, rankCount, count, true);
 }

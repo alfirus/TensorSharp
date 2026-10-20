@@ -43,6 +43,7 @@ public partial class MuseSparkModel
 
     private Tensor MoE(Tensor input, int layer, int rows)
     {
+        _sparkPhaseFrame?.Next(MuseSparkPhase.Router);
         string p = _prefixes[layer];
         using var logits = LinearForward(input, p + "ffn_gate_inp.weight");
         float[] router = TensorToFloatArray(logits);
@@ -54,11 +55,27 @@ public partial class MuseSparkModel
                 _expertWeightsNorm, _expertScale,
                 selected.AsSpan(row * _numExpertsUsed, _numExpertsUsed),
                 routing.AsSpan(row * _numExpertsUsed, _numExpertsUsed));
+        _sparkPhaseFrame?.Next(MuseSparkPhase.LatentPreparation);
         using var latent = LinearForward(input, p + "ffn_latent_down.weight");
         using var expertInput = Norm(latent, Config.Eps, p + "ffn_pre_exp_norm.weight");
+        if (IsTensorParallel && !MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+        {
+            using var parallelOutput = TensorParallelExperts(expertInput, layer, rows, selected, routing);
+            _sparkPhaseFrame?.Next(MuseSparkPhase.LatentUp);
+            return LinearForward(parallelOutput, p + "ffn_latent_up.weight");
+        }
+        if (_sparkPhaseFrame != null)
+        {
+            bool nativeCpu = IsGgmlBackend && MoeCpuOffloadConfig.IsLayerOnCpu(layer) &&
+                _stackedExpertWeights.ContainsKey(p + "ffn_gate_exps.weight") &&
+                _stackedExpertWeights.ContainsKey(p + "ffn_up_exps.weight") &&
+                _stackedExpertWeights.ContainsKey(p + "ffn_down_exps.weight");
+            _sparkPhaseFrame.Next(nativeCpu ? MuseSparkPhase.CpuExperts : MuseSparkPhase.ExpertsSingle);
+        }
         using var expertOutput = new Tensor(_allocator, DType.Float32, rows, _latentSize);
         if (!TryNativeExperts(expertInput, expertOutput, layer, rows, selected, routing))
             GroupedExperts(expertInput, expertOutput, layer, rows, selected, routing);
+        _sparkPhaseFrame?.Next(MuseSparkPhase.LatentUp);
         return LinearForward(expertOutput, p + "ffn_latent_up.weight");
     }
 
@@ -133,9 +150,12 @@ public partial class MuseSparkModel
             return result;
         }
         using var plane = _weights[p + ".weight"].Select(0, expert);
-        using var transpose = plane.Transpose();
         var output = new Tensor(_allocator, DType.Float32, input.Sizes[0], width);
-        Ops.Addmm(output, 0f, output, 1f, input, transpose);
-        return output;
+        try
+        {
+            SparkFloatProjection(output, input, plane);
+            return output;
+        }
+        catch { output.Dispose(); throw; }
     }
 }

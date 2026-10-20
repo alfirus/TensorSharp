@@ -14,13 +14,74 @@ code; the fetched ggml dependency remains unchanged.
 | Expert path | [MuseSparkModel.Moe.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Moe.cs), native `TSGgml_MuseSparkMoEFFNQuantF32` |
 | Images | Matching Spark mmproj, shared Muse-Glimmer vision encoder |
 | Audio | Not implemented; an audio tower in the projector does not enable audio inference |
-| GPU placement | Whole-layer placement through `--layer-split`; tensor-parallel sharding is not implemented |
-| Expert offload | `--n-cpu-moe N` keeps the first N layers' routed expert weights in host memory |
+| GPU placement | `--tp N` shards attention and partitions experts; `--layer-split N` assigns complete layers. These are separate, single-process modes on `ggml_cuda`/`ggml_vulkan`. |
+| Expert offload | `--n-cpu-moe N` runs the first N layers' preserved native expert stacks on the CPU; F32 tensor fallbacks retain the selected backend |
 | KV cache | F32/F16 linear GQA caches, truncation and prefix snapshots; block-quantized KV is rejected |
 | Continuous batching | Packed, paged text forward with F32 KV; F16 and image requests use the ordinary sequence path |
 | Speculation | Generic n-gram drafter through `--spec --spec-type ngram`; no learned Muse Spark draft model is assumed |
 
-## Measured status
+## Tensor parallelism
+
+`--tp N` splits Q/K/V/gate projections by complete GQA head groups and splits
+the attention output projection by input columns. Each GPU computes its heads
+concurrently, then the partial output projections are summed before the
+post-attention normalization. Routed experts are partitioned whole across the
+same GPUs. Each expert's complete latent output is normalized before routing
+weights and the cross-GPU sum are applied. The router, latent down/up
+projections, residual stream and output head execute on rank 0.
+
+This supports uneven head/expert partitions, including nine GPUs for the
+published 128-query/16-KV-head checkpoint. Each rank must own at least one KV
+group and expert, and quantized attention output cuts must preserve complete
+quantization blocks. Unsupported geometry and multi-node TP are refused.
+`--n-cpu-moe N` still evaluates the selected prefix of preserved native expert
+stacks once on the host; it does not duplicate those expert computations across
+ranks. This covers the published quantized checkpoint. F32 expert tensors that
+use the ordinary tensor-operation fallback remain on the selected backend
+(rank 0 in TP), even when they lie in that prefix. Capacity checks count those
+F32 weights as GPU weights.
+
+The GGML per-operation path returns partial results to host memory. Small
+reductions run there; larger reductions can use the backend transport.
+Spark requests F32-preserving reduction, including TensorSharp's own F32 NCCL
+transport or exact fallback, so prefill collectives do not silently narrow
+partials to BF16. PCIe topology and rank-0 work can limit scaling. TP therefore
+requires measurement on the intended hardware; it is not a promise of linear
+speedup or lower aggregate model memory.
+
+The TP path retains separate Q/K/V/gate weight projections. The optional
+`TS_MUSE_SPARK_FUSE_QK_PREP=1` packs their initialized host outputs and performs
+Q/K normalization and optional RoPE together on each CUDA rank, using that
+rank's actual head counts. It adds a host packing cost and is off by default;
+its TP performance requires a controlled comparison. Norm scratch reuse and
+F16 2D KV uploads remain available. Successful
+optimization-use records from a layer-split run do not establish their use in
+a TP run.
+
+Spark's CUDA projections for F32 weights explicitly preserve F32 operands,
+including uneven attention shards, expert planes and the output head. This
+scoped path reuses a backend wrapper per rank; quantized weights and other
+models retain their existing matmul policies. It addresses the observed
+shape-dependent TF32 arithmetic difference between full and uneven-shard
+projections. Device regression and full-model validation of this correction
+are pending; the earlier failed numerical checks remain recorded.
+
+Spark's CUDA F32 KV paths also use TensorSharp-owned attention that preserves
+F32 Q/K/V operands. Upstream CUDA flash attention can narrow F32 K/V to F16;
+the published head geometry exposed this difference in packed scalar checks.
+Ordinary and paged Spark calls now require an explicit owned-CUDA success
+status and report separate successful-use counters. This is not upstream
+flash execution. The F16 path and other models' attention policies are unchanged.
+The strict packed scalar bounds remain unchanged; device validation of this
+correction is pending.
+
+Capacity checks run from GGUF descriptors before payload loading. TP checks
+the actual uneven shards plus rank-0 weights, while layer split checks complete
+layer assignments. The remaining memory estimate is workload-dependent; see
+the startup guidance below. Both modes preserve F32/F16 linear KV snapshots
+and speculative rewind; packed continuous batching requires F32 KV.
+
+## Previous five-GPU layer-split measurements
 
 The completed v4r2 F16 campaign on the Q3 checkpoint passed 13 selected quality
 fixtures, a separate thinking check and all nine timing-case content checks.
@@ -188,8 +249,8 @@ profile above, llama.cpp's `--ctx-size 16384 --kv-unified
 --kv-unified-per-slot 16384 --parallel 4` preserves the same aggregate capacity
 and request ceiling. Its whole-layer split includes the output projection, so
 the corresponding settings are `--split-mode layer --tensor-split 35,7,7,7,7`.
-The llama.cpp option name does not mean TensorSharp implements tensor-parallel
-matrix sharding.
+These settings describe the previous whole-layer comparison. TensorSharp's
+separate `--tp N` mode performs the attention sharding described above.
 
 Use the process/container memory limit when budgeting host experts. The Q4
 profile with 42 offloaded layers needs approximately 334 GiB for those expert
@@ -200,6 +261,46 @@ readiness after severe paging and is not a passing inference test.
 from host capacity. `eng/validation/muse-spark-launch-plan.py` estimates placement
 from complete shard headers and explicit KV, projector, runtime and streaming
 reserves; an estimated fit still requires measured memory peaks.
+
+For whole-layer placement on GGML CUDA/Vulkan, TensorSharp now checks the
+GGUF tensor descriptors against each selected device's current free memory
+before reading weight payloads. A refusal distinguishes weights that already
+exceed VRAM from insufficient estimated compute/active-KV headroom. It reports
+a higher CPU-offload count when one fits the same header-based estimate;
+settings are never changed automatically. Host memory must also accommodate
+those offloaded experts.
+
+Tensor parallelism also plans from descriptors before loading weights. It keeps
+uniform whole-expert counts when they fit every measured device. Otherwise it
+assigns contiguous expert ranges to balance remaining memory after fixed
+attention/trunk weights and the same reserve; rank 0 can own fewer experts to
+accommodate its trunk. The preflight and loader use one immutable plan, and the
+startup log records its counts and policy. If any device's free memory is
+unavailable, it falls back to uniform counts and reports which checks were
+unavailable. This never changes `--n-cpu-moe`. It does not reserve the vision
+tower or prove that the maximum configured context will fit.
+
+Muse Spark CUDA TP contexts retain up to eight reusable host scratch blocks per
+rank, capped at 128 blocks of at most 8 MiB each (1 GiB total), allocated on
+demand. Single-device, layer-placement and other-model pools keep their existing
+policy. `TS_MUSE_SPARK_TP_HOST_POOL=0` selects the original eight-block pool for
+a controlled comparison. With `TS_MUSE_SPARK_PHASE_TIMING=1`, forward reports
+include immutable before/after host-pool counters alongside phase timings.
+These counters measure host allocation/reuse, not device memory or kernel time.
+The increased retention is bounded; a whole-model performance benefit remains
+unmeasured.
+
+The headroom estimate is 2560 MiB per GPU for this full model at up to 256
+prefill rows, scales with model geometry and larger chunks, and excludes the
+vision tower and additional retained requests. It is not a fit guarantee.
+`TS_MUSE_SPARK_SCRATCH_RESERVE_MIB` explicitly overrides that estimate; lowering
+it cannot bypass the weight-only check. Keep `MAX_CONTEXT` and
+`TS_KV_INITIAL_TOKENS` explicit as in the example: the model's advertised
+context limit is not evidence that a machine can hold that much KV memory.
+GGML linear KV tensors are host-backed and grow lazily unless the configured
+initial allocation reserves more; the check reports their initial and
+maximum host sizes rather than charging the full advertised context to every
+GPU.
 
 For images, pass the matching Spark release's `--mmproj` as shown above.
 Its projector type is `muse-glimmer`, but its output width must match the Spark
@@ -265,7 +366,8 @@ are already folded into the GGUF tensors and must not be applied again.
 
 The native expert graph batches selected experts with `mul_mat_id` and performs
 the order-sensitive expert norm, routing multiply and reduction in one graph.
-Offloaded experts run on the CPU by default. The experimental
+Offloaded preserved native expert stacks run on the CPU by default; the F32
+tensor fallback limitation described above still applies. The experimental
 `TS_MUSE_SPARK_STREAM_EXPERTS=1` option lets prefills of at least
 `TS_HOST_MOE_DEVICE_MIN_BATCH` rows (default 128) stream selected experts to
 the layer's GPU. It supports layer splitting and checks the measured full
@@ -307,14 +409,19 @@ was evicted or isolate a throughput gain from this option.
 post-normalization gated residual on CPU and CUDA, including packed batches.
 The FFN channel scale stays before normalization; alpha and beta stay on the
 two residual branches. A diagnostic confirms the first successful dispatch.
+The graph now retains the normalized branch and beta-scaled branch as separate
+stored-F32 intermediates, preventing CUDA expression fusion from changing
+their rounding boundaries. New same-input comparisons against separate native
+operations are required; device validation of this correction is pending.
 Other backends retain the original operations. This option remains off by
 default. The completed combined F16 profile recorded successful use; it is not
 an isolated residual-fusion speed comparison.
 
 `TS_MUSE_SPARK_FUSE_QK_PREP=1` combines per-head Q/K normalization and the
-sliding layers' RoPE in one GGML graph on CPU and CUDA. It requires the fused
-Q/K/V/gate projection; separate projections and other backends retain their
-existing path. Global layers preserve NoPE. Q/K preparation and fused residual
+sliding layers' RoPE in one GGML graph on CPU and CUDA. The ordinary path uses
+the fused Q/K/V/gate projection; CUDA TP packs its separate projection outputs
+without changing weight ownership. Other backends retain their existing path.
+Global layers preserve NoPE. Q/K preparation and fused residual
 graphs reuse device-local scratch with fresh inputs on every call. A diagnostic
 confirms the first successful Q/K dispatch. This option is off by default.
 Successful use was recorded in the completed combined F16 campaign; a separate
@@ -394,8 +501,8 @@ preserved in the [isolated proof](../validation/muse-spark/lifecycle-completed-r
 The native libraries used a scoped partial relink; continuations rebuilt only
 the fixture and reused those exact libraries. This was component validation,
 not a post-repair full-model run.
-The final reusable validation tool requires all 27 native cases, including the
-three lifecycle lanes; 27 local Python guard tests separately verified that
+That lifecycle proof's validation tool required all 27 native cases, including
+the three lifecycle lanes; 27 local Python guard tests separately verified that
 selection. Those tooling tests are not additional device tests.
 
 `eng/validation/validate-muse-spark-final-candidate.sh` reproduces the isolated
@@ -410,6 +517,34 @@ The separately continued n-gram full-model checks passed, including verified
 acceptance and rollback. The separate F16 displaced-prefix probe also passed.
 Component passes cannot substitute for these independently recorded runtime
 checks.
+
+For the current TP implementation, use
+[`eng/validation/validate-muse-spark-tp.py`](../../eng/validation/validate-muse-spark-tp.py).
+It runs an already-built Linux runtime, with explicit CPU, rank-count,
+attention, cache and collective lanes. `--list-lanes` lists the exact inventory
+and device requirements. The default includes every required lane; diagnostic
+lanes are separate and a subset does not establish a full-suite pass.
+The native inventory now requires 32 cases, including cache-failure recovery
+and the new F32 projection precision checks. This requirement is not a claim
+that the new device checks have passed.
+
+Supply a source manifest and a successful build receipt whose build-time hashes
+cover the entire managed runtime, every selected native test executable and
+`native-build/libGgmlOps.so`. The managed and native libraries must match.
+The runner verifies those hashes and unchanged upstream ggml before and after
+each lane, refuses active model workloads, preserves failed output in a fresh
+evidence directory, and rejects skipped or missing required cases. For example:
+
+```bash
+python eng/validation/validate-muse-spark-tp.py \
+  --root /work/TensorSharp --source-manifest /proof/source.json \
+  --build-record /proof/build.json --runtime /proof/managed \
+  --native-build /proof/native --output /proof/new-tp \
+  --dotnet /opt/dotnet/dotnet --devices 0,1,2,3,4,5,6,7,8
+```
+
+These synthetic component gates do not replace checkpoint quality tests,
+serving-mechanism evidence or matched performance measurements.
 
 The test project builds a tiny deterministic model with both sliding and global
 layers, GQA, routing correction, latent experts, nonuniform post-expert scales,

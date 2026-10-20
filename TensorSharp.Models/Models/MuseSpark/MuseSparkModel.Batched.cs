@@ -19,6 +19,17 @@ public partial class MuseSparkModel : IBatchedPagedModel
 
     public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
     {
+        if (!_sparkPhaseTimingEnabled) return ForwardBatchCore(ctx);
+        return TimedForwardBatch(ctx);
+    }
+
+    private IReadOnlyList<float[]> TimedForwardBatch(BatchedForwardContext ctx)
+    {
+        return RecordSparkForward("packed", ctx?.Positions.Count ?? 0, -1, () => ForwardBatchCore(ctx));
+    }
+
+    private IReadOnlyList<float[]> ForwardBatchCore(BatchedForwardContext ctx)
+    {
         ArgumentNullException.ThrowIfNull(ctx);
         if (!BatchedForwardAvailable)
             throw new NotSupportedException("Muse Spark paged batching requires F32 KV and text-only input.");
@@ -63,17 +74,20 @@ public partial class MuseSparkModel : IBatchedPagedModel
             if (slot < 0 || slot >= checked(requiredBlocks * blockSize))
                 throw new ArgumentException("Invalid Muse Spark KV slot.", nameof(ctx));
 
-        int priorRank = LayerSplitDegree > 1 ? GgmlBasicOps.GetActiveRank() : 0;
-        bool priorPin = LayerSplitDegree > 1 && GgmlBasicOps.PinRank(0);
+        bool pinExecution = IsGgmlBackend && (LayerSplitDegree > 1 || IsTensorParallel);
+        int priorRank = pinExecution ? GgmlBasicOps.GetActiveRank() : 0;
+        bool priorPin = pinExecution && GgmlBasicOps.PinRank(0);
         Tensor hidden = null;
         _forwardSw.Start();
         try
         {
+            _sparkPhaseFrame?.Next(MuseSparkPhase.Embedding);
             using (var embedding = Embedding(tokens)) hidden = Norm(embedding, Config.Eps);
             using var qPositions = SparkBatchPositions(positions, Config.NumHeads);
             using var kPositions = SparkBatchPositions(positions, Config.NumKVHeads);
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
+                _sparkPhaseFrame?.Next(MuseSparkPhase.LayerNorms);
                 if (LayerSplitDegree > 1 && GgmlBasicOps.GetActiveRank() != LayerRank(layer))
                 {
                     SyncTensorHostCache(hidden);
@@ -81,21 +95,28 @@ public partial class MuseSparkModel : IBatchedPagedModel
                 }
                 string p = _prefixes[layer];
                 using var preAttention = Norm(hidden, Config.Eps, p + "attn_norm.weight");
+                _sparkPhaseFrame?.Next(MuseSparkPhase.AttentionSingle);
                 using var attention = SparkBatchAttention(preAttention, layer, rows, sequences,
                     qPositions, kPositions, positions, starts, slots, lengths, ctx.BlockTables, blocks, offsets);
+                _sparkPhaseFrame?.Next(MuseSparkPhase.Residual);
                 using var ffnInput = PostNormResidual(hidden, attention, p + "attn_resid_alpha.weight", p + "attn_resid_beta.weight");
                 hidden.Dispose(); hidden = null;
+                _sparkPhaseFrame?.Next(MuseSparkPhase.LayerNorms);
                 using var ffnNorm = Norm(ffnInput, Config.Eps, p + "ffn_norm.weight");
                 using var moe = MoE(ffnNorm, layer, rows);
+                _sparkPhaseFrame?.Next(MuseSparkPhase.Residual);
                 hidden = PostNormResidual(ffnInput, moe, p + "ffn_resid_alpha.weight", p + "ffn_resid_beta.weight",
                     p + "post_ffw_norm.weight");
+                _sparkPhaseFrame?.Next(MuseSparkPhase.Cleanup);
             }
+            _sparkPhaseFrame?.Next(MuseSparkPhase.OutputNorm);
             using var final = Norm(hidden, Config.Eps, "output_norm.weight");
             float[] finalFlat = TensorToFloatArray(final);
             if (ctx.CaptureHiddenAll != null)
                 finalFlat.CopyTo(ctx.CaptureHiddenAll, 0);
             if (ctx.CaptureLogitsAll != null)
             {
+                _sparkPhaseFrame?.Next(MuseSparkPhase.OutputHead);
                 using var everyLogit = LinearForward(final, "output.weight");
                 float[] all = TensorToFloatArray(everyLogit);
                 ApplySparkLogitScale(all);
@@ -103,17 +124,20 @@ public partial class MuseSparkModel : IBatchedPagedModel
             }
             float[] lastRows = PagedKvBatchOps.GatherLastTokenPerSeq(finalFlat, Config.HiddenSize, starts, sequences);
             using var last = CreateFloatTensor(lastRows, sequences, Config.HiddenSize);
+            _sparkPhaseFrame?.Next(MuseSparkPhase.OutputHead);
             using var output = LinearForward(last, "output.weight");
             float[] logits = TensorToFloatArray(output);
             ApplySparkLogitScale(logits);
             var result = new float[sequences][];
             for (int s = 0; s < sequences; s++) result[s] = logits.AsSpan(s * Config.VocabSize, Config.VocabSize).ToArray();
+            _sparkPhaseFrame?.Next(MuseSparkPhase.Cleanup);
             return result;
         }
         finally
         {
+            _sparkPhaseFrame?.Next(MuseSparkPhase.Cleanup);
             hidden?.Dispose();
-            if (LayerSplitDegree > 1) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
+            if (pinExecution) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
             _forwardCount++;
             _forwardSw.Stop();
         }
@@ -132,6 +156,8 @@ public partial class MuseSparkModel : IBatchedPagedModel
         Tensor qPositions, Tensor kPositions, int[] positions, int[] starts, int[] slots,
         int[] lengths, int[][] tables, int[] blocks, int[] offsets)
     {
+        if (IsTensorParallel)
+            return SparkTpBatchAttention(input, layer, rows, sequences, positions, starts, slots, lengths, tables, blocks, offsets);
         string p = _prefixes[layer];
         var projections = AttentionProjections(input, layer, 0, positions, out bool preparedQK);
         using var q0 = projections.Query;
@@ -147,9 +173,9 @@ public partial class MuseSparkModel : IBatchedPagedModel
         float[] qFlat = TensorToFloatArray(q), attention = new float[checked(rows * Config.NumHeads * _headDim)];
         int window = _isSwa[layer] ? _slidingWindow : 0;
         if (IsGgmlBackend)
-            GgmlBasicOps.PagedAttentionForward(qFlat, _pagedKeys[layer], _pagedValues[layer], attention,
+            SparkPagedAttentionF32(qFlat, _pagedKeys[layer], _pagedValues[layer], attention,
                 starts, lengths, positions, blocks, offsets, sequences, rows, Config.NumHeads, Config.NumKVHeads,
-                _headDim, _pagedBlockSize, 1f / MathF.Sqrt(_headDim), window);
+                window);
         else
             ManagedPagedAttention.Forward(qFlat, _pagedKeys[layer], _pagedValues[layer], attention, rows,
                 Config.NumHeads, Config.NumKVHeads, _headDim, _pagedBlockSize, starts, lengths, positions,
@@ -177,6 +203,7 @@ public partial class MuseSparkModel : IBatchedPagedModel
 
     private void EnsureSparkPagedBuffers(int blocks, int blockSize)
     {
+        if (IsTensorParallel) { EnsureSparkTpPagedBuffers(blocks, blockSize); return; }
         if (_pagedKeys != null && _pagedBlocks >= blocks && _pagedBlockSize == blockSize) return;
         int capacity = Math.Max(blocks, checked(_pagedBlocks * 2));
         var keys = new float[Config.NumLayers][];

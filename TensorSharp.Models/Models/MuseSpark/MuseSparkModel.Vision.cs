@@ -24,8 +24,9 @@ namespace TensorSharp.Models
             // reject it before allocating a multi-billion-parameter encoder.
             using (var gguf = new GgufFile(mmProjPath))
                 ValidateVisionProjector(gguf, Config.HiddenSize);
-            int priorRank = LayerSplitDegree > 1 ? GgmlBasicOps.GetActiveRank() : 0;
-            bool priorPin = LayerSplitDegree > 1 && GgmlBasicOps.PinRank(0);
+            bool pinRank = IsGgmlBackend && (LayerSplitDegree > 1 || IsTensorParallel);
+            int priorRank = pinRank ? GgmlBasicOps.GetActiveRank() : 0;
+            bool priorPin = pinRank && GgmlBasicOps.PinRank(0);
             try
             {
                 var encoder = new MuseGlimmerVisionEncoder(mmProjPath, _allocator);
@@ -35,7 +36,7 @@ namespace TensorSharp.Models
             }
             finally
             {
-                if (LayerSplitDegree > 1) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
+                if (pinRank) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
             }
         }
 
@@ -67,12 +68,13 @@ namespace TensorSharp.Models
         List<int> IMultimodalPromptExpander.ExpandMultimodalPrompt(
             ModelMultimodalInjector injector, List<ChatMessage> history, List<int> inputTokens)
         {
-            int priorRank = LayerSplitDegree > 1 ? GgmlBasicOps.GetActiveRank() : 0;
-            bool priorPin = LayerSplitDegree > 1 && GgmlBasicOps.PinRank(0);
+            bool pinRank = IsGgmlBackend && (LayerSplitDegree > 1 || IsTensorParallel);
+            int priorRank = pinRank ? GgmlBasicOps.GetActiveRank() : 0;
+            bool priorPin = pinRank && GgmlBasicOps.PinRank(0);
             try { return injector.ProcessMuseGlimmerHistory(_visionEncoder, history, inputTokens); }
             finally
             {
-                if (LayerSplitDegree > 1) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
+                if (pinRank) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
             }
         }
 

@@ -1685,6 +1685,11 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_MuseSparkProjectionFloat32(
+            GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_AddmmQuantF32(
             GgmlTensorView2D result,
             GgmlTensorView2D m1,
@@ -4790,6 +4795,10 @@ internal enum GgmlIndexReductionOp
 
         internal static void AddmmPreciseMetal(GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight)
             => CheckResult(TSGgml_AddmmF32PreciseMetal(result, default, input, weight, 0, 1), "gemma4_projection_float32_metal");
+
+        internal static void MuseSparkProjectionFloat32(
+            GgmlTensorView2D result, GgmlTensorView2D input, GgmlTensorView2D weight)
+            => CheckResult(TSGgml_MuseSparkProjectionFloat32(result, input, weight), "muse_spark_projection_float32");
 
         public static void AddmmQuant(GgmlTensorView2D result, GgmlTensorView2D m1, IntPtr m2Data, int m2GgmlType, long m2Ne0, long m2Ne1, long m2RawBytes)
         {

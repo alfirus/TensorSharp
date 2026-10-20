@@ -9,10 +9,70 @@
 #include <vector>
 
 struct View { void* data; int rows, channels, row_stride, channel_stride; int64_t bytes; };
+struct View4 { void* data; int ne0, ne1, ne2, ne3; int64_t nb1, nb2, nb3, bytes; };
 extern "C" {
 int TSGgml_IsBackendAvailable(int);
 int TSGgml_MuseSparkPostNormResidualF32(View, View, View, void*, void*, void*, int, float);
+int TSGgml_NormF32(int, View4, View4, View4, View4, int, float);
+int TSGgml_BinaryTensorF32(int, View4, View4, View4);
+const char* TSGgml_GetLastError();
 void TSGgml_Shutdown();
+}
+
+static View view(std::vector<float>& values, int rows, int width) {
+    return {values.data(), rows, width, width, 1, int64_t(rows) * width * int64_t(sizeof(float))};
+}
+
+static View4 view4(std::vector<float>& values, int rows, int width) {
+    const int64_t row_bytes = int64_t(width) * sizeof(float), bytes = rows * row_bytes;
+    return {values.data(), width, rows, 1, 1, row_bytes, bytes, bytes, bytes};
+}
+
+// Compare the actual exported fused operation with the original separate
+// native operations on identical inputs. A scalar tolerance cannot expose a
+// changed stored-F32 boundary before a later quantized activation projection.
+static bool check_stored_boundaries() {
+    const int shapes[][2] = {{1,32},{3,32},{9,64},{128,64},{1,8192},{3,8192},{9,32},{1,32}};
+    int cases = 0;
+    for (int seed : {17, 173}) for (const auto& shape : shapes) for (bool pre_scale : {false, true}) {
+        const int rows = shape[0], width = shape[1], count = rows * width;
+        std::vector<float> stream(count), branch(count), scaled(count), normed(count), stream_part(count),
+            branch_part(count), separate(count), fused(count), alpha(width), beta(width), scale(width), ones(width, 1.f);
+        uint32_t state = seed;
+        auto random = [&]() {
+            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+            return float(int32_t(state % 200001) - 100000) / 32767.f;
+        };
+        for (int c = 0; c < width; ++c) {
+            alpha[c] = random(); beta[c] = random(); scale[c] = random();
+        }
+        for (int i = 0; i < count; ++i) { stream[i] = random(); branch[i] = random(); }
+        auto checked = [&](int status) {
+            if (status == 1) return true;
+            std::fprintf(stderr, "stored-boundary operation failed: %s\n", TSGgml_GetLastError());
+            return false;
+        };
+        if (pre_scale && !checked(TSGgml_BinaryTensorF32(3, view4(scaled, rows, width),
+                view4(branch, rows, width), view4(scale, 1, width)))) return false;
+        auto& norm_input = pre_scale ? scaled : branch;
+        if (!checked(TSGgml_NormF32(2, view4(normed, rows, width), view4(norm_input, rows, width),
+                view4(ones, 1, width), {}, 0, 1e-8f)) ||
+            !checked(TSGgml_BinaryTensorF32(3, view4(stream_part, rows, width), view4(stream, rows, width), view4(alpha, 1, width))) ||
+            !checked(TSGgml_BinaryTensorF32(3, view4(branch_part, rows, width), view4(normed, rows, width), view4(beta, 1, width))) ||
+            !checked(TSGgml_BinaryTensorF32(1, view4(separate, rows, width), view4(stream_part, rows, width), view4(branch_part, rows, width))) ||
+            !checked(TSGgml_MuseSparkPostNormResidualF32(view(fused, rows, width), view(stream, rows, width),
+                view(branch, rows, width), alpha.data(), beta.data(), pre_scale ? scale.data() : nullptr, width, 1e-8f))) return false;
+        for (int i = 0; i < count; ++i) {
+            if (!std::isfinite(fused[i]) || !std::isfinite(separate[i]) || fused[i] != separate[i]) {
+                std::fprintf(stderr, "stored-F32 boundary mismatch: rows=%d width=%d seed=%d pre_scale=%d index=%d fused=%.9g separate=%.9g delta=%.9g\n",
+                    rows, width, seed, int(pre_scale), i, fused[i], separate[i], fused[i] - separate[i]);
+                return false;
+            }
+        }
+        ++cases;
+    }
+    std::printf("PASS: %d shared-input stored-F32 boundary cases against separate native operations\n", cases);
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -67,6 +127,7 @@ int main(int argc, char** argv) {
     // Aliasing the branch also retains the pre-call input during normalization.
     if (call(b, s, b, alpha.data(), beta.data(), width, 1e-5f) != 1) return 1;
     for (size_t i = 0; i < branch.size(); ++i) if (std::abs(branch[i] - out[i]) > 3e-5f) return 1;
+    if (!check_stored_boundaries()) return 1;
     TSGgml_Shutdown();
     std::puts("PASS: Spark residual arithmetic, aliasing, exact spans and non-mutating rejection");
     return 0;

@@ -60,12 +60,13 @@ public sealed class MuseSparkQKPrepTests
         Assert.All(k.GetElementsAsFloat(16), value => Assert.Equal(71f, value));
     }
 
-    private static void GraphCheck(GgmlBackendType backend, int devices)
+    internal static void GraphCheck(GgmlBackendType backend, int devices, int qh = 128, int kh = 16)
     {
         var context = new GgmlContext(Enumerable.Range(0, devices).ToArray(), backend, enableCollectives: false);
         var allocator = new GgmlAllocator(context, 0);
         int oldRank = GgmlBasicOps.GetActiveRank(); bool oldPin = GgmlBasicOps.PinRank(0);
-        const int hd = 64, qh = 128, kh = 16, qw = qh * hd, kw = kh * hd, width = 2 * (qw + kw);
+        const int hd = 64;
+        int qw = qh * hd, kw = kh * hd, width = 2 * (qw + kw);
         int iteration = 0;
         try
         {

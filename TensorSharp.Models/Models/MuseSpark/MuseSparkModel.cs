@@ -27,9 +27,18 @@ public partial class MuseSparkModel : ModelBase
 
     public MuseSparkModel(string ggufPath, BackendType backend, int tpDegree = 1,
         ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
-        : base(ggufPath, ValidateBackend(backend, tpDegree, tpGroup, layerSplitDegree),
-            1, null, layerSplitDegree)
+        : this(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, null)
     {
+    }
+
+    // A supplied snapshot allows deterministic placement tests without reserving
+    // device memory. The public constructor always queries the selected devices.
+    internal MuseSparkModel(string ggufPath, BackendType backend, int tpDegree,
+        ITensorParallelGroup tpGroup, int layerSplitDegree, long[] tensorParallelFreeBytes)
+        : base(ggufPath, ValidateBackend(backend, tpDegree, tpGroup, layerSplitDegree),
+            tpDegree, tpGroup, layerSplitDegree)
+    {
+        _sparkTpPlanningFreeBytes = tensorParallelFreeBytes == null ? null : (long[])tensorParallelFreeBytes.Clone();
         try
         {
         string arch = _gguf.GetString("general.architecture") ?? "muse-spark";
@@ -68,12 +77,19 @@ public partial class MuseSparkModel : ModelBase
         for (int l = 0; l < _prefixes.Length; l++) _prefixes[l] = $"blk.{l}.";
         ParseTokenizer();
         ValidateWeights();
+        PreflightLayerSplitCapacity();
+        PreflightSparkTensorParallel();
         LoadWeights();
-        FuseAttentionProjections();
-        BuildLayerPlacement();
-        PrepareCudaQuantizedWeightsForInference();
-        ReleasePreloadedGpuSourcePages();
+        // Choose from the complete checkpoint before TP removes matrices from
+        // the unsharded dictionaries.
         ApplyModelAlignedKvCacheDefault(_quantWeights);
+        InitializeSparkTensorParallel();
+        ConfigureSparkTensorParallelHostPool();
+        FuseAttentionProjections();
+        if (IsTensorParallel) PrepareCudaQuantizedWeightsForInferenceTP();
+        else PrepareCudaQuantizedWeightsForInference();
+        ReleasePreloadedGpuSourcePages();
+        if (IsTensorParallel) ReleaseTensorParallelGpuSourcePages();
         _maxContextLength = ResolveConfiguredContextLength();
         _kvCacheK = new Tensor[Config.NumLayers];
         _kvCacheV = new Tensor[Config.NumLayers];
@@ -90,8 +106,12 @@ public partial class MuseSparkModel : ModelBase
 
     private static BackendType ValidateBackend(BackendType backend, int tp, ITensorParallelGroup group, int split)
     {
-        if (tp != 1 || group != null)
-            throw new NotSupportedException("Muse Spark supports --layer-split N, not tensor-parallel sharding.");
+        bool tensorParallel = tp > 1 || group?.IsActive == true;
+        if (tensorParallel && split > 1)
+            throw new NotSupportedException("Muse Spark tensor parallelism and layer split are separate placement modes.");
+        if (tensorParallel && backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan) &&
+            !(backend == BackendType.Cpu && group != null))
+            throw new NotSupportedException("Muse Spark tensor parallelism requires ggml_cuda or ggml_vulkan (or an explicit CPU test group).");
         if (split > 1 && backend is not (BackendType.GgmlCuda or BackendType.GgmlVulkan))
             throw new NotSupportedException("Muse Spark layer placement requires ggml_cuda or ggml_vulkan.");
         if (MoeCpuOffloadConfig.IsEnabled && backend is not (BackendType.Cpu or BackendType.GgmlCpu or
@@ -201,14 +221,30 @@ public partial class MuseSparkModel : ModelBase
 
     private float[] ForwardChunk(int[] tokens, bool outputLogits, bool allLogitsRows = false, float[] hiddenRows = null)
     {
+        if (!_sparkPhaseTimingEnabled) return ForwardChunkCore(tokens, outputLogits, allLogitsRows, hiddenRows);
+        return TimedForwardChunk(tokens, outputLogits, allLogitsRows, hiddenRows);
+    }
+
+    // Keep the capturing delegate in a separate enabled-only method: a C#
+    // display class must not be allocated at entry to the disabled fast path.
+    private float[] TimedForwardChunk(int[] tokens, bool outputLogits, bool allLogitsRows, float[] hiddenRows)
+    {
+        return RecordSparkForward("ordinary", tokens.Length, _cacheSeqLen,
+            () => ForwardChunkCore(tokens, outputLogits, allLogitsRows, hiddenRows));
+    }
+
+    private float[] ForwardChunkCore(int[] tokens, bool outputLogits, bool allLogitsRows, float[] hiddenRows)
+    {
         _forwardSw.Start();
         int rows = tokens.Length, start = _cacheSeqLen;
         EnsureCacheCapacity(start + rows);
-        int priorRank = LayerSplitDegree > 1 ? GgmlBasicOps.GetActiveRank() : 0;
-        bool priorPin = LayerSplitDegree > 1 && GgmlBasicOps.PinRank(0);
+        bool pinExecution = IsGgmlBackend && (LayerSplitDegree > 1 || IsTensorParallel);
+        int priorRank = pinExecution ? GgmlBasicOps.GetActiveRank() : 0;
+        bool priorPin = pinExecution && GgmlBasicOps.PinRank(0);
         Tensor hidden = null;
         try
         {
+            _sparkPhaseFrame?.Next(MuseSparkPhase.Embedding);
             using (var embeddings = Embedding(tokens))
             {
                 DrainPendingVisionEmbeddings(embeddings, start);
@@ -216,6 +252,7 @@ public partial class MuseSparkModel : ModelBase
             }
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
+                _sparkPhaseFrame?.Next(MuseSparkPhase.LayerNorms);
                 if (LayerSplitDegree > 1 && GgmlBasicOps.GetActiveRank() != LayerRank(layer))
                 {
                     SyncTensorHostCache(hidden);
@@ -223,22 +260,29 @@ public partial class MuseSparkModel : ModelBase
                 }
                 string p = _prefixes[layer];
                 using var preAttention = Norm(hidden, Config.Eps, p + "attn_norm.weight");
+                _sparkPhaseFrame?.Next(MuseSparkPhase.AttentionSingle);
                 using var attention = Attention(preAttention, layer, rows, start);
+                _sparkPhaseFrame?.Next(MuseSparkPhase.Residual);
                 using var ffnInput = PostNormResidual(hidden, attention, p + "attn_resid_alpha.weight", p + "attn_resid_beta.weight");
                 hidden.Dispose(); hidden = null;
+                _sparkPhaseFrame?.Next(MuseSparkPhase.LayerNorms);
                 using var ffnNorm = Norm(ffnInput, Config.Eps, p + "ffn_norm.weight");
                 using var moeOutput = MoE(ffnNorm, layer, rows);
+                _sparkPhaseFrame?.Next(MuseSparkPhase.Residual);
                 hidden = PostNormResidual(ffnInput, moeOutput, p + "ffn_resid_alpha.weight", p + "ffn_resid_beta.weight",
                     p + "post_ffw_norm.weight");
+                _sparkPhaseFrame?.Next(MuseSparkPhase.Cleanup);
             }
             _cacheSeqLen += rows;
             if (!outputLogits) return null;
+            _sparkPhaseFrame?.Next(MuseSparkPhase.OutputNorm);
             using var last = hidden.Narrow(0, allLogitsRows || hiddenRows != null ? 0 : rows - 1,
                 allLogitsRows || hiddenRows != null ? rows : 1);
             using var final = Norm(last, Config.Eps, "output_norm.weight");
             if (hiddenRows != null) TensorToFloatArray(final).CopyTo(hiddenRows, 0);
             using var headInput = final.Narrow(0, allLogitsRows ? 0 : (int)final.Sizes[0] - 1,
                 allLogitsRows ? rows : 1);
+            _sparkPhaseFrame?.Next(MuseSparkPhase.OutputHead);
             using var logits = LinearForward(headInput, "output.weight");
             _logitsBuffer = TensorToFloatArray(logits);
             for (int i = 0; i < _logitsBuffer.Length; i++)
@@ -246,12 +290,14 @@ public partial class MuseSparkModel : ModelBase
                 float x = _logitsBuffer[i] * _logitScale;
                 _logitsBuffer[i] = _softcap > 0 ? _softcap * MathF.Tanh(x / _softcap) : x;
             }
+            _sparkPhaseFrame?.Next(MuseSparkPhase.Cleanup);
             return _logitsBuffer;
         }
         finally
         {
+            _sparkPhaseFrame?.Next(MuseSparkPhase.Cleanup);
             hidden?.Dispose();
-            if (LayerSplitDegree > 1) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
+            if (pinExecution) GgmlBasicOps.RestoreRankPin(priorPin, priorRank);
             _forwardCount++;
             _forwardSw.Stop();
         }
@@ -277,6 +323,7 @@ public partial class MuseSparkModel : ModelBase
 
     private Tensor Attention(Tensor input, int layer, int rows, int start)
     {
+        if (IsTensorParallel) return TensorParallelAttention(input, layer, rows, start);
         string p = _prefixes[layer];
         var projections = AttentionProjections(input, layer, start, null, out bool preparedQK);
         using var q0 = projections.Query;
@@ -319,14 +366,14 @@ public partial class MuseSparkModel : ModelBase
             using (var flatOutput = output.View(rows, Config.NumHeads * _headDim))
                 return ReshapeToHeads(flatOutput, Config.NumHeads, rows, _headDim);
         }
-        // Compact GQA cache views, with fused attention on GGML and a managed
-        // reference path elsewhere. No [heads, query, key] matrix on GGML.
+        // Compact GQA cache views. CUDA keeps F32 operands in the Spark-owned
+        // path; other GGML backends retain their existing attention policy.
         using var k = ExpandKVHeads(_kvCacheK[layer], 1, total);
         using var v = ExpandKVHeads(_kvCacheV[layer], 1, total);
         if (IsGgmlBackend)
         {
-            GgmlBasicOps.FusedPrefillAttention(q, k, v, output, Config.NumHeads,
-                Config.NumKVHeads, _headDim, rows, total, start, window, scale);
+            SparkPrefillAttentionF32(q, k, v, output, Config.NumHeads,
+                Config.NumKVHeads, rows, total, start, window, scale);
             InvalidateTensorDeviceCache(output);
             // The native function consumes head-first Q but returns token-first
             // [tokens, heads * dim], irrespective of the output Tensor's shape.
@@ -441,6 +488,20 @@ public partial class MuseSparkModel : ModelBase
     private void InvalidateKvDeviceCopies()
     {
         if (_kvCacheK == null) return;
+        if (IsTensorParallel && _tpKvFirst != null)
+        {
+            _tpGroup.RunPerRank(rank =>
+            {
+                for (int layer = 0; layer < _kvCacheK.Length; layer++)
+                {
+                    if (_kvCacheK[layer] == null) continue;
+                    using var k = _kvCacheK[layer].Narrow(0, _tpKvFirst[rank], _tpKvCount[rank]);
+                    using var v = _kvCacheV[layer].Narrow(0, _tpKvFirst[rank], _tpKvCount[rank]);
+                    InvalidateTensorDeviceCache(k); InvalidateTensorDeviceCache(v);
+                }
+            });
+            return;
+        }
         for (int l = 0; l < _kvCacheK.Length; l++)
         {
             int previousRank = LayerSplitDegree > 1 ? GgmlBasicOps.GetActiveRank() : 0;
@@ -468,6 +529,8 @@ public partial class MuseSparkModel : ModelBase
         _kvCacheK = _kvCacheV = null;
         _pagedKeys = _pagedValues = null;
         _pagedBlocks = _pagedBlockSize = 0;
+        if (IsGgmlBackend) OnBeforeReleaseGgmlDeviceResidency();
+        DisposeSparkTensorParallel();
         base.Dispose();
     }
 }

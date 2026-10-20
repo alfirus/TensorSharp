@@ -3339,6 +3339,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     // it has to be released explicitly or the threads outlive the shutdown.
     tsg::moe_ffn_host_release();
     tsg::bonsai_clear_backend();
+    tsg::free_spark_float32_backends();
 
     for (int r = 0; r < ranks; ++r)
     {
