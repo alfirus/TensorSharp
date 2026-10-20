@@ -346,6 +346,15 @@ namespace TensorSharp.Chat
             // frame and nothing else. Null for every non-video model, so the UI can test
             // one field instead of pattern-matching an architecture string.
             object video = null;
+            if (_svc.Model is TensorSharp.Models.Ltx25.Ltx25Model ltx)
+            {
+                try { _ = ltx.TryLoadIngredientsAdapterIfPresent(); }
+                catch (Exception e) when (e is not OperationCanceledException)
+                {
+                    _loggerFactory.CreateLogger("TensorSharp.Server.Video").LogError(e,
+                        "Could not attach the LTX Ingredients adapter discovered beside the loaded checkpoint.");
+                }
+            }
             if (_svc.Model is TensorSharp.Models.Video.IVideoGenerationModel videoModel)
             {
                 video = new

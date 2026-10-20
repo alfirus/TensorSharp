@@ -411,9 +411,9 @@ ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4
 
 ## 在 TensorAgent Mac 应用里
 
-32 GB 档位提供 **MiniMax-H3**（`minimax-h3-fl2va-q4k`）和
-**MiniMax-H3 References**（`minimax-h3-ref2va-q4k`），自动下载带哈希校验的网络和三份
-分词器文件。首个条目把一张上传图作为首帧，两张作为首尾帧；参考条目接受参考媒体。
+32 GB 档位提供一个 **MiniMax-H3** 条目（`minimax-h3-fl2va-q4k`），自动下载带哈希校验的
+FL2VA 与 Ref2VA 去噪器、共享网络和三份分词器文件。在 Video Studio 中可选择首尾帧模式或参考模式；
+切换时只更换活动去噪器，已加载的模型和共享组件保持就绪。
 目录可用性不等于已完成每个模型/设备的验证；当前 Windows 与 iOS 的媒体生成未验证。
 完整应用与构建说明见 [TensorAgent](../../TensorAgent/README.md)。
 
