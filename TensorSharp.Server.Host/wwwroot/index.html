@@ -1600,13 +1600,21 @@ function renderAttachments() {
   attachmentsDiv.innerHTML = '';
   let imageNum = 0;
   const totalImages = pendingAttachments.filter(a => a.mediaType === 'image').length;
-  if (totalImages && currentVideoCaps?.supportsKeyframeConditioning && !currentVideoCaps.referenceMode) {
+  if (totalImages && currentVideoCaps?.supportsKeyframeConditioning) {
+    const referenceMode = !!currentVideoCaps.referenceMode;
+    const lengths = referenceMode
+      ? [[121, '5 s · trained length'], [241, '10 s']]
+      : [[17, '0.7 s preview'], [33, '1.4 s'], [97, '4 s'], [121, '5 s']];
+    const savedLength = Number(currentVideoCaps.clipFrames || currentVideoCaps.defaultPreviewFrames || 17);
+    const selectedLength = lengths.some(([frames]) => frames === savedLength)
+      ? savedLength : (referenceMode ? 121 : 17);
+    currentVideoCaps.clipFrames = selectedLength;
     const label = document.createElement('label'); label.textContent = 'Clip length ';
     const length = document.createElement('select'); length.setAttribute('aria-label', 'Video clip length');
-    for (const [value, text] of [[17, '0.7 s preview'], [33, '1.4 s'], [97, '4 s'], [121, '5 s']]) {
+    for (const [value, text] of lengths) {
       const option = document.createElement('option'); option.value = String(value); option.textContent = text; length.appendChild(option);
     }
-    length.value = String(currentVideoCaps.clipFrames || currentVideoCaps.defaultPreviewFrames || 17);
+    length.value = String(selectedLength);
     length.addEventListener('change', () => { currentVideoCaps.clipFrames = Number(length.value); renderAttachments(); });
     label.appendChild(length); attachmentsDiv.appendChild(label);
   }
@@ -1617,7 +1625,12 @@ function renderAttachments() {
       const option = document.createElement('option'); option.value = value; option.textContent = text; choice.appendChild(option);
     }
     choice.value = currentVideoCaps.referenceMode ? 'ref' : 'keyframes';
-    choice.addEventListener('change', () => { currentVideoCaps.referenceMode = choice.value === 'ref'; renderAttachments(); });
+    choice.addEventListener('change', () => {
+      currentVideoCaps.referenceMode = choice.value === 'ref';
+      if (currentVideoCaps.referenceMode && (currentVideoCaps.clipFrames || 0) < 121)
+        currentVideoCaps.clipFrames = 121;
+      renderAttachments();
+    });
     label.appendChild(choice); attachmentsDiv.appendChild(label);
     if (currentVideoCaps.referenceMode) {
       const help = document.createElement('span'); help.className = 'image-selection-role'; help.style.flexBasis = '100%';
@@ -3079,13 +3092,9 @@ function fmtDuration(s) {
 
 async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
   bubbleText.textContent = 'Starting video generation… (this takes a few minutes)';
-  // What attached media MEANS depends on the checkpoint, and only the server knows
-  // which one is loaded. A reference model (MiniMax-H3 Ref2VA) takes stills, clips
-  // and soundtracks as identity and appearance references for a brand-new scene and
-  // accepts several at once; a keyframe model takes the first still as the opening
-  // frame and, where it does first-and-last, a second as the closing one. Sending the
-  // attachments down the wrong one of those is not a degraded clip, it is a refused
-  // request, so the payload is shaped from /api/models rather than guessed here.
+  // What attached media MEANS depends on the loaded model. Photos become image guides
+  // or appearance references. A video attached for MiniMax-H3 or LTX 2.5 continues
+  // from its exact last frame; a second video can pin the new take's ending.
   // With no capability block (an older server, or a model that reports none) this
   // falls through to exactly the single-image request the UI has always sent.
   const caps = currentVideoCaps || {};
@@ -3101,8 +3110,8 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
   let unused = 0;
 
   if (currentArchitecture === 'ltx-2.5') {
-    if (clips.length || sounds.length) {
-      bubbleText.textContent = 'LTX 2.5 accepts image keyframes. Video and audio reference adapters require separate checkpoints.';
+    if (sounds.length) {
+      bubbleText.textContent = 'LTX 2.5 does not accept audio reference inputs.';
       statsDiv.textContent = 'Unsupported input';
       return;
     }
@@ -3113,12 +3122,28 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
       steps: 8, cfg: 1, sampler: 'euler_ancestral', flowShift: 0, videoMode: 't2va', generateAudio: true });
   }
 
-  if (caps.supportsKeyframeConditioning && userMsg.videoMode === 'ref') {
+  if (clips.length) {
+    if (stills.length || sounds.length || userMsg.imageConditions || userMsg.image_conditions) {
+      bubbleText.textContent = 'Use video continuations by themselves; remove attached photos, keyframes or sound.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    if (clips.length > 2) {
+      bubbleText.textContent = 'Use one or two reference videos. The first ends where the new clip starts; the second ends where it finishes.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    if (!caps.supportsImageConditioning || clips.length === 2 && !caps.supportsEndImageConditioning) {
+      bubbleText.textContent = 'Video continuation needs MiniMax-H3 FL2VA or LTX 2.5 image conditioning.';
+      statsDiv.textContent = 'Unsupported input'; return;
+    }
+    payload.continueFromVideos = clips;
+    payload.videoMode = clips.length === 1 ? 'i2v' : 'fl2v';
+    mode = clips.length === 1 ? 'Continue from last frame' : 'Continue between last frames';
+  } else if (caps.supportsKeyframeConditioning && userMsg.videoMode === 'ref') {
     if (!caps.supportsReferenceConditioning || !stills.length || stills.length > caps.maxReferenceImages) {
       bubbleText.textContent = 'Identity references require the installed Ingredients adapter and uploaded images.';
       statsDiv.textContent = 'Unsupported input'; return;
     }
-    Object.assign(payload, { width: 768, height: 448, frames: 121, fps: 24,
+    Object.assign(payload, { width: 768, height: 448, frames: userMsg.videoFrames || 121, fps: 24,
       videoMode: 'ref', referenceImages: stills });
     mode = 'Identity references (Ingredients)';
   } else if (caps.supportsKeyframeConditioning) {

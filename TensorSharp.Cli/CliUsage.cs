@@ -746,6 +746,10 @@ namespace TensorSharp.Cli
                     "either way it is resampled onto the model's own 24 fps and its own canvas. Pair a " +
                     "soundtrack with --ref-video-audio.",
                     "--ref-video clip/"),
+                new OptionHelp("--continue-from-video <file>",
+                    "Continue a new MiniMax-H3 or LTX 2.5 take from the exact last frame of a video. " +
+                    "Repeat once to also pin the new take's last frame to a second video's last frame.",
+                    "--continue-from-video previous.mp4"),
                 new OptionHelp("--ref-video-audio <file>",
                     "Soundtrack for the reference video at the SAME position: the first " +
                     "--ref-video-audio pairs with the first --ref-video, and so on. Separate from " +

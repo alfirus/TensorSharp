@@ -388,8 +388,8 @@ server takes no `--cfg` at all — so the model's own defaults apply.
 > tokenizer is not one. Put three files from the `processor/` folder of
 > [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
 > beside it — `vocab.json`, `merges.txt` and `tokenizer_config.json` — or point
-> `TS_VIDEO_TOKENIZER` at the folder holding them. (The TensorAgent Mac app's catalog
-> entries download all three; see [TensorAgent](../../TensorAgent/README.md).) Neither
+> `TS_VIDEO_TOKENIZER` at the folder holding them. (The TensorAgent Mac app's single catalog entry downloads all three; see
+> [TensorAgent](../../TensorAgent/README.md).) Neither
 > published GGUF has any metadata at all, so TensorSharp identifies H3 by its tensors
 > rather than by an architecture string (arch keys `minimax-h3` / `minimax_h3` are
 > accepted when a file does declare one).
@@ -597,7 +597,7 @@ choose plug-ins; send requests without `steps`, as the Web UI does
 ([API examples](../../TensorSharp.Server.Host/API_EXAMPLES.md#minimax-h3--video-and-native-32-khz-stereo-audio)).
 [Video Studio](../video-studio.md#sampling-recipes) shows the recipe, fixes the step
 count and binds each job to it. The [TensorAgent app](../../TensorAgent/README.md)
-offers both plug-ins on its keyframes entry as speed plug-ins, applied per clip in
+offers both plug-ins on the MiniMax-H3 entry for FL2VA clips, applied per clip in
 chat and in Studio, and never sends steps, a flow shift or a sampler.
 
 ### Turbo validation status
@@ -704,20 +704,25 @@ Returns `{ ok, url, audioUrl, audioMuxed, width, height, frames, fps, seed, code
 `audioUrl` is null when the model produced no track; `audioMuxed` says whether the MP4
 carries the soundtrack as well ([below](#audio-output)). The full field set is `prompt`,
 `width`, `height`, `frames`, `steps`, `cfg`, `fps`, `seed`, `flowShift`,
-`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`,
+`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`, `continueFromVideos`,
 `referenceImages`, `referenceVideos`, `referenceAudios`, `referenceVideoAudios`;
 the Wan fields `negativePrompt`, `sampler`, `cfgCacheStride` and `cfg2` are
 accepted and ignored by H3. Most of them are **camelCase only** —
-`videoMode`, `generateAudio`, `endImage` and the four `reference*` lists are the
+`videoMode`, `generateAudio`, `endImage`, `continueFromVideos` and the four `reference*` lists are the
 only ones that also accept a snake_case spelling (`video_mode`, `generate_audio`,
-`end_image`, `reference_images`, …), and camelCase wins when both are present.
+`end_image`, `continue_from_videos`, `reference_images`, …), and camelCase wins when both are present.
 Sending `image_path` or `flow_shift` is silently ignored rather than rejected, so
 prefer camelCase everywhere. `referenceVideoAudios` pairs **by index** with
 `referenceVideos`, the same positional rule `--ref-video-audio` follows. `imagePath` / `endImage` /
 `referenceImages` name files previously uploaded through `/api/upload`; paths
 outside the upload directory are rejected. `/v1/videos/generations` shares the same
-parser, so the same seven fields accept snake_case there too (`video_mode`,
+parser, so the same fields accept snake_case there too (`video_mode`,
 `reference_images`, …); it returns `audio_url` rather than `audioUrl`, and no mux flag.
+
+`continueFromVideos` takes one or two previously uploaded video files and uses their
+exact final frames as the new take's first frame and, optionally, its last frame. The
+first clip starts the take; the second clip's ending pins the take's end. This uses
+FL2VA frame conditioning; `referenceVideos` continues to provide full-clip Ref2VA context.
 
 A model rejection — the wrong checkpoint for the mode, or keyframes together with
 references — comes back as a **400 carrying the model's own message**, not a generic

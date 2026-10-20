@@ -331,10 +331,18 @@ Notes:
 
 ## Experimental LTX 2.5 preset
 
-[`ltx-2.5-distilled.json`](ltx-2.5-distilled.json) records the verified Q4_K_M
+[`ltx-2.5-distilled.json`](ltx-2.5-distilled.json) records the verified UD-Q4_K_XL
 distilled denoiser, the dedicated Gemma 4 text encoder with LTX projections, the
-convolutional video VAE, the x2 spatial latent upscaler and the audio VAE. All five
-files are pinned by commit and SHA-256, with a combined size of 44.76 GB. Paths use
+convolutional video VAE, the x2 spatial latent upscaler and the audio VAE. The five
+base files are pinned by commit and SHA-256, totaling 43.08 GB. It also declares the
+optional Ingredients IC-LoRA (1.31 GB), pinned to Lightricks commit
+`12040e4091ac2008d3906a594e31a7fb1ab9d546`; the complete download is 44.39 GB when
+that adapter is available. Lightricks gates this adapter: accept its terms and configure
+`HF_TOKEN` or a Hugging Face token file. Config expansion downloads it before loading
+the model when authorized and continues without it otherwise, leaving ordinary video
+generation available. The running server reads the config at startup, so use the
+updated preset on the next launch to have references available from the initial model
+load. Paths use
 `${TENSORSHARP_MODELS:-../models}/ltx25`, including the upstream `text_encoders/`,
 `vae/` and `latent_upscale_models/` subfolders. The preset's output is 1024 × 1024,
 17 frames at 24 fps.
@@ -343,7 +351,8 @@ then the publisher's two-stage distilled recipe: the complete 48-block denoiser
 samples the published eight sigmas (ancestral Euler, CFG 1) at half the output size,
 the latent upscaler doubles it, and three refinement steps run at full size. The
 convolutional video decoder and the 48 kHz stereo audio decoder/vocoder finish.
-TensorAgent offers **Download** and **Use** for **LTX 2.5 Distilled** (Q4_K_M).
+TensorAgent offers **Download** and **Use** for **LTX 2.5 Distilled** (UD-Q4_K_XL + BF16),
+including the Ingredients adapter when optional downloads are enabled (the default).
 The experimental catalog tier is 48 GB; this is not a measured minimum for every
 resolution or duration. Width and height must be multiples of 64 (each pass keeps
 the 32-pixel latent grid), and frame counts must be `8k+1`. First, last and
