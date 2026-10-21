@@ -439,6 +439,9 @@ namespace TensorSharp.Models.MiniMaxH3
         int IVideoGenerationModel.FrameCountMultiple => 17;
         int IVideoGenerationModel.FrameCountOffset => 5;
         int IVideoGenerationModel.DefaultPreviewFps => MiniMaxH3Geometry.Fps;
+        int IVideoGenerationModel.DefaultOutputWidth => 640;
+        int IVideoGenerationModel.DefaultOutputHeight => 384;
+        int IVideoGenerationModel.ResolutionMultiple => 32;
         // The joint audio stream is generated either way; only its decode needs the VAE.
         bool IVideoGenerationModel.SupportsAudio => _audioVaePath != null;
         bool IVideoGenerationModel.SupportsImageConditioning => SupportsPartition(MiniMaxH3Partition.FirstLastFrame);

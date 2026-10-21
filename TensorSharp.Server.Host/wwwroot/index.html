@@ -1369,6 +1369,7 @@ let currentVideoCaps = null;
 let videoComposerModelId = null;
 let videoComposerMode = 'auto';
 let videoComposerFrames = 0;
+let videoComposerResolution = 'default';
 // Architectures whose /api/models 'architecture' id means "this model generates video".
 // The id comes from GGUF metadata, so it is matched rather than renamed.
 const VIDEO_ARCHITECTURES = new Set(['wan', 'wan2.1', 'wan2.2', 'minimax-h3', 'ltx-2.5']);
@@ -1456,6 +1457,7 @@ function updateStatusBadge(data) {
     videoComposerModelId = currentLoadedModel;
     videoComposerMode = 'auto';
     videoComposerFrames = 0;
+    videoComposerResolution = 'default';
   }
   renderAttachments();
 
@@ -1605,11 +1607,51 @@ async function uploadFiles(files) {
     if (uploaded.length !== files.length || uploaded.some(file => !file || !file.ok || !file.file)) {
       throw new Error('The server did not return every uploaded file. Please try again.');
     }
+    // Keep the source canvas size with each attachment so the video composer can offer
+    // its original resolution and smaller choices with the same aspect ratio. Browser
+    // metadata reads never block an upload failure: unsupported formats keep the model
+    // default option until their dimensions are available another way.
+    for (let i = 0; i < uploaded.length; i++) {
+      const dimensions = await readMediaDimensions(files[i], uploaded[i].mediaType);
+      if (dimensions) Object.assign(uploaded[i], dimensions);
+    }
     pendingAttachments.push(...uploaded);
     renderAttachments();
     uploaded.forEach(file => { if (file.warning) alert(file.warning); });
   } catch (e) {
     alert('Upload error: ' + e.message);
+  }
+}
+
+async function readMediaDimensions(file, mediaType) {
+  if (!file || !['image', 'video'].includes(mediaType)) return null;
+  const url = URL.createObjectURL(file);
+  try {
+    if (mediaType === 'image') {
+      const image = new Image();
+      image.decoding = 'async';
+      image.src = url;
+      try { await image.decode(); } catch { return null; }
+      return image.naturalWidth > 0 && image.naturalHeight > 0
+        ? { width: image.naturalWidth, height: image.naturalHeight } : null;
+    }
+
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.src = url;
+    try {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Video metadata timed out')), 8000);
+        video.onloadedmetadata = () => { clearTimeout(timeout); resolve(); };
+        video.onerror = () => { clearTimeout(timeout); reject(new Error('Video metadata unavailable')); };
+        video.load();
+      });
+    } catch { return null; }
+    return video.videoWidth > 0 && video.videoHeight > 0
+      ? { width: video.videoWidth, height: video.videoHeight } : null;
+  } finally {
+    URL.revokeObjectURL(url);
   }
 }
 
@@ -1629,6 +1671,43 @@ function defaultVideoFrames(caps = currentVideoCaps) {
 
 function selectedVideoFrames(caps = currentVideoCaps) {
   return videoComposerFrames > 0 ? videoComposerFrames : defaultVideoFrames(caps);
+}
+
+function videoResolutionChoices(caps = currentVideoCaps) {
+  const choices = [{ value: 'default', label: 'Model default' }];
+  const source = pendingAttachments.find(att =>
+    (att.mediaType === 'image' || att.mediaType === 'video')
+    && Number(att.width) > 0 && Number(att.height) > 0);
+  let baseWidth = source ? Number(source.width) : Number(caps?.defaultOutputWidth);
+  let baseHeight = source ? Number(source.height) : Number(caps?.defaultOutputHeight);
+  if (!source && currentArchitecture === 'ltx-2.5' && videoComposerMode === 'ref') {
+    baseWidth = 768;
+    baseHeight = 448;
+  }
+  if (!(baseWidth > 0 && baseHeight > 0)) return choices;
+
+  const grid = Math.max(1, Number(caps?.resolutionMultiple) || 16);
+  const seen = new Set();
+  for (const scale of [1, 0.75, 0.5, 0.375]) {
+    const width = Math.max(grid, Math.round(baseWidth * scale / grid) * grid);
+    const height = Math.max(grid, Math.round(baseHeight * scale / grid) * grid);
+    const value = `${width}x${height}`;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    const size = `${width} × ${height}`;
+    let label;
+    if (scale === 1 && source) {
+      label = `Original input · ${source.width} × ${source.height}`;
+      if (width !== source.width || height !== source.height)
+        label += ` (model grid ${size})`;
+    } else if (scale === 1) {
+      label = `Model size · ${size}`;
+    } else {
+      label = `${Math.round(scale * 100)}% · ${size}`;
+    }
+    choices.push({ value, label, width, height });
+  }
+  return choices;
 }
 
 function videoModeChoices(caps) {
@@ -1695,7 +1774,24 @@ function appendVideoGenerationControls() {
     document.getElementById('video-length-select')?.focus();
   });
   framesLabel.appendChild(length);
-  controls.append(modeLabel, framesLabel);
+  const resolutionLabel = document.createElement('label'); resolutionLabel.textContent = 'Output resolution ';
+  const resolution = document.createElement('select'); resolution.id = 'video-resolution-select';
+  resolution.setAttribute('aria-label', 'Output video resolution');
+  const resolutions = videoResolutionChoices(caps);
+  for (const choice of resolutions) {
+    const option = document.createElement('option');
+    option.value = choice.value;
+    option.textContent = choice.label;
+    resolution.appendChild(option);
+  }
+  if (!resolutions.some(choice => choice.value === videoComposerResolution)) videoComposerResolution = 'default';
+  resolution.value = videoComposerResolution;
+  resolution.addEventListener('change', () => {
+    videoComposerResolution = resolution.value;
+    resolution.focus();
+  });
+  resolutionLabel.appendChild(resolution);
+  controls.append(modeLabel, framesLabel, resolutionLabel);
   if (videoComposerMode === 'ref') {
     const help = document.createElement('span'); help.className = 'video-generation-hint';
     help.textContent = 'Attached images and videos guide appearance; they are not pinned as output frames.';
@@ -2928,6 +3024,11 @@ async function sendMessage() {
   if (currentVideoCaps) {
     if (videoComposerFrames > 0) msg.videoFrames = videoComposerFrames;
     if (videoComposerMode !== 'auto') msg.videoMode = videoComposerMode;
+    const resolution = videoResolutionChoices().find(choice => choice.value === videoComposerResolution);
+    if (resolution && resolution.width > 0 && resolution.height > 0) {
+      msg.videoWidth = resolution.width;
+      msg.videoHeight = resolution.height;
+    }
   }
   if (currentVideoCaps?.supportsKeyframeConditioning && (videoComposerMode === 'auto' || videoComposerMode === 'keyframes')) {
     const conditions = videoImageConditions(attachmentsCopy, selectedVideoFrames());
@@ -2955,6 +3056,10 @@ async function sendMessage() {
         mediaType: att.mediaType || 'text'
       };
       if (att.frames && att.frames.length) stored.frames = [...att.frames];
+      if (Number.isInteger(att.width) && att.width > 0 && Number.isInteger(att.height) && att.height > 0) {
+        stored.width = att.width;
+        stored.height = att.height;
+      }
       if (att.fileBacked === true) stored.fileBacked = true;
       if (att.previewUrl) stored.previewUrl = att.previewUrl;
       if (att.editUrl) stored.editUrl = att.editUrl;
@@ -3189,6 +3294,10 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
   const sounds = userMsg.audioPaths || [];
   const requestedMode = userMsg.videoMode || 'auto';
   const payload = { prompt: userMsg.content || '' };
+  if (Number(userMsg.videoWidth) > 0 && Number(userMsg.videoHeight) > 0) {
+    payload.width = Number(userMsg.videoWidth);
+    payload.height = Number(userMsg.videoHeight);
+  }
   const requestedFrames = Number(userMsg.videoFrames) || Number(caps.configuredFrames) || Number(caps.defaultPreviewFrames);
   if (requestedFrames > 0) payload.frames = requestedFrames;
   let mode = 'Text-to-Video';
@@ -3234,7 +3343,7 @@ async function runVideoGenerate(userMsg, bubbleText, statsDiv, generation) {
     const minimum = Number(caps.minimumReferenceFrames) || 0;
     payload.frames = Math.max(frameCount, minimum);
     if (currentArchitecture === 'ltx-2.5') {
-      Object.assign(payload, { width: 768, height: 448 });
+      if (!(payload.width > 0 && payload.height > 0)) Object.assign(payload, { width: 768, height: 448 });
       mode = 'Identity references (Ingredients)';
     } else mode = 'Reference-to-Video';
     const parts = [];

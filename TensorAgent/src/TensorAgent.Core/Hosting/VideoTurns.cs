@@ -256,6 +256,17 @@ public static class VideoTurns
         {
             ["prompt"] = prompt,
         };
+        // Chat WebUX sends an explicit output canvas only when the user selects one.
+        // Keeping the model default otherwise preserves the established image-to-video
+        // aspect behavior and each model's own text-to-video default.
+        if (user.TryGetProperty("videoWidth", out JsonElement outputWidth)
+            && outputWidth.ValueKind == JsonValueKind.Number && outputWidth.TryGetInt32(out int width) && width > 0
+            && user.TryGetProperty("videoHeight", out JsonElement outputHeight)
+            && outputHeight.ValueKind == JsonValueKind.Number && outputHeight.TryGetInt32(out int height) && height > 0)
+        {
+            payload["width"] = width;
+            payload["height"] = height;
+        }
         string? requestedMode = Text(user, "videoMode") ?? Text(user, "video_mode")
             ?? Text(body, "videoMode") ?? Text(body, "video_mode");
         bool requestsReferences = string.Equals(requestedMode, "ref", StringComparison.OrdinalIgnoreCase)
@@ -304,7 +315,12 @@ public static class VideoTurns
                     return VideoRequest.Refused(Loc.T("host.video.photosOnly"));
                 if (photos.Length > model.MaxReferenceImages)
                     return VideoRequest.Refused(Loc.T("host.video.tooManyReferences", ("max", model.MaxReferenceImages), ("count", photos.Length)));
-                payload["width"] = 768; payload["height"] = 448; payload["frames"] = 121;
+                if (!payload.ContainsKey("width") || !payload.ContainsKey("height"))
+                {
+                    payload["width"] = 768;
+                    payload["height"] = 448;
+                }
+                payload["frames"] = 121;
                 payload["videoMode"] = "ref"; payload["referenceImages"] = photos;
                 return VideoRequest.For(payload);
             }

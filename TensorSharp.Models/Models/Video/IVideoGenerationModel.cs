@@ -40,6 +40,17 @@ namespace TensorSharp.Models.Video
         /// <summary>Frame rate used when a request does not specify one.</summary>
         int DefaultPreviewFps => 24;
 
+        /// <summary>Default output width offered by clients when the user has not selected a
+        /// custom canvas. Zero leaves the output size to the model.</summary>
+        int DefaultOutputWidth => 0;
+
+        /// <summary>Default output height offered by clients when the user has not selected a
+        /// custom canvas. Zero leaves the output size to the model.</summary>
+        int DefaultOutputHeight => 0;
+
+        /// <summary>Pixel grid for output width and height choices shown by clients.</summary>
+        int ResolutionMultiple => 16;
+
         /// <summary>Minimum frame count required by the model's reference workflow, or zero.</summary>
         int MinimumReferenceFrames => 0;
 
