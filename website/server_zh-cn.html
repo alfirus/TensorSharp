@@ -111,7 +111,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model ./models/minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_cuda \
     --video-steps 20 --video-frames 22</code></pre>
-  <p>FL2VA 与 Ref2VA 是两个权重文件，而不是两档设置：加载哪一个决定了附上的图像被当作关键帧还是参考，<code>/api/models</code> 报给浏览器的也正是这一点。<code>config/minimax-h3-fl2va.json</code> 把尺寸交给模型，<code>config/minimax-h3-ref2va.json</code> 固定 640×384；两者都会在首次运行时下载去噪器、共享的 Qwen3-VL-32B 文本编码器与两个 VAE —— 但不包括分词器，因为它不是一个命令行参数：请把上游 <code>MiniMaxAI/MiniMax-H3</code> 仓库 <code>processor/</code> 目录下的 <code>vocab.json</code> 与 <code>merges.txt</code> 放到编码器旁边，或让 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</p>
+  <p>FL2VA 与 Ref2VA 是关键帧和参考模式各自使用的独立检查点。唯一配置 <code>config/minimax-h3-fl2va.json</code> 会下载两者、共享的 Qwen3-VL-32B 编码器、两个 VAE 和固定版本的分词器。模型按请求切换去噪器，<code>/api/models</code> 会报告可用模式。配置把输出尺寸交给对应工作流；手动安装分词器时可设置 <code>TS_VIDEO_TOKENIZER</code>。</p>
   <p>要让 FL2VA 按 LightX2V 的 8 步或 4 步 Turbo 配方提供服务，加上它的插件配置即可。此后每段片段都按插件的调度采样，所以请不设 <code>--video-steps</code>（或设为插件的步数），请求也不要带 <code>steps</code>，与 Web UI 一样：与之冲突的 <code>--video-steps</code> 会在下载任何文件之前终止启动，冲突的请求返回 <code>400</code>（流式路由则是 <code>{done, error}</code> 事件）。权重（1.38 GB）在首次使用时下载；4 步配方为推断所得。→ <a href="models-video_zh-cn.html#h3-turbo">Turbo 插件</a></p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json \
     --lora config/lora/minimax-h3-fl2v-turbo-8step.json</code></pre>

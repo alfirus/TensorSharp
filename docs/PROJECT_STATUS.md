@@ -161,7 +161,8 @@ The following changes span several release tags. LTX 2.5, EmbeddingGemma 2, nati
   `ggml_metal`.
 
 - **MiniMax-H3 refuses a photo, or a photo or clip reference, without `tokenizer_config.json`.**
-  Image, first-and-last-frame and picture reference conditioning need it beside `vocab.json` and
+  The shipped MiniMax-H3 config now downloads this file, `vocab.json` and `merges.txt` beside the
+  text encoder; manual installations still need to provide them. Image, first-and-last-frame and picture reference conditioning need it beside `vocab.json` and
   `merges.txt` (`MiniMaxAI/MiniMax-H3`, `processor/`); it alone defines `<|vision_start|>`,
   `<|image_pad|>` and `<|vision_end|>`. Without it those were split into ordinary pieces,
   the vision features landed on the wrong prompt positions and the clip quietly ignored
