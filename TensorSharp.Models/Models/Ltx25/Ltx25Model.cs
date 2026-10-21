@@ -367,6 +367,10 @@ public sealed class Ltx25Model : ModelBase, IVideoGenerationModel
 
     public string VideoModelFamily => ArchitectureId;
     public int DefaultPreviewFrames => 17;
+    public int FrameCountMultiple => 8;
+    public int FrameCountOffset => 1;
+    public int DefaultPreviewFps => 24;
+    public int MinimumReferenceFrames => Ltx25ReferenceConditioning.MinimumFrames;
     public bool SupportsAudio => true;
     public bool SupportsImageConditioning => MediaCodecs.VideoEncoder.SupportsH264ImageConditioning;
     public bool SupportsEndImageConditioning => SupportsImageConditioning;

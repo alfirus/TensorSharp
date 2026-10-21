@@ -264,8 +264,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
     --backend ggml_cuda
 
-# The same run from a shipped config, which auto-downloads all four networks on
-# first use (config/minimax-h3-ref2va.json is the reference checkpoint).
+# The same run from the single shipped config, which downloads both denoisers,
+# the shared networks and tokenizer on first use.
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 
@@ -673,8 +673,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
     --video-steps 20 --video-frames 22
 
-# The same host from a shipped config (config/minimax-h3-ref2va.json swaps in the
-# reference checkpoint; only the denoiser differs, so nothing re-downloads).
+# The same host from the config, which includes both conditioning checkpoints.
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
 
 # MiniMax-H3 Turbo: every clip samples the plug-in's 8 steps. Leave --video-steps
@@ -1330,10 +1329,9 @@ checkpoints have different conditioning contracts:
 
 | Checkpoint/config | Inputs |
 |---|---|
-| `minimax_h3_fl2va_pruned-Q4_K.gguf` / `config/minimax-h3-fl2va.json` | Text (`t2v`), first frame (`i2v`), first and last frame (`fl2v`) |
-| `minimax_h3_ref2va_pruned-Q4_K.gguf` / `config/minimax-h3-ref2va.json` | Text or identity/appearance references (`ref`), including image, video and audio references |
+| `minimax_h3_fl2va_pruned-Q4_K.gguf` + `minimax_h3_ref2va_pruned-Q4_K.gguf` / `config/minimax-h3-fl2va.json` | Text (`t2v`), first frame (`i2v`), first and last frame (`fl2v`), or identity/appearance references (`ref`) including image, video and audio |
 
-Both configs pin a denoiser, Qwen3-VL-32B text encoder, video VAE and audio VAE.
+The single config downloads both denoisers, Qwen3-VL-32B text encoder, video VAE and audio VAE.
 The text encoder also needs `vocab.json`, `merges.txt` and `tokenizer_config.json`
 from the processor revision linked in the [model card](docs/models/minimax-h3.md).
 Keep `fl2va`/`ref2va` in the denoiser filename. Companion overrides are
@@ -1348,9 +1346,9 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 \
   --cfg 1 --diffusion-seed 42 --output wave.mp4
 
-# Ref2VA creates a new scene using the referenced identity.
+# Reference mode creates a new scene using the referenced identity.
 dotnet run --project TensorSharp.Cli -c Release -- \
-  --config config/minimax-h3-ref2va.json --backend ggml_cuda \
+  --config config/minimax-h3-fl2va.json --backend ggml_cuda \
   --video-mode ref --ref-image portrait.png \
   --prompt "<Picture 1> walks through a sunlit garden." \
   --width 640 --height 384 --video-frames 22 --diffusion-seed 42 --output garden.mp4

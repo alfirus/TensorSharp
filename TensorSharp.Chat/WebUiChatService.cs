@@ -360,12 +360,20 @@ namespace TensorSharp.Chat
                 video = new
                 {
                     family = videoModel.VideoModelFamily,
+                    supportsTextToVideo = videoModel.SupportsTextToVideo,
                     supportsAudio = videoModel.SupportsAudio,
                     supportsImageConditioning = videoModel.SupportsImageConditioning,
                     supportsEndImageConditioning = videoModel.SupportsEndImageConditioning,
                     supportsKeyframeConditioning = videoModel.SupportsKeyframeConditioning,
                     defaultPreviewFrames = videoModel.DefaultPreviewFrames,
+                    frameCountMultiple = videoModel.FrameCountMultiple,
+                    frameCountOffset = videoModel.FrameCountOffset,
+                    defaultPreviewFps = videoModel is TensorSharp.Models.MiniMaxH3.MiniMaxH3Model
+                        ? videoModel.DefaultPreviewFps
+                        : _options.DefaultVideoFps > 0 ? _options.DefaultVideoFps : videoModel.DefaultPreviewFps,
+                    configuredFrames = _options.DefaultVideoFrames,
                     supportsReferenceConditioning = videoModel.SupportsReferenceConditioning,
+                    minimumReferenceFrames = videoModel.MinimumReferenceFrames,
                     maxReferenceImages = videoModel.MaxReferenceImages,
                 };
             }
