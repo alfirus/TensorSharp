@@ -128,6 +128,27 @@
   </div>
   <p>Decode 在 1% 以内打平，而 TensorSharp 加载这份 236.4 GiB 的权重快 <strong>2.9×</strong>。诚实的差距在首 token 时延：41.9 s 对 29.0 s，约<strong>慢 1.4×</strong>，这也是那轮对比中最值得动手的一处。llama.cpp 的 prefill 单元是故意留空的：那次运行早于客户端在流里索取 usage，因此它没有自己的提示 token 计数，也就没有可记录的 tok/s 数字。两个引擎跑的都是整层切分放置；当前 TensorSharp 用 <code>--layer-split 8</code> 在八张 GPU 上选择该放置方式。<code>--tp 8</code> 在这个模型上意味着真正的张量并行、每个 rank 都跑每一层，需要<strong>每个 rank 41.7 GiB</strong>，装不进 46 GB 的卡 —— 它是一个被接受的模式，加载时会把这笔算术连同办法一起打印出来，但并不是一份已实测的配置。方法、模型来源与该矩阵的其余部分：<code>docs/validation/cross-engine-2026-09/README.md</code>（本地验证记录，未提交到 Git）。</p>
 
+  <h2 id="muse-spark">Muse Spark 816B 在六张 A40 上</h2>
+  <p>这是一个既要多张 GPU、<em>又</em>要借助主机内存的检查点：<code>Muse-Spark-Open-816B-A42B</code>（816B 稀疏 MoE，每 token 激活约 42B），UD-Q3_K_XL 量化——10 个分片、374 GiB——外加 <code>mmproj-Q8_0.gguf</code>；硬件为<strong>六张 NVIDIA A40（46 GB，PCIe 4.0）与两颗 Xeon Gold 6342（两个 NUMA 节点）</strong>，容器内存上限 280 GiB、CPU 配额 48 个。TensorSharp 在 <code>ggml_cuda</code> 上运行原生整模型执行器，使用 <code>--layer-split 6</code> 与 <code>TS_MUSE_SPARK_CPU_MOE=auto</code>，把 7、9、9、9、12、16 层分别放到六张 GPU 上——GPU 上 240.4 GiB 权重，主机上 131.8 GiB 专家堆栈——底层是未经修改的上游 ggml <code>a05c9922</code>；llama.cpp 为未经修改的 <code>0a1ef309c</code>（build 11796）。两个引擎都提供 32,768 token 的上下文与 F16 KV（TensorSharp 规划 5 个槽位），接收同样的 OpenAI 兼容流式请求，贪心采样、关闭思考，且每个引擎单独占用整台机器。所有数字都是三次重复的中位数；<strong>比值高于 1.00× 表示 TensorSharp 更好</strong>（吞吐更高或延迟更低）。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>场景</th><th>llama.cpp</th><th>TensorSharp</th><th>比值</th></tr></thead>
+    <tbody>
+      <tr><td>Decode，单个请求</td><td>9.92 tok/s</td><td><span class="yes">11.05 tok/s</span></td><td>1.11×</td></tr>
+      <tr><td>首 token 时延，短提示</td><td>2.60 s</td><td><span class="yes">1.11 s</span></td><td>2.35×</td></tr>
+      <tr><td>Prefill，4K token 提示</td><td>76 tok/s</td><td><span class="yes">162 tok/s</span></td><td>2.12×</td></tr>
+      <tr><td>Prefill，16K token 提示</td><td>84 tok/s</td><td><span class="yes">161 tok/s</span></td><td>1.92×</td></tr>
+      <tr><td>四个并发请求，总输出</td><td>17.66 tok/s</td><td><span class="yes">19.35 tok/s</span></td><td>1.10×</td></tr>
+      <tr><td>2.3K token 对话的第二轮，首 token</td><td>1.60 s</td><td><span class="yes">0.86 s</span></td><td>1.86×</td></tr>
+      <tr><td>共享 2.3K token 系统提示词的新对话，首 token</td><td>1.14 s</td><td><span class="yes">0.84 s</span></td><td>1.36×</td></tr>
+      <tr><td>加载时间</td><td>约 21.5 分钟（<code>--load-mode none</code>）</td><td><span class="yes">约 5 分钟</span></td><td>4.3×</td></tr>
+      <tr><td>答案校验用例（<code>eng/muse-spark-validate.py</code>）</td><td>13 / 16</td><td>15 / 16</td><td></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>读这张表时要连同它的局限一起看。所有数据都来自<strong>一台共享的虚拟机</strong>：重复之间有几个百分点的波动，也不给出置信区间。llama.cpp 默认的内存映射加载在 280 GiB 上限内没能完成，因此改用 <code>--load-mode none</code> 加载，而它单线程的加载器几乎把全部主机侧权重都放在了一个 NUMA 节点上；换成 <strong>NUMA 均衡的主机内存</strong>（<code>GGML_CUDA_NO_PINNED=1 --numa distribute</code>）后，它的单请求 decode 达到 <strong>10.72 tok/s，与 TensorSharp 相差 3% 以内</strong>，但 4K prefill 跌到 35 tok/s——这里测过的 llama.cpp 配置没有一个能在 decode 与 prefill 上同时追平 TensorSharp。放了 16 层的那张 GPU 接近满载，内存压力偶尔导致的模板检查点未命中也计入了中位数。<strong>未测量：</strong>张量并行（<code>--tp</code>）、推测解码、更重的 CPU 卸载配置，以及 16K token 以上的上下文；Vulkan 默认也会选择同一个执行器，但没有任何整模型运行记录。这些校验用例检验的是集成，而不是模型的总体质量——TensorSharp 唯一的失败是固定 512 token 的 decode：回答连贯，但在讲到冲突之前就用完了 token 预算。</p>
+  <p>作为对照：在更早的一轮五 GPU 测试中，<code>TS_MUSE_SPARK_NATIVE=0</code> 仍会选择的逐算子路径 decode 只有 llama.cpp 的 0.72×，此后原生执行器取代它成为默认路径。方法、两种 llama.cpp 配置、答案质量表与复现命令：<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/perf/muse-spark-vs-llama-cpp.md" target="_blank" rel="noopener"><code>docs/perf/muse-spark-vs-llama-cpp.md</code></a>。启动配置与选项：<a href="models-text_zh-cn.html#muse-spark">Muse Spark</a>。</p>
+
   <h2 id="qwen-image21">Qwen-Image-2.1：LoRA 插件与前缀缓存</h2>
   <p>2026-09-25 对 <strong><code>stable-diffusion.cpp</code></strong> <code>19bbbca</code> 手工执行的图像对比，两个引擎都基于未修改的 ggml <code>353b63b</code>。每次运行都是 1024×1024 文生图，提示词相同、种子 42、CFG 1、Euler，并使用同一个 F32 sigma 向量，每个引擎各自在全新进程中运行；每种配置跑两次、两个引擎轮流先跑，表中为中位数。每步秒数取稳态步，不含第一步。不使用步数蒸馏 LoRA 时，6 步本来就会得到模糊图像（模型默认 40 步），因此「无 LoRA」一行只衡量速度，不衡量质量。</p>
   <div class="table-scroll">

@@ -217,7 +217,7 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
+| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer、Muse Spark（仅 n-gram）（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
 | `TS_SPEC_TYPE` | 同上全部 | 投机算法：`auto` \| `draft-head` \| `block` \| `ngram` | `auto` | 未注册 | 否 |
 | `TS_SPEC_DRAFT` | 同上全部 | 每个投机步最多起草的 token 数（1-64） | `8` | 未注册 | 否 |
 | `TS_SPEC_PMIN` | 同上全部 | 草稿置信度门限；含义随算法而定 | 按算法（`0.15` / `0.35` / `0`） | 未注册 | 否 |
@@ -244,6 +244,21 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_Q35_VERIFY_SNAPSHOTS` | Qwen 3.5 / 3.8 投机验证 | `0` 回退为先保存验证前的递归状态副本、再对已接受前缀重新前向，而不是每行保留一份快照 | 开 | 未注册 | 否 |
 | `TS_SPEC_ADAPTIVE` | 投机解码（所有草稿器） | `0` 关闭成本调节器，于是起草不再与普通 baseline 做对比、也永远不会被暂停。用于 A/B 测量：调节器每一轮的 baseline 步骤都是普通 decode，它们并不免费 | 开 | 未注册 | 否 |
 | `TS_GGML_LOG_DEBUG` | GGML 后端 | `1` 把 ggml 的 DEBUG 日志通道透传出来而不是丢弃。它承载 CUDA 后端的 "CUDA graph warmup complete" / "reset" 这两行，而这是唯一能看出一张图是否真的被 CUDA graph 捕获的途径 | 关 | 未注册 | 否 |
+
+## 矩阵外的 Muse Spark 开关
+
+Muse Spark 原生整模型执行器的选择与容量规划由以下开关控制，均未在 `EnvVarMatrix.All`
+中注册。完整列表（包括逐算子路径的可选优化）见 [Muse Spark 卡片](models/muse-spark_zh-cn.md)。
+
+| 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
+|---|---|---|---|---|---|
+| `TS_MUSE_SPARK_NATIVE` | Muse Spark | `0` 选择逐算子路径；`1` 让 `ggml_cpu` 也运行原生执行器。`--tp` 总是走逐算子路径 | `ggml_cuda` / `ggml_vulkan` 上开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_CPU_MOE` | Muse Spark（原生） | `auto` 逐个放置专家栈，尽可能多地留在 GPU 上、让主机上的字节尽可能少；覆盖 `--n-cpu-moe` | 关闭 | 未注册 | 否 |
+| `TS_MUSE_SPARK_PLAN_SLOTS` | Muse Spark（原生） | 放置规划中预留的滑动窗口环数；设为并发数再加一（留给共享前缀检查点） | `1` | 未注册 | 否 |
+| `TS_MUSE_SPARK_UBATCH` | Muse Spark（原生） | prefill 微批行数；放不下的计算图会把该次调用拆成减半的微批 | `2048` | 未注册 | 否 |
+| `TS_MUSE_SPARK_DEV0_RESERVE_MB` | Muse Spark（原生） | 在 GPU 0 上额外预留的内存，例如给视觉编码器 | `0` | 未注册 | 否 |
+| `TS_MUSE_SPARK_HOST_NUMA` | Muse Spark（原生） | `0` 让主机专家保留在 GGUF 映射中，而不是复制到 NUMA 本地并由绑核工作线程计算 | 有两个及以上 NUMA 节点时开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark（原生，GPU） | `0` 跳过加载时的满尺寸 prefill；该 prefill 让 ggml-cuda 的内核 scratch 池在 slot 占用内存之前先长到峰值 | 有 GPU 时开启 | 未注册 | 否 |
 
 ## 矩阵外的 DeepSeek V4 / V4.1 开关
 

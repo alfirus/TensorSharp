@@ -693,7 +693,7 @@ if (!hostingOptions.EmbeddingsEnabled
         startupLogger.LogWarning(LogEventIds.HostConfiguration, "{QwenImageSizeDefault}", sizeWarning);
 }
 
-// Prepare the prompt every conversation shares after the container is live, before
+// Prepare the prompt Web UI conversations share after the container is live, before
 // app.Run binds a socket, so warm-up cannot contend with a real request.
 //
 // The cost is that the first launch after a prompt, skills, model or DATE change does not
@@ -701,7 +701,10 @@ if (!hostingOptions.EmbeddingsEnabled
 // is the trade this feature exists to make: one slow startup instead of one slow first
 // message. Models with persistent checkpoint support can restore the shared prefix on
 // later launches from the store attached above.
-if (!hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
+// API-only clients provide their own prompts and tools; warming the Web UI's skills
+// and tool catalog delays readiness without preparing those requests. Model kernel
+// warmup and normal API prefix caching remain enabled independently of this block.
+if (hostingOptions.WebUiEnabled && !hostingOptions.EmbeddingsEnabled && hostingOptions.PrefixCacheEnabled
     && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching
     && !string.IsNullOrWhiteSpace(hostingOptions.StartupModelPath)
     // Image/video diffusion models have no autoregressive chat prefix to prefill.

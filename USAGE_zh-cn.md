@@ -43,6 +43,8 @@ EmbeddingGemma 2 加载投影器后，两个嵌入端点也接受有序媒体 co
 
 **GLM 5.x（`glm-dsa`）是另一个例外。** 它那套 744B-A40B 的 MLA + 稀疏注意力 MoE 在 `--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal` 上走原生整模型 ggml 执行器，在 `--backend cpu`（100% 托管，无原生依赖）与 `--backend cuda` 上走托管逐算子路径；在 GGML 后端上设 `TS_GLM_NATIVE=0` 可切到托管路径做 A/B 对照。**GLM-5.3（非 Flash）与 GLM-5.2 是同一套 `glm-dsa` 块结构**——79 个 block（78 层主干 + 一个 NextN）、256 个路由专家 top-8 外加一个共享专家、带 lightning indexer 的 MLA、rope base 8e6——因此它就走 GLM-5.2 那条路径、同样这几个后端，不需要新代码也不需要新参数；它是**仅文本**，而且是两重意义上的仅文本：仓库在任何量化档都没有发布 mmproj，而在 `glm-dsa` 上给出 `--mmproj` 只会收到一条警告并被忽略，而不是让这次运行失败。分片 GGUF 由 `GgufFile` 自己处理——`--model` 指向该量化目录里 `-00001-of-` 那一片即可（GLM-5.2 是 6 分片，GLM-5.3 的 UD-Q2_K_XL 是 7 分片、236.4 GiB）。MLX 跑不了它。详见 [GLM 卡片](docs/models/glm_zh-cn.md)，两者的差别见其中的 [GLM-5.3 专节](docs/models/glm_zh-cn.md#glm-53glm-dsa)。
 
+**Muse Spark（`muse-spark`）同样有自己的原生整模型执行器。** 这个 816B-A42B 的 Unsloth 发布在 `--backend ggml_cuda` / `ggml_vulkan` 上由 TensorSharp 自有的执行器运行：每个微批提交一张横跨全部 GPU 与 CPU 的 GGML 图，所用 ggml 为未修改的上游版本。`--layer-split N` 把 62 层分到 N 张本地 GPU，`TS_MUSE_SPARK_CPU_MOE=auto` 逐个放置专家栈，让留在主机上的字节尽可能少；既没有它也没有 `--n-cpu-moe N` 时，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。并发请求在按序列的 F16 KV slot 上共享批处理 decode 与 prefill 计算图。`TS_MUSE_SPARK_NATIVE=0` 选回较早的托管逐算子路径，`--tp N` 总是走这条路径；`TS_MUSE_SPARK_NATIVE=1` 让 `ggml_cpu` 也使用该执行器。完整模型测量都在 `ggml_cuda`（六块 A40 GPU）上完成，Vulkan 没有测量记录。与所有分片 GGUF 一样，`--model` 可以指向任意一片：TensorSharp 从第 1 片读取元数据，从所有分片读取张量。详见 [Muse Spark 卡片](docs/models/muse-spark_zh-cn.md)与 [llama.cpp 对比报告](docs/perf/muse-spark-vs-llama-cpp.md)（英文）。
+
 
 
 ## 配置文件（CLI + Server）
@@ -1543,6 +1545,15 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
   真实文本（1,818 token 提示词、贪心生成 256 个 token）上 prefill 109.4-115.5 tok/s、
   decode 12.8-12.9 tok/s，llama-server 为 20.4-22.4 与 13.00-13.24（加 `--no-op-offload`
   时为 28.8-31.6 与 11.94-12.48）。详见[模型卡片](docs/models/qwen38-flash-next_zh-cn.md#超出内存运行)。
+* **Muse Spark 逐个放置专家栈。** 在它的原生执行器上，`TS_MUSE_SPARK_CPU_MOE=auto` 会以一个
+  使主机字节最少的规划取代 `--n-cpu-moe`：每层的稠密权重留在该层所在的 GPU，gate、up、down
+  三个专家栈各自独立放置，使落到主机上的字节尽可能少。启动日志会列出主机上的专家栈
+  （`6,7,...,18:gu,...,45:d`）。在有两个及以上 NUMA 节点的主机上，主机专家栈会被复制到固定绑核的
+  工作线程本地的内存中（`TS_MUSE_SPARK_HOST_NUMA=0` 则保留 GGUF 映射）；在双路测试主机上，这让主机
+  专家带宽从约 100 GB/s 提升到 165-174 GB/s。2-16 个 token 的批次通过一个静态行内核计算主机专家，
+  结果与 ggml 逐位一致。在六张 A40 上，该规划把 374 GiB 的 UD-Q3_K_XL checkpoint 中的 131.8 GiB
+  放在主机上，decode 仍达到 11.05 tok/s，为同机 llama.cpp 的 1.11 倍。详见
+  [模型卡片](docs/models/muse-spark_zh-cn.md)。
 * **单 token 的主机专家走 TensorSharp 自己的内核。** 用的仍是 ggml 的 CPU 点积，但
   线程组每层只唤醒一次、算完即休眠，而不是每次调用都要唤醒工作线程的 ggml 图。忙等的
   线程组在主机侧更快，却让层间的 GPU 段在 Apple 芯片上慢了 1.5-2 倍，所以线程组改为
@@ -1670,6 +1681,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | GPT OSS | ✅ | attention sink，YaRN。`cuda` 与 GGML 后端均可运行；GGML 路径是专家并行（每个 rank 持有整个专家，每层每个投影一次批量 `ggml_mul_mat_id` 派发），只有专家数不能被 TP 度整除时才回退到逐专家切分 |
 | Nemotron-H | ✅ | Mamba2 在 rank 0 上复制计算，MoE 专家切分。GGML 上仍按 token、按 rank 逐个遍历专家（尚未使用专家并行） |
 | Muse-Glimmer | ✅（最多 `--tp 2`） | 只有 2 个 KV head，因此 TP 度最多为 2；仅限 GGML CUDA / Vulkan；TP 下 DFlash 草稿器会被拒绝挂载——CLI 打印警告并按普通解码运行，服务端拒绝启动（见[约束](#约束)） |
+| Muse Spark | ✅（仅本地，逐算子路径）+ 按层切分 | GGML CUDA / Vulkan 上的 `--tp N` 按完整 GQA 头组切分 Q/K/V/gate 投影、按输入列切分注意力输出投影，并把路由专家整个分到各 rank；允许不均匀切分（已发布的 128 查询头 / 16 KV 头 checkpoint 可用九张 GPU），但每个 rank 至少要拥有一个 KV 组和一个专家。路由器、潜空间投影、残差流与输出头在 rank 0 上执行。TP 总是走逐算子路径而非原生执行器，且没有性能测量；实测过的模式是 `--layer-split N`（原生执行器的放置方式）。两者不能组合，分布式组会被拒绝 |
 | GLM 5.x | ✅（仅本地） | 仅限 GGML GPU 后端；GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 的原生 TP 路径都只支持本地单进程（`--tp-node-id` / `--tp-peers` 对整个 GLM 家族都是硬拒绝）。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 也保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。CPU MoE、tracing、部分 `TS_GLM_TP_SHARD` 切分、超额 rank 或缺少原生超连接内核时使用组合调度器回退，其中共享专家只在 rank 0 运行一次。GLM-5.3（非 Flash）同样以本地单进程的方式接受 `--tp N`，并在每个 rank 上复制 MLA 与 indexer cache，因此 `--tp` 会成倍放大 KV 占用；它在 `--tp N>1` 下从未被实际跑过——唯一有记录的算术是一个装不下的例子：`--tp 8` 每个 rank 需要 41.7 GiB，而卡只有 46 GB——因此它只是一个被接受的模式，而不是已验证的配置；另外在那里只要 `--tp N>1`，`--spec` 就会被拒绝。用 `--layer-split N` 选择整层放置 |
 | DeepSeek V4 Flash | 按层切分 | 不是张量并行：整模型执行器按每张卡的空闲显存把连续的整层装箱分配，`--layer-split N` 只限制这次切分用几张卡 |
 | DeepSeek V4.1 Flash | partial TP | `--layer-split N` 选择本地整层放置。GGML CUDA 上的实验性 routed-MoE TP 使用 `--tp N`；不支持注意力 TP 与分布式组。两种模式不能组合。 |
@@ -1804,8 +1816,9 @@ Radix 把页快照、模型分页块与模型自有的续写状态放进同一�
 引擎 API 调用方应为会话复用提供稳定的 `SequenceState.CacheScope`；未设作用域的请求在 Radix
 模式下只共享它声明的 `SharedPrefixTokens`。支持它的模型族：Qwen 3.5 / 3.6 / 3.8-27B
 （`qwen35*`、`qwen3next`）、Gemma 4、GLM 5.x、Qwen 3.8 Flash Next 与 DeepSeek V4 / V4.1
-（以 holder / 末态复用），以及 GPT-OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer 与
-Nemotron-H（以页复用）；DiffusionGemma 与各媒体生成模型不参与。`--spec` 不会关闭它。
+（以 holder / 末态复用），GPT-OSS、Mistral 3、Hunyuan Dense、Muse-Glimmer 与
+Nemotron-H（以页复用），以及 Muse Spark（原生执行器保留的 slot 移交给延续该会话的请求，逐算子
+路径上以页复用）；DiffusionGemma 与各媒体生成模型不参与。`--spec` 不会关闭它。
 
 启动预热让通用的 system/developer 消息与工具声明作为公共前缀提供给新会话。Server 在接受请求
 之前预热其启动模型，TensorAgent 在加载模型后预热。两者都挂接了 checkpoint 存储，因此支持

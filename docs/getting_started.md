@@ -66,7 +66,11 @@ Layer splitting is local to one node; it cannot use `--tp-node-id` / `--tp-peers
 Existing layer-split commands must replace `--tp N` with `--layer-split N`
 (or `TENSORSHARP_LAYER_SPLIT_DEGREE=N`). With neither mode configured, inference uses one device. GLM 5.x accepts
 `--layer-split N` for whole-layer placement and `--tp N` for its native local
-tensor-parallel path on the GGML GPU backends. For Qwen-Image-2.1,
+tensor-parallel path on the GGML GPU backends. Muse Spark's native whole-model
+executor uses `--layer-split N` (with `TS_MUSE_SPARK_CPU_MOE=auto` to put the
+expert stacks that do not fit in host memory), while `--tp N` selects its per-op
+tensor-parallel path; see the [measured six-GPU profile](models/muse-spark.md#launching).
+For Qwen-Image-2.1,
 `--tp N` shards only the diffusion transformer; its text/vision encoders and VAE
 stay on the first GPU. Install the CUDA toolkit first, then:
 

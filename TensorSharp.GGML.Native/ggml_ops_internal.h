@@ -293,6 +293,11 @@ namespace tsg
     struct DeviceState
     {
         ggml_backend_t backend = nullptr;
+        // Explicit-F32 Spark projections share this rank's CUDA stream while
+        // keeping their private cuBLAS math policy out of the ordinary backend.
+        // The sidecar must be released before backend replacement/teardown.
+        ggml_backend_t spark_float32_backend = nullptr;
+        std::mutex spark_float32_mutex;
         // Index into the ggml device list this slot was initialized from
         // (== the CUDA/Vulkan ordinal). -1 until initialized.
         int device_index = -1;
@@ -1308,6 +1313,9 @@ namespace tsg
     // Free the cached reuse buffer (called from TSGgml_Shutdown).
     void free_reuse_compute_buffer();
 
+    void free_spark_float32_backend();
+    void free_spark_float32_backends();
+
     // Allocate a graph's intermediates into a persistent, reused gallocr (grown on
     // demand, never freed per call) — for large multi-token fused graphs (e.g. the
     // MTP MoE verify) whose per-call gallocr alloc/free would fragment Metal VRAM.
@@ -1319,6 +1327,16 @@ namespace tsg
     // outer graph, so they must not re-plan the allocator that outer graph's
     // tensors are placed in. See alloc_graph_in_gallocr_slot.
     bool alloc_graph_moe_stream_gallocr(ggml_cgraph* graph);
+    struct MoeStreamMemoryPlan
+    {
+        std::size_t required = 0;
+        std::size_t free = 0;
+        std::size_t reusable = 0;
+        const char* reason = "unavailable";
+    };
+    // Measures without allocating accelerator memory. Includes every expert
+    // tensor and graph temporary, and accounts for this rank's retained buffer.
+    bool plan_moe_stream_memory(ggml_cgraph* graph, MoeStreamMemoryPlan& plan);
     // Run Metal's backend graph optimizer before any graph allocation. Direct
     // backend graph_compute calls do not invoke this hook themselves.
     //
@@ -1359,6 +1377,7 @@ namespace tsg
     // ggml_ops_norm_attn.cpp; called from TSGgml_Shutdown so their CUDA
     // buffers are released before driver teardown).
     void free_prefill_attn_sessions();
+    void free_paged_attn_sessions();
 
     // --- Size / layout queries ---
 

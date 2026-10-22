@@ -274,6 +274,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_bonsai.cpp
     ggml_ops_attention_alloc.cpp
     ggml_ops_attention_precision.cpp
+    ggml_ops_muse_spark_attention.cpp
     ggml_ops_flash_attn_guard.cpp
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
@@ -300,6 +301,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gemma4_verify.cpp
     ggml_ops_gemma4_moe.cpp
     ggml_ops_muse_glimmer.cpp
+    ggml_ops_muse_spark.cpp
     ggml_ops_muse_glimmer_vision.cpp
     ggml_ops_dflash.cpp
     ggml_ops_diffusion.cpp
@@ -319,6 +321,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_deepseek41_vision.cpp
     ggml_ops_embeddings.cpp
     ggml_ops_glm_dsa.cpp
+    ggml_ops_muse_spark_exec.cpp
     ggml_ops_dsv4_fused_cpu.cpp
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp
@@ -939,12 +942,65 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(GgmlOpsGetRowsQuantTest PRIVATE GgmlOps)
 
+    # Test-only observability; regular production builds expose no probe ABI.
+    target_compile_definitions(GgmlOps PRIVATE TSG_GGML_TEST_DIAGNOSTICS=1)
+    add_executable(GgmlOpsPagedAttentionLifecycleTest tests/paged_attention_lifecycle_test.cpp)
+    target_link_libraries(GgmlOpsPagedAttentionLifecycleTest PRIVATE GgmlOps)
+    add_test(NAME paged-attention-lifecycle-cpu COMMAND GgmlOpsPagedAttentionLifecycleTest cpu)
+    set_tests_properties(paged-attention-lifecycle-cpu PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME paged-attention-lifecycle-cuda COMMAND GgmlOpsPagedAttentionLifecycleTest cuda)
+        add_test(NAME paged-attention-lifecycle-cuda-multi COMMAND GgmlOpsPagedAttentionLifecycleTest multi)
+        set_tests_properties(paged-attention-lifecycle-cuda paged-attention-lifecycle-cuda-multi
+            PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endif()
+
     # The standalone MoE kernel's uploaded biases must never share memory with an
     # activation a fused backend kernel writes while still reading them.
     add_executable(GgmlOpsMoeFusedBiasAliasTest tests/moe_fused_bias_alias_test.cpp)
+    add_executable(GgmlOpsMuseSparkMoeTest tests/muse_spark_moe_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkMoeTest PRIVATE GgmlOps)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_executable(GgmlOpsAttentionDeviceCacheTest tests/attention_device_cache_test.cpp)
+        target_link_libraries(GgmlOpsAttentionDeviceCacheTest PRIVATE GgmlOps)
+        add_test(NAME attention-device-cache-cuda COMMAND GgmlOpsAttentionDeviceCacheTest)
+        set_tests_properties(attention-device-cache-cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    add_test(NAME muse-spark-moe-cpu COMMAND GgmlOpsMuseSparkMoeTest cpu)
+    set_tests_properties(muse-spark-moe-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(GgmlOpsMuseSparkCpuMoeScratchTest tests/muse_spark_cpu_moe_scratch_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkCpuMoeScratchTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-cpu-moe-scratch-off COMMAND GgmlOpsMuseSparkCpuMoeScratchTest off)
+    add_test(NAME muse-spark-cpu-moe-scratch-on COMMAND GgmlOpsMuseSparkCpuMoeScratchTest on)
+    add_test(NAME muse-spark-moe-cpu-reuse COMMAND GgmlOpsMuseSparkMoeTest cpu)
+    add_test(NAME moe-fused-bias-alias-cpu-reuse COMMAND GgmlOpsMoeFusedBiasAliasTest cpu)
+    # Each test is a new process: native startup getenv does not depend on .NET
+    # environment propagation. Legacy/non-Spark allocation must stay unchanged.
+    set_tests_properties(muse-spark-cpu-moe-scratch-off muse-spark-moe-cpu
+        PROPERTIES ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=0;TS_CPU_MOE_THREADS=2")
+    set_tests_properties(muse-spark-cpu-moe-scratch-on muse-spark-moe-cpu-reuse moe-fused-bias-alias-cpu-reuse
+        PROPERTIES ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=1;TS_CPU_MOE_THREADS=2")
+    set_tests_properties(muse-spark-cpu-moe-scratch-off muse-spark-cpu-moe-scratch-on
+        muse-spark-moe-cpu-reuse moe-fused-bias-alias-cpu-reuse
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 120 SKIP_RETURN_CODE 77)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-moe-cuda COMMAND GgmlOpsMuseSparkMoeTest cuda)
+        set_tests_properties(muse-spark-moe-cuda PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME muse-spark-moe-cuda-multi COMMAND GgmlOpsMuseSparkMoeTest cuda-multi)
+        set_tests_properties(muse-spark-moe-cuda-multi PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME muse-spark-moe-cuda-reuse COMMAND GgmlOpsMuseSparkMoeTest cuda)
+        add_test(NAME muse-spark-moe-cuda-multi-reuse COMMAND GgmlOpsMuseSparkMoeTest cuda-multi)
+        set_tests_properties(muse-spark-moe-cuda muse-spark-moe-cuda-multi PROPERTIES
+            ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=0;TS_CPU_MOE_THREADS=2")
+        set_tests_properties(muse-spark-moe-cuda-reuse muse-spark-moe-cuda-multi-reuse PROPERTIES
+            ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=1;TS_CPU_MOE_THREADS=2"
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
     target_link_libraries(GgmlOpsMoeFusedBiasAliasTest PRIVATE GgmlOps)
     add_test(NAME moe-fused-bias-alias-cpu COMMAND GgmlOpsMoeFusedBiasAliasTest cpu)
     set_tests_properties(moe-fused-bias-alias-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(moe-fused-bias-alias-cpu PROPERTIES
+        ENVIRONMENT "TS_MUSE_SPARK_REUSE_CPU_MOE_SCRATCH=0;TS_CPU_MOE_THREADS=2")
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
         set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
@@ -955,6 +1011,77 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
 
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
+    # One-shot return/exception injection is present only in native test builds.
+    set_property(SOURCE ggml_ops_matmul.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsAddmmQuantCacheRecoveryTest tests/addmm_quant_cache_recovery_test.cpp)
+    target_link_libraries(GgmlOpsAddmmQuantCacheRecoveryTest PRIVATE GgmlOps)
+    add_test(NAME addmm-quant-cache-recovery-cpu COMMAND GgmlOpsAddmmQuantCacheRecoveryTest cpu)
+    set_tests_properties(addmm-quant-cache-recovery-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME addmm-quant-cache-recovery-cuda COMMAND GgmlOpsAddmmQuantCacheRecoveryTest cuda)
+        set_tests_properties(addmm-quant-cache-recovery-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    endif()
+    add_executable(GgmlOpsResidentDeviceCopyTest tests/resident_device_copy_test.cpp)
+    add_executable(GgmlOpsMuseSparkProjectionPrecisionTest tests/muse_spark_projection_precision_test.cpp)
+    add_executable(GgmlOpsMuseSparkAttentionPrecisionTest tests/muse_spark_attention_precision_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkAttentionPrecisionTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-attention-precision-cpu COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cpu)
+    set_tests_properties(muse-spark-attention-precision-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-attention-precision-cuda COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cuda)
+        add_test(NAME muse-spark-attention-precision-cuda-multi COMMAND GgmlOpsMuseSparkAttentionPrecisionTest cuda-multi)
+        set_tests_properties(muse-spark-attention-precision-cuda muse-spark-attention-precision-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240 RUN_SERIAL TRUE)
+    endif()
+    target_link_libraries(GgmlOpsMuseSparkProjectionPrecisionTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-projection-precision-cpu COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cpu)
+    set_tests_properties(muse-spark-projection-precision-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 RUN_SERIAL TRUE)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-projection-precision-cuda COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cuda)
+        add_test(NAME muse-spark-projection-precision-cuda-multi COMMAND GgmlOpsMuseSparkProjectionPrecisionTest cuda-multi)
+        set_tests_properties(muse-spark-projection-precision-cuda muse-spark-projection-precision-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
+    target_link_libraries(GgmlOpsResidentDeviceCopyTest PRIVATE GgmlOps)
+    add_test(NAME resident-device-copy-cpu COMMAND GgmlOpsResidentDeviceCopyTest cpu)
+    set_tests_properties(resident-device-copy-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(GgmlOpsMuseSparkResidualTest tests/muse_spark_residual_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkResidualTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-residual-cpu COMMAND GgmlOpsMuseSparkResidualTest cpu)
+    add_executable(GgmlOpsMuseSparkKv2DUploadTest tests/muse_spark_kv_2d_upload_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkKv2DUploadTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-kv-2d-cpu COMMAND GgmlOpsMuseSparkKv2DUploadTest cpu)
+    set_tests_properties(muse-spark-kv-2d-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-kv-2d-cuda COMMAND GgmlOpsMuseSparkKv2DUploadTest cuda)
+        add_test(NAME muse-spark-kv-2d-cuda-multi COMMAND GgmlOpsMuseSparkKv2DUploadTest multi)
+        set_tests_properties(muse-spark-kv-2d-cuda muse-spark-kv-2d-cuda-multi
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+    endif()
+    add_executable(GgmlOpsMuseSparkNormGateTest tests/muse_spark_norm_gate_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkNormGateTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-norm-gate-cpu COMMAND GgmlOpsMuseSparkNormGateTest cpu)
+    set_tests_properties(muse-spark-norm-gate-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-norm-gate-cuda COMMAND GgmlOpsMuseSparkNormGateTest cuda)
+        add_test(NAME muse-spark-norm-gate-cuda-multi COMMAND GgmlOpsMuseSparkNormGateTest multi)
+        set_tests_properties(muse-spark-norm-gate-cuda muse-spark-norm-gate-cuda-multi PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
+    add_executable(GgmlOpsMuseSparkQKPrepTest tests/muse_spark_qk_prep_test.cpp)
+    target_link_libraries(GgmlOpsMuseSparkQKPrepTest PRIVATE GgmlOps)
+    add_test(NAME muse-spark-qk-prep-cpu COMMAND GgmlOpsMuseSparkQKPrepTest cpu)
+    set_tests_properties(muse-spark-qk-prep-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    if (GGML_CUDA)
+        add_test(NAME muse-spark-qk-prep-cuda COMMAND GgmlOpsMuseSparkQKPrepTest cuda)
+        set_tests_properties(muse-spark-qk-prep-cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    set_tests_properties(muse-spark-residual-cpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME muse-spark-residual-cuda COMMAND GgmlOpsMuseSparkResidualTest cuda)
+        set_tests_properties(muse-spark-residual-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        add_test(NAME resident-device-copy-cuda COMMAND GgmlOpsResidentDeviceCopyTest cuda)
+        set_tests_properties(resident-device-copy-cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
     target_include_directories(GgmlOpsAddmmVectorTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
