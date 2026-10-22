@@ -133,7 +133,7 @@ Hadamard 变换。它需要单设备 GGML 后端（`cpu`、`cuda`、`mlx` 与 `-
   F16/F32 的 K/V，因此在加载时改用 `f16`；MLX 的拒绝信息会说明 MLX 缺少哪些内核（稀疏注意力索引器、超连接、n-gram 表
   与 IQ2_XS/IQ3_XXS 专家），并建议改用 `ggml_metal`。
 
-- **MiniMax-H3 缺少 `tokenizer_config.json` 时会拒绝照片、以及含照片或视频片段的参考。** 图像、首尾帧与画面参考条件需要把它放在
+- **MiniMax-H3 缺少 `tokenizer_config.json` 时会拒绝照片、以及含照片或视频片段的参考。** 随附的 MiniMax-H3 配置现在会将此文件、`vocab.json` 与 `merges.txt` 下载到文本编码器旁；手动安装时仍需自行提供。图像、首尾帧与画面参考条件需要把它放在
   `vocab.json` 与 `merges.txt` 旁边（`MiniMaxAI/MiniMax-H3` 的 `processor/`），因为只有它定义了 `<|vision_start|>`、
   `<|image_pad|>` 与 `<|vision_end|>`。缺少它时这些标记被拆成普通片段，视觉特征落到错误的提示词位置上，生成的片段
   悄悄忽略了图片；现在这类请求会在视觉塔运行之前被拒绝，并点名该文件。文生视频从来不需要它。见

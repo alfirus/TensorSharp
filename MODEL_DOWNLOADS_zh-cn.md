@@ -46,7 +46,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | EmbeddingGemma 2 | 文本 / 代码及可选媒体嵌入 | [`config/embeddinggemma2.json`](config/embeddinggemma2.json) 将 Q8_0 文本模型固定到 Unsloth 修订 `031f0d4b35536f69ab3509d4893c923264fcf253`；同一版本的可选 `mmproj-Q8_0.gguf` 提供图像 / 音频 / 视频输入。用 `--embeddings` 承载；输出 768 维（MRL：512/256/128），默认输入窗口 8192 token。已实现六个后端，不支持 Vulkan。命令与覆盖范围见[嵌入指南](docs/embeddings_zh-cn.md)。 |
 | MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**CFG 必须为 1.0**（默认值）；默认 20 步，下面可选的 Turbo 插件把 FL2VA 检查点蒸馏为 8 或 4 步。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB。TensorAgent 的桌面目录（32 GB 档位）会通过单个 `minimax-h3-fl2va-q4k` 条目下载两种带哈希校验的去噪器及 24.0 GB 共用文件（含分词器）。Video Studio 可在两种条件模式间切换，无需重新加载共用模型。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#在-tensoragent-mac-应用里) |
 | MiniMax-H3 音视频生成 | Qwen3-VL-32B 文本编码器（必需） | 同仓库：`qwen3vl_32b_minimax_h3-Q4_K_M.gguf`（16.97 GiB），或 `-Q2_K_M.gguf`（12.20 GiB）以搭配最小的那几个去噪器。截断到 50 层并去掉最后的 norm，去噪开始前即从显存释放。**它不含分词器**——还需要下一行那三个文件 |
-| MiniMax-H3 音视频生成 | `vocab.json` + `merges.txt` + `tokenizer_config.json`（必需） | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor) 的 `processor/`（三个合计 4.46 MB）——编码器 GGUF 缺的那对 Qwen2 字节级 BPE 文件，外加 `tokenizer_config.json`：只有它定义了 `<\|vision_start\|>`、`<\|image_pad\|>` 和 `<\|vision_end\|>`。文生视频与参考全是录音的请求不需要它；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行前被拒绝（以前图片会被放到提示词的错误位置上、悄悄被忽略）。这也是配置文件唯一无法替你自动下载的东西（自动下载只能补齐“是参数”的条目，而分词器不是），不过 TensorAgent 的目录会自己下载这三个文件。放在编码器旁边，或用 `TS_VIDEO_TOKENIZER` 指向存放它们的目录 |
+| MiniMax-H3 音视频生成 | `vocab.json` + `merges.txt` + `tokenizer_config.json`（必需） | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor) 的 `processor/`（三个合计 4.46 MB）——编码器 GGUF 缺的那对 Qwen2 字节级 BPE 文件，外加 `tokenizer_config.json`：只有它定义了 `<\|vision_start\|>`、`<\|image_pad\|>` 和 `<\|vision_end\|>`。文生视频与参考全是录音的请求不需要它；缺了它，带关键帧、或参考中含照片或视频片段的请求会在视觉塔运行前被拒绝（以前图片会被放到提示词的错误位置上、悄悄被忽略）。随附的 `minimax-h3-fl2va.json` 配置会在首次运行时自动下载这三个文件；手动安装时将它们放在编码器旁边，或用 `TS_VIDEO_TOKENIZER` 指向存放它们的目录 |
 | MiniMax-H3 音视频生成 | 视频 VAE（必需） | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/vae) 里的 `minimax_h3_video_vae_fp16.safetensors`（5.21 GB）。空间 16 倍 / 时间 4 倍，解码器是纯 Transformer。放在去噪器旁或用 `--video-vae` 指定 |
 | MiniMax-H3 音视频生成 | 音频 VAE（可选） | 同一目录下的 `minimax_h3_audio_vae_fp32.safetensors`（0.61 GB）。把联合生成的音频 latent 解码成 32 kHz 立体声，作为旁挂 `.wav` 写在视频边上。**不下载也照样出视频**，只是没有声音。用 `--audio-vae` 指定 |
 | MiniMax-H3 音视频生成 | Turbo LoRA 插件（可选，仅 FL2VA） | [`config/lora/`](config/lora/) 中的两个步数蒸馏插件，用 `--lora` 加载，来自 [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo/tree/a29e57d195f80ead07c89f89e55ecf2911e893c5)，固定修订版本 `a29e57d195f80ead07c89f89e55ecf2911e893c5`（Apache-2.0），各 1,383,677,808 字节（1.38 GB），首次使用时下载到模型根目录下的 `minimax-h3/loras/`。`minimax-h3-fl2v-turbo-8step.json`：`minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors`，SHA-256 `9b0efe3613b43a84e30febaa43af27432ea9d0711eac7bba904b2556b175f6d4`，8 步。`minimax-h3-fl2v-turbo-4step.json`：`minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors`，SHA-256 `c3d4a2cf618efea71b9e21a4baaa12d412f1eb6c2b6f86efacaf0ebb6814b689`，4 步，配方为推断所得。各自把步数、flow shift、采样器与 CFG 锁定为其配方；Ref2VA 两个都拒绝。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#turbo-插件) |
@@ -357,7 +357,7 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 
 **MiniMax-H3 音视频生成**（提示词 + 可选关键帧或参考 → H.264 MP4，**外加原生 32 kHz 立体声音频，在同一个打包 latent 里一起生成**）：
 
-这里有四个网络协同工作，所以最短路径是现成的配置文件——它把四个都写好了，缺什么下什么（首次运行约 35.5 GB）：
+这里有五个模型文件协同工作，所以最短路径是现成的配置文件——它会下载两个去噪器和三个共享网络（首次运行约 46 GB）：
 
 ```bash
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
@@ -365,15 +365,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 ```
 
-`config/minimax-h3-ref2va.json` 是另一个 checkpoint：最多九个身份与外观参考——静态图、片段、音轨——
-用于一个全新的镜头，而不是必须被复现的帧。FL2VA 与 Ref2VA 是**两个独立的 checkpoint，不是一个开关**，
-向其中一个索要另一个的条件输入会直接报错，并在错误信息里点名你真正需要的那个文件。两份配置只有去噪器
-不同（那边约 35.4 GB），下面三个网络是共用的，所以第二份配置只会下它自己的 DiT。参见
+单个配置会同时下载 FL2VA 与 Ref2VA 两个独立的 checkpoint；它们不是一个开关，而是分别服务关键帧与身份参考。
+最多九个身份与外观参考——静态图、片段、音轨——用于一个全新的镜头，而不是必须被复现的帧。
+向不匹配的分区索要条件输入会直接报错。参见
 [config/README.md](config/README.md#video-generation-with-sound-minimax-h3)。文件会落到
 `TENSORSHARP_MODELS` 指向的位置，或仓库根目录下的 `models/`（已被 Git 忽略）。
 
-分词器无论走哪条路都不会自动下载：文本编码器的 GGUF 不含分词器，而自动下载只能补齐“是参数”的条目。
-三个文件都放在编码器旁边；`tokenizer_config.json` 是唯一定义视觉标记的那个，缺了它文生视频照样能跑，
+配置会自动下载分词器：文本编码器的 GGUF 不含分词器，但配置将三个文件作为伴随下载放在编码器旁边。
+`tokenizer_config.json` 是唯一定义视觉标记的那个，缺了它文生视频照样能跑，
 但带关键帧、或参考中含照片或视频片段的请求会被拒绝：
 
 ```bash

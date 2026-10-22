@@ -79,8 +79,8 @@
   </table>
   </div>
   <div class="callout note"><div class="ic">🧩</div><p>多模态模型需要<strong>投影器（mmproj）</strong>文件。请下载匹配文件并显式传入 <code>--mmproj</code>；服务端不会自动检测聊天模型的投影器（Qwen-Image-2.1 的编辑用投影器例外：两个宿主都会在 DiT 旁查找它，见上表对应行）。CLI 在给出图像却没有 <code>--mmproj</code> 时（Gemma 4 与 Nemotron 在给出音频或视频时也会），只会在模型旁边查找该家族声明的文件名——例如 Qwen 3.8 Flash Next 与 GLM 5.x 的 <code>*mmproj*.gguf</code>、DeepSeek V4.1 的 <code>deepseek41.vision.gguf</code>、Bonsai2 的两个投影器文件名——而且从不查找 DiffusionGemma 的视觉分片。</p></div>
-  <div class="callout warn"><div class="ic">🔤</div><p><strong>MiniMax-H3 的文本编码器 GGUF 不带分词器。</strong>自动下载只能补上属于<em>命令行选项</em>的那些文件，而分词器不是选项，所以任何配置文件都不会替你取它。请从 <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor" target="_blank" rel="noopener">MiniMaxAI/MiniMax-H3</a> 的 <code>processor/</code> 目录下载 <code>vocab.json</code> 与 <code>merges.txt</code> 并放在编码器旁边，或把 <code>TS_VIDEO_TOKENIZER</code> 指向存放它们的目录。</p></div>
-  <div class="callout tip"><div class="ic">📦</div><p><code>config/minimax-h3-fl2va.json</code> 与 <code>config/minimax-h3-ref2va.json</code> 把四个网络全部写明，第一次运行会自动下载（总计约 35.5 GB），之后直接复用。两个文件只有 <code>model</code> 一项不同，因此文本编码器与两个 VAE 只下载<em>一次</em>并共用——补上第二个检查点只多下一个去噪器，而不是再来一整套。四个网络还是轮流加载、用完即释放，所以显存峰值取决于其中最大的那一个，而不是四者之和。</p></div>
+  <div class="callout warn"><div class="ic">🔤</div><p><strong>MiniMax-H3 的文本编码器 GGUF 不带分词器。</strong>随仓库提供的唯一配置会从 <a href="https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor" target="_blank" rel="noopener">MiniMaxAI/MiniMax-H3</a> 下载固定版本的 <code>vocab.json</code>、<code>merges.txt</code> 与 <code>tokenizer_config.json</code>，并放在编码器旁边。手动安装时可将 <code>TS_VIDEO_TOKENIZER</code> 指向这些文件所在目录。</p></div>
+  <div class="callout tip"><div class="ic">📦</div><p><code>config/minimax-h3-fl2va.json</code> 下载两个去噪器、共享文本编码器、两个 VAE 与分词器文件（总计约 46 GB）；后续运行复用缓存。服务无需重启即可切换首尾帧与参考模式。模型网络会轮流加载和释放，因此显存峰值取决于最大的单个网络，而非总和。</p></div>
   <div class="content-footer">
     <a href="models_zh-cn.html">← 支持的模型</a>
     <a href="models-text_zh-cn.html">下一篇：文本与 LLM 模型 →</a>

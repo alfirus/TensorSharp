@@ -218,8 +218,8 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <minimax_h3_fl2va_pruned-
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
     --backend ggml_cuda
 
-# 同一件事也可以交给随仓库提供的配置文件，首次运行会自动下载全部四个网络
-# （config/minimax-h3-ref2va.json 对应参考检查点）。
+# 同一件事也可以交给唯一的 MiniMax-H3 配置文件，首次运行会下载两个去噪器、
+# 共享网络与分词器。
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 
@@ -602,8 +602,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model ./models/minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
     --video-steps 20 --video-frames 22
 
-# 同样的托管也可以直接用随仓库提供的配置文件（config/minimax-h3-ref2va.json 换成
-# 参考检查点；两者只有去噪器不同，其余三个网络不会重复下载）。
+# 同样的托管也可以用唯一配置文件，它同时包含两种条件模式所需的检查点。
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
 
 # MiniMax-H3 Turbo：每段片段都按插件的 8 步采样。不要设置 --video-steps（或设为 8）；
@@ -1196,10 +1195,9 @@ MiniMax-H3 联合生成视频与原生 32 kHz 立体声音频。两个检查点�
 
 | 检查点 / 配置 | 输入 |
 |---|---|
-| `minimax_h3_fl2va_pruned-Q4_K.gguf` / `config/minimax-h3-fl2va.json` | 文本（`t2v`）、首帧（`i2v`）、首尾帧（`fl2v`） |
-| `minimax_h3_ref2va_pruned-Q4_K.gguf` / `config/minimax-h3-ref2va.json` | 文本或身份 / 外观参考（`ref`），含图像、视频与音频参考 |
+| `minimax_h3_fl2va_pruned-Q4_K.gguf` + `minimax_h3_ref2va_pruned-Q4_K.gguf` / `config/minimax-h3-fl2va.json` | 文本（`t2v`）、首帧（`i2v`）、首尾帧（`fl2v`），或身份 / 外观参考（`ref`），含图像、视频与音频 |
 
-两个配置均固定去噪器、Qwen3-VL-32B 文本编码器、视频 VAE 与音频 VAE。
+唯一配置会下载两个去噪器、Qwen3-VL-32B 文本编码器、视频 VAE 与音频 VAE。
 编码器还需[模型卡片](docs/models/minimax-h3_zh-cn.md)中 processor 修订版本的
 `vocab.json`、`merges.txt` 与 `tokenizer_config.json`。
 去噪器文件名需保留 `fl2va` / `ref2va`。伴随文件可用 `--video-text-encoder`、
@@ -1214,9 +1212,9 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 \
   --cfg 1 --diffusion-seed 42 --output wave.mp4
 
-# Ref2VA 用参考身份生成新场景。
+# 参考模式用参考身份生成新场景。
 dotnet run --project TensorSharp.Cli -c Release -- \
-  --config config/minimax-h3-ref2va.json --backend ggml_cuda \
+  --config config/minimax-h3-fl2va.json --backend ggml_cuda \
   --video-mode ref --ref-image portrait.png \
   --prompt "<Picture 1> walks through a sunlit garden." \
   --width 640 --height 384 --video-frames 22 --diffusion-seed 42 --output garden.mp4
