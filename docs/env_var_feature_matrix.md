@@ -251,7 +251,7 @@ replacement.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_SPEC` | Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash (n-gram only), Gemma 4, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Muse-Glimmer (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
+| `TS_SPEC` | Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash (n-gram only), Gemma 4, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Muse-Glimmer, Muse Spark (n-gram only) (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
 | `TS_SPEC_TYPE` | all of the above | Speculation algorithm: `auto` \| `draft-head` \| `block` \| `ngram` | `auto` | not registered | no |
 | `TS_SPEC_DRAFT` | all of the above | Max tokens drafted per speculative step (1-64) | `8` | not registered | no |
 | `TS_SPEC_PMIN` | all of the above | Draft-confidence gate; meaning is per algorithm | per algorithm (`0.15` / `0.35` / `0`) | not registered | no |
@@ -280,6 +280,23 @@ A/B switch, plus long-context sizing knobs. None are registered in
 | `TS_Q35_VERIFY_SNAPSHOTS` | Qwen 3.5 / 3.8 speculative verify | `0` reverts to restoring a pre-verify recurrent-state copy and re-forwarding the accepted prefix instead of keeping one snapshot per row | ON | not registered | no |
 | `TS_SPEC_ADAPTIVE` | Speculative decoding (all drafters) | `0` disables the cost governor, so drafting is never measured against a plain baseline and never parked. For A/B measurement: a governor round's baseline steps are plain decodes and they are not free | ON | not registered | no |
 | `TS_GGML_LOG_DEBUG` | GGML backends | `1` passes ggml's DEBUG log channel through instead of dropping it. Carries the CUDA backend's "CUDA graph warmup complete"/"reset" lines, which are the only way to see whether a graph is actually being CUDA-graph-captured | OFF | not registered | no |
+
+## Out-of-Matrix Muse Spark Knobs
+
+Muse Spark's native whole-model executor is selected and sized by these switches.
+None are registered in `EnvVarMatrix.All`. The full list, including the per-op
+path's opt-in optimizations, is in the
+[Muse Spark card](models/muse-spark.md#options).
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_MUSE_SPARK_NATIVE` | Muse Spark | `0` selects the per-op path; `1` also runs the native executor on `ggml_cpu`. `--tp` always uses the per-op path | ON for `ggml_cuda` / `ggml_vulkan` | not registered | no |
+| `TS_MUSE_SPARK_CPU_MOE` | Muse Spark (native) | `auto` places each expert stack separately, keeping as many on the GPUs as fit and as few bytes as possible on the host; overrides `--n-cpu-moe` | OFF | not registered | no |
+| `TS_MUSE_SPARK_PLAN_SLOTS` | Muse Spark (native) | Sliding-window rings reserved in the placement plan; set to the concurrency plus one for the shared-prefix checkpoint | `1` | not registered | no |
+| `TS_MUSE_SPARK_UBATCH` | Muse Spark (native) | Prefill micro-batch rows; a graph that does not fit runs that call in halved micro-batches | `2048` | not registered | no |
+| `TS_MUSE_SPARK_DEV0_RESERVE_MB` | Muse Spark (native) | Extra memory kept free on GPU 0, e.g. for the vision encoder | `0` | not registered | no |
+| `TS_MUSE_SPARK_HOST_NUMA` | Muse Spark (native) | `0` keeps host experts in the GGUF mapping instead of NUMA-local copies with pinned workers | ON with two or more NUMA nodes | not registered | no |
+| `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark (native, GPUs) | `0` skips the full-size prefill at load that grows ggml-cuda's kernel-scratch pools to their peak before slots take the memory | ON with GPUs | not registered | no |
 
 ## Out-of-Matrix DeepSeek V4 / V4.1 Knobs
 

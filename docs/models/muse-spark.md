@@ -1,6 +1,6 @@
 # Muse Spark
 
-[Back to model index](README.md)
+[← back to model index](README.md) | [中文](muse-spark_zh-cn.md)
 
 TensorSharp recognizes the `muse-spark` GGUF architecture used by
 [Unsloth's Muse-Spark-Open-816B-A42B release](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF).

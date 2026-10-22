@@ -153,8 +153,8 @@ Muse-Glimmer (DFlash / DFlash2) and Qwen 3.8-27B (DFlash2) also take block draft
 through `--draft-model`.
 
 A weight-free n-gram (prompt-lookup) speculator, selected with `--spec-type ngram`,
-needs no drafter and runs on the Qwen 3.5 family, Gemma 4, GLM 5.x and Qwen 3.8
-Flash Next, and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is
+needs no drafter and runs on the Qwen 3.5 family, Gemma 4, GLM 5.x, Qwen 3.8
+Flash Next and Muse Spark (its only speculator), and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is
 loaded. It does not run on GPT OSS, Mistral 3 or Hunyuan Dense,
 and Nemotron-H refuses every speculator; see
 [speculative decoding](../speculative_decoding.md).

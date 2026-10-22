@@ -44,7 +44,7 @@ The largest gains come from four changes in TensorSharp:
 
 | | TensorSharp | llama.cpp |
 |---|---|---|
-| Source | branch `codex/muse-spark-inference` at `c58ed9ed` plus the uncommitted native executor changes described in [muse-spark.md](../models/muse-spark.md#native-whole-model-executor) | `0a1ef309c` (build 11796), unmodified |
+| Source | branch `codex/muse-spark-inference` at `c58ed9ed` plus the native executor changes described in [muse-spark.md](../models/muse-spark.md#native-whole-model-executor), uncommitted when measured and since committed as `80c64c19` | `0a1ef309c` (build 11796), unmodified |
 | ggml | upstream `a05c9922`, unmodified (`git status` clean) | in-tree |
 | Model | `unsloth/Muse-Spark-Open-816B-A42B-GGUF`, UD-Q3_K_XL, 10 shards, 374 GiB | same files |
 | Projector | `mmproj-Q8_0.gguf` (2.2 GB) | same file |

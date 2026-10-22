@@ -8,7 +8,7 @@
 
 **TensorSharp 是在本地运行 GGUF 模型的 .NET 10 推理引擎。** 在 Windows、macOS 或 Linux 上，通过 CLI、浏览器聊天或兼容 Ollama/OpenAI 的 API 使用，也可直接集成到自己的 .NET 应用中。可选择纯托管 C# CPU 内核或原生 CUDA、Metal、Vulkan 后端，具体支持取决于模型。
 
-当前源码涵盖文本与推理、多模态输入、嵌入、图像生成与编辑、带音频的视频、个人知识库，以及带代码工具的 Agent Skills。TensorSharp 也为 iPhone、iPad、Mac 和 Windows 上的本地应用 [TensorAgent](TensorAgent/README.md) 提供引擎。可直接从下文开始，或查看[项目状态](docs/PROJECT_STATUS_zh-cn.md)中的能力与验证限制；LTX 2.5、EmbeddingGemma 2 与原生技能发现需要 `v2026.10.11` 标签之后的源码构建。
+当前源码涵盖文本与推理、多模态输入、嵌入、图像生成与编辑、带音频的视频、个人知识库，以及带代码工具的 Agent Skills。TensorSharp 也为 iPhone、iPad、Mac 和 Windows 上的本地应用 [TensorAgent](TensorAgent/README.md) 提供引擎。可直接从下文开始，或查看[项目状态](docs/PROJECT_STATUS_zh-cn.md)中的能力与验证限制。
 
 <p align="center">
   <a href="https://trendshift.io/repositories/51351#achievements"><img src="https://trendshift.io/api/badge/repositories/51351" alt="TensorSharp on GitHub Trending: #2 Repository Of The Day" width="250" height="55"></a>
@@ -24,7 +24,7 @@
 - **Agent Skills 与代码工具。** `TensorSharp.AgentHost` 提供文件、shell 和文档工作流。[17 个随附技能](docs/agent_skills.md)（英文）涵盖研究、文档、TDD、设计访谈与交接；开启联网后，`find-skills` 可搜索、检查并安装更多技能。服务端与 TensorAgent 聊天还支持[有界子智能体委派](docs/multi_agent.md)（英文），子智能体拥有私有工作区并默认只读。
 - **个人知识库。** [上传文件或嵌套目录，导入已保存聊天及其附件和产物](docs/knowledge-system_zh-cn.md)。按聊天选择集合，检索带页码 / 行号 / 时间位置的引用片段、预览原件，或让代码智能体打开完整数据集。默认使用本地 BM25，可选 GGUF 嵌入提供语义搜索；兼容的媒体模型可索引图像、音频和采样视频。提取状态与警告显示覆盖边界。
 - **生成中追加指令。** CLI、服务端 Web UI 和 TensorAgent 在推理或回答时都可提交新指令；后续回答使用对话、已有部分输出与新指导。仍可单独停止当前生成。
-- **有记录的性能对比。** 与 `llama.cpp` 的测试使用相同 GGUF 文件和硬件，结果对应所测的模型、后端及工作负载。详见[性能数据](docs/benchmarks_zh-cn.md)。
+- **有记录的性能对比。** 与 `llama.cpp` 的测试使用相同 GGUF 文件和硬件，结果对应所测的模型、后端及工作负载。在六块 A40 GPU 上，816B 的 [Muse Spark](docs/models/muse-spark_zh-cn.md) decode 速度为 llama.cpp 的 1.11 倍，prefill 约为 2 倍。详见[性能数据](docs/benchmarks_zh-cn.md)。
 - **TensorAgent 应用。** 在手机和桌面进行本地聊天、使用附件与技能并保存工作。详见 [Mac / Windows 安装指南](docs/tensoragent_desktop_zh-cn.md)与[应用验证范围](TensorAgent/README.md)。
 
 ## 配合书籍学习
@@ -98,7 +98,7 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 ## 支持的模型家族一览
 
-- **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md) 与 [Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md)。
+- **文本、推理与多模态 LLM：** [DeepSeek V4 Flash](docs/models/deepseek4_zh-cn.md) / [V4.1 Flash](docs/models/deepseek41_zh-cn.md)、[GLM 5.x](docs/models/glm_zh-cn.md)、[Gemma 4](docs/models/gemma4_zh-cn.md)、[Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35_zh-cn.md)、[Qwen 3.8 Flash Next](docs/models/qwen38-flash-next_zh-cn.md)、[Bonsai2](docs/models/bonsai2_zh-cn.md)（Qwen 家族）、[GPT OSS](docs/models/gptoss_zh-cn.md)、[Nemotron-H](docs/models/nemotron_zh-cn.md)、[Mistral 3](docs/models/mistral3_zh-cn.md)、[Hunyuan Dense](docs/models/hunyuan-dense_zh-cn.md)、[Muse-Glimmer](docs/models/muse-glimmer_zh-cn.md) 与 [Muse Spark](docs/models/muse-spark_zh-cn.md)（816B MoE，多 GPU）。
 - **文本扩散：** [DiffusionGemma](docs/models/diffusiongemma_zh-cn.md)，包含 `/v1/systemone` 上的 [Jev 类型化判定](docs/models/jev_zh-cn.md)（支持文本、图像、上传文档、抽样视频帧，以及通过已配置 ASR 配套服务得到的语音转录）。
 - **图像生成/编辑与视频生成：** [Qwen-Image-2.1](docs/models/qwenimage21_zh-cn.md)、[LTX 2.5 Distilled（视频 + 48 kHz 立体声音频）](docs/models/ltx-2.5_zh-cn.md)、[MiniMax-H3（视频 + 立体声音频）](docs/models/minimax-h3_zh-cn.md) 与 [Wan 2.1 / 2.2](docs/models/wan_zh-cn.md)。
 - **嵌入：** [EmbeddingGemma 2](docs/embeddings_zh-cn.md)，包括文本 / 代码及可选的图像、音频、视频输入；以及 Snowflake Arctic Embed L v2.0、all-MiniLM-L6-v2 等 BERT / XLM-R 编码器。
@@ -139,6 +139,8 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | Qwen 3.6 27B（UD-IQ2_XXS，dense） | CUDA | **1.07×** | 0.96× | 0.95× |
 | Qwen 3.6 27B（UD-IQ2_XXS，dense） | Vulkan | 1.02× | 0.85× | 0.84× |
 
+有正面对比记录的最大模型是在六块 A40 GPU 上运行的 816B Muse Spark（UD-Q3_K_XL）：decode 1.11×，4K / 16K token 的 prefill 分别为 2.12× / 1.92×，四个并发请求的总输出为 1.10×（[报告](docs/perf/muse-spark-vs-llama-cpp.md)，英文）。
+
 这些数字的含义、如何复现，以及放不进这块 GPU 的大模型的正面对比，见[性能数据](docs/benchmarks_zh-cn.md)。
 
 ## 文档
@@ -168,6 +170,7 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 哪些高影响运行时开关影响哪些模型、后端与提示类型 |
 | [引擎对比报告](docs/engine_comparison_report.md) | TensorSharp 对比 llama.cpp 的完整逐场景表格 |
 | [ggml_metal 对比 llama.cpp](docs/perf/metal-vs-llama-cpp.md) | Apple Silicon 上 prefill / decode 的正面对比，找到的四处计算图构建差距，以及每一处的实际收益 |
+| [Muse Spark 对比 llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | 816B MoE 在六块 A40 GPU 上的测试：原生整模型执行器、测试环境、逐场景结果与对比的局限 |
 | [测试 / 基准矩阵运行器](TensorSharp.TestMatrix/README_zh-cn.md) | 扫描 model × backend × feature × env-var 组合并生成回归报告 |
 | [服务端 API 示例](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md) | 完整的 curl 与 Python 示例 |
 

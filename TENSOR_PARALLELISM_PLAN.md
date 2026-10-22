@@ -958,5 +958,6 @@ Stage 3 (RDMA)              ░░░░░░░░░░░░░░░░░�
 | GptOss | MoE | ✅ Done | Expert slicing with biased projections, attention sinks, YaRN; expert down-bias skipped in TP |
 | Nemotron | SSM + MoE | ✅ Done | Mamba2 replicated on rank 0, attention (no RoPE), MoE expert slicing |
 | Muse-Glimmer | Dense + vision | ✅ Done | Interleaved SWA/NoPE layers, per-head QK norm (replicated), attention output gate (column-parallel by head), segmented fused gate_up; **tp=2 max — 2 KV heads**; vision tower replicated on rank 0; DFlash and pooled KV snapshots stay single-GPU |
+| Muse Spark | MoE + vision | ✅ Done (per-op path) | Q/K/V/gate split by whole GQA head groups, attention output by input columns, routed experts partitioned whole with per-expert norm before the cross-GPU sum; uneven partitions allowed (9 GPUs for 128 query / 16 KV heads); router, latent projections and output head on rank 0; local only. Not performance-measured; the native whole-model executor uses `--layer-split N` instead |
 | DiffusionGemma | Diffusion | ❌ N/A | Not autoregressive text generation |
 | QwenImage | Image gen | ❌ N/A | Not autoregressive text generation |

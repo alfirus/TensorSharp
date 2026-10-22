@@ -66,6 +66,8 @@ for setup, extraction limits, citations and complete-original access.
 
 **GLM 5.x (`glm-dsa`) is another exception.** Its 744B-A40B MLA + sparse-attention MoE runs through a native whole-model ggml executor on `--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal`, and through a managed per-op path on `--backend cpu` (100% managed, no native dependencies) and `--backend cuda`; `TS_GLM_NATIVE=0` selects the managed path on a GGML backend for an A/B. **GLM-5.3 (not Flash) is the same `glm-dsa` block shape as GLM-5.2** — 79 blocks (78 trunk + one NextN), 256 routed experts at top-8 plus one shared expert, MLA with the lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path, on the same backends, with no new code and no new flag; it is text only twice over, because the repo publishes no mmproj at any quant and `--mmproj` on `glm-dsa` is warned about and ignored rather than failing the run. A split GGUF is handled by `GgufFile` itself — point `--model` at the `-00001-of-` shard of the quant directory (six shards for GLM-5.2, seven and 236.4 GiB for GLM-5.3's UD-Q2_K_XL). MLX does not run it. See the [GLM card](docs/models/glm.md), and [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) for what differs.
 
+**Muse Spark (`muse-spark`) has a native whole-model executor as well.** The 816B-A42B Unsloth release runs on `--backend ggml_cuda` / `ggml_vulkan` through a TensorSharp-owned executor that submits one GGML graph per micro-batch across every GPU and the CPU, on unchanged upstream ggml. `--layer-split N` spreads its 62 layers over N local GPUs, and `TS_MUSE_SPARK_CPU_MOE=auto` places each expert stack so that as few bytes as possible stay on the host; with neither that nor `--n-cpu-moe N`, a checkpoint that does not fit is refused with a message naming the option. Concurrent requests share batched decode and prefill graphs over per-sequence F16 KV slots. `TS_MUSE_SPARK_NATIVE=0` selects the older managed per-op path, which `--tp N` always uses; `TS_MUSE_SPARK_NATIVE=1` opts `ggml_cpu` into the executor. The full-model measurements are on `ggml_cuda` (six A40 GPUs); Vulkan has none. As for any split GGUF, `--model` may name any shard: TensorSharp reads the metadata from shard 1 and the tensors from every shard. See the [Muse Spark card](docs/models/muse-spark.md) and the [llama.cpp comparison](docs/perf/muse-spark-vs-llama-cpp.md).
+
 ## Configuration file (CLI + Server)
 
 Both `TensorSharp.Cli` and `TensorSharp.Server.Host` can read their options from a JSON
@@ -1753,6 +1755,18 @@ Notes:
   llama-server's 20.4-22.4 and 13.00-13.24 (28.8-31.6 and 11.94-12.48 with
   `--no-op-offload`). See the
   [model card](docs/models/qwen38-flash-next.md#larger-than-memory).
+* **Muse Spark places expert stacks one at a time.** On its native executor,
+  `TS_MUSE_SPARK_CPU_MOE=auto` overrides `--n-cpu-moe` with a byte-minimizing plan:
+  each layer's dense weights stay on its GPU, and its gate, up and down expert stacks
+  are placed independently so that as few bytes as possible land on the host. The
+  startup log lists the host stacks (`6,7,...,18:gu,...,45:d`). On hosts with two or
+  more NUMA nodes, host stacks are copied into memory local to pinned worker threads
+  (`TS_MUSE_SPARK_HOST_NUMA=0` keeps the GGUF mapping); on the 2-socket test host that
+  raised host expert bandwidth from about 100 to 165-174 GB/s. Batches of 2-16 tokens
+  run host experts through a static-row kernel whose results match ggml's bit for bit.
+  On six A40s the plan put 131.8 GiB of the 374 GiB UD-Q3_K_XL checkpoint on the host,
+  and decode still reached 11.05 tok/s, 1.11x llama.cpp on the same machine. See the
+  [model card](docs/models/muse-spark.md#native-whole-model-executor).
 * **One-token host experts run on TensorSharp's own kernel.** ggml's CPU dot
   products, but on a team woken once per layer and parked as soon as the layer is
   done, instead of a ggml graph whose workers wake at every call. A busy-waiting
@@ -1900,6 +1914,7 @@ must be reachable between all nodes.
 | GPT OSS | ✅ | Attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path is expert-parallel (whole experts per rank, one batched `ggml_mul_mat_id` dispatch per projection per layer) and falls back to per-expert slicing only when the expert count does not divide the TP degree |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Still walks experts per token per rank on GGML (no expert parallelism yet) |
 | Muse-Glimmer | ✅ (`--tp 2` at most) | Its 2 KV heads cap the degree at 2; GGML CUDA / Vulkan only, and a DFlash drafter is declined under TP — the CLI warns and decodes plainly, the server refuses to start (see [Constraints](#constraints)) |
+| Muse Spark | ✅ (local only, per-op path) + layer split | `--tp N` on GGML CUDA / Vulkan splits Q/K/V/gate projections by whole GQA head groups and the attention output by input columns, and partitions routed experts whole; uneven partitions are allowed (nine GPUs for the published 128-query / 16-KV-head checkpoint), but each rank must own at least one KV group and expert. The router, latent projections, residual stream and output head run on rank 0. TP always takes the per-op path rather than the native executor and has no performance measurement; `--layer-split N` (the native executor's placement) is the measured mode. The two cannot be combined, and distributed groups are refused |
 | GLM 5.x | ✅ (local only) | GGML GPU backends only; the native TP path is local/single-process for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (`--tp-node-id` / `--tp-peers` are hard-refused for the whole family). GLM-5.2 shards MLA heads and hidden rows inside every routed expert. GLM-5.3-Flash also head-shards KDA with per-rank recurrent state; its MLA heads and routed-expert hidden rows are sharded likewise. Attention partials reduce before each nonlinear Sinkhorn hyper-connection. On GLM-5.3-Flash's eligible segmented fast path, routed-MoE partials reduce first, then each rank computes/adds the replicated shared expert locally; hyper-connections, pooled indexer, router, norms, dense layers and embedding also remain unsharded and execute per rank, while output norm / LM head stay on rank 0. CPU MoE, tracing, partial `TS_GLM_TP_SHARD`, oversubscription, or missing native hyper-connection kernels use the combined scheduler fallback, where the shared expert runs once on rank 0. Plain GLM-5.3 accepts `--tp N` on the same local terms and replicates the MLA and indexer caches on every rank, so `--tp` multiplies the KV footprint; nothing has ever been run on it at `--tp N>1` — the only recorded arithmetic is a non-fit, `--tp 8` wanting 41.7 GiB per rank against 46 GB cards — so treat it as an accepted mode rather than a validated configuration, and note that `--spec` is refused there whenever `--tp N>1`. Use `--layer-split N` for whole-layer placement |
 | DeepSeek V4 Flash | layer split | Not tensor parallelism: the whole-model executors bin-pack contiguous runs of whole layers against each device's free VRAM, and `--layer-split N` only caps how many GPUs that split uses |
 | DeepSeek V4.1 Flash | partial TP | `--layer-split N` selects local whole-layer placement. Experimental routed-MoE TP (`--tp N`) runs on GGML CUDA; attention TP and distributed groups are unsupported. The two modes cannot be combined. |
@@ -2050,9 +2065,10 @@ remain eligible for disk persistence. Engine API callers should supply a stable
 `SequenceState.CacheScope` for conversation reuse; an unscoped request shares only
 its declared `SharedPrefixTokens` in Radix mode. The families that take part: the
 Qwen 3.5 / 3.6 / 3.8-27B family (`qwen35*`, `qwen3next`), Gemma 4, GLM 5.x, Qwen 3.8
-Flash Next and DeepSeek V4 / V4.1 (holder / end-state reuse), and GPT-OSS,
-Mistral 3, Hunyuan Dense, Muse-Glimmer and Nemotron-H (page reuse); DiffusionGemma
-and the media-generation models do not. `--spec` does not turn it off.
+Flash Next and DeepSeek V4 / V4.1 (holder / end-state reuse), GPT-OSS,
+Mistral 3, Hunyuan Dense, Muse-Glimmer and Nemotron-H (page reuse), and Muse Spark
+(retained native slots donated to the continuing request, page reuse on its per-op
+path); DiffusionGemma and the media-generation models do not. `--spec` does not turn it off.
 
 Startup warmup makes the common system/developer messages and tool declarations
 available to new chats as a public prefix. With the Web UI enabled, the server
