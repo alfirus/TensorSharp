@@ -620,12 +620,28 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
                 break;
             }
             ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
-#if !defined(_WIN32)
             // The device copy is the only one this process needs: drop the file
             // pages so a GPU-bound read does not evict the mapped CPU experts
-            // from a container's page-cache budget.
-            if (drop_cache) posix_fadvise(fileno(f), (off_t) j.file_off, (off_t) j.len, POSIX_FADV_DONTNEED);
+            // from a container's page-cache budget. Only Linux can drop one
+            // range: macOS declares neither posix_fadvise nor POSIX_FADV_DONTNEED
+            // and offers whole-descriptor F_NOCACHE instead (as the DSV4 loader
+            // does). Anywhere else the request has no effect and says so.
+            if (drop_cache)
+            {
+#if defined(__linux__)
+                posix_fadvise(fileno(f), (off_t) j.file_off, (off_t) j.len, POSIX_FADV_DONTNEED);
+#elif defined(__APPLE__)
+                // Idempotent and per-descriptor: from here this handle's reads
+                // bypass the page cache entirely.
+                fcntl(fileno(f), F_NOCACHE, 1);
+#else
+                static std::once_flag warned;
+                std::call_once(warned, []() {
+                    fprintf(stderr, "[muse-spark] TS_MUSE_SPARK_DROP_UPLOAD_CACHE has no effect on this platform; "
+                                    "the checkpoint's pages stay in the page cache\n");
+                });
 #endif
+            }
             done_bytes.fetch_add(j.len, std::memory_order_relaxed);
         }
         for (FILE * f : files) if (f) fclose(f);
@@ -2821,6 +2837,11 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
                     ggml_backend_tensor_set(pw->t, src, 0, pw->bytes);
 #if !defined(_WIN32)
                     posix_madvise((void *) ((uintptr_t) src & ~(uintptr_t) 4095), pw->bytes + ((uintptr_t) src & 4095), POSIX_MADV_DONTNEED);
+#endif
+#if defined(__linux__)
+                    // macOS has no ranged page-cache drop (no posix_fadvise); the
+                    // madvise above only deactivates the mapped pages there, so
+                    // they are the first reclaimed rather than dropped now.
                     if (int fd = open(m->shards.paths[(size_t) pw->shard].c_str(), O_RDONLY); fd >= 0)
                     {
                         posix_fadvise(fd, (off_t) pw->file_off, (off_t) pw->bytes, POSIX_FADV_DONTNEED);
