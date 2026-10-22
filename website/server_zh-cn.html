@@ -271,7 +271,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>TS_SCHED_MAX_BATCHED_TOKENS</code></td><td>每步 token 预算（默认 <code>4096</code>）。</td></tr>
       <tr><td><code>TS_SCHED_MAX_RUNNING_SEQS</code></td><td>最大在飞序列数（默认 <code>16</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFILL_CHUNK</code></td><td>存在活跃 decode 时每请求的 prefill 上限（默认 <code>256</code>）；仅 prefill 时会用满完整 token 预算。</td></tr>
-      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>系统中最多一个序列时的 prefill 分块大小，会限制所有独占 prefill 分块（默认 <code>8192</code>）。</td></tr>
+      <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>系统中最多一个序列时的 prefill 分块大小，会限制所有独占 prefill 分块（默认 <code>8192</code>，受 <code>TS_SCHED_MAX_BATCHED_TOKENS</code> 约束）。不设置时，能自行决定单独提示步长的模型会自己决定：开启流水线 prefill 的 Muse Spark 使用 8192 token 的步长，不超过 2048 token 的余数并入前一步，可能超过该预算。设置它则关闭模型自定的步长；引擎日志会说明实际采用哪一种。</td></tr>
       <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>切换序列前的 decode token 数（默认 <code>256</code> = 块大小）。</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>引擎池中的物理块数（默认 <code>256</code>） / 每块 token 数（只靠整页复用的家族默认 <code>16</code>，其余默认 <code>256</code>）。</td></tr>
       <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用所有跨请求的运行时前缀复用（= <code>--no-prefix-cache</code> 所设置的值）。</td></tr>

@@ -36,16 +36,15 @@ public partial class MuseSparkModel : ISoloPrefillBudgetModel
     private int _nativeTpDegree;         // GPUs the native executor splits every layer over; 0 for a layer split
 
     /// <summary>A lone prompt's prefill step. Each native call fills and drains the GPU pipeline
-    /// once: on 10x A40 one 8192-token call keeps about 93% of a 16K call's throughput (a 4K call
-    /// about 72%), and a request that arrives meanwhile waits for one step of about 6 s rather
+    /// once: on 10x A40 one 8192-token call keeps about 90% of a 16K call's throughput (a 4K call
+    /// about 70%), and a request that arrives meanwhile waits for one step of about 6 s rather
     /// than 10 s. A remainder of at most a quarter step joins the step before it, so no short
     /// call fills and drains the pipeline alone. 0 (the scheduler's own step) when the call would
     /// not run pipelined: pipelined prefill off, or a context whose masks exceed its budget.</summary>
     public int PreferredSoloPrefillTokens(int start, int remaining)
     {
-        // Image rows replace token embeddings inside the call, which runs it one
-        // micro-batch at a time: the scheduler's own step is the better size then.
-        if (_nativePipelineUbatch <= 0 || HasPendingVisionEmbeddings) return 0;
+        // (The scheduler keeps its own step when the step would carry image rows.)
+        if (_nativePipelineUbatch <= 0) return 0;
         lock (_nativeSync)
         {
             if (_native == IntPtr.Zero) return 0;

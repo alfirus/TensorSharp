@@ -2525,6 +2525,8 @@ static bool forward(model & m, const int32_t * tokens, int64_t n, float * logits
 {
     if (!m.active_slot || n <= 0) return false;
     int64_t off = 0;
+    if (m.pipe.enabled && !all_rows && n >= 2 && !m.embd_ovr.empty())
+        pipe_warn(m, "image rows replace token embeddings inside pipelined micro-batches");
     if (m.pipe.enabled && !all_rows && m.embd_ovr.empty() && n >= 2)
     {
         const int rc = forward_pipelined(m, tokens, n, logits_out, &off);
@@ -2703,7 +2705,7 @@ static ggml_backend_t tp_open(model & m, int tp, const char * backend_name, cons
     else if (layer_split && *layer_split)
         why = "--tp cannot be combined with TS_MUSE_SPARK_LAYER_SPLIT (a layer split); use one or the other";
     else if (n_cpu_moe_req > 0)
-        why = "--tp keeps every expert in GPU memory; --n-cpu-moe / TS_MUSE_SPARK_CPU_MOE=N needs --layer-split";
+        why = "--tp keeps every expert in GPU memory; --n-cpu-moe needs --layer-split";
     else if (opt_get("TS_MUSE_SPARK_PIPELINE") == "1")
         why = "TS_MUSE_SPARK_PIPELINE=1 cannot run under --tp (it pipelines a layer split's GPUs)";
     else if (env_long("TS_MUSE_SPARK_PROFILE", 0) > 0)
@@ -3042,6 +3044,8 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
         while ((1 << steps) < n) steps++;
         const size_t reduce = (size_t) steps * (size_t) hp.latent * (size_t) hp.n_expert_used * (size_t) m->n_ubatch * sizeof(float);
         const size_t reserve = (size_t) env_long("TS_MUSE_SPARK_VRAM_RESERVE_MB", 2048 + m->n_ubatch / 4) * 1024 * 1024 + reduce;
+        // GPU 0 also holds the managed side's vision encoder.
+        const size_t dev0_extra = (size_t) env_long("TS_MUSE_SPARK_DEV0_RESERVE_MB", 0) * 1024 * 1024;
         auto kv_dev = [&](int j) -> size_t
         {
             size_t b = 0;
@@ -3055,7 +3059,7 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
         auto misfit = [&]() -> int
         {
             for (int j = 0; j < n; j++)
-                if (w_dev[(size_t) j] + kv_dev(j) + reserve > free_dev[(size_t) j]) return j;
+                if (w_dev[(size_t) j] + kv_dev(j) + reserve + (j == 0 ? dev0_extra : 0) > free_dev[(size_t) j]) return j;
             return -1;
         };
         const int64_t min_ctx = pad_to(4096, m->kv_pad);
@@ -3082,8 +3086,9 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
             tsg::report_load_refusal("[muse-spark] tensor parallel: GPU %d needs %.1f GiB (weights %.1f, K/V %.1f, compute and "
                                      "reductions %.1f) at a %d-token context but has %.1f GiB free; set a smaller MAX_CONTEXT, "
                                      "TS_MUSE_SPARK_PLAN_SLOTS or TS_MUSE_SPARK_UBATCH, or use more GPUs\n", j,
-                                     (w_dev[(size_t) j] + kv_dev(j) + reserve) / 1073741824.0, w_dev[(size_t) j] / 1073741824.0,
-                                     kv_dev(j) / 1073741824.0, reserve / 1073741824.0, m->n_ctx, free_dev[(size_t) j] / 1073741824.0);
+                                     (w_dev[(size_t) j] + kv_dev(j) + reserve + (j == 0 ? dev0_extra : 0)) / 1073741824.0,
+                                     w_dev[(size_t) j] / 1073741824.0, kv_dev(j) / 1073741824.0,
+                                     (reserve + (j == 0 ? dev0_extra : 0)) / 1073741824.0, m->n_ctx, free_dev[(size_t) j] / 1073741824.0);
             return nullptr;
         }
         for (int j = 0; j < n; j++)

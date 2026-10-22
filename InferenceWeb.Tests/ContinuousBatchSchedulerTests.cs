@@ -346,6 +346,26 @@ public class ContinuousBatchSchedulerTests
     }
 
     [Fact]
+    public void Scheduler_SoloPrefillPolicy_KeepsItsOwnStepForImageRows()
+    {
+        // A step carrying image rows runs one micro-batch at a time on a model that
+        // pipelines text prefill, so it keeps the scheduler's budget-bounded size.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 16, MaxNumRunningSequences = 4, MaxPrefillChunkSize = 4,
+            NumBlocks = 64, BlockSize = BlockSize, EnablePrefixCaching = false,
+        };
+        var sched = new ContinuousBatchScheduler(cfg, NewPool(cfg.NumBlocks), NullLogger.Instance);
+        sched.SetSoloPrefillPolicy(new SoloPolicyStub(step: 64));
+        var tokens = Enumerable.Range(1, 100).ToList();
+        var image = new SequenceState("img", tokens, 4, BlockSize, SamplingConfig.Default,
+            mediaSpans: new[] { new PromptMediaSpan(40, 50, "image-1") });
+        sched.Submit(image);
+        var first = Assert.Single(sched.Schedule().ScheduledWork);
+        Assert.Equal(16, first.NumScheduledTokens);
+    }
+
+    [Fact]
     public void Engine_SoloPrefillPolicy_YieldsToAChosenSoloChunk()
     {
         var policy = new SoloPolicyStub(step: 16384);

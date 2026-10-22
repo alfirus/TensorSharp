@@ -24,7 +24,7 @@
 - **Agent Skills 与代码工具。** `TensorSharp.AgentHost` 提供文件、shell 和文档工作流。[17 个随附技能](docs/agent_skills.md)（英文）涵盖研究、文档、TDD、设计访谈与交接；开启联网后，`find-skills` 可搜索、检查并安装更多技能。服务端与 TensorAgent 聊天还支持[有界子智能体委派](docs/multi_agent.md)（英文），子智能体拥有私有工作区并默认只读。
 - **个人知识库。** [上传文件或嵌套目录，导入已保存聊天及其附件和产物](docs/knowledge-system_zh-cn.md)。按聊天选择集合，检索带页码 / 行号 / 时间位置的引用片段、预览原件，或让代码智能体打开完整数据集。默认使用本地 BM25，可选 GGUF 嵌入提供语义搜索；兼容的媒体模型可索引图像、音频和采样视频。提取状态与警告显示覆盖边界。
 - **生成中追加指令。** CLI、服务端 Web UI 和 TensorAgent 在推理或回答时都可提交新指令；后续回答使用对话、已有部分输出与新指导。仍可单独停止当前生成。
-- **有记录的性能对比。** 与 `llama.cpp` 的测试使用相同 GGUF 文件和硬件，结果对应所测的模型、后端及工作负载。在六块 A40 GPU 上，816B 的 [Muse Spark](docs/models/muse-spark_zh-cn.md) decode 速度为 llama.cpp 的 1.11 倍，prefill 约为 2 倍。详见[性能数据](docs/benchmarks_zh-cn.md)。
+- **有记录的性能对比。** 与 `llama.cpp` 的测试使用相同 GGUF 文件和硬件，结果对应所测的模型、后端及工作负载。在十块 A40 GPU 上，816B 的 [Muse Spark](docs/models/muse-spark_zh-cn.md) 按层切分时 4K token 提示的 prefill 速度为 llama.cpp 的 2.07 倍，张量并行时 decode 速度为 1.40 倍。详见[性能数据](docs/benchmarks_zh-cn.md)。
 - **TensorAgent 应用。** 在手机和桌面进行本地聊天、使用附件与技能并保存工作。详见 [Mac / Windows 安装指南](docs/tensoragent_desktop_zh-cn.md)与[应用验证范围](TensorAgent/README.md)。
 
 ## 配合书籍学习
@@ -139,7 +139,7 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | Qwen 3.6 27B（UD-IQ2_XXS，dense） | CUDA | **1.07×** | 0.96× | 0.95× |
 | Qwen 3.6 27B（UD-IQ2_XXS，dense） | Vulkan | 1.02× | 0.85× | 0.84× |
 
-有正面对比记录的最大模型是在六块 A40 GPU 上运行的 816B Muse Spark（UD-Q3_K_XL）：decode 1.11×，4K / 16K token 的 prefill 分别为 2.12× / 1.92×，四个并发请求的总输出为 1.10×（[报告](docs/perf/muse-spark-vs-llama-cpp.md)，英文）。
+有正面对比记录的最大模型是在十块 A40 GPU 上运行的 816B Muse Spark（UD-IQ3_XXS），对照 llama.cpp 的对应模式：按层切分的 decode 持平（0.99×），4K / 16K token 的 prefill 分别为 2.07× / 1.63×；`--tp 10` 的 decode 为 1.40×，4K token 提示的 prefill 为 3.88×（[报告](docs/perf/muse-spark-vs-llama-cpp.md)，英文）。
 
 这些数字的含义、如何复现，以及放不进这块 GPU 的大模型的正面对比，见[性能数据](docs/benchmarks_zh-cn.md)。
 
@@ -170,7 +170,7 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 哪些高影响运行时开关影响哪些模型、后端与提示类型 |
 | [引擎对比报告](docs/engine_comparison_report.md) | TensorSharp 对比 llama.cpp 的完整逐场景表格 |
 | [ggml_metal 对比 llama.cpp](docs/perf/metal-vs-llama-cpp.md) | Apple Silicon 上 prefill / decode 的正面对比，找到的四处计算图构建差距，以及每一处的实际收益 |
-| [Muse Spark 对比 llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | 816B MoE 在六块 A40 GPU 上的测试：原生整模型执行器、测试环境、逐场景结果与对比的局限 |
+| [Muse Spark 对比 llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | 816B MoE 在十块 A40 GPU 上的按层切分与张量并行测试：测试环境、逐场景结果、teacher-forced 质量与对比的局限 |
 | [测试 / 基准矩阵运行器](TensorSharp.TestMatrix/README_zh-cn.md) | 扫描 model × backend × feature × env-var 组合并生成回归报告 |
 | [服务端 API 示例](TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md) | 完整的 curl 与 Python 示例 |
 

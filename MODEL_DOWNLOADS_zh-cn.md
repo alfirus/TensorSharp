@@ -28,7 +28,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF)，Pixtral 投影器 `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` |
 | Hunyuan Dense | 腾讯稠密 Hunyuan 检查点（`hunyuan-dense`） | 任何 `general.architecture` 为 `hunyuan-dense` 的 GGUF 均可加载，例如 Hy-MT2 系列（参考对话模板取自 `tencent/Hy-MT2-1.8B`）。仅文本、单设备，没有投影器也没有草稿模型。见 [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | Muse-Glimmer-30B（稠密，支持图像） | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)，如 `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` 或 `Muse-Glimmer-30B-Q8_0.gguf`；`general.architecture` 为 `muse-glimmer` / `muse_glimmer`。图像输入需同仓库的 `mmproj-Muse-Glimmer-30B-Q8_0.gguf`：传 `--image` 时 CLI 会在模型旁边找到它，服务端则需用 `--mmproj` 指定。可选提速产物：同仓库的 DFlash 分块 draft `dflash-kquant.gguf`，或更新的 DFlash2 draft [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF)（16 GB 显卡上优先选 `-Q4_K_M`，见 [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect) 中关于 draft 大小的说明），用 `--draft-model` 加载即可无损推测解码——不要传任何采样参数，它只在纯贪心下生效 |
-| Muse Spark | Muse-Spark-Open-816B-A42B（816B-A42B MoE，支持图像） | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF)：每个量化档一个子目录，各为一组分片：`UD-Q3_K_XL/` 为 10 个分片、374 GiB（即实测所用的量化），`UD-Q4_K_XL/` 为 12 个分片。同一量化档的所有分片需放在同一目录，`--model` 指向其中任意一片即可；后续分片只含切分元数据，不能单独作为模型加载。`general.architecture` 为 `muse-spark` / `muse_spark`。图像输入需用 `--mmproj` 指定仓库根目录下的 `mmproj-Q8_0.gguf`（2.2 GB）；Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。实测配置为六张 46 GB A40，另有 131.8 GiB 专家栈放在主机内存（见下方运行示例）。没有草稿器：投机解码只能用无权重的 n-gram |
+| Muse Spark | Muse-Spark-Open-816B-A42B（816B-A42B MoE，支持图像） | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF)：每个量化档一个子目录，各为一组分片：`UD-IQ3_XXS/` 为 8 个分片、317 GiB（即实测所用的量化），`UD-Q3_K_XL/` 为 10 个分片、374 GiB，`UD-Q4_K_XL/` 为 12 个分片。同一量化档的所有分片需放在同一目录，`--model` 指向其中任意一片即可；后续分片只含切分元数据，不能单独作为模型加载。`general.architecture` 为 `muse-spark` / `muse_spark`。图像输入需用 `--mmproj` 指定仓库根目录下的 `mmproj-Q8_0.gguf`（2.2 GB）；Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。实测配置为十张 46 GB A40，全部专家都放在显存中（见下方运行示例）。没有草稿器：投机解码只能用无权重的 n-gram |
 | DeepSeek V4.1 | DeepSeek-V4.1-Flash（`deepseek41`，384 个路由专家） | [smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5)，固定 revision `d1de55c19f95172c882906cc83c0e55932d26a63`——`Q2_K-Q5/` 下十个分片，共 335,382,014,624 字节（312.349 GiB），Engram 表为 Q5_K，并恢复 F32 mHC 与 BF16 Engram 门控张量。所有分片放在同一目录，`--model` 指向第一个分片。原七分片 vcruz Q2 存在敏感张量量化问题，不再推荐。修复版头部与十个完整文件哈希均已校验，双卡按层切分与实验性路由专家 TP 下的有限普通/DSpark 文本/图像 HTTP 检查均已通过，回答以 EOS 完成，服务正常退出。另行进行的 24-token 普通/DSpark 文本/图像配对检查，在两种模式下均匹配 token ID 与 `max_tokens` 结束原因，DSpark 实际参与解码且进程正常退出；这些有限续写与 HTTP 的 EOS 检查分开记录。两个图像配对中 DSpark 都更慢。简短的重复文本预热对照也已完成：每种模式一次预热、三次计时，每对输入 69 token、输出 24 token，token ID 与结束原因完全一致，DSpark 实际参与解码且进程正常退出。小样本与大量磁盘换页限制了这些结果，不声明通用质量/性能、提速、跨节点执行或完整模型 TP 通过。每次重新下载仍须校验哈希。GGUF 已包含 Engram 权重与哈希常量，无需生成 Engram 或单独的 Engram 文件。`eng/dsv41-prepare-vision.py` 生成约 970 MB 的可选视觉伴随文件，图像与视频经 `--mmproj` 使用。服务后端为 `ggml_cuda`；`ggml_cpu` 与 `cpu` 是正确性与可移植性路径，而非服务路径——`--backend cpu` 用纯 C# 执行器 `DeepSeek4CpuExecutor` 跑完整的 V4.1 计算图，不依赖 ggml、原生库与 GPU；它同样直接读取内嵌的 Engram 元数据，而视觉伴随文件不会跟到这个后端上（`LoadVisionEncoder` 会抛异常），因此该后端上没有图像也没有视频。V4 的草稿模型会被拒绝；`deepseek41-dspark` 草稿模型可在 `ggml_cuda` / `ggml_cpu` 上经 `--draft-model` 加载，属于实验性路径，训练模型已在 `ggml_cuda` 双 GPU 按层切分与实验性路由专家 TP 下通过初步文本/图像 HTTP 检查；尚不构成通用质量或吞吐验证。完整流程与校验哈希见 [deepseek41](docs/models/deepseek41_zh-cn.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731（284B MoE） | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF)；每种量化一个子目录（`UD-Q8_K_XL/`、`UD-IQ4_XS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。仅文本 |
 | GLM 5.x | GLM-5.2（744B-A40B MoE，内嵌 NextN MTP） | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF)；每种量化一个子目录（`UD-Q4_K_XL/`、`UD-IQ2_XXS/` 等），均为多分片，`--model` 指向 `-00001-of-` 分片。**仅文本**——再往下两行的 GLM-5.3-Flash 才是支持图像的那个；中间那行的 GLM-5.3 同样仅文本。这些 GGUF 已带有 `--spec` 所需的 NextN 块——与 Qwen 3.6 不同，不存在需要挑选的独立 MTP 仓库 |
@@ -191,27 +191,32 @@ GLM 系列都会在构建模型之前被拒绝），而且会在每个 rank 上�
 **Muse Spark**（816B-A42B MoE，文本 + 图像、思维链、ATEM 工具；`ggml_cuda` / `ggml_vulkan` 上使用原生整模型执行器）：
 
 ```bash
-# UD-Q3_K_XL 是 10 个分片、374 GiB。实测机器有六张 46 GB A40，内存上限 280 GiB：
-# 240.4 GiB 权重放在 GPU 上，131.8 GiB 专家栈放在 NUMA 本地的主机内存中。
-hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF --include "UD-Q3_K_XL/*" --local-dir models/muse-spark
+# UD-IQ3_XXS 是 8 个分片、317 GiB。实测机器有十张 46 GB A40，全部专家都放在显存中，
+# 每张 GPU 约 36 GiB。
+hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF --include "UD-IQ3_XXS/*" --local-dir models/muse-spark
 hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF mmproj-Q8_0.gguf --local-dir models/muse-spark
 
-MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_MUSE_SPARK_CPU_MOE=auto TS_MUSE_SPARK_DEV0_RESERVE_MB=3072 \
+# 按层切分，长提示更快。生成更快的张量并行模式：把 --layer-split 10 换成 --tp 10（仅 ggml_cuda）。
+MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 \
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
-    --mmproj models/muse-spark/mmproj-Q8_0.gguf \
-    --backend ggml_cuda --layer-split 6 --port 5000
+    --model models/muse-spark/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf \
+    --backend ggml_cuda --layer-split 10 --port 5000
 ```
 
-`TS_MUSE_SPARK_CPU_MOE=auto` 让尽可能多的专家栈留在 GPU 上，其余放到主机内存；如果既没有它，
-也没有 `--n-cpu-moe N`，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。
-`TS_MUSE_SPARK_PLAN_SLOTS=5` 为四个并发请求加共享前缀检查点预留空间，
-`TS_MUSE_SPARK_DEV0_RESERVE_MB=3072` 在 GPU 0 上为图像编码器留出余量。`--layer-split N` 按你的
-GPU 数设置。实测运行还传了 `--no-webui --no-skills --no-multi-agent`。`TS_MUSE_SPARK_NATIVE=0`
-会选回较早的逐算子路径，`--tp N` 也总是走这条路径；两者都不在那次实测之内。无权重投机解码用
-`--spec --spec-type ngram`。该配置下与 llama.cpp 的对比见
-[性能数据](docs/benchmarks_zh-cn.md#六块-a40-上的-muse-spark-816b)；全部选项见
-[模型卡片](docs/models/muse-spark_zh-cn.md)。
+`--layer-split N` 或 `--tp N` 按你的 GPU 数设置（最多 16 张；`--tp` 还要求所有 GPU 型号相同）。
+`TS_MUSE_SPARK_PLAN_SLOTS=5` 为四个并发请求加共享前缀检查点预留空间。实测运行还设置了
+`TS_CODE_EXEC=0`，传了 `--no-webui --no-skills --no-multi-agent`，且没有加载投影器；需要图像
+输入时，加上 `--mmproj models/muse-spark/mmproj-Q8_0.gguf` 与
+`TS_MUSE_SPARK_DEV0_RESERVE_MB=3072`，后者在 GPU 0 上为图像编码器留出余量。GPU 较少时，按层
+切分配合 `TS_MUSE_SPARK_CPU_MOE=auto` 让尽可能多的专家栈留在 GPU 上，其余放到主机内存；如果
+既没有它，也没有 `--n-cpu-moe N`，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。早先
+一套六张 A40 的[配置](docs/models/muse-spark_zh-cn.md#早期的六张-a40cpu-专家卸载配置)就这样运行
+10 个分片的 UD-Q3_K_XL，131.8 GiB 专家栈放在主机内存中。
+`--tp N` 让全部专家留在 GPU 上。`TS_MUSE_SPARK_NATIVE=0` 会选回较早的逐算子路径，
+`ggml_vulkan` 上的 `--tp N` 也走这条路径。无权重投机解码用 `--spec --spec-type ngram`；原生
+`--tp` 路径不使用投机解码。该配置下与 llama.cpp 的对比见
+[性能数据](docs/benchmarks_zh-cn.md#十块-a40-上的-muse-spark-816b)；全部选项见
+[模型卡片](docs/models/muse-spark_zh-cn.md#选项)。
 
 **Gemma 4**（文本 + 图像/视频/音频、思维链、工具、可选 MTP）：
 

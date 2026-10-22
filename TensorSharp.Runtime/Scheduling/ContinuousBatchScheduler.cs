@@ -508,6 +508,12 @@ namespace TensorSharp.Runtime.Scheduling
             if (_soloPrefillPolicy == null || promptUncomputed <= 0) return;
             int step = _soloPrefillPolicy.PreferredSoloPrefillTokens(seq.NumComputedTokens, promptUncomputed);
             if (step <= 0) return;
+            // Image rows replace token embeddings inside the call, which a model
+            // that pipelines its prefill runs one micro-batch at a time: such a
+            // step keeps the scheduler's own, budget-bounded size.
+            int s0 = seq.NumComputedTokens, s1 = s0 + step;
+            foreach (var span in seq.MediaSpans)
+                if (span.Start < s1 && span.End > s0) return;
             cap = step;
             tokenBudget = Math.Max(tokenBudget, step);
         }
