@@ -300,6 +300,7 @@ namespace TensorSharp.Runtime
                 ThinkingBudgetTransitionText = "<|eom|><|start|>assistant to=user<|message|>",
                 ThinkingBudgetToolTransitionText = "<|eom|><|start|>assistant",
                 RendersReasoningEffort = true,
+                SharesTemplatePreamble = true,
                 AppendMediaPlaceholders = (msg, sb) =>
                 {
                     if (msg.IsVideo && msg.ImagePaths is { Count: > 0 })

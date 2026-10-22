@@ -15,7 +15,8 @@ public partial class MuseSparkModel : IBatchedPagedModel
 
     // These buffers contain F32 values. Quantized/F16 caches retain the ordinary
     // snapshot scheduler instead of silently changing their requested precision.
-    public bool BatchedForwardAvailable => _kvCacheDtype.ToDType() == DType.Float32 && !HasPendingVisionEmbeddings;
+    // The native executor serves concurrency through its own sequence slots.
+    public bool BatchedForwardAvailable => !UsesNativeExecutor && _kvCacheDtype.ToDType() == DType.Float32 && !HasPendingVisionEmbeddings;
 
     public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
     {

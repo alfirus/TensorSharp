@@ -321,6 +321,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_deepseek41_vision.cpp
     ggml_ops_embeddings.cpp
     ggml_ops_glm_dsa.cpp
+    ggml_ops_muse_spark_exec.cpp
     ggml_ops_dsv4_fused_cpu.cpp
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp

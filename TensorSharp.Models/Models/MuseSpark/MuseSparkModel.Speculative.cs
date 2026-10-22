@@ -18,7 +18,10 @@ public partial class MuseSparkModel : ISpeculativeTarget
     public bool SpecPlainStepUsesForward => true;
     public bool SpecSupportsMultimodalPrefill => true;
 
-    public void SpecEnsureCapacity(int requiredSeqLen) => EnsureCacheCapacity(requiredSeqLen);
+    public void SpecEnsureCapacity(int requiredSeqLen)
+    {
+        if (!UsesNativeExecutor) EnsureCacheCapacity(requiredSeqLen);
+    }
     public void SpecSnapshotRecurrentState() { }
     public void SpecRestoreRecurrentState() { }
     public void SpecRewindCache(int length) => TruncateKVCacheCore(length);
@@ -35,6 +38,15 @@ public partial class MuseSparkModel : ISpeculativeTarget
             throw new ArgumentException("The verification hidden-state buffer is too short.", nameof(hAllOut));
         if ((long)_cacheSeqLen + tokens.Length > _maxContextLength)
             throw new InvalidOperationException("Muse Spark context length exceeded.");
+        if (UsesNativeExecutor)
+        {
+            // The native executor chunks into ubatches itself and returns every
+            // requested row; it has no hidden-state output (n-gram drafting needs none).
+            if (hAllOut != null)
+                throw new NotSupportedException("The native Muse Spark executor does not export hidden states.");
+            ForwardNative(tokens, allLogitsRows, logitsOut);
+            return;
+        }
 
         // Chunking limits prefill scratch while retaining the full row contract.
         // Caller owns GpuComputeLock for the entire verify/accept/rewind operation.

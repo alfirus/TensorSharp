@@ -10,15 +10,173 @@ code; the fetched ggml dependency remains unchanged.
 | Property | Implementation |
 |---|---|
 | Architecture | `muse-spark`, alias `muse_spark` |
-| Decoder | [MuseSparkModel](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.cs) |
-| Expert path | [MuseSparkModel.Moe.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Moe.cs), native `TSGgml_MuseSparkMoEFFNQuantF32` |
+| Decoder | [MuseSparkModel](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.cs); on `ggml_cuda`/`ggml_vulkan` the [native whole-model executor](#native-whole-model-executor) runs it by default |
+| Expert path | Native executor: one `mul_mat_id` graph per layer inside the whole-model graph. Per-op path: [MuseSparkModel.Moe.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Moe.cs), native `TSGgml_MuseSparkMoEFFNQuantF32` |
 | Images | Matching Spark mmproj, shared Muse-Glimmer vision encoder |
 | Audio | Not implemented; an audio tower in the projector does not enable audio inference |
-| GPU placement | `--tp N` shards attention and partitions experts; `--layer-split N` assigns complete layers. These are separate, single-process modes on `ggml_cuda`/`ggml_vulkan`. |
-| Expert offload | `--n-cpu-moe N` runs the first N layers' preserved native expert stacks on the CPU; F32 tensor fallbacks retain the selected backend |
-| KV cache | F32/F16 linear GQA caches, truncation and prefix snapshots; block-quantized KV is rejected |
-| Continuous batching | Packed, paged text forward with F32 KV; F16 and image requests use the ordinary sequence path |
+| GPU placement | Native executor: `--layer-split N` assigns layers to N GPUs and places expert stacks by a byte-minimizing plan. Per-op path: `--tp N` shards attention and partitions experts; `--layer-split N` assigns complete layers |
+| Expert offload | Native executor: `TS_MUSE_SPARK_CPU_MOE=auto` keeps the expert stacks that do not fit VRAM on NUMA-placed host memory; `--n-cpu-moe N` forces the first N layers there. Per-op path: `--n-cpu-moe N` runs the first N layers' preserved native expert stacks on the CPU |
+| KV cache | Native executor: F16 per-sequence slots, a ring for sliding layers and lazily grown rows for global layers. Per-op path: F32/F16 linear GQA caches; block-quantized KV is rejected |
+| Continuous batching | Native executor: batched decode across sequence slots (text and image requests) and batched prefill of new text prompts. Per-op path: packed, paged text forward with F32 KV |
+| Prefix cache | Native executor: conversation continuation, rewind of a finished conversation, and shared system-prompt checkpoints cloned into new conversations |
 | Speculation | Generic n-gram drafter through `--spec --spec-type ngram`; no learned Muse Spark draft model is assumed |
+
+## Native whole-model executor
+
+On `ggml_cuda` and `ggml_vulkan`, Muse Spark runs through a TensorSharp-owned
+native executor,
+[ggml_ops_muse_spark_exec.cpp](../../TensorSharp.GGML.Native/ggml_ops_muse_spark_exec.cpp),
+with managed glue in
+[MuseSparkModel.Native.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Native.cs).
+It loads the split GGUF itself and submits one GGML graph per micro-batch
+across every GPU and the CPU. It uses the unchanged upstream ggml. The per-op
+path described in the later sections remains the reference implementation:
+`TS_MUSE_SPARK_NATIVE=0` selects it, and `TS_MUSE_SPARK_NATIVE=1` opts the GGML
+CPU backend into the native executor. Tensor parallelism (`--tp`) always uses
+the per-op path.
+
+### How it runs
+
+- **One graph per micro-batch.** `ggml_backend_sched` splits each graph
+  between the GPUs and the CPU backend. Graphs are cached by shape, so a decode
+  step reuses its graph. Prefill uses 2048-token micro-batches
+  (`TS_MUSE_SPARK_UBATCH`). Host expert cost per token falls from 0.305 ms to
+  0.175 ms per layer between 512 and 2048 rows. When a graph does not fit, the
+  executor halves the micro-batch and retries.
+- **Weight placement.** `--layer-split N` spreads the 62 layers over N GPUs.
+  Each layer's dense weights (attention, router, latent projections, norms)
+  stay on its GPU. A dynamic program then places each layer's gate, up and
+  down expert stacks independently: it keeps as many on the GPUs as fit and
+  puts as few bytes as possible on the host. The expert bytes on the host set
+  the decode cost. `TS_MUSE_SPARK_CPU_MOE=auto` enables this plan.
+  `--n-cpu-moe N` instead forces the first N layers' experts to the host.
+  Without either, a model that does not fit is refused with a message that
+  names the option. The startup log prints each GPU's layers and the host
+  stacks (`6,7,...,18:gu,...,45:d`; `g`, `u` and `d` name single stacks).
+- **Host experts.** With two or more NUMA nodes, host expert stacks are copied
+  into anonymous memory by threads pinned to each node, and a strict, pinned
+  CPU thread pool runs them. ggml's CPU `mul_mat_id` gives each worker a fixed
+  row range, so every worker reads memory on its own node. On the 2-socket
+  test host this raised host expert bandwidth from about 100 to 165–174 GB/s.
+  `numactl --interleave` was unavailable because the container forbids
+  `set_mempolicy`. `TS_MUSE_SPARK_HOST_NUMA=0` keeps the GGUF memory mapping
+  instead. When two tokens of a batched decode step pick the same expert,
+  ggml's kernel switches that expert to dynamically claimed chunks, so workers
+  read the other socket's rows. Batches of 2–16 tokens therefore run host
+  experts through a TensorSharp kernel (`host_moe_matmul`). It keeps the
+  static row ownership and reads each weight row once for every token that
+  selected it, using ggml's own quantization and dot product, so results are
+  bit-identical. One layer with 4 tokens took 3.5–3.8 ms instead of 3.8–3.9 ms.
+- **KV cache.** Each sequence slot owns F16 K/V rows on the GPU of each layer.
+  The 46 sliding-window layers keep a ring of the 2048-token window plus the
+  micro-batch and a 512-row rewind margin; each row carries its absolute
+  position. The 16 global layers start at 4096 rows and double on demand.
+  A rewind that the ring can no longer serve is refused, and the scheduler
+  re-prefills instead.
+- **Batching.** Decode steps of every running request share one graph with
+  per-sequence attention masks. New text prompts that arrive together are
+  prefilled in one graph. Image embeddings replace their placeholder rows
+  inside the graph.
+- **Prefix cache.** A finished request's slot is retained and donated to the
+  request that continues the conversation. It may be rewound first, so a
+  regenerated answer reuses the prompt. The tokens before the chat layer's
+  shared-prefix boundary (system prompt and tool declarations) are copied once
+  into a checkpoint slot and cloned into each new conversation. Muse Spark's
+  template opens every conversation with the same system header (knowledge
+  cutoff, date, reasoning level), so that header is a shared prefix even
+  without a system message. Under memory
+  pressure, retained end states are freed before checkpoints. As in every
+  TensorSharp model, unrelated conversations share only that public prefix,
+  so an identical but separate request does not reuse another request's
+  private tokens.
+- **Memory admission.** A new slot or KV growth is admitted only while each
+  device keeps `TS_MUSE_SPARK_SLOT_HEADROOM_MB` plus room for the largest
+  graph seen so far, capped at `TS_MUSE_SPARK_ADMIT_GRAPH_MB`. Otherwise
+  retained slots are freed first; cached graphs count as reclaimable. A
+  running sequence's KV growth is never refused while the memory physically
+  exists. Without the cap, a single 16K-token prefill's 1.2 GiB graph made
+  later concurrent requests evict the shared-prompt checkpoint. A graph that
+  does not fit frees retained slots, then runs that call in halved
+  micro-batches. ggml-cuda's kernel-scratch pool sits outside this
+  accounting: it grows on first use, never shrinks, and aborts the process
+  when it cannot grow. Loading therefore runs one full-size prefill
+  (`TS_MUSE_SPARK_WARM_POOLS`) so the pool reaches its peak first; without it,
+  the first 4K-token prompt after a run of concurrent requests crashed the
+  server.
+
+### Options
+
+| Setting | Default | Effect |
+|---|---|---|
+| `TS_MUSE_SPARK_NATIVE` | on for CUDA/Vulkan | `0` selects the per-op path; `1` enables the executor on the GGML CPU backend |
+| `TS_MUSE_SPARK_CPU_MOE=auto` | off | Byte-minimizing per-stack expert placement (overrides `--n-cpu-moe`) |
+| `TS_MUSE_SPARK_UBATCH` | 2048 | Prefill micro-batch rows |
+| `TS_MUSE_SPARK_PLAN_SLOTS` | 1 | Sliding-window rings reserved in the placement plan; raise for concurrent requests |
+| `TS_MUSE_SPARK_PLAN_CTX_TOKENS` | context | Global-layer KV tokens reserved in the placement plan |
+| `TS_MUSE_SPARK_VRAM_RESERVE_MB` | 2048 + ubatch/4 | Per-GPU room kept for compute buffers |
+| `TS_MUSE_SPARK_DEV0_RESERVE_MB` | 0 | Extra room on GPU 0, e.g. for the vision encoder |
+| `TS_MUSE_SPARK_SLOT_INIT_ROWS` | 4096 | Initial global-layer KV rows per slot |
+| `TS_MUSE_SPARK_SLOT_HEADROOM_MB` | 256 | Free memory a new slot or KV growth must leave |
+| `TS_MUSE_SPARK_ADMIT_GRAPH_MB` | 512 | Most graph memory a new slot or KV growth keeps free, on top of the headroom |
+| `TS_MUSE_SPARK_SWA_REWIND` | 512 | Extra sliding-ring rows that make short rewinds possible |
+| `TS_MUSE_SPARK_HOST_NUMA` | on with ≥2 nodes | NUMA-placed host experts and pinned workers |
+| `TS_CPU_MOE_THREADS` | allowed CPUs; NUMA mode leaves about 1/6 free | Host expert worker count |
+| `TS_MUSE_SPARK_HOST_MOE_TOKENS` | 16 | Batches of 2 to N tokens run host experts through the static-row kernel; `0` keeps ggml's `mul_mat_id` |
+| `TS_MUSE_SPARK_CPU_REPACK` | off | ggml CPU repacking of host experts; it did not speed up decode here |
+| `TS_MUSE_SPARK_OP_OFFLOAD` | on only without host experts | Let the scheduler copy host weights to a GPU for large batches |
+| `TS_MUSE_SPARK_WARM_POOLS` | on with GPUs | Run one full-size prefill at load so ggml-cuda's kernel-scratch pools reach their peak before slots take the memory |
+| `TS_MUSE_SPARK_EXEC_DEBUG` | off | Log placement, graph builds and memory decisions |
+| `TS_MUSE_SPARK_PROFILE` | 0 | Print per-node timings of N graphs |
+
+### Launching
+
+The measured profile below uses six A40 GPUs (46 GB each), a 280 GiB memory
+limit and a 48-CPU quota. Its 32K context and five planned slots leave room for
+four concurrent requests, the shared-prefix checkpoint and the image encoder.
+With four planned slots, the GPU holding the most layers ran short, and one of
+four concurrent requests often lost the template checkpoint and prefilled its
+whole prompt:
+
+```bash
+MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_MUSE_SPARK_CPU_MOE=auto \
+TS_MUSE_SPARK_DEV0_RESERVE_MB=3072 TS_CODE_EXEC=0 \
+dotnet TensorSharp.Server.Host.dll \
+  --model /workspace/models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
+  --mmproj /workspace/models/muse-spark/mmproj-Q8_0.gguf \
+  --backend ggml_cuda --layer-split 6 --n-cpu-moe 21 \
+  --host 127.0.0.1 --port 8083 --no-webui --no-skills --no-multi-agent
+```
+
+`--n-cpu-moe 21` is overridden by `TS_MUSE_SPARK_CPU_MOE=auto`. The plan put
+7, 9, 9, 9, 12 and 16 layers on the six GPUs and 240.4 GiB of weights on them,
+plus 131.8 GiB of expert stacks on the host from 33 layers. Loading took about
+5 minutes, against 21.5 minutes for llama.cpp's `--load-mode none` load on the
+same host (its default memory-mapped load did not finish inside the memory
+limit).
+
+### Measured results
+
+Measured with the profile above against llama.cpp `0a1ef309c` on the same
+machine and checkpoint. These are medians of three repeats; the
+[full report](../perf/muse-spark-vs-llama-cpp.md) has the method, both
+llama.cpp configurations and the limits of the comparison.
+
+| Scenario | TensorSharp | llama.cpp | Ratio |
+|---|---:|---:|---:|
+| Decode, one request | 11.05 tok/s | 9.92 tok/s | 1.11x |
+| Time to first token, short prompt | 1.11 s | 2.60 s | 2.35x |
+| Prefill, 4K / 16K-token prompt | 162 / 161 tok/s | 76 / 84 tok/s | 2.12x / 1.92x |
+| Four concurrent requests, total output | 19.35 tok/s | 17.66 tok/s | 1.10x |
+| Second turn of a 2.3K-token conversation, first token | 0.86 s | 1.60 s | 1.86x |
+| New conversation sharing a 2.3K-token system prompt, first token | 0.84 s | 1.14 s | 1.36x |
+| Answer-checking fixtures (`eng/muse-spark-validate.py`) | 15 / 16 | 13 / 16 | |
+
+With NUMA-balanced host memory, llama.cpp's single-request decode reached
+10.72 tok/s, within 3% of TensorSharp, but its prefill fell to 35 tok/s.
+TensorSharp's one fixture failure is the fixed 512-token decode. Its answer
+is coherent but used the token budget before covering collisions. Reusing the
+127-token template checkpoint changes the prefill batch shapes, so greedy
+decoding took a different branch than on an earlier build that passed.
 
 ## Tensor parallelism
 
@@ -83,7 +241,8 @@ and speculative rewind; packed continuous batching requires F32 KV.
 
 ## Previous five-GPU layer-split measurements
 
-The completed v4r2 F16 campaign on the Q3 checkpoint passed 13 selected quality
+These measurements predate the native executor: they used the per-op path,
+which `TS_MUSE_SPARK_NATIVE=0` still selects. The completed v4r2 F16 campaign on the Q3 checkpoint passed 13 selected quality
 fixtures, a separate thinking check and all nine timing-case content checks.
 The quality fixtures cover short English/Chinese answers, JSON/schema/Unicode,
 tool and agent workflows, images/chart OCR, conversation memory and parallel
@@ -580,6 +739,7 @@ checks.
 
 Generated logs/reports belong in ignored `docs/validation/muse-spark/` or
 `artifacts/`. The recorded evidence does not establish general model-quality
-parity, and the measured equal-work decode performance target is not met.
+parity. The per-op path's equal-work decode target was not met. The native
+executor's measurements above cover one machine and one quantization.
 Architecture support, synthetic numerical tests and passing bounded fixtures
 must not be presented as proof of general quality or performance superiority.

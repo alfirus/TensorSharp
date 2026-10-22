@@ -36,7 +36,11 @@ public partial class MuseSparkModel : ModelBase
     internal MuseSparkModel(string ggufPath, BackendType backend, int tpDegree,
         ITensorParallelGroup tpGroup, int layerSplitDegree, long[] tensorParallelFreeBytes)
         : base(ggufPath, ValidateBackend(backend, tpDegree, tpGroup, layerSplitDegree),
-            tpDegree, tpGroup, layerSplitDegree)
+            // The native executor owns every GPU it uses; the managed base keeps only
+            // device 0's context (vision tower, tokenizer-side helpers).
+            NativeRequested(backend, tpDegree, tpGroup) ? 1 : tpDegree,
+            NativeRequested(backend, tpDegree, tpGroup) ? null : tpGroup,
+            NativeRequested(backend, tpDegree, tpGroup) ? 1 : layerSplitDegree)
     {
         _sparkTpPlanningFreeBytes = tensorParallelFreeBytes == null ? null : (long[])tensorParallelFreeBytes.Clone();
         try
@@ -77,6 +81,11 @@ public partial class MuseSparkModel : ModelBase
         for (int l = 0; l < _prefixes.Length; l++) _prefixes[l] = $"blk.{l}.";
         ParseTokenizer();
         ValidateWeights();
+        if (NativeRequested(backend, tpDegree, tpGroup))
+        {
+            InitNativeExecutor(ggufPath, backend, layerSplitDegree);
+            return;
+        }
         PreflightLayerSplitCapacity();
         PreflightSparkTensorParallel();
         LoadWeights();
@@ -208,6 +217,7 @@ public partial class MuseSparkModel : ModelBase
     protected override float[] ForwardCore(int[] tokens)
     {
         if (tokens == null || tokens.Length == 0) throw new ArgumentException("A forward pass needs at least one token.", nameof(tokens));
+        if (UsesNativeExecutor) return ForwardNative(tokens);
         if ((long)_cacheSeqLen + tokens.Length > _maxContextLength) throw new InvalidOperationException("Muse Spark context length exceeded.");
         float[] logits = null;
         for (int offset = 0; offset < tokens.Length; offset += _prefillChunk)
@@ -414,7 +424,16 @@ public partial class MuseSparkModel : ModelBase
     // repeats the whole 816B decoder eight times with the default chunk size.
     protected override int GgmlPrefillChunkWarmupLength => _prefillChunk;
     protected override long KvCacheBytesPerToken => (long)Config.NumLayers * Config.NumKVHeads * _headDim * 2 * _kvCacheDtype.ToDType().Size();
-    public override void PrepareForPrefill(int requiredContextTokens) => EnsureCacheCapacity(Math.Min(requiredContextTokens, _maxContextLength));
+    public override void PrepareForPrefill(int requiredContextTokens)
+    {
+        if (!UsesNativeExecutor) EnsureCacheCapacity(Math.Min(requiredContextTokens, _maxContextLength));
+    }
+
+    public override void WarmUpKernels()
+    {
+        if (UsesNativeExecutor) WarmUpNative();
+        else base.WarmUpKernels();
+    }
 
     private void EnsureCacheCapacity(int required)
     {
@@ -456,27 +475,49 @@ public partial class MuseSparkModel : ModelBase
         _cacheCapacity = capacity;
     }
 
-    protected override void ResetKVCacheCore() { _cacheSeqLen = 0; ClearPendingVisionEmbeddings(); }
+    protected override void ResetKVCacheCore()
+    {
+        if (UsesNativeExecutor) ResetNative();
+        _cacheSeqLen = 0;
+        ClearPendingVisionEmbeddings();
+    }
     protected override void TruncateKVCacheCore(int tokenCount)
     {
+        if (UsesNativeExecutor)
+        {
+            if (!RewindNative(tokenCount))
+                throw new InvalidOperationException($"Muse Spark cannot rewind its sliding-window cache to {tokenCount} tokens " +
+                    $"(head at {_cacheSeqLen}); use TryTruncateKVCache and re-prefill when it declines.");
+            ClearPendingVisionEmbeddings();
+            return;
+        }
         if ((uint)tokenCount > (uint)_cacheSeqLen) throw new ArgumentOutOfRangeException(nameof(tokenCount));
         _cacheSeqLen = tokenCount;
         ClearPendingVisionEmbeddings();
     }
     protected override bool TryTruncateKVCacheCore(int tokenCount)
     {
+        if (UsesNativeExecutor)
+        {
+            if (!RewindNative(tokenCount)) return false;
+            ClearPendingVisionEmbeddings();
+            return true;
+        }
         if (!CanTruncateKVCache(_cacheSeqLen, tokenCount)) return false;
         TruncateKVCacheCore(tokenCount);
         return true;
     }
-    public override bool SupportsKVStateSnapshot => _kvCacheK != null;
+    public override bool SupportsKVStateSnapshot => !UsesNativeExecutor && _kvCacheK != null;
     public override string KVStateFingerprint => $"muse-spark|layers={Config.NumLayers}|heads={Config.NumHeads}:{Config.NumKVHeads}:{_headDim}" +
-        $"|swa={_slidingWindow}:{string.Join(',', _isSwa)}|rope={_ropeDim}:{Config.RopeBase}:{Config.RopeScale}|dtype={_kvCacheDtype.ToShortString()}";
-    public override long ComputeKVBlockByteSize(int tokens) => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokens);
+        $"|swa={_slidingWindow}:{string.Join(',', _isSwa)}|rope={_ropeDim}:{Config.RopeBase}:{Config.RopeScale}" +
+        $"|dtype={(UsesNativeExecutor ? "f16" : _kvCacheDtype.ToShortString())}|exec={(UsesNativeExecutor ? "native" : "managed")}";
+    public override long ComputeKVBlockByteSize(int tokens)
+        => UsesNativeExecutor ? 0 : KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokens);
     public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
-        => KvBlockTransfer.Extract(_allocator, _kvCacheK, _kvCacheV, _cacheSeqLen, startToken, tokenCount, destination);
+        => !UsesNativeExecutor && KvBlockTransfer.Extract(_allocator, _kvCacheK, _kvCacheV, _cacheSeqLen, startToken, tokenCount, destination);
     public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
     {
+        if (UsesNativeExecutor) return false;
         if (destToken < 0 || tokenCount <= 0 || (long)destToken + tokenCount > _maxContextLength) return false;
         EnsureCacheCapacity(destToken + tokenCount);
         if (!KvBlockTransfer.Inject(_allocator, _kvCacheK, _kvCacheV, _cacheSeqLen, destToken, tokenCount, source)) return false;
@@ -520,6 +561,7 @@ public partial class MuseSparkModel : ModelBase
 
     public override void Dispose()
     {
+        DisposeNative();
         DisposeVisionState();
         foreach (var t in _ones.Values) t.Dispose();
         _ones.Clear();
