@@ -12,13 +12,18 @@ internal sealed class MuseSparkSyntheticModelBuilder
     internal const float Eps = 1e-5f, PostEps = 2e-6f, RopeBase = 7777, LogitScale = 0.7f, Softcap = 1.3f;
     internal readonly Dictionary<string, (ulong[] Shape, float[] Data)> Weights = new();
 
-    private readonly int _heads, _kvHeads, _headDim, _experts, _used, _latent, _ffn;
+    private readonly int _heads, _kvHeads, _headDim, _experts, _used, _latent, _ffn, _contextLength, _slidingLayer;
 
+    /// <param name="contextLength">The GGUF's advertised context.</param>
+    /// <param name="slidingFirst">Layer 0 is the sliding-window layer and layer 1 the global one
+    /// (the default), or the other way round.</param>
     internal MuseSparkSyntheticModelBuilder(int heads = Heads, int kvHeads = KvHeads, int experts = Experts,
-        int used = Used, int headDim = HeadDim, int latent = Latent, int ffn = Ffn)
+        int used = Used, int headDim = HeadDim, int latent = Latent, int ffn = Ffn, int contextLength = 64,
+        bool slidingFirst = true)
     {
         _heads = heads; _kvHeads = kvHeads; _experts = experts; _used = used;
         _headDim = headDim; _latent = latent; _ffn = ffn;
+        _contextLength = contextLength; _slidingLayer = slidingFirst ? 0 : 1;
         Add("token_embd.weight", 0.8f, 0, Hidden, Vocab);
         Add("output_norm.weight", 0.2f, 1, Hidden);
         Add("output.weight", 0.1f, 0, Hidden, Vocab);
@@ -93,7 +98,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
         {
             ["general.architecture"] = "muse-spark",
             ["muse-spark.block_count"] = (uint)Layers,
-            ["muse-spark.context_length"] = 64u,
+            ["muse-spark.context_length"] = (uint)_contextLength,
             ["muse-spark.embedding_length"] = (uint)Hidden,
             ["muse-spark.feed_forward_length"] = (uint)_ffn,
             ["muse-spark.attention.head_count"] = (uint)_heads,
@@ -106,7 +111,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
             ["muse-spark.rope.freq_base"] = RopeBase,
             ["muse-spark.rope.dimension_count"] = (uint)_headDim,
             ["muse-spark.attention.sliding_window"] = (uint)Window,
-            ["muse-spark.attention.sliding_window_pattern"] = new[] { true, false },
+            ["muse-spark.attention.sliding_window_pattern"] = new[] { _slidingLayer == 0, _slidingLayer == 1 },
             ["muse-spark.moe_latent_size"] = (uint)_latent,
             ["muse-spark.expert_feed_forward_length"] = (uint)_ffn,
             ["muse-spark.expert_count"] = (uint)_experts,
@@ -214,7 +219,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
                 for (int h = 0; h < heads; h++)
                 {
                     double[] head = Norm(tensor[t].AsSpan(h * _headDim, _headDim).ToArray(), Eps, norm);
-                    if (layer == 0)
+                    if (layer == _slidingLayer)
                         for (int d = 0; d < _headDim; d += 2)
                         {
                             double angle = t / Math.Pow(RopeBase, (double)d / _headDim), a = head[d], b = head[d + 1];
@@ -231,7 +236,7 @@ internal sealed class MuseSparkSyntheticModelBuilder
                 var attention = new double[_heads * _headDim];
                 for (int h = 0; h < _heads; h++)
                 {
-                    int kv = h / (_heads / _kvHeads), first = layer == 0 ? Math.Max(0, t - Window + 1) : 0;
+                    int kv = h / (_heads / _kvHeads), first = layer == _slidingLayer ? Math.Max(0, t - Window + 1) : 0;
                     var scores = new double[t + 1];
                     for (int s = first; s <= t; s++)
                     for (int d = 0; d < _headDim; d++) scores[s] += queries[t][h * _headDim + d] * keys[s][kv * _headDim + d] / Math.Sqrt(_headDim);

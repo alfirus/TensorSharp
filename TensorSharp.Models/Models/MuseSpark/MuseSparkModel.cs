@@ -83,7 +83,7 @@ public partial class MuseSparkModel : ModelBase
         ValidateWeights();
         if (NativeRequested(backend, tpDegree, tpGroup))
         {
-            InitNativeExecutor(ggufPath, backend, layerSplitDegree);
+            InitNativeExecutor(ggufPath, backend, layerSplitDegree, tpDegree);
             return;
         }
         PreflightLayerSplitCapacity();

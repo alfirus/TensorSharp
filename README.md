@@ -25,7 +25,7 @@ Current source covers text and reasoning, multimodal input, embeddings, image ge
 - **Agent Skills and code tools.** `TensorSharp.AgentHost` adds file, shell and document workflows. The [17 bundled skills](docs/agent_skills.md) include research, documents, TDD, design interviews and handoff; `find-skills` searches, inspects and installs additional skills when network access is enabled. Server and TensorAgent chats also support [bounded sub-agent delegation](docs/multi_agent.md) with private workspaces and read-only defaults.
 - **Personal knowledge collections.** [Upload files or nested folders, and import saved chats with their attachments and artifacts](docs/knowledge-system.md). Select collections per chat, retrieve cited excerpts with page/row/time locations, preview originals, or let code agents open full datasets. Local BM25 works by default; optional GGUF embeddings add semantic search, and compatible media models index images, audio and sampled video. Extraction status and warnings show coverage limits.
 - **Steer an active response.** Submit a new instruction while the CLI, server Web UI or TensorAgent is reasoning or answering. The next response uses the conversation, partial output and your guidance; Stop remains available.
-- **Recorded comparisons.** Benchmarks against `llama.cpp` use identical GGUF files and hardware; results apply to the measured model, backend and workload. On six A40 GPUs, the 816B [Muse Spark](docs/models/muse-spark.md) decodes 1.11× and prefills about 2× as fast as llama.cpp. See [Benchmarks](docs/benchmarks.md).
+- **Recorded comparisons.** Benchmarks against `llama.cpp` use identical GGUF files and hardware; results apply to the measured model, backend and workload. On ten A40 GPUs, the 816B [Muse Spark](docs/models/muse-spark.md) prefills a 4K-token prompt 2.07× as fast as llama.cpp with layer split, and decodes 1.40× as fast with tensor parallelism. See [Benchmarks](docs/benchmarks.md).
 - **TensorAgent apps.** Local chat, attachments, skills and saved work on phones and desktops. See the [Mac/Windows installation guide](docs/tensoragent_desktop.md) and [app coverage notes](TensorAgent/README.md).
 
 ## Learn with the books
@@ -140,7 +140,7 @@ TensorSharp and `llama.cpp` run identical GGUF files on the same NVIDIA RTX 3080
 | Qwen 3.6 27B (UD-IQ2_XXS, dense) | CUDA | **1.07×** | 0.96× | 0.95× |
 | Qwen 3.6 27B (UD-IQ2_XXS, dense) | Vulkan | 1.02× | 0.85× | 0.84× |
 
-The largest model with a recorded head-to-head is the 816B Muse Spark on six A40 GPUs (UD-Q3_K_XL): 1.11× decode, 2.12× / 1.92× prefill at 4K / 16K tokens, and 1.10× total output with four concurrent requests ([report](docs/perf/muse-spark-vs-llama-cpp.md)).
+The largest model with a recorded head-to-head is the 816B Muse Spark on ten A40 GPUs (UD-IQ3_XXS), against llama.cpp's matching mode. Layer split decodes level (0.99×) and prefills 2.07× / 1.63× as fast at 4K / 16K tokens; `--tp 10` decodes 1.40× and prefills a 4K-token prompt 3.88× as fast ([report](docs/perf/muse-spark-vs-llama-cpp.md)).
 
 What these numbers mean, how to rerun them, and the head-to-heads of models too large for this GPU: [Benchmarks](docs/benchmarks.md).
 
@@ -171,7 +171,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
 | [Engine comparison report](docs/engine_comparison_report.md) | Full per-scenario TensorSharp vs llama.cpp tables |
 | [ggml_metal vs llama.cpp](docs/perf/metal-vs-llama-cpp.md) | Head-to-head prefill/decode on Apple Silicon, the four graph-construction gaps it found, and what each was worth |
-| [Muse Spark vs llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | The 816B MoE on six A40 GPUs: the native whole-model executor, setup, per-scenario results, and the limits of the comparison |
+| [Muse Spark vs llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | The 816B MoE on ten A40 GPUs, in layer split and tensor parallelism: setup, per-scenario results, teacher-forced quality, and the limits of the comparison |
 | [Test/benchmark matrix runner](TensorSharp.TestMatrix/README.md) | Sweep model × backend × feature × env-var cells and generate regression reports |
 | [Server API examples](TensorSharp.Server.Host/API_EXAMPLES.md) | Complete curl and Python examples for the server surface |
 

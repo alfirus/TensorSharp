@@ -31,7 +31,7 @@ TensorSharp loads models in GGUF format. Below are verified Hugging Face repos f
 | Mistral 3 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) — Pixtral mmproj `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` in the same repo |
 | Hunyuan Dense | Tencent dense Hunyuan checkpoints (`hunyuan-dense`) | Any GGUF whose `general.architecture` is `hunyuan-dense`, such as the Hy-MT2 releases (`tencent/Hy-MT2-1.8B` supplies the reference chat template). Text only, single device, no projector and no drafter. See [hunyuan-dense.md](docs/models/hunyuan-dense.md) |
 | Muse-Glimmer | Muse-Glimmer-30B (dense, image-capable) | [unsloth/Muse-Glimmer-30B-GGUF](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) — e.g. `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` or `Muse-Glimmer-30B-Q8_0.gguf`; `general.architecture` = `muse-glimmer` / `muse_glimmer`. Image input requires `mmproj-Muse-Glimmer-30B-Q8_0.gguf` (same repo): the CLI finds it beside the model when you pass `--image`, and the server needs it named with `--mmproj`. Optional speed artifacts: the DFlash block drafter `dflash-kquant.gguf` (same repo) or the newer DFlash2 drafter [z-lab/Muse-Glimmer-30B-DFlash2-GGUF](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2-GGUF) (prefer `-Q4_K_M` on a 16 GB card — see the note on drafter size in [speculative_decoding.md](docs/speculative_decoding.md#what-to-expect)), loaded with `--draft-model` for lossless speculative decoding — pass no sampler flags, it needs plain greedy |
-| Muse Spark | Muse-Spark-Open-816B-A42B (816B-A42B MoE, image-capable) | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) — one subdirectory per quant, each a multi-shard set: `UD-Q3_K_XL/` is ten shards, 374 GiB (the measured quant), and `UD-Q4_K_XL/` is twelve. Keep every shard of a quant in one directory and point `--model` at any of them; later shards hold only split metadata and are not standalone models. `general.architecture` = `muse-spark` / `muse_spark`. Image input needs `mmproj-Q8_0.gguf` (2.2 GB, repo root) named with `--mmproj`; a Muse-Glimmer-30B projector has a different output width and is rejected. The measured profile used six 46 GB A40s with 131.8 GiB of expert stacks in host memory (see the run block below). There is no drafter: speculation is the weight-free n-gram one |
+| Muse Spark | Muse-Spark-Open-816B-A42B (816B-A42B MoE, image-capable) | [unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) — one subdirectory per quant, each a multi-shard set: `UD-IQ3_XXS/` is eight shards, 317 GiB (the measured quant), `UD-Q3_K_XL/` is ten shards, 374 GiB, and `UD-Q4_K_XL/` is twelve. Keep every shard of a quant in one directory and point `--model` at any of them; later shards hold only split metadata and are not standalone models. `general.architecture` = `muse-spark` / `muse_spark`. Image input needs `mmproj-Q8_0.gguf` (2.2 GB, repo root) named with `--mmproj`; a Muse-Glimmer-30B projector has a different output width and is rejected. The measured profile used ten 46 GB A40s with every expert in GPU memory (see the run block below). There is no drafter: speculation is the weight-free n-gram one |
 | DeepSeek V4.1 | DeepSeek-V4.1-Flash (`deepseek41`, 384 routed experts) | [smalinin/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/smalinin/DeepSeek-V4.1-Flash-GGUF/tree/d1de55c19f95172c882906cc83c0e55932d26a63/Q2_K-Q5) at revision `d1de55c19f95172c882906cc83c0e55932d26a63` — ten `Q2_K-Q5/` shards, 335,382,014,624 bytes (312.349 GiB), with Q5_K Engram tables and restored F32 mHC/BF16 Engram gates. Keep all shards together and point `--model` at the first. The original seven-shard vcruz Q2 has a known sensitive-tensor quantization issue and is not recommended. The repaired headers and all ten full-file hashes have been verified; bounded plain/DSpark text/image HTTP probes passed on two-GPU layer split and experimental routed-expert TP, through EOS with clean shutdown. Separate 24-token plain/DSpark text/image pairs matched token IDs and `max_tokens` finishes in both modes, with active DSpark and clean exit; these bounded continuations are separate from the HTTP EOS checks. Image DSpark was slower in both measured pairs. Short repeated warm text controls also completed: one warmup and three measured 69-prompt/24-output-token pairs per mode, with exact token IDs and finishes, active DSpark, and clean exit. The small sample and heavy paging limit these results; no broad quality/performance, speedup, multi-node execution, or full-model TP qualification is claimed. Verify hashes for each new download. Engram weights and hash constants are already embedded in the GGUF; no Engram preparation or separate Engram file is needed. `eng/dsv41-prepare-vision.py` builds the optional ~970 MB vision companion that `--mmproj` needs for images and video. `ggml_cuda` is the serving backend; `ggml_cpu` and `cpu` are correctness and portability paths rather than serving ones — `--backend cpu` runs the whole V4.1 graph on the pure-C# `DeepSeek4CpuExecutor`, with no ggml, no native library and no GPU; it reads the embedded Engram metadata, and the vision companion does not follow it there (`LoadVisionEncoder` throws), so images and video are not available on that backend. V4 drafters are rejected; a `deepseek41-dspark` drafter is accepted through `--draft-model` on `ggml_cuda` / `ggml_cpu` as an experimental path; initial text/image HTTP probes with trained weights passed using two-GPU layer split and experimental routed-expert TP on `ggml_cuda`; broad quality and throughput remain unqualified. Full recipe and checkpoint hashes: [deepseek41.md](docs/models/deepseek41.md) |
 | DeepSeek V4 | DeepSeek-V4-Flash-0731 (284B MoE) | [unsloth/DeepSeek-V4-Flash-0731-GGUF](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) — one subdirectory per quant (`UD-Q8_K_XL/`, `UD-IQ4_XS/`, `UD-IQ1_S/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. Text only |
 | GLM 5.x | GLM-5.2 (744B-A40B MoE, embedded NextN MTP) | [unsloth/GLM-5.2-GGUF](https://huggingface.co/unsloth/GLM-5.2-GGUF) — one subdirectory per quant (`UD-Q4_K_XL/`, `UD-IQ2_XXS/`, …), each a multi-shard set; point `--model` at the `-00001-of-` shard. **Text only** — GLM-5.3-Flash, two rows down, is the one that takes images; the GLM-5.3 row in between is text-only as well. These GGUFs already carry the NextN block for `--spec` — unlike Qwen 3.6 there is no separate MTP repo to pick |
@@ -208,29 +208,34 @@ way from their own repos in the table above. Details: [glm.md](docs/models/glm.m
 **Muse Spark** — 816B-A42B MoE, text + image, thinking, ATEM tools; native whole-model executor on `ggml_cuda` / `ggml_vulkan` ([unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF))
 
 ```bash
-# UD-Q3_K_XL is ten shards, 374 GiB. The measured machine had six 46 GB A40s and a
-# 280 GiB memory limit: 240.4 GiB of weights went to the GPUs and 131.8 GiB of
-# expert stacks to NUMA-local host memory.
-hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF --include "UD-Q3_K_XL/*" --local-dir models/muse-spark
+# UD-IQ3_XXS is eight shards, 317 GiB. The measured machine had ten 46 GB A40s and
+# kept every expert in GPU memory, about 36 GiB per GPU.
+hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF --include "UD-IQ3_XXS/*" --local-dir models/muse-spark
 hf download unsloth/Muse-Spark-Open-816B-A42B-GGUF mmproj-Q8_0.gguf --local-dir models/muse-spark
 
-MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_MUSE_SPARK_CPU_MOE=auto TS_MUSE_SPARK_DEV0_RESERVE_MB=3072 \
+# Layer split, the faster mode for long prompts. For tensor parallelism, the faster
+# mode for generation, replace --layer-split 10 with --tp 10 (ggml_cuda only).
+MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 \
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-    --model models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
-    --mmproj models/muse-spark/mmproj-Q8_0.gguf \
-    --backend ggml_cuda --layer-split 6 --port 5000
+    --model models/muse-spark/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf \
+    --backend ggml_cuda --layer-split 10 --port 5000
 ```
 
+Set `--layer-split N` or `--tp N` to your GPU count (at most 16; `--tp` also needs every
+GPU to be the same model). `TS_MUSE_SPARK_PLAN_SLOTS=5` reserves room for four concurrent
+requests plus the shared-prefix checkpoint. The measured runs also set `TS_CODE_EXEC=0`,
+passed `--no-webui --no-skills --no-multi-agent` and loaded no projector; for image input add
+`--mmproj models/muse-spark/mmproj-Q8_0.gguf` and `TS_MUSE_SPARK_DEV0_RESERVE_MB=3072`,
+which leaves GPU 0 room for the image encoder. On fewer GPUs, layer split with
 `TS_MUSE_SPARK_CPU_MOE=auto` keeps as many expert stacks on the GPUs as fit and puts the
 rest in host memory; without it (or `--n-cpu-moe N`), a checkpoint that does not fit is
-refused with a message naming the option. `TS_MUSE_SPARK_PLAN_SLOTS=5` reserves room for
-four concurrent requests plus the shared-prefix checkpoint, and
-`TS_MUSE_SPARK_DEV0_RESERVE_MB=3072` leaves GPU 0 room for the image encoder. Set
-`--layer-split N` to your GPU count. The measured run also passed `--no-webui --no-skills
---no-multi-agent`. `TS_MUSE_SPARK_NATIVE=0` selects the older per-op path, which `--tp N`
-always uses; neither was part of that run. Weight-free speculation is
-`--spec --spec-type ngram`. Results against llama.cpp on this profile:
-[Benchmarks](docs/benchmarks.md#muse-spark-816b-on-six-a40-gpus); every option:
+refused with a message naming the option. An earlier six-A40
+[profile](docs/models/muse-spark.md#earlier-six-a40-profile-with-cpu-expert-offload) ran
+the ten-shard UD-Q3_K_XL this way, with 131.8 GiB of expert stacks in host memory. `--tp N`
+keeps every expert on the GPUs. `TS_MUSE_SPARK_NATIVE=0` selects the older per-op path,
+which `--tp N` on `ggml_vulkan` also uses. Weight-free speculation is
+`--spec --spec-type ngram`; the native `--tp` path decodes without it. Results against llama.cpp on this profile:
+[Benchmarks](docs/benchmarks.md#muse-spark-816b-on-ten-a40-gpus); every option:
 [model card](docs/models/muse-spark.md#options).
 
 **Gemma 4** — text + image/video/audio, thinking, tools, MTP ([ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF))

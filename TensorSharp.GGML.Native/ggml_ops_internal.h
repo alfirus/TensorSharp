@@ -818,6 +818,27 @@ namespace tsg
     // process creates its first NCCL communicator for its verdict to be
     // actionable — NCCL caches NCCL_P2P_DISABLE at that point.
     int tp_probe_cuda_peer_access(const int* device_indices, int count);
+#if defined(TSG_CUDA_VMM_PEER_GUARD)
+    // Whether ggml-cuda's VMM pool, sharing a chunk on any of these devices with
+    // every peer-capable GPU, would exceed CUDA's per-GPU peer limit. Tested on a
+    // scratch chunk that is freed again (ggml_ops_cuda_vmm_peer_guard.cpp).
+    bool cuda_vmm_pool_grant_exceeds_peer_limit(const int* device_indices, int count);
+    // Bit d set: the cuMemSetAccess wrapper itself downgraded a refused pool
+    // grant on device d (the probe above does not set these).
+    std::uint64_t cuda_vmm_peer_guard_handled_mask();
+#endif
+    // On hosts where that limit keeps ggml's pool memory private to each GPU,
+    // NCCL's in-process P2P direct mode must not touch it: sets
+    // NCCL_P2P_DIRECT_DISABLE=1 unless NCCL runs without P2P or the operator
+    // chose. Call before the process creates its first NCCL communicator.
+    void tp_cuda_respect_vmm_peer_limit(const int* device_indices, int count);
+#if defined(TSG_GGML_USE_CUDA)
+    // Choose the collective before a CUDA backend creates its communicator:
+    // NCCL without P2P where peer copies are advertised but broken, the VMM
+    // peer limit respected, and the internal / host reduction where NCCL does
+    // not work at all. An explicit GGML_CUDA_ALLREDUCE skips the choice.
+    void tp_cuda_prepare_collective(const int* device_indices, int count);
+#endif
     // Release the collective context and every rank's AllReduce scratch buffer.
     void tp_comm_free();
     // In-place device AllReduce (sum) over one contiguous F32 tensor per rank.

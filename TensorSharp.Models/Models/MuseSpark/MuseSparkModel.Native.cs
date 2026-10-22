@@ -12,9 +12,12 @@
 // most of its time in host round trips at that scale; the native executor
 // (TensorSharp.GGML.Native/ggml_ops_muse_spark_exec.cpp) loads the split GGUF
 // itself, owns every sequence slot's K/V rows on the devices that read them, and
-// submits ONE graph per ubatch. The managed per-op path remains the reference
-// implementation: TS_MUSE_SPARK_NATIVE=0 selects it on a GGML backend, and
-// TS_MUSE_SPARK_NATIVE=1 opts the GGML CPU backend into the native executor.
+// submits ONE graph per ubatch. --layer-split N spreads whole layers over N
+// GPUs; --tp N on ggml_cuda splits every layer over N GPUs through ggml's meta
+// backend (llama.cpp's -sm tensor mechanism). The managed per-op path remains
+// the reference implementation: TS_MUSE_SPARK_NATIVE=0 selects it on a GGML
+// backend (also for --tp), and TS_MUSE_SPARK_NATIVE=1 opts the GGML CPU backend
+// into the native executor.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -24,11 +27,45 @@ using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Models;
 
-public partial class MuseSparkModel
+public partial class MuseSparkModel : ISoloPrefillBudgetModel
 {
     private IntPtr _native;
     private readonly object _nativeSync = new();
     private int _nativeUbatch;
+    private int _nativePipelineUbatch;   // pipelined prefill micro-batch rows (adaptive: their upper bound); 0 when off
+    private int _nativeTpDegree;         // GPUs the native executor splits every layer over; 0 for a layer split
+
+    /// <summary>A lone prompt's prefill step. Each native call fills and drains the GPU pipeline
+    /// once: on 10x A40 one 8192-token call keeps about 90% of a 16K call's throughput (a 4K call
+    /// about 70%), and a request that arrives meanwhile waits for one step of about 6 s rather
+    /// than 10 s. A remainder of at most a quarter step joins the step before it, so no short
+    /// call fills and drains the pipeline alone. 0 (the scheduler's own step) when the call would
+    /// not run pipelined: pipelined prefill off, or a context whose masks exceed its budget.</summary>
+    public int PreferredSoloPrefillTokens(int start, int remaining)
+    {
+        // (The scheduler keeps its own step when the step would carry image rows.)
+        if (_nativePipelineUbatch <= 0) return 0;
+        lock (_nativeSync)
+        {
+            if (_native == IntPtr.Zero) return 0;
+            IntPtr handle = _native;
+            return SoloPrefillStep(start, remaining, (p0, n) => GgmlMuseSparkNative.PipelinePlan(handle, p0, n));
+        }
+    }
+
+    /// <summary>The lone-prompt step rule: <see cref="SoloPrefillTokens"/> tokens, a remainder of at most
+    /// a quarter step joined to the step before it, and 0 when <paramref name="pipelinePlan"/> says the call
+    /// would not run pipelined.</summary>
+    internal static int SoloPrefillStep(int start, int remaining, Func<long, long, int> pipelinePlan)
+    {
+        if (remaining <= 0 || start < 0) return 0;
+        int step = Math.Min(remaining, SoloPrefillTokens);
+        int rest = remaining - step;
+        if (rest > 0 && rest <= SoloPrefillTokens / 4) step = remaining;
+        return pipelinePlan(start, step) > 0 ? step : 0;
+    }
+
+    internal const int SoloPrefillTokens = 8192;
 
     /// <summary>True when the native whole-model executor drives this instance.</summary>
     internal bool UsesNativeExecutor => _native != IntPtr.Zero;
@@ -41,9 +78,11 @@ public partial class MuseSparkModel
 
     private static bool NativeRequested(BackendType backend, int tpDegree, ITensorParallelGroup tpGroup)
     {
-        if (tpDegree > 1 || tpGroup?.IsActive == true) return false;
+        if (tpGroup?.IsActive == true) return false;
         string flag = Environment.GetEnvironmentVariable("TS_MUSE_SPARK_NATIVE");
         if (string.Equals(flag, "0", StringComparison.Ordinal)) return false;
+        // Native tensor parallelism runs on ggml's meta backend over CUDA GPUs.
+        if (tpDegree > 1) return backend == BackendType.GgmlCuda;
         return backend switch
         {
             BackendType.GgmlCuda or BackendType.GgmlVulkan => true,
@@ -64,19 +103,65 @@ public partial class MuseSparkModel
     private static int ParseEnvInt(string name, int fallback)
         => int.TryParse(Environment.GetEnvironmentVariable(name), out int v) && v > 0 ? v : fallback;
 
-    private void InitNativeExecutor(string ggufPath, BackendType backend, int layerSplitDegree)
+    /// <summary>GPUs the native executor can span (MAX_GPUS in ggml_ops_muse_spark_exec.cpp).</summary>
+    internal const int NativeMaxGpus = 16;
+
+    /// <summary>The GPU count the native executor is asked for: <c>--layer-split N</c>, or more when
+    /// TS_MUSE_SPARK_LAYER_SPLIT lists more per-GPU counts. A count it cannot honour is a load refusal
+    /// rather than a run on fewer GPUs. <paramref name="available"/> is null on the CPU backend.</summary>
+    internal static int ResolveNativeGpuCount(int layerSplitDegree, string explicitSplit, int? available, string backendName)
     {
         int requested = Math.Max(1, layerSplitDegree);
-        string split = Environment.GetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT");
-        if (!string.IsNullOrWhiteSpace(split))
-            requested = Math.Max(requested, split.Split(',', StringSplitOptions.RemoveEmptyEntries).Length);
-        if (backend is BackendType.GgmlCuda or BackendType.GgmlVulkan)
+        if (!string.IsNullOrWhiteSpace(explicitSplit))
+            requested = Math.Max(requested, explicitSplit.Split(',', StringSplitOptions.RemoveEmptyEntries).Length);
+        if (available is int visible)
         {
-            var kind = backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Vulkan;
-            int available = GgmlBasicOps.GetGpuDeviceCount(kind);
-            if (available < requested)
-                throw new InvalidOperationException($"Requested {requested} GPU(s) but the GGML {kind} backend sees only {available}.");
+            if (requested > NativeMaxGpus)
+                throw new ModelLoadRefusedException(
+                    $"[muse-spark] {requested} GPUs requested; the native executor spans at most {NativeMaxGpus}.");
+            if (visible < requested)
+                throw new ModelLoadRefusedException(
+                    $"[muse-spark] {requested} GPU(s) requested but the GGML {backendName} backend sees only {visible}.");
         }
+        return requested;
+    }
+
+    /// <summary>Per-op-path settings the native executor does not read. Under --tp they used to tune the
+    /// managed tensor-parallel path, so they are named when ignored rather than dropped silently.</summary>
+    internal static readonly string[] PerOpOnlyOptionNames =
+    [
+        "TS_MUSE_SPARK_PHASE_TIMING", "TS_MUSE_SPARK_FUSE_QK_PREP", "TS_MUSE_SPARK_REUSE_NORM_SCRATCH",
+        "TS_MUSE_SPARK_KV_UPLOAD_2D", "TS_MUSE_SPARK_FUSE_RESIDUALS", "TS_MUSE_SPARK_TP_HOST_POOL",
+        "TS_MUSE_SPARK_PREFILL_CHUNK", "TS_MUSE_SPARK_SCRATCH_RESERVE_MIB", "TS_MUSE_SPARK_RELEASE_GPU_SOURCE_PAGES",
+    ];
+
+    private void InitNativeExecutor(string ggufPath, BackendType backend, int layerSplitDegree, int tpDegree)
+    {
+        string split = Environment.GetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT");
+        int? available = null;
+        if (backend is BackendType.GgmlCuda or BackendType.GgmlVulkan)
+            available = GgmlBasicOps.GetGpuDeviceCount(backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Vulkan);
+        bool tensorParallel = tpDegree > 1;
+        if (tensorParallel)
+        {
+            if (!string.IsNullOrWhiteSpace(split))
+                throw new ModelLoadRefusedException(
+                    "[muse-spark] --tp cannot be combined with TS_MUSE_SPARK_LAYER_SPLIT (a layer split); use one or the other.");
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEVICES")))
+                throw new ModelLoadRefusedException(
+                    "[muse-spark] the native executor's --tp uses the first N CUDA GPUs and does not read TENSORSHARP_TP_DEVICES; " +
+                    "select GPUs with CUDA_VISIBLE_DEVICES, or set TS_MUSE_SPARK_NATIVE=0 for the per-op path that reads it.");
+            if (tpDegree > Config.NumKVHeads)
+                throw new ModelLoadRefusedException(
+                    $"[muse-spark] --tp {tpDegree} exceeds the model's {Config.NumKVHeads} KV heads; every GPU needs at least one.");
+            string[] ignored = PerOpOnlyOptionNames.Where(n => !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(n))).ToArray();
+            if (ignored.Length > 0)
+                Console.Error.WriteLine($"[muse-spark] ignoring {string.Join(", ", ignored)}: only the per-op path reads " +
+                    "them (TS_MUSE_SPARK_NATIVE=0); the native tensor-parallel executor runs without them.");
+        }
+        int requested = tensorParallel
+            ? ResolveNativeGpuCount(tpDegree, null, available, NativeBackendName(backend))
+            : ResolveNativeGpuCount(layerSplitDegree, split, available, NativeBackendName(backend));
 
         int nUbatch = ParseEnvInt("TS_MUSE_SPARK_UBATCH", 2048);
         int nThreads = ParseEnvInt("TS_MUSE_SPARK_THREADS", 0);
@@ -90,7 +175,7 @@ public partial class MuseSparkModel
         ForwardNativeOptions();
 
         IntPtr handle = GgmlMuseSparkNative.LoadModel(ggufPath, requested, maxContext, nUbatch, nThreads, cpuMoe,
-            NativeBackendName(backend), hardLimit, split);
+            NativeBackendName(backend), hardLimit, tensorParallel ? null : split, tensorParallel ? tpDegree : 0);
         if (handle == IntPtr.Zero)
             throw NativeLoadRefused("muse-spark", ggufPath,
                 "TS_MUSE_SPARK_NATIVE=0 selects the per-op path instead of the native executor.");
@@ -101,8 +186,26 @@ public partial class MuseSparkModel
         if (vocab > 0) Config.VocabSize = vocab;
         _logitsBuffer = new float[Config.VocabSize];
         _primarySlot = 0;
-        Console.WriteLine($"Muse Spark native executor: {Config.NumLayers} layers over {requested} GPU(s), " +
-            $"context {_maxContextLength}, ubatch {nUbatch}, CPU expert layers {(cpuMoe < 0 ? "auto" : cpuMoe.ToString())}.");
+        long[] stats = GgmlMuseSparkNative.GetStats(handle);
+        _nativePipelineUbatch = stats != null ? (int)stats[9] : 0;
+        _nativeTpDegree = stats != null ? (int)stats[11] : 0;
+        if (tensorParallel && _nativeTpDegree != tpDegree)
+            throw new ModelLoadRefusedException(
+                $"[muse-spark] --tp {tpDegree} was requested but the native executor reports tensor parallelism over {_nativeTpDegree} GPU(s).");
+        string hostLayers = stats != null ? stats[3].ToString() : cpuMoe < 0 ? "auto" : cpuMoe.ToString();
+        if (tensorParallel)
+            Console.WriteLine($"Muse Spark native executor: {Config.NumLayers} layers tensor-parallel over {_nativeTpDegree} GPUs, " +
+                $"context {_maxContextLength}, ubatch {nUbatch}.");
+        else
+            Console.WriteLine($"Muse Spark native executor: {Config.NumLayers} layers over " +
+                $"{(stats != null ? stats[4].ToString() : requested.ToString())} GPU(s), " +
+                $"context {_maxContextLength}, ubatch {nUbatch}, layers with host experts {hostLayers}.");
+    }
+
+    /// <summary>Native executor counters (<see cref="GgmlMuseSparkNative.GetStats"/>); null without the executor.</summary>
+    internal long[] NativeStatsForTests()
+    {
+        lock (_nativeSync) return _native == IntPtr.Zero ? null : GgmlMuseSparkNative.GetStats(_native);
     }
 
     /// <summary>Settings the native executor reads. Process-environment values set from .NET never reach
@@ -117,7 +220,7 @@ public partial class MuseSparkModel
         "TS_MUSE_SPARK_SLOT_HEADROOM_MB", "TS_MUSE_SPARK_CPU_REPACK", "TS_MUSE_SPARK_PROFILE", "TS_CPU_MOE_THREADS",
         "TS_MUSE_SPARK_HOST_NUMA", "TS_MUSE_SPARK_NUMA_BATCH_GB", "TS_MUSE_SPARK_SLOT_INIT_ROWS",
         "TS_MUSE_SPARK_PLAN_CTX_TOKENS", "TS_MUSE_SPARK_HOST_MOE_TOKENS", "TS_MUSE_SPARK_ADMIT_GRAPH_MB",
-        "TS_MUSE_SPARK_WARM_POOLS",
+        "TS_MUSE_SPARK_WARM_POOLS", "TS_MUSE_SPARK_PIPELINE", "TS_MUSE_SPARK_PIPELINE_UBATCH",
     ];
 
     private static void ForwardNativeOptions()

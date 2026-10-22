@@ -43,10 +43,12 @@
 // ---------------------------------------------------------------------------
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_muse_spark_tp.h"
 #include "dsv4_file_warm.h"
 
 #include "gguf.h"
 
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdarg>
@@ -63,6 +65,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -79,7 +82,10 @@
 namespace tsg_mspark
 {
 
-static constexpr int MAX_GPUS = 8;
+/// GPUs one model can span. ggml-cuda addresses at most GGML_CUDA_MAX_DEVICES
+/// (16) and ggml-vulkan GGML_VK_MAX_DEVICES (16); TensorSharp builds ggml-base
+/// with GGML_SCHED_MAX_BACKENDS=32, so these plus the CPU fit one scheduler.
+static constexpr int MAX_GPUS = 16;
 /// Sequences one batched decode step serves at most.
 static constexpr int MAX_BATCHED_DECODE = 16;
 /// Default granularity of the attention windows. Decode reuses one graph shape
@@ -278,10 +284,11 @@ struct graph_entry
     graph_inputs inp;
     ggml_tensor * logits = nullptr;
     ggml_tensor * hidden = nullptr;     // post-norm rows (when requested)
+    bool owns_sched = true;             // false: the pipeline's persistent scheduler
 
     ~graph_entry()
     {
-        if (sched) ggml_backend_sched_free(sched);
+        if (sched && owns_sched) ggml_backend_sched_free(sched);
         if (ctx) ggml_free(ctx);
     }
 };
@@ -289,6 +296,50 @@ struct graph_entry
 struct shard_files
 {
     std::vector<std::string> paths;
+};
+
+/// Pipelined prefill across the layer-split GPUs (forward_pipelined). One
+/// persistent scheduler with ggml's rotating input copies runs consecutive
+/// micro-batches of a prompt back to back, so GPU k works on micro-batch j
+/// while GPU k+1 works on j-1 (llama.cpp's pipeline parallelism).
+struct pipeline_state
+{
+    bool enabled = false;
+    bool forced = false;                     // TS_MUSE_SPARK_PIPELINE=1
+    bool ubatch_fixed = false;               // TS_MUSE_SPARK_PIPELINE_UBATCH set: every call uses `ubatch` rows
+    int64_t ubatch = 512;                    // the fixed micro-batch, or the adaptive one's upper bound
+    ggml_backend_sched_t sched = nullptr;
+    int n_copies = 1;
+    size_t n_nodes = 0;
+    std::vector<int> stages;                 // devices holding layers, in layer order
+    std::vector<ggml_backend_event_t> done;  // [stage * n_copies + copy]: stage finished the micro-batch in that copy slot
+    std::vector<ggml_backend_event_t> staged;// [stage * n_staging + slot]: uploads from that staging slot finished
+    std::vector<uint8_t> busy;               // staging slot has uploads in flight
+    int n_staging = 0;
+    ggml_backend_buffer_t staging = nullptr; // pinned host memory, n_staging slots
+    size_t slot_bytes = 0;
+    std::vector<uint8_t> meta;               // graph metadata, rebuilt per micro-batch
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::set<std::string> warned;
+    uint64_t n_calls = 0, n_ubatches = 0, n_declines = 0;
+    int64_t res_u = 0, res_kv_g = 0, res_kv_s = 0;   // shapes the scheduler is reserved for
+    int res_nodes = 0;                               // node count of the reserved graph (its topology)
+    // The smallest shape whose reservation failed: larger calls decline without
+    // retrying the allocation until a slot gives memory back (slot_free).
+    int64_t fail_u = 0, fail_kv_g = 0, fail_kv_s = 0;
+
+    void release()
+    {
+        res_u = res_kv_g = res_kv_s = 0;
+        res_nodes = 0;
+        if (sched) { ggml_backend_sched_free(sched); sched = nullptr; }
+        for (auto e : done) if (e) ggml_backend_event_free(e);
+        for (auto e : staged) if (e) ggml_backend_event_free(e);
+        done.clear(); staged.clear(); busy.clear();
+        if (staging) { ggml_backend_buffer_free(staging); staging = nullptr; }
+        slot_bytes = 0;
+        n_staging = 0;
+    }
 };
 
 struct model
@@ -369,10 +420,24 @@ struct model
     uint64_t n_graph_builds = 0;
     uint64_t n_graph_reuses = 0;
 
+    pipeline_state pipe;
+
+    // Tensor parallelism (load with tp > 1): backends[0] is one ggml meta
+    // backend over tp.devs (n_gpu == 1), and tp.ud's plan splits every weight
+    // and K/V tensor among them.
+    struct tp_state
+    {
+        int n = 0;
+        ggml_backend_dev_t devs[MAX_GPUS] = {};
+        ggml_backend_dev_t meta_dev = nullptr;
+        std::unique_ptr<tsg_mspark_tp::userdata> ud;
+    } tp;
+
     std::mutex mu;
 
     ~model()
     {
+        pipe.release();   // its scheduler and events reference the backends
         graph_cache.clear();
         slots.clear();
         for (auto & sc : slot_ctxs)
@@ -572,8 +637,10 @@ struct load_job
     size_t len;
 };
 
+/// `set_mu`, when given, serializes the device writes (a meta buffer's split
+/// bookkeeping is not thread-safe); the file reads still run in parallel.
 static bool upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads,
-                            std::atomic<size_t> & done_bytes)
+                            std::atomic<size_t> & done_bytes, std::mutex * set_mu = nullptr)
 {
     std::sort(jobs.begin(), jobs.end(), [](const load_job & a, const load_job & b)
     {
@@ -619,7 +686,15 @@ static bool upload_parallel(const shard_files & shards, std::vector<load_job> & 
                 failed.store(true);
                 break;
             }
-            ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
+            if (set_mu)
+            {
+                std::lock_guard<std::mutex> lk(*set_mu);
+                ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
+            }
+            else
+            {
+                ggml_backend_tensor_set(j.t, staging.data(), j.tensor_off, j.len);
+            }
             // The device copy is the only one this process needs: drop the file
             // pages so a GPU-bound read does not evict the mapped CPU experts
             // from a container's page-cache budget. Only Linux can drop one
@@ -897,26 +972,99 @@ static size_t kv_bytes_per_token_layer(const hparams & hp)
     return (size_t) hp.n_kv() * 2 /* K+V */ * sizeof(uint16_t);
 }
 
-/// Copy `src`'s first `rows` cache rows into `dst` (device to device). The
-/// shapes match because every slot is allocated with the same geometry.
-static void copy_cache_rows(ggml_tensor * src, ggml_tensor * dst, int64_t rows)
+/// The first `rows` cache rows of `src`, copied into `dst`.
+struct row_copy { ggml_tensor * src; ggml_tensor * dst; int64_t rows; };
+
+/// Copy cache rows device to device. The shapes match because every slot is
+/// allocated with the same geometry; global rows grow per slot, so a source
+/// and its destination may differ in length. Under tensor parallelism the
+/// slices of a tensor live on every GPU and the meta buffer cannot copy, so
+/// one graph of copies runs on the meta backend: each GPU copies its own
+/// slices, nothing crosses the host.
+static bool copy_cache_rows(model & m, const std::vector<row_copy> & copies)
 {
-    // Global rows grow per slot, so source and destination may differ in length.
-    rows = std::min<int64_t>(rows, std::min<int64_t>(src->ne[1], dst->ne[1]));
-    if (rows <= 0) return;
-    if (rows == src->ne[1] && rows == dst->ne[1])
+    if (m.tp.n > 1)
     {
-        ggml_backend_tensor_copy(src, dst);
+        const size_t n_nodes = copies.size() * 4 + 8;
+        ggml_init_params p = { n_nodes * ggml_tensor_overhead() + ggml_graph_overhead_custom(n_nodes, false), nullptr, true };
+        ggml_context * c = ggml_init(p);
+        if (!c) return false;
+        ggml_cgraph * gf = ggml_new_graph_custom(c, n_nodes, false);
+        for (const row_copy & rc : copies)
+        {
+            const int64_t rows = std::min<int64_t>(rc.rows, std::min<int64_t>(rc.src->ne[1], rc.dst->ne[1]));
+            if (rows <= 0) continue;
+            ggml_tensor * vs = ggml_view_2d(c, rc.src, rc.src->ne[0], rows, rc.src->nb[1], 0);
+            ggml_tensor * vd = ggml_view_2d(c, rc.dst, rc.dst->ne[0], rows, rc.dst->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(c, vs, vd));
+        }
+        bool ok = true;
+        if (ggml_graph_n_nodes(gf) > 0)
+        {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++)
+            {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                for (int k = 0; k < GGML_MAX_SRC; k++)
+                    if (ggml_tensor * src = node->src[k]; src && src->view_src && !src->buffer) ggml_backend_view_init(src);
+                if (node->view_src && !node->buffer) ggml_backend_view_init(node);
+            }
+            ok = ggml_backend_graph_compute(m.backends[0], gf) == GGML_STATUS_SUCCESS;
+        }
+        ggml_free(c);
+        // The meta backend keeps per-GPU views only for the graph it computed
+        // last; the cached graph is rebuilt on its next use.
+        m.graph_cache.clear();
+        return ok;
+    }
+    for (const row_copy & rc : copies)
+    {
+        const int64_t rows = std::min<int64_t>(rc.rows, std::min<int64_t>(rc.src->ne[1], rc.dst->ne[1]));
+        if (rows <= 0) continue;
+        if (rows == rc.src->ne[1] && rows == rc.dst->ne[1])
+        {
+            ggml_backend_tensor_copy(rc.src, rc.dst);
+            continue;
+        }
+        ggml_init_params p = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * c = ggml_init(p);
+        ggml_tensor * vs = ggml_view_2d(c, rc.src, rc.src->ne[0], rows, rc.src->nb[1], 0);
+        ggml_tensor * vd = ggml_view_2d(c, rc.dst, rc.dst->ne[0], rows, rc.dst->nb[1], 0);
+        ggml_backend_view_init(vs);
+        ggml_backend_view_init(vd);
+        ggml_backend_tensor_copy(vs, vd);
+        ggml_free(c);
+    }
+    return true;
+}
+
+/// Free and total memory of sched backend d: under tensor parallelism the
+/// meta backend's device reports sums, but each GPU holds its own slices, so
+/// the smallest GPU is what bounds an allocation.
+static void dev_memory(const model & m, int d, size_t * free_b, size_t * total_b)
+{
+    *free_b = 0;
+    *total_b = 0;
+    if (m.tp.n > 1 && d == 0)
+    {
+        for (int j = 0; j < m.tp.n; j++)
+        {
+            size_t f = 0, t = 0;
+            ggml_backend_dev_memory(m.tp.devs[j], &f, &t);
+            if (j == 0 || f < *free_b) *free_b = f;
+            if (j == 0 || t < *total_b) *total_b = t;
+        }
         return;
     }
-    ggml_init_params p = { 4 * ggml_tensor_overhead(), nullptr, true };
-    ggml_context * c = ggml_init(p);
-    ggml_tensor * vs = ggml_view_2d(c, src, src->ne[0], rows, src->nb[1], 0);
-    ggml_tensor * vd = ggml_view_2d(c, dst, dst->ne[0], rows, dst->nb[1], 0);
-    ggml_backend_view_init(vs);
-    ggml_backend_view_init(vd);
-    ggml_backend_tensor_copy(vs, vd);
-    ggml_free(c);
+    ggml_backend_dev_memory(ggml_backend_get_device(m.backends[d]), free_b, total_b);
+}
+
+/// Bytes the largest GPU slice of `t` takes (all of it without tensor parallelism).
+static size_t dev_nbytes(const model & m, const ggml_tensor * t)
+{
+    if (m.tp.n <= 1) return ggml_nbytes(t);
+    size_t most = 0;
+    for (int j = 0; j < m.tp.n; j++) most = std::max(most, tsg_mspark_tp::device_bytes(*m.tp.ud, t->name, t->type, t->ne, j));
+    return most;
 }
 
 /// Allocate one part of a slot (0: the sliding-layer rings, 1: the global
@@ -963,11 +1111,11 @@ static bool slot_alloc_part(model & m, slot & s, int part, int64_t rows, bool ad
         {
             if (!ggml_get_first_tensor(ctxs[(size_t) d])) continue;
             size_t free_b = 0, total_b = 0;
-            ggml_backend_dev_memory(ggml_backend_get_device(m.backends[d]), &free_b, &total_b);
+            dev_memory(m, d, &free_b, &total_b);
             if (!total_b) continue;
             size_t need = 0;
             for (ggml_tensor * t = ggml_get_first_tensor(ctxs[(size_t) d]); t; t = ggml_get_next_tensor(ctxs[(size_t) d], t))
-                need += ggml_nbytes(t) + 512;
+                need += dev_nbytes(m, t) + 512;
             size_t cached = 0, largest = d < (int) m.max_graph_bytes.size() ? m.max_graph_bytes[(size_t) d] : 0;
             for (const auto & e : m.graph_cache)
                 if (e->sched)
@@ -976,6 +1124,8 @@ static bool slot_alloc_part(model & m, slot & s, int part, int64_t rows, bool ad
                     cached += b;
                     largest = std::max(largest, b);
                 }
+            // The pipelined prefill's buffers are rebuilt on its next call.
+            if (m.pipe.sched) cached += ggml_backend_sched_get_buffer_size(m.pipe.sched, m.backends[d]);
             largest = std::min(largest, graph_cap);
             if (free_b + cached < need + largest + reserve)
             {
@@ -987,7 +1137,7 @@ static bool slot_alloc_part(model & m, slot & s, int part, int64_t rows, bool ad
             }
             if (free_b < need + reserve) drop_graphs = true;
         }
-        if (drop_graphs) m.graph_cache.clear();
+        if (drop_graphs) { m.graph_cache.clear(); m.pipe.release(); }
     }
 
     std::vector<ggml_backend_buffer_t> bufs((size_t) m.n_gpu + 1, nullptr);
@@ -1054,8 +1204,9 @@ static bool slot_reserve_rows(model & m, slot & s, int64_t rows)
     bool ok = slot_alloc_part(m, s, 1, cap, true);
     if (!ok)
     {
-        // Retained slots and cached graphs give their memory back first.
+        // Cached graphs (the pipeline's included) and retained slots give their memory back first.
         m.graph_cache.clear();
+        m.pipe.release();
         const int32_t self = s.id;
         while (!ok && reclaim_for_graph(m, &self, 1)) ok = slot_alloc_part(m, s, 1, cap, true);
         if (!ok) ok = slot_alloc_part(m, s, 1, cap, false);
@@ -1066,12 +1217,15 @@ static bool slot_reserve_rows(model & m, slot & s, int64_t rows)
         return false;
     }
     const int64_t keep = std::min(old_cap, s.n_past);
+    std::vector<row_copy> copies;
     for (int il = 0; il < m.hp.n_layer; il++)
     {
         if (m.layers[(size_t) il].swa) continue;
-        copy_cache_rows(old_k[(size_t) il], s.k[(size_t) il], keep);
-        copy_cache_rows(old_v[(size_t) il], s.v[(size_t) il], keep);
+        copies.push_back({ old_k[(size_t) il], s.k[(size_t) il], keep });
+        copies.push_back({ old_v[(size_t) il], s.v[(size_t) il], keep });
     }
+    const bool copied = copy_cache_rows(m, copies);
+    if (!copied) fprintf(stderr, "[muse-spark] copying slot %d's K/V rows into its grown cache failed\n", s.id);
     for (auto & o : old)
     {
         if (o.buf) ggml_backend_buffer_free(o.buf);
@@ -1079,7 +1233,7 @@ static bool slot_reserve_rows(model & m, slot & s, int64_t rows)
     }
     drop_slot_graphs(m, s.id);
     if (debug_on()) fprintf(stderr, "[muse-spark] slot %d global rows %" PRId64 " -> %" PRId64 "\n", s.id, old_cap, cap);
-    return true;
+    return copied;
 }
 
 static slot * slot_alloc(model & m, bool admit)
@@ -1110,6 +1264,7 @@ static slot * slot_alloc(model & m, bool admit)
 static void slot_free(model & m, int slot_id)
 {
     drop_slot_graphs(m, slot_id);
+    m.pipe.fail_u = m.pipe.fail_kv_g = m.pipe.fail_kv_s = 0;   // memory came back: retry
     m.slots.erase(slot_id);
     m.reclaimable.erase(std::remove(m.reclaimable.begin(), m.reclaimable.end(), slot_id), m.reclaimable.end());
     for (auto it = m.slot_ctxs.begin(); it != m.slot_ctxs.end(); )
@@ -1635,6 +1790,36 @@ static bool key_matches(const graph_entry & e, const graph_entry & k)
     return true;
 }
 
+/// Under --tp every layer op runs on ggml's meta backend: an op the GPUs do not
+/// support would be scheduled on the CPU and come back as a whole (mirrored)
+/// tensor, which the meta backend cannot combine with its GPU slices (it
+/// aborts). Checked before allocation so the call fails with a reason instead.
+/// Only the token-row gather (from the host table) belongs on the CPU.
+static bool tp_check_graph(const model & m, ggml_cgraph * gf)
+{
+    if (m.tp.n <= 1) return true;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++)
+    {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) continue;
+        bool host_side = false;
+        for (int k = 0; k < GGML_MAX_SRC && !host_side; k++)
+            if (const ggml_tensor * src = node->src[k]; src && src == m.tok_embd) host_side = true;
+        if (host_side) continue;
+        if (ggml_nelements(node) == 0 || !ggml_backend_supports_op(m.backends[0], node))
+        {
+            tsg::set_last_error(std::string("[muse-spark] --tp: ") + ggml_op_desc(node) + " (" + node->name +
+                                ") cannot run on the GPUs at this shape, and a tensor-parallel layer cannot fall back to the CPU");
+            fprintf(stderr, "[muse-spark] --tp: %s (%s, [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]) cannot run on the "
+                    "GPUs at this shape, and a tensor-parallel layer cannot fall back to the CPU\n", ggml_op_desc(node), node->name,
+                    node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+            return false;
+        }
+    }
+    return true;
+}
+
 static graph_entry * acquire_graph(model & m, std::unique_ptr<graph_entry> key, bool * reused)
 {
     for (auto it = m.graph_cache.begin(); it != m.graph_cache.end(); ++it)
@@ -1648,6 +1833,10 @@ static graph_entry * acquire_graph(model & m, std::unique_ptr<graph_entry> key, 
         m.n_graph_reuses++;
         return raw;
     }
+
+    // Under --tp two whole-graph compute buffers would sit on every GPU: the
+    // one graph kept goes before the next is built.
+    if (m.tp.n > 1) m.graph_cache.clear();
 
     // Reads: the slots this graph touches (never reclaimed for it).
     std::vector<int32_t> reads;
@@ -1685,6 +1874,7 @@ static graph_entry * acquire_graph(model & m, std::unique_ptr<graph_entry> key, 
         builder b(m, *e);
         if (e->kind == 0) b.build_single(*m.slots.at(e->slot_id));
         else              b.build_segments();
+        if (!tp_check_graph(m, e->gf)) return nullptr;
 
         const auto t0 = std::chrono::steady_clock::now();
         if (ggml_backend_sched_alloc_graph(e->sched, e->gf))
@@ -1716,10 +1906,11 @@ static graph_entry * acquire_graph(model & m, std::unique_ptr<graph_entry> key, 
         }
         e.reset();
         // Out of memory: drop the cached graphs first (each holds compute
-        // buffers), then retained slots, before giving up.
-        if (!m.graph_cache.empty())
+        // buffers, the pipeline's too), then retained slots, before giving up.
+        if (!m.graph_cache.empty() || m.pipe.sched)
         {
             m.graph_cache.clear();
+            m.pipe.release();
             continue;
         }
         if (!reclaim_for_graph(m, reads.data(), (int) reads.size()))
@@ -1896,16 +2087,459 @@ static bool forward_ubatch(model & m, const int32_t * tokens, int64_t nt, bool w
     return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// pipelined prefill
+// ---------------------------------------------------------------------------
+// forward_ubatch runs one micro-batch through every GPU and waits, so with
+// layers split over S GPUs each GPU idles (S-1)/S of a prefill. Here the
+// micro-batches of one call go to ONE persistent scheduler created with
+// parallel=true: ggml then keeps n_copies rotating copies of every graph input
+// and of every tensor handed from one GPU to the next, and each micro-batch is
+// only enqueued (graph_compute_async); one synchronize ends the call. Each GPU
+// runs its splits in order on its own stream, so micro-batch j+1 reads the K/V
+// rows j wrote without a host wait. llama.cpp's layer split does the same.
+//
+// What keeps the in-flight micro-batches apart:
+//  * the scheduler is reserved for the call's largest micro-batch (its last
+//    K/V window) before anything is in flight. Every micro-batch builds the same
+//    graph topology (one logits row each), only with a window that grows, so
+//    ggml's allocator keeps every node and copy slot at its reserved address
+//    and never reallocates mid-call (a reallocation would drain the pipeline);
+//  * inputs pinned to a GPU are uploaded with tensor_set_async on that GPU's
+//    stream, from a pinned staging ring the host refills only after the
+//    uploads that read a slot have run;
+//  * ggml copies a GPU's output into the next GPU's copy slot on the PRODUCER's
+//    stream, while its own guard waits on the consumer's. Before micro-batch j
+//    every producer therefore waits for its consumer to finish micro-batch
+//    j - n_copies, the last reader of that slot.
+// A call of n tokens is cut into k = ceil(n / TS_MUSE_SPARK_PIPELINE_UBATCH)
+// equal micro-batches; the last is padded with fewer than k copies of the final
+// token, so no partial micro-batch has to cross every GPU alone. The padding
+// writes K/V rows past the call's end: global rows there are rewritten before
+// any query reads them, and the ring rows it overwrites held positions outside
+// every later window; their labels are cleared, so a rewind that needs them is
+// refused instead of reading them. Near the context limit, where it cannot
+// pad, the call keeps floor(n / k)-row micro-batches and runs the few left-over
+// tokens on the sequential path.
+// A micro-batch's masks (global + sliding window, F16) stage at most this much:
+// a context long enough to need more prefills one micro-batch at a time.
+static constexpr size_t PIPE_MASK_BUDGET = (size_t) 96 << 20;
+// Adaptive micro-batches (TS_MUSE_SPARK_PIPELINE_UBATCH unset) have at least
+// PIPE_MIN_UBATCH rows, and shrink to PIPE_MASK_MIN_UBATCH only where a long
+// context's masks need it.
+static constexpr int64_t PIPE_MIN_UBATCH = 512;
+static constexpr int64_t PIPE_MASK_MIN_UBATCH = 128;
+
+static bool pipe_warn(model & m, const std::string & reason)
+{
+    if (m.pipe.warned.insert(reason).second)
+    {
+        fprintf(stderr, "[muse-spark] pipelined prefill declined (%s); this call runs one micro-batch at a time\n", reason.c_str());
+        fflush(stderr);
+    }
+    m.pipe.n_declines++;
+    return false;
+}
+
+/// How a call of n tokens at position p0 runs pipelined: n_full micro-batches
+/// of u rows, the last padded with `pad` copies of the final token. The
+/// micro-batch is TS_MUSE_SPARK_PIPELINE_UBATCH when set. Otherwise it is about
+/// a quarter of the call, between PIPE_MIN_UBATCH and the prefill ubatch, and
+/// smaller where a long context's masks need it: on 10x A40 four micro-batches
+/// per call beat both llama.cpp's fixed 512 rows (one 4K call 3.7 s against
+/// 4.5 s, one 16K call 10.2 s against 15.3 s at 2048 rows) and two large ones.
+enum pipe_verdict { PIPE_OK, PIPE_TOO_SHORT, PIPE_MASKS, PIPE_CTX };
+struct pipe_shape { int64_t u = 0, n_full = 0, pad = 0, p_last = 0, n_kv_g = 0, s0 = 0, n_kv_s = 0; };
+
+static pipe_verdict pipe_plan(const model & m, int64_t p0, int64_t n, pipe_shape * out)
+{
+    const pipeline_state & P = m.pipe;
+    if (n < 2 || p0 + n > m.n_ctx) return n < 2 ? PIPE_TOO_SHORT : PIPE_CTX;
+    const int64_t u_max = P.ubatch_fixed ? P.ubatch : std::max<int64_t>(1, P.ubatch);
+    const int64_t u_min = P.ubatch_fixed ? P.ubatch : std::min<int64_t>(PIPE_MIN_UBATCH, u_max);
+    int64_t target = P.ubatch_fixed ? P.ubatch : std::clamp<int64_t>((n + 3) / 4, u_min, u_max);
+    for (;;)
+    {
+        pipe_shape sh;
+        sh.n_full = (n + target - 1) / target;
+        if (sh.n_full < 2) return PIPE_TOO_SHORT;
+        sh.u = (n + sh.n_full - 1) / sh.n_full;
+        sh.pad = sh.n_full * sh.u - n;                       // < n_full
+        if (p0 + sh.n_full * sh.u > m.n_ctx) { sh.u = n / sh.n_full; sh.pad = 0; }
+        sh.p_last = p0 + sh.n_full * sh.u;
+        // The last micro-batch has the largest windows.
+        sh.n_kv_g = plan_n_kv_g(m, sh.p_last, m.kv_pad);
+        plan_swa(m, sh.p_last - sh.u, sh.p_last, m.kv_pad, &sh.s0, &sh.n_kv_s);
+        const size_t mask_bytes = (size_t) (sh.n_kv_g + sh.n_kv_s) * (size_t) sh.u * sizeof(uint16_t);
+        if (mask_bytes <= PIPE_MASK_BUDGET) { *out = sh; return PIPE_OK; }
+        if (P.ubatch_fixed || sh.u <= PIPE_MASK_MIN_UBATCH) return PIPE_MASKS;
+        target = std::max<int64_t>(PIPE_MASK_MIN_UBATCH, sh.u / 2);
+    }
+}
+
+static size_t pipe_slot_layout(int64_t u, int64_t n_kv_g, int64_t n_kv_s, size_t * off_kv, size_t * off_kv_s,
+                               size_t * off_out, size_t * off_mg, size_t * off_ms)
+{
+    auto al = [](size_t x) { return (x + 255) & ~(size_t) 255; };
+    size_t o = al((size_t) u * sizeof(int32_t));                       // pos
+    *off_kv = o;   o = al(o + (size_t) u * sizeof(int64_t));
+    *off_kv_s = o; o = al(o + (size_t) u * sizeof(int64_t));
+    *off_out = o;  o = al(o + sizeof(int32_t));
+    *off_mg = o;   o = al(o + (size_t) (n_kv_g * u) * sizeof(uint16_t));
+    *off_ms = o;   o = al(o + (size_t) (n_kv_s * u) * sizeof(uint16_t));
+    return o;
+}
+
+/// The GPUs holding layers, in layer order: the pipeline's stages.
+static std::vector<int> pipe_stage_list(const model & m)
+{
+    std::vector<int> stages;
+    for (int il = 0; il < m.hp.n_layer; il++)
+    {
+        const int d = m.layers[(size_t) il].device;
+        if (d < m.n_gpu && (stages.empty() || stages.back() != d)) stages.push_back(d);
+    }
+    return stages;
+}
+
+/// Scheduler, events and staging for micro-batches of `u` rows over windows
+/// up to (n_kv_g, n_kv_s). Runs only while nothing is in flight.
+static bool pipe_ensure(model & m, int64_t u, int64_t n_kv_g, int64_t n_kv_s)
+{
+    pipeline_state & P = m.pipe;
+    if (!P.sched)
+    {
+        P.n_nodes = (size_t) m.hp.n_layer * 160 + 1024;
+        if (const long v = env_long("TS_MUSE_SPARK_NODES_PER_LAYER", 0); v > 0) P.n_nodes = (size_t) m.hp.n_layer * (size_t) v + 1024;
+        P.bufts.assign(m.sched_bufts, m.sched_bufts + m.n_sched_backends);
+        // Host-side tensors (gathered token rows) in pinned memory, as llama.cpp does.
+        if (m.n_gpu > 0)
+            if (ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(m.backends[0])))
+                P.bufts[(size_t) m.n_gpu] = host;
+        P.sched = ggml_backend_sched_new(m.sched_backends, P.bufts.data(), m.n_sched_backends, P.n_nodes, true, m.op_offload);
+        if (!P.sched) return false;
+        P.n_copies = std::max(1, ggml_backend_sched_get_n_copies(P.sched));
+        P.meta.resize(ggml_tensor_overhead() * P.n_nodes + ggml_graph_overhead_custom(P.n_nodes, false));
+        P.stages = pipe_stage_list(m);
+        P.n_staging = (int) P.stages.size() + 2;
+        P.done.assign(P.stages.size() * (size_t) P.n_copies, nullptr);
+        P.staged.assign(P.stages.size() * (size_t) P.n_staging, nullptr);
+        for (size_t i = 0; i < P.stages.size(); i++)
+        {
+            ggml_backend_dev_t dev = ggml_backend_get_device(m.backends[P.stages[i]]);
+            for (int c = 0; c < P.n_copies; c++) P.done[i * (size_t) P.n_copies + (size_t) c] = ggml_backend_event_new(dev);
+            for (int h = 0; h < P.n_staging; h++) P.staged[i * (size_t) P.n_staging + (size_t) h] = ggml_backend_event_new(dev);
+        }
+        P.busy.assign((size_t) P.n_staging, 0);
+    }
+    size_t a, b, c, d, e;
+    const size_t need = pipe_slot_layout(u, n_kv_g, n_kv_s, &a, &b, &c, &d, &e);
+    if (need > P.slot_bytes)
+    {
+        if (P.staging) { ggml_backend_buffer_free(P.staging); P.staging = nullptr; }
+        ggml_backend_buffer_type_t host = m.n_gpu > 0 ? ggml_backend_dev_host_buffer_type(ggml_backend_get_device(m.backends[0])) : nullptr;
+        ggml_backend_buffer_type_t bt = host ? host : ggml_backend_cpu_buffer_type();
+        // Doubling amortizes growth, but never past what the mask budget can need.
+        const size_t grown = std::max(need, std::min(P.slot_bytes * 2, PIPE_MASK_BUDGET + ((size_t) 1 << 20)));
+        P.staging = ggml_backend_buft_alloc_buffer(bt, grown * (size_t) P.n_staging);
+        // ggml-cuda falls back to pageable memory when pinning fails, and an
+        // async upload from pageable memory may wait for the stream.
+        if (!P.staging || (host && ggml_backend_buffer_get_type(P.staging) != host))
+        {
+            if (P.staging) { ggml_backend_buffer_free(P.staging); P.staging = nullptr; }
+            P.slot_bytes = 0;
+            return false;
+        }
+        P.slot_bytes = grown;
+        std::fill(P.busy.begin(), P.busy.end(), 0);
+    }
+    return true;
+}
+
+static void pipe_upload(ggml_backend_t be, ggml_tensor * t, const void * src, size_t bytes)
+{
+    if (live(t)) ggml_backend_tensor_set_async(be, t, src, 0, bytes);
+}
+
+/// Returns 1 when [0, *done) of the call ran pipelined and every requested
+/// output is in place (*done == n), -1 when it declined after *done tokens
+/// (the caller continues sequentially from there), 0 on failure.
+static int forward_pipelined(model & m, const int32_t * tokens, int64_t n, float * logits_out, int64_t * done)
+{
+    pipeline_state & P = m.pipe;
+    *done = 0;
+    slot & s = *m.active_slot;
+    const int64_t p0 = s.n_past;
+    pipe_shape sh;
+    switch (pipe_plan(m, p0, n, &sh))
+    {
+        case PIPE_OK: break;
+        case PIPE_MASKS:
+            pipe_warn(m, "masks of a context this long exceed the staging budget even in " +
+                      std::to_string(m.pipe.ubatch_fixed ? m.pipe.ubatch : PIPE_MASK_MIN_UBATCH) + "-row micro-batches");
+            return -1;
+        default: return -1;                       // too short to overlap, or past the context (the sequential path reports it)
+    }
+    const int64_t n_full = sh.n_full, u = sh.u, pad = sh.pad, p_last = sh.p_last;
+    std::vector<int32_t> padded;
+    if (pad > 0)
+    {
+        padded.assign(tokens, tokens + n);
+        padded.resize((size_t) (n + pad), tokens[n - 1]);
+        tokens = padded.data();
+    }
+
+    // The largest micro-batch is the last: its windows size the reservation and the staging.
+    const int64_t n_kv_g = sh.n_kv_g, s0 = sh.s0, n_kv_s = sh.n_kv_s;
+    if (P.fail_u && u >= P.fail_u && n_kv_g >= P.fail_kv_g && n_kv_s >= P.fail_kv_s)
+        return pipe_warn(m, "its compute buffers do not fit"), -1;
+    // K/V rows are reserved up front: growing them moves tensors that in-flight
+    // micro-batches still read.
+    if (!slot_reserve_rows(m, s, plan_n_kv_g(m, std::max(p0 + n, p_last), m.kv_pad)))
+        return pipe_warn(m, "no device memory to reserve this call's K/V rows up front"), -1;
+    if (!pipe_ensure(m, u, n_kv_g, n_kv_s)) { pipe_warn(m, "no pinned host memory for its input staging"); return -1; }
+
+    size_t off_kv, off_kv_s, off_out, off_mg, off_ms;
+    pipe_slot_layout(u, n_kv_g, n_kv_s, &off_kv, &off_kv_s, &off_out, &off_mg, &off_ms);
+    uint8_t * stage_base = (uint8_t *) ggml_backend_buffer_get_base(P.staging);
+    const int C = P.n_copies;
+    const size_t S = P.stages.size();
+    const auto t_start = std::chrono::steady_clock::now();
+    double enqueue_ms = 0.0;
+
+    std::unique_ptr<graph_entry> g;
+    auto new_graph = [&](int64_t pj, int64_t kv_g, int64_t ss0, int64_t kv_s) -> bool
+    {
+        if (g) { g->ctx = (ggml_free(g->ctx), nullptr); }
+        g.reset(new graph_entry());
+        g->owns_sched = false;
+        g->kind = 0; g->slot_id = s.id; g->nt = u; g->p0 = pj; g->n_kv_g = kv_g; g->s0 = ss0; g->n_kv_s = kv_s;
+        g->want_logits = true; g->n_out = 1; g->n_ovr = 0;
+        ggml_init_params gp = { P.meta.size(), P.meta.data(), true };
+        g->ctx = ggml_init(gp);
+        if (!g->ctx) return false;
+        g->gf = ggml_new_graph_custom(g->ctx, P.n_nodes, false);
+        g->sched = P.sched;
+        ggml_backend_sched_reset(P.sched);
+        builder b(m, *g);
+        b.build_single(s);
+        return true;
+    };
+    // Smaller windows later in the call (and in later calls) fit the reserved
+    // layout as long as the topology is the same: ggml reallocates (draining
+    // every GPU and moving the input copies) when the node count differs.
+    bool reserve = u > P.res_u || n_kv_g > P.res_kv_g || n_kv_s > P.res_kv_s;
+    if (!reserve)
+    {
+        int64_t s0_first = 0, kv_s_first = 0;
+        plan_swa(m, p0, p0 + u, m.kv_pad, &s0_first, &kv_s_first);
+        if (!new_graph(p0, plan_n_kv_g(m, p0 + u, m.kv_pad), s0_first, kv_s_first)) return 0;
+        reserve = ggml_graph_n_nodes(g->gf) != P.res_nodes;
+    }
+    if (reserve)
+    {
+        if (!new_graph(p_last - u, n_kv_g, s0, n_kv_s) || !ggml_backend_sched_reserve(P.sched, g->gf))
+        {
+            // A failed reserve may have regrown some GPUs' buffers already: give
+            // them back to the sequential path, and do not retry this shape.
+            P.release();
+            P.fail_u = u; P.fail_kv_g = n_kv_g; P.fail_kv_s = n_kv_s;
+            pipe_warn(m, "its compute buffers do not fit");
+            return -1;
+        }
+        P.res_u = u; P.res_kv_g = n_kv_g; P.res_kv_s = n_kv_s;
+        P.res_nodes = ggml_graph_n_nodes(g->gf);
+    }
+
+    // Copy slots rotate from 0 after a synchronize of an unallocated scheduler.
+    ggml_backend_sched_reset(P.sched);
+    ggml_backend_sched_synchronize(P.sched);
+
+    std::vector<const void *> first_pos_addr((size_t) C, nullptr);
+    std::vector<uint16_t> mask;
+    bool in_flight = false;
+    // Host time per phase (TS_MUSE_SPARK_EXEC_DEBUG): where an enqueue that is
+    // not much shorter than the call itself is spent.
+    double ms_wait = 0, ms_build = 0, ms_inputs = 0, ms_submit = 0;
+    auto lap = [](std::chrono::steady_clock::time_point & t) {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - t).count();
+        t = now;
+        return ms;
+    };
+    for (int64_t j = 0; j < n_full; j++)
+    {
+        const auto t_j = std::chrono::steady_clock::now();
+        const int64_t pj = p0 + j * u;
+        const int c = (int) (j % C);
+        const int h = (int) (j % P.n_staging);
+        uint8_t * slot_mem = stage_base + (size_t) h * P.slot_bytes;
+        auto t_phase = t_j;
+        // The uploads that last read this staging slot must have run.
+        if (P.busy[(size_t) h])
+            for (size_t i = 0; i < S; i++)
+                if (ggml_backend_event_t ev = P.staged[i * (size_t) P.n_staging + (size_t) h]) ggml_backend_event_synchronize(ev);
+        ms_wait += lap(t_phase);
+
+        // ---- graph -----------------------------------------------------------
+        const int64_t kv_g_j = plan_n_kv_g(m, pj + u, m.kv_pad);
+        int64_t s0_j = 0, kv_s_j = 0;
+        plan_swa(m, pj, pj + u, m.kv_pad, &s0_j, &kv_s_j);
+        if (!new_graph(pj, kv_g_j, s0_j, kv_s_j)) { if (in_flight) ggml_backend_sched_synchronize(P.sched); return 0; }
+        if (!ggml_backend_sched_alloc_graph(P.sched, g->gf))
+        {
+            // ggml may have freed buffers it then failed to regrow: rebuild on the next call.
+            if (in_flight) { ggml_backend_sched_synchronize(P.sched); }
+            P.release();
+            if (j == 0) { pipe_warn(m, "its compute buffers do not fit"); return -1; }
+            fprintf(stderr, "[muse-spark] pipelined prefill: graph allocation failed after %" PRId64 " micro-batches\n", j);
+            return 0;
+        }
+        // ggml must hand out the copy slots in order; anything else would let
+        // a micro-batch overwrite inputs another one still reads. The probe is
+        // the first stage-0 input the graph reads (a stage of only global layers
+        // never reads positions, one of only sliding layers never reads kv_idx;
+        // an input no node reads has no copies and no memory).
+        if (!P.stages.empty() && C > 1)
+        {
+            const int d0 = P.stages[0];
+            const ggml_tensor * probe = nullptr;
+            for (const ggml_tensor * t : { g->inp.pos[d0], g->inp.kv_idx[d0], g->inp.kv_idx_s[d0], g->inp.mask_g[d0], g->inp.mask_s[d0] })
+                if (live(t)) { probe = t; break; }
+            const void * a = probe ? probe->data : nullptr;
+            const bool repeats = a && j >= C && a != first_pos_addr[(size_t) c];
+            const bool collides = a && j >= 1 && a == first_pos_addr[(size_t) ((c + C - 1) % C)];
+            if (j < C) first_pos_addr[(size_t) c] = a;
+            if (repeats || collides)
+            {
+                if (in_flight) ggml_backend_sched_synchronize(P.sched);
+                P.enabled = false;
+                P.release();
+                fprintf(stderr, "[muse-spark] pipelined prefill disabled: ggml did not rotate its input copies as expected; "
+                        "prompts now prefill one %d-row micro-batch at a time\n", m.n_ubatch);
+                *done = j * u;
+                s.n_past = pj;
+                return -1;
+            }
+        }
+
+        ms_build += lap(t_phase);
+        // ---- inputs ------------------------------------------------------------
+        int32_t * pos = (int32_t *) slot_mem;
+        int64_t * kv = (int64_t *) (slot_mem + off_kv);
+        int64_t * kv_s = (int64_t *) (slot_mem + off_kv_s);
+        int32_t * out_id = (int32_t *) (slot_mem + off_out);
+        uint16_t * mg = (uint16_t *) (slot_mem + off_mg);
+        uint16_t * ms = (uint16_t *) (slot_mem + off_ms);
+        for (int64_t i = 0; i < u; i++)
+        {
+            pos[i] = (int32_t) (pj + i);
+            kv[i] = pj + i;
+            kv_s[i] = (pj + i) % m.swa_ring;
+        }
+        *out_id = (int32_t) (u - 1 - (j + 1 == n_full ? pad : 0));   // the last real token
+        // Rows are labeled before the mask is built: this micro-batch writes
+        // them before any of its attention reads them.
+        swa_write(m, s, pj, u);
+        bool need_g = false, need_s = false;
+        for (int d = 0; d <= m.n_gpu; d++) { need_g |= live(g->inp.mask_g[d]); need_s |= live(g->inp.mask_s[d]); }
+        if (need_g)
+        {
+            fill_mask(mask, 0, kv_g_j, pj, u, 0);
+            memcpy(mg, mask.data(), mask.size() * sizeof(uint16_t));
+        }
+        if (need_s)
+        {
+            fill_swa_mask(m, s, mask, kv_s_j, pj, u);
+            memcpy(ms, mask.data(), mask.size() * sizeof(uint16_t));
+        }
+        set_i32(g->inp.tokens, tokens + j * u, (size_t) u);   // host buffer: a plain copy
+        for (int d = 0; d <= m.n_gpu; d++)
+        {
+            ggml_backend_t be = m.backends[d];
+            pipe_upload(be, g->inp.pos[d], pos, (size_t) u * sizeof(int32_t));
+            pipe_upload(be, g->inp.kv_idx[d], kv, (size_t) u * sizeof(int64_t));
+            pipe_upload(be, g->inp.kv_idx_s[d], kv_s, (size_t) u * sizeof(int64_t));
+            pipe_upload(be, g->inp.mask_g[d], mg, (size_t) (kv_g_j * u) * sizeof(uint16_t));
+            pipe_upload(be, g->inp.mask_s[d], ms, (size_t) (kv_s_j * u) * sizeof(uint16_t));
+        }
+        if (live(g->inp.out_ids))
+        {
+            ggml_backend_t be = ggml_backend_sched_get_tensor_backend(P.sched, g->inp.out_ids);
+            if (be) pipe_upload(be, g->inp.out_ids, out_id, sizeof(int32_t));
+            else set_i32(g->inp.out_ids, out_id, 1);
+        }
+        for (size_t i = 0; i < S; i++)
+            if (ggml_backend_event_t ev = P.staged[i * (size_t) P.n_staging + (size_t) h])
+                ggml_backend_event_record(ev, m.backends[P.stages[i]]);
+        P.busy[(size_t) h] = 1;
+
+        ms_inputs += lap(t_phase);
+        // ---- ordering guards and submission ----------------------------------
+        if (j >= C)
+            for (size_t i = 0; i + 1 < S; i++)
+                if (ggml_backend_event_t ev = P.done[(i + 1) * (size_t) C + (size_t) c])
+                    ggml_backend_event_wait(m.backends[P.stages[i]], ev);
+        if (ggml_backend_sched_graph_compute_async(P.sched, g->gf) != GGML_STATUS_SUCCESS)
+        {
+            ggml_backend_sched_synchronize(P.sched);
+            fprintf(stderr, "[muse-spark] pipelined prefill: graph compute failed\n");
+            return 0;
+        }
+        in_flight = true;
+        for (size_t i = 0; i < S; i++)
+            if (ggml_backend_event_t ev = P.done[i * (size_t) C + (size_t) c])
+                ggml_backend_event_record(ev, m.backends[P.stages[i]]);
+        ms_submit += lap(t_phase);
+        s.n_past = pj + u;
+        P.n_ubatches++;
+        enqueue_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_j).count();
+    }
+
+    ggml_backend_sched_synchronize(P.sched);
+    std::fill(P.busy.begin(), P.busy.end(), 0);
+    if (pad > 0)
+    {
+        // The padding is not part of the sequence.
+        for (int64_t p = p0 + n; p < p_last; p++)
+            if (s.swa_lab[(size_t) (p % m.swa_ring)] == p) s.swa_lab[(size_t) (p % m.swa_ring)] = -1;
+        s.n_past = p0 + n;
+    }
+    *done = std::min<int64_t>(n, n_full * u);
+    if (*done == n && logits_out && g->logits)
+        ggml_backend_tensor_get(g->logits, logits_out, 0, (size_t) m.hp.n_vocab * sizeof(float));
+    P.n_calls++;
+    if (debug_on())
+        fprintf(stderr, "[muse-spark] pipelined prefill: %" PRId64 " x %" PRId64 " rows (+%" PRId64 " padding) over %zu stages, "
+                "enqueue %.0f ms (staging wait %.0f, graph %.0f, inputs %.0f, submit %.0f), total %.0f ms (%.0f tok/s)\n",
+                n_full, u, pad, S, enqueue_ms, ms_wait, ms_build, ms_inputs, ms_submit,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count(),
+                (double) *done / std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+    return *done == n ? 1 : -1;
+}
+
 /// Evaluate `n` tokens on the active slot in ubatches. Logits of the last
 /// token (or every row when all_rows) land in logits_out.
 static bool forward(model & m, const int32_t * tokens, int64_t n, float * logits_out, bool all_rows)
 {
     if (!m.active_slot || n <= 0) return false;
+    int64_t off = 0;
+    if (m.pipe.enabled && !all_rows && n >= 2 && !m.embd_ovr.empty())
+        pipe_warn(m, "image rows replace token embeddings inside pipelined micro-batches");
+    if (m.pipe.enabled && !all_rows && m.embd_ovr.empty() && n >= 2)
+    {
+        const int rc = forward_pipelined(m, tokens, n, logits_out, &off);
+        if (rc == 0) { m.embd_ovr.clear(); return false; }
+        if (rc > 0) { m.embd_ovr.clear(); return true; }
+        // declined after `off` tokens: the rest runs one micro-batch at a time
+    }
     // vision overrides relative to this call's token array
     std::vector<float> rows;
     std::vector<int64_t> idx;
     int64_t ubatch = m.n_ubatch;
-    for (int64_t off = 0; off < n;)
+    int halvings = 0;
+    for (; off < n;)
     {
         const int64_t cnt = std::min<int64_t>(ubatch, n - off);
         rows.clear(); idx.clear();
@@ -1932,7 +2566,9 @@ static bool forward(model & m, const int32_t * tokens, int64_t n, float * logits
             // the same tokens in halves for the rest of this call. The next
             // call starts at the full ubatch again, since memory is shared with
             // slots that come and go.
-            if (m.alloc_failed && cnt > 64)
+            // Under --tp every failed build leaves views of the static tensors
+            // behind that ggml's meta backend can only hold so many of.
+            if (m.alloc_failed && cnt > 64 && (m.tp.n <= 1 || ++halvings <= 3))
             {
                 ubatch = std::max<int64_t>(64, cnt / 2);
                 fprintf(stderr, "[muse-spark] a %" PRId64 "-token graph does not fit; continuing with %" PRId64 "-token ubatches\n",
@@ -2053,24 +2689,116 @@ static bool is_expert_name(const char * name)
     return strstr(name, "_exps.") != nullptr;
 }
 
+/// Tensor parallelism over `tp` CUDA GPUs: one ggml meta backend (the
+/// mechanism behind llama.cpp's -sm tensor) whose split-state callback is
+/// tsg_mspark_tp's plan, filled in once the metadata is read. Returns the
+/// backend, or null after reporting the refusal.
+static ggml_backend_t tp_open(model & m, int tp, const char * backend_name, const char * layer_split, int n_cpu_moe_req)
+{
+    // What tensor parallelism cannot run, refused before any GPU is touched.
+    const char * why = nullptr;
+    char buf[256];
+    if (!backend_name || strcmp(backend_name, "CUDA") != 0)
+        why = "tensor parallelism (--tp) runs on CUDA GPUs only; use --layer-split N on this backend";
+    else if (tp > MAX_GPUS)
+        why = (snprintf(buf, sizeof(buf), "%d GPUs requested; tensor parallelism spans at most %d", tp, MAX_GPUS), buf);
+    else if (layer_split && *layer_split)
+        why = "--tp cannot be combined with TS_MUSE_SPARK_LAYER_SPLIT (a layer split); use one or the other";
+    else if (n_cpu_moe_req > 0)
+        why = "--tp keeps every expert in GPU memory; --n-cpu-moe needs --layer-split";
+    else if (opt_get("TS_MUSE_SPARK_PIPELINE") == "1")
+        why = "TS_MUSE_SPARK_PIPELINE=1 cannot run under --tp (it pipelines a layer split's GPUs)";
+    else if (env_long("TS_MUSE_SPARK_PROFILE", 0) > 0)
+        why = "TS_MUSE_SPARK_PROFILE reads graph slices between --tp's reductions, which would profile wrong values";
+    else if (env_long("TS_MUSE_SPARK_GRAPH_CACHE", 0) > 1)
+        why = "TS_MUSE_SPARK_GRAPH_CACHE above 1 cannot run under --tp (its backend keeps one graph's GPU views)";
+    else if (opt_get("TS_MUSE_SPARK_FUSE_QKVG") == "1")
+        why = "TS_MUSE_SPARK_FUSE_QKVG=1 cannot run under --tp (each GPU holds a slice of q, k, v and gate separately)";
+    else if (opt_get("TS_MUSE_SPARK_CPU_REPACK") == "1")
+        why = "TS_MUSE_SPARK_CPU_REPACK=1 repacks host experts, which --tp does not use";
+    if (why) { tsg::report_load_refusal("[muse-spark] %s\n", why); return nullptr; }
+
+    // The first `tp` CUDA GPUs in index order (CUDA_VISIBLE_DEVICES selects
+    // them), opened only through the meta device so each gets one stream.
+    int n = 0;
+    std::vector<int> cuda_index;
+    int cuda_seen = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count() && n < tp; i++)
+    {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        const enum ggml_backend_dev_type dt = ggml_backend_dev_type(dev);
+        if (!reg_name || strcmp(reg_name, "CUDA") != 0) continue;
+        if (dt != GGML_BACKEND_DEVICE_TYPE_GPU && dt != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        m.tp.devs[n++] = dev;
+        cuda_index.push_back(cuda_seen++);
+    }
+    if (n < tp)
+    {
+        tsg::report_load_refusal("[muse-spark] --tp %d needs %d CUDA GPUs; %d are visible\n", tp, tp, n);
+        return nullptr;
+    }
+    // Every GPU routes the experts itself from mirrored weights: unlike GPUs
+    // could pick differently and sum mismatched partials without an error.
+    for (int j = 1; j < n; j++)
+        if (strcmp(ggml_backend_dev_description(m.tp.devs[j]), ggml_backend_dev_description(m.tp.devs[0])) != 0)
+        {
+            tsg::report_load_refusal("[muse-spark] --tp needs identical GPUs; GPU %d is %s and GPU 0 is %s\n", j,
+                                     ggml_backend_dev_description(m.tp.devs[j]), ggml_backend_dev_description(m.tp.devs[0]));
+            return nullptr;
+        }
+#if defined(TSG_GGML_USE_CUDA)
+    // Before the meta backend creates its communicator.
+    tsg::tp_cuda_prepare_collective(cuda_index.data(), n);
+#endif
+    m.tp.n = n;
+    m.tp.ud.reset(new tsg_mspark_tp::userdata());
+    static std::mutex meta_mu;   // ggml's meta device cache is not thread-safe
+    std::lock_guard<std::mutex> lk(meta_mu);
+    m.tp.meta_dev = ggml_backend_meta_device(m.tp.devs, (size_t) n, tsg_mspark_tp::split_state_cb, m.tp.ud.get());
+    ggml_backend_t be = m.tp.meta_dev ? ggml_backend_dev_init(m.tp.meta_dev, nullptr) : nullptr;
+    if (!be) tsg::report_load_refusal("[muse-spark] creating the tensor-parallel backend over %d GPUs failed\n", n);
+    return be;
+}
+
 static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch, int n_threads,
-                    int n_cpu_moe_req, const char * backend_name, bool ctx_is_hard_limit, const char * layer_split)
+                    int n_cpu_moe_req, const char * backend_name, bool ctx_is_hard_limit, const char * layer_split, int tp)
 {
     const auto t_start = std::chrono::steady_clock::now();
     std::unique_ptr<model> m(new model());
 
     // --- backends ---------------------------------------------------------
     const bool cpu_only = backend_name && strcmp(backend_name, "CPU") == 0;
+    if (!cpu_only && n_gpu_req > MAX_GPUS && tp <= 1)
+    {
+        tsg::report_load_refusal("[muse-spark] %d GPUs requested; the native executor spans at most %d\n", n_gpu_req, MAX_GPUS);
+        return nullptr;
+    }
     int n_gpu = 0;
+    if (tp > 1)
+    {
+        ggml_backend_t be = tp_open(*m, tp, backend_name, layer_split, n_cpu_moe_req);
+        if (!be) return nullptr;
+        m->backends[n_gpu++] = be;
+        n_gpu_req = 1;
+        if (n_cpu_moe_req < 0) n_cpu_moe_req = 0;   // automatic: every expert in GPU memory
+    }
     for (int pass = 0; pass < 2 && n_gpu == 0 && !cpu_only; pass++)
     {
         const char * want = pass == 0 ? backend_name : nullptr;
         for (size_t i = 0; i < ggml_backend_dev_count() && n_gpu < MAX_GPUS; i++)
         {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-            if (!backend_matches(reg ? ggml_backend_reg_name(reg) : nullptr, want)) continue;
+            const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+            // ggml-cuda IGPUs count too, as in tsg::enumerate_gpu_devices: some
+            // virtualized hosts report a discrete card as integrated. Other
+            // registries keep integrated GPUs out of a model this size.
+            const enum ggml_backend_dev_type dt = ggml_backend_dev_type(dev);
+            const bool cuda_reg = reg_name && strcmp(reg_name, "CUDA") == 0;
+            if (dt != GGML_BACKEND_DEVICE_TYPE_GPU && !(cuda_reg && dt == GGML_BACKEND_DEVICE_TYPE_IGPU)) continue;
+            if (!backend_matches(reg_name, want)) continue;
             if (n_gpu_req > 0 && n_gpu >= n_gpu_req) break;
             ggml_backend_t be = ggml_backend_dev_init(dev, nullptr);
             if (!be) continue;
@@ -2101,7 +2829,22 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
         m->sched_bufts[i] = ggml_backend_get_default_buffer_type(m->backends[i]);
     }
     m->n_sched_backends = n_gpu + 1;
+    // Host tensors that cross into the meta backend (the gathered token rows)
+    // are copied to every GPU synchronously: from pinned memory, as llama.cpp.
+    if (m->tp.n > 1)
+        if (ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(m->tp.meta_dev))
+            m->sched_bufts[n_gpu] = host;
+    if (!cpu_only && n_gpu_req > 0 && n_gpu < n_gpu_req)
+    {
+        // The layers would silently crowd onto fewer GPUs than asked for.
+        tsg::report_load_refusal("[muse-spark] %d GPU(s) requested but only %d usable %s device(s) found\n",
+                                 n_gpu_req, n_gpu, backend_name ? backend_name : "GPU");
+        return nullptr;
+    }
     if (const long v = env_long("TS_MUSE_SPARK_GRAPH_CACHE", 0); v > 0) m->graph_cache_cap = (int) v;
+    // The meta backend keeps per-GPU views only for the graph it ran last, so
+    // under --tp an older cached graph could not run again.
+    if (m->tp.n > 1) m->graph_cache_cap = 1;
 
     // --- metadata ---------------------------------------------------------
     int32_t split_count = 1;
@@ -2216,16 +2959,19 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
     m->kv_pad = std::max(1L, env_long("TS_MUSE_SPARK_KV_PAD", (long) KV_PAD_DEFAULT));
     m->n_ctx = (int32_t) pad_to(m->n_ctx, m->kv_pad);
     m->n_ubatch = n_ubatch > 0 ? n_ubatch : 512;
+    // Like llama.cpp's iSWA cache, a sliding layer keeps its window plus a
+    // ubatch; the extra margin bounds how far a slot can be rewound exactly
+    // (prefix reuse, speculative rollback). TS_MUSE_SPARK_SWA_FULL keeps
+    // every position instead.
+    const long swa_margin = std::max(0L, env_long("TS_MUSE_SPARK_SWA_REWIND", 512));
+    const bool swa_full = env_flag("TS_MUSE_SPARK_SWA_FULL", false);
+    auto size_swa_ring = [&]
     {
-        // Like llama.cpp's iSWA cache, a sliding layer keeps its window plus a
-        // ubatch; the extra margin bounds how far a slot can be rewound exactly
-        // (prefix reuse, speculative rollback). TS_MUSE_SPARK_SWA_FULL keeps
-        // every position instead.
-        const long margin = std::max(0L, env_long("TS_MUSE_SPARK_SWA_REWIND", 512));
-        int64_t ring = pad_to((int64_t) hp.n_swa + m->n_ubatch + MAX_BATCHED_DECODE + margin, m->kv_pad);
-        if (env_flag("TS_MUSE_SPARK_SWA_FULL", false) || ring > m->n_ctx) ring = m->n_ctx;
+        int64_t ring = pad_to((int64_t) hp.n_swa + m->n_ubatch + MAX_BATCHED_DECODE + swa_margin, m->kv_pad);
+        if (swa_full || ring > m->n_ctx) ring = m->n_ctx;
         m->swa_ring = (int32_t) ring;
-    }
+    };
+    size_swa_ring();
     m->layers.resize((size_t) hp.n_layer);
     for (int il = 0; il < hp.n_layer; il++) m->layers[(size_t) il].swa = hp.is_swa[(size_t) il] != 0;
 
@@ -2234,13 +2980,129 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
     // Every slot keeps a full ring on each sliding layer; global rows grow with
     // each sequence, so the plan reserves TS_MUSE_SPARK_PLAN_CTX_TOKENS of them
     // in total (one full context by default, like llama.cpp's unified KV).
-    const size_t plan_ctx_tokens = (size_t) std::max(1L, env_long("TS_MUSE_SPARK_PLAN_CTX_TOKENS", m->n_ctx));
+    const long plan_ctx_env = env_long("TS_MUSE_SPARK_PLAN_CTX_TOKENS", 0);
+    const bool plan_ctx_explicit = plan_ctx_env > 0;
+    if (!plan_ctx_explicit && !opt_get("TS_MUSE_SPARK_PLAN_CTX_TOKENS").empty())
+        fprintf(stderr, "[muse-spark] TS_MUSE_SPARK_PLAN_CTX_TOKENS=%s is not a positive token count; the plan "
+                "reserves global K/V rows for the whole context instead\n", opt_get("TS_MUSE_SPARK_PLAN_CTX_TOKENS").c_str());
+    size_t plan_ctx_tokens = plan_ctx_explicit ? (size_t) plan_ctx_env : (size_t) m->n_ctx;
+    // Re-size everything the context sizes (the placement plan reads these).
+    auto set_ctx = [&](int32_t ctx)
+    {
+        m->n_ctx = ctx;
+        size_swa_ring();
+        if (!plan_ctx_explicit) plan_ctx_tokens = (size_t) ctx;
+    };
     auto kv_layer_bytes_of = [&](int il) -> size_t
     {
         return hp.is_swa[(size_t) il] ? kv_bytes_per_token_layer(hp) * (size_t) m->swa_ring * plan_slots
                                       : kv_bytes_per_token_layer(hp) * plan_ctx_tokens;
     };
+    // --- tensor parallelism: the split plan, and what each GPU must hold ---
+    if (m->tp.n > 1)
+    {
+        tsg_mspark_tp::shape ts;
+        ts.n_layer = hp.n_layer; ts.n_head = hp.n_head; ts.n_head_kv = hp.n_head_kv; ts.head_dim = hp.head_dim;
+        ts.n_ff_exp = hp.n_ff_exp; ts.n_vocab = hp.n_vocab;
+        ts.is_swa.assign(hp.is_swa.begin(), hp.is_swa.begin() + hp.n_layer);
+        // Quantizations may differ per layer: the largest block bounds every share.
+        for (int il = 0; il < hp.n_layer; il++)
+        {
+            char nm[96];
+            snprintf(nm, sizeof(nm), "blk.%d.attn_output.weight", il);
+            if (const tensor_source * t = src_of(nm); t && ggml_blck_size(t->type) > ggml_blck_size(ts.wo_type)) ts.wo_type = t->type;
+            snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
+            if (const tensor_source * t = src_of(nm); t && ggml_blck_size(t->type) > ggml_blck_size(ts.down_type)) ts.down_type = t->type;
+        }
+        std::string err;
+        if (!tsg_mspark_tp::make_plan(ts, m->tp.n, &m->tp.ud->p, &err))
+        {
+            tsg::report_load_refusal("[muse-spark] %s\n", err.c_str());
+            return nullptr;
+        }
+        m->tp.ud->s = ts;
+        const tsg_mspark_tp::userdata & ud = *m->tp.ud;
+        const int n = m->tp.n;
+        // Weights per GPU: its slices of the split tensors and a whole copy of
+        // the rest. The token table stays in the host mapping.
+        std::vector<size_t> w_dev((size_t) n, 0), free_dev((size_t) n, 0);
+        for (const auto & kv : sources)
+        {
+            if (kv.first == "token_embd.weight") continue;
+            for (int j = 0; j < n; j++)
+                w_dev[(size_t) j] += tsg_mspark_tp::device_bytes(ud, kv.first.c_str(), kv.second.type, kv.second.ne, j) + 4096;
+        }
+        for (int j = 0; j < n; j++)
+        {
+            size_t f = 0, t = 0;
+            ggml_backend_dev_memory(m->tp.devs[j], &f, &t);
+            free_dev[(size_t) j] = f;
+        }
+        // Compute buffers are the whole graph's on every GPU, plus the reduction
+        // scratch ggml's meta backend keeps (ceil(log2 n) MoE partials of a ubatch).
+        int steps = 0;
+        while ((1 << steps) < n) steps++;
+        const size_t reduce = (size_t) steps * (size_t) hp.latent * (size_t) hp.n_expert_used * (size_t) m->n_ubatch * sizeof(float);
+        const size_t reserve = (size_t) env_long("TS_MUSE_SPARK_VRAM_RESERVE_MB", 2048 + m->n_ubatch / 4) * 1024 * 1024 + reduce;
+        // GPU 0 also holds the managed side's vision encoder.
+        const size_t dev0_extra = (size_t) env_long("TS_MUSE_SPARK_DEV0_RESERVE_MB", 0) * 1024 * 1024;
+        auto kv_dev = [&](int j) -> size_t
+        {
+            size_t b = 0;
+            for (int il = 0; il < hp.n_layer; il++)
+            {
+                const size_t rows = hp.is_swa[(size_t) il] ? (size_t) m->swa_ring * plan_slots : plan_ctx_tokens;
+                b += rows * 2 * (size_t) (ud.p.groups[(size_t) il][(size_t) j] * hp.head_dim) * sizeof(uint16_t);
+            }
+            return b;
+        };
+        auto misfit = [&]() -> int
+        {
+            for (int j = 0; j < n; j++)
+                if (w_dev[(size_t) j] + kv_dev(j) + reserve + (j == 0 ? dev0_extra : 0) > free_dev[(size_t) j]) return j;
+            return -1;
+        };
+        const int64_t min_ctx = pad_to(4096, m->kv_pad);
+        const int32_t advertised = m->n_ctx;
+        if (misfit() >= 0 && !ctx_is_hard_limit && !plan_ctx_explicit && m->n_ctx > min_ctx)
+        {
+            set_ctx((int32_t) min_ctx);
+            if (misfit() < 0)
+            {
+                int64_t lo = min_ctx / m->kv_pad, hi = advertised / m->kv_pad;   // lo fits, hi does not
+                while (hi - lo > 1)
+                {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    set_ctx((int32_t) (mid * m->kv_pad));
+                    if (misfit() < 0) lo = mid; else hi = mid;
+                }
+                set_ctx((int32_t) (lo * m->kv_pad));
+                fprintf(stderr, "[muse-spark] context capped to %d tokens (the GGUF advertises %d) so each GPU's share of the "
+                        "weights and the KV plan fit; set MAX_CONTEXT to choose a size\n", m->n_ctx, advertised);
+            }
+        }
+        if (const int j = misfit(); j >= 0)
+        {
+            tsg::report_load_refusal("[muse-spark] tensor parallel: GPU %d needs %.1f GiB (weights %.1f, K/V %.1f, compute and "
+                                     "reductions %.1f) at a %d-token context but has %.1f GiB free; set a smaller MAX_CONTEXT, "
+                                     "TS_MUSE_SPARK_PLAN_SLOTS or TS_MUSE_SPARK_UBATCH, or use more GPUs\n", j,
+                                     (w_dev[(size_t) j] + kv_dev(j) + reserve + (j == 0 ? dev0_extra : 0)) / 1073741824.0,
+                                     w_dev[(size_t) j] / 1073741824.0, kv_dev(j) / 1073741824.0,
+                                     (reserve + (j == 0 ? dev0_extra : 0)) / 1073741824.0, m->n_ctx, free_dev[(size_t) j] / 1073741824.0);
+            return nullptr;
+        }
+        for (int j = 0; j < n; j++)
+            fprintf(stderr, "[muse-spark] tensor parallel GPU %d: %.1f GiB weights + %.1f GiB K/V of %.1f GiB free\n", j,
+                    w_dev[(size_t) j] / 1073741824.0, kv_dev(j) / 1073741824.0, free_dev[(size_t) j] / 1073741824.0);
+    }
+
     std::vector<size_t> dev_budget((size_t) std::max(n_gpu, 1), 0);
+    if (m->tp.n > 1)
+    {
+        // Checked per GPU above: the layer placement sees one unbounded device.
+        dev_budget[0] = SIZE_MAX / 4;
+    }
+    else
     {
         // Compute buffers grow with the ubatch (~0.95 GiB per GPU at 2048 rows), and
         // ggml-cuda keeps its scratch pool at the largest size any kernel needed.
@@ -2273,7 +3135,9 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
     };
     // Host expert bytes when device d holds layers [a, b); -1 if even the
     // dense parts do not fit (or, without `extra`, if the unforced stacks do not).
-    auto range_cost = [&](int d, int a, int b, bool extra, std::vector<uint8_t> * mark) -> int64_t
+    // `gpu_used` receives the bytes the range keeps on the device.
+    auto range_cost = [&](int d, int a, int b, bool extra, std::vector<uint8_t> * mark,
+                          size_t * gpu_used = nullptr) -> int64_t
     {
         const size_t cap = dev_budget[(size_t) d];
         size_t used = 0;
@@ -2292,7 +3156,11 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
                 buckets[bytes].push_back(il * 3 + k);
                 free_total += bytes;
             }
-        if (free_total <= left) return host;
+        if (free_total <= left)
+        {
+            if (gpu_used) *gpu_used = used + free_total;
+            return host;
+        }
         if (!extra) return -1;
         // Best fill of `left`: enumerate how many of the largest stacks go to
         // the GPU, then fill greedily with the smaller sizes (exact for two sizes).
@@ -2312,6 +3180,7 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
             if (g > best_gpu) { best_gpu = g; best_first = c0; }
         }
         host += (int64_t) (free_total - best_gpu);
+        if (gpu_used) *gpu_used = used + best_gpu;
         if (mark)
         {
             size_t g = (size_t) best_first * bs[0].first;
@@ -2327,10 +3196,16 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
         }
         return host;
     };
+    // Among plans with the fewest host bytes, prefer the one whose GPUs are
+    // filled most evenly (smallest sum of squared fill fractions). Without it a
+    // plan that fits on fewer GPUs left the leading ones empty and packed the
+    // rest to their budgets, so their spare memory for K/V growth went unused.
+    // Both terms are sums over GPUs, so the lexicographic DP stays exact.
     auto place = [&](bool extra) -> int64_t
     {
         const int64_t INF = INT64_MAX / 4;
         std::vector<std::vector<int64_t>> best((size_t) n_gpu + 1, std::vector<int64_t>((size_t) L + 1, INF));
+        std::vector<std::vector<double>> spread((size_t) n_gpu + 1, std::vector<double>((size_t) L + 1, 0.0));
         std::vector<std::vector<int>> from((size_t) n_gpu + 1, std::vector<int>((size_t) L + 1, -1));
         best[0][0] = 0;
         for (int d = 0; d < n_gpu; d++)
@@ -2339,11 +3214,18 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
                 if (best[(size_t) d][(size_t) a] >= INF) continue;
                 for (int b = a; b <= L; b++)
                 {
-                    const int64_t c = b == a ? 0 : range_cost(d, a, b, extra, nullptr);
+                    size_t used = 0;
+                    const int64_t c = b == a ? 0 : range_cost(d, a, b, extra, nullptr, &used);
                     if (c < 0) break;   // longer ranges only need more room
-                    if (best[(size_t) d][(size_t) a] + c < best[(size_t) d + 1][(size_t) b])
+                    const double fill = dev_budget[(size_t) d] > 0 ? (double) used / (double) dev_budget[(size_t) d] : 0.0;
+                    const int64_t host = best[(size_t) d][(size_t) a] + c;
+                    const double sq = spread[(size_t) d][(size_t) a] + fill * fill;
+                    int64_t & bh = best[(size_t) d + 1][(size_t) b];
+                    double & bs = spread[(size_t) d + 1][(size_t) b];
+                    if (host < bh || (host == bh && sq < bs - 1e-12))
                     {
-                        best[(size_t) d + 1][(size_t) b] = best[(size_t) d][(size_t) a] + c;
+                        bh = host;
+                        bs = sq;
                         from[(size_t) d + 1][(size_t) b] = a;
                     }
                 }
@@ -2367,43 +3249,98 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
     }
     else
     {
+        // Explicit layers per GPU (TS_MUSE_SPARK_LAYER_SPLIT); empty = automatic.
+        std::vector<int> counts;
         if (layer_split && *layer_split)
         {
-            // explicit counts per GPU
-            std::vector<int> counts;
-            const char * p = layer_split;
-            while (*p)
-            {
-                counts.push_back(atoi(p));
-                while (*p && *p != ',') p++;
-                if (*p == ',') p++;
-            }
             int sum = 0;
-            for (int c : counts) sum += c;
+            for (const char * p = layer_split; *p;)
+            {
+                char * end = nullptr;
+                const long v = strtol(p, &end, 10);
+                if (end == p || (*end != ',' && *end != '\0') || v < 0 || v > (long) (L - sum))
+                {
+                    tsg::report_load_refusal("[muse-spark] layer split '%s' must list non-negative layer counts "
+                                             "summing to %d\n", layer_split, L);
+                    return nullptr;
+                }
+                counts.push_back((int) v);
+                sum += (int) v;
+                p = *end == ',' ? end + 1 : end;
+            }
             if ((int) counts.size() > n_gpu || sum != L)
             {
                 tsg::report_load_refusal("[muse-spark] layer split '%s' must list at most %d counts summing to %d\n",
                                          layer_split, n_gpu, L);
                 return nullptr;
             }
+        }
+        // The first GPU whose explicit range does not fit, or -1.
+        auto split_misfit = [&](std::vector<uint8_t> * mark) -> int
+        {
+            for (int d = 0, a = 0; d < (int) counts.size(); a += counts[(size_t) d], d++)
+                if (counts[(size_t) d] > 0 && range_cost(d, a, a + counts[(size_t) d], auto_cpu, mark) < 0) return d;
+            return -1;
+        };
+        auto fits = [&]() { return counts.empty() ? place(auto_cpu) >= 0 : split_misfit(nullptr) < 0; };
+
+        // An advertised context that does not fit is capped, not refused (GLM's
+        // rule, and the per-op path's); only MAX_CONTEXT makes it a requirement.
+        // The plan reserves every global-layer row of a full context, so a
+        // smaller one leaves room for the expert stacks the placement asked for.
+        const int64_t min_ctx = pad_to(4096, m->kv_pad);
+        const int32_t advertised = m->n_ctx;
+        bool floor_failed = false;   // not even min_ctx fits; the refusal speaks about that size
+        if (!ctx_is_hard_limit && !plan_ctx_explicit && m->n_ctx > min_ctx && !fits())
+        {
+            set_ctx((int32_t) min_ctx);
+            if (fits())
+            {
+                int64_t lo = min_ctx / m->kv_pad, hi = advertised / m->kv_pad;   // lo fits, hi does not
+                while (hi - lo > 1)
+                {
+                    const int64_t mid = lo + (hi - lo) / 2;
+                    set_ctx((int32_t) (mid * m->kv_pad));
+                    if (fits()) lo = mid; else hi = mid;
+                }
+                set_ctx((int32_t) (lo * m->kv_pad));
+                fprintf(stderr, "[muse-spark] context capped to %d tokens (the GGUF advertises %d) so the weights and "
+                        "the KV plan fit the %d GPU(s) with the requested expert placement; set MAX_CONTEXT to "
+                        "choose a size\n", m->n_ctx, advertised, n_gpu);
+            }
+            else
+            {
+                floor_failed = true;
+            }
+        }
+        // A smaller MAX_CONTEXT helps only when this one was not already the floor.
+        const char * smaller_ctx_hint = floor_failed ? "" : ", or set a smaller MAX_CONTEXT / TS_MUSE_SPARK_PLAN_SLOTS";
+
+        if (!counts.empty())
+        {
             int il = 0;
             for (size_t d = 0; d < counts.size(); d++)
                 for (int c = 0; c < counts[d]; c++) assign[(size_t) il++] = (int) d;
-            for (int d = 0, a = 0; d < (int) counts.size(); a += counts[(size_t) d], d++)
-                if (counts[(size_t) d] > 0 && range_cost(d, a, a + counts[(size_t) d], auto_cpu, &cpu_stack) < 0)
-                {
-                    tsg::report_load_refusal("[muse-spark] layer split '%s' does not fit GPU %d\n", layer_split, d);
-                    return nullptr;
-                }
+            std::fill(cpu_stack.begin(), cpu_stack.end(), 0);
+            if (const int d = split_misfit(&cpu_stack); d >= 0)
+            {
+                tsg::report_load_refusal("[muse-spark] layer split '%s' does not fit GPU %d at a %d-token context%s\n",
+                                         layer_split, d, m->n_ctx, smaller_ctx_hint);
+                return nullptr;
+            }
         }
         else if (place(auto_cpu) < 0)
         {
             if (place(true) >= 0)
-                tsg::report_load_refusal("[muse-spark] the model does not fit the %d visible GPU(s) with --n-cpu-moe %d; "
-                                         "TS_MUSE_SPARK_CPU_MOE=auto places only the expert stacks that must stay on the host "
-                                         "(or use a smaller context / TS_MUSE_SPARK_PLAN_SLOTS)\n", n_gpu, forced_prefix);
+                tsg::report_load_refusal("[muse-spark] the model does not fit %d GPU(s) at a %d-token context%s with the "
+                                         "experts of %d leading layer(s) on the host (--n-cpu-moe); "
+                                         "TS_MUSE_SPARK_CPU_MOE=auto places only the expert stacks that must stay on the "
+                                         "host%s\n",
+                                         n_gpu, m->n_ctx, floor_failed ? " (the smallest it tries)" : "",
+                                         forced_prefix, smaller_ctx_hint);
             else
-                tsg::report_load_refusal("[muse-spark] the model does not fit the %d visible GPU(s) even with every expert on the host\n", n_gpu);
+                tsg::report_load_refusal("[muse-spark] the model does not fit %d GPU(s) at a %d-token context even with "
+                                         "every expert on the host%s\n", n_gpu, m->n_ctx, smaller_ctx_hint);
             return nullptr;
         }
     }
@@ -2436,7 +3373,7 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
             nl[(size_t) m->layers[(size_t) il].device]++;
         }
         if (n_gpu > 0) used[(size_t) m->out_device] += head_bytes;
-        for (int d = 0; d < n_gpu; d++)
+        for (int d = 0; d < n_gpu && m->tp.n <= 1; d++)
             fprintf(stderr, "[muse-spark] GPU %d: %d layers, %.1f GiB weights+KV of %.1f GiB budget\n",
                     d, nl[(size_t) d], used[(size_t) d] / 1073741824.0, dev_budget[(size_t) d] / 1073741824.0);
         if (n_cpu_moe > 0)
@@ -2577,7 +3514,8 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
     char nb[256];
     auto lname = [&](int il, const char * suffix) -> const char * { snprintf(nb, sizeof(nb), "blk.%d.%s", il, suffix); return nb; };
 
-    const bool want_fuse = env_flag("TS_MUSE_SPARK_FUSE_QKVG", true);
+    // Under --tp each GPU holds its own slices of q, k, v and gate.
+    const bool want_fuse = m->tp.n <= 1 && env_flag("TS_MUSE_SPARK_FUSE_QKVG", true);
     m->tok_embd = make(m->embd_device, "token_embd.weight", true);
     m->output_norm = make(m->out_device, "output_norm.weight", true);
     m->output = make(m->out_device, "output.weight", true);
@@ -2669,6 +3607,11 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
         if (!m->w_buf[d]) { tsg::report_load_refusal("[muse-spark] weight allocation failed on device %d\n", d); return nullptr; }
         ggml_backend_buffer_set_usage(m->w_buf[d], GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
+    if (m->tp.n > 1 && m->tp.ud->unplanned.load())
+    {
+        tsg::report_load_refusal("[muse-spark] internal: tensor %s has no tensor-parallel split\n", m->tp.ud->unplanned_name.c_str());
+        return nullptr;
+    }
     std::vector<const pending_weight *> numa_jobs;
     if (m->numa_ctx && ggml_get_first_tensor(m->numa_ctx))
     {
@@ -2716,8 +3659,20 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
                 continue;
             if (m->repack_buf && pw.t->buffer == m->repack_buf) continue;   // repacked below
             if (m->numa_buf && pw.t->buffer == m->numa_buf) continue;       // placed below
-            for (size_t off = 0; off < pw.bytes; off += chunk)
-                jobs.push_back({ pw.t, pw.shard, pw.file_off + off, pw.tensor_off + off, std::min(chunk, pw.bytes - off) });
+            // A split tensor is written in whole slabs along its split axis (rows
+            // for axis 0, whole matrices for axis 1): each write is scattered.
+            size_t step = chunk;
+            if (m->tp.n > 1 && pw.t->buffer == m->w_buf[0])
+            {
+                const ggml_backend_meta_split_state st = tsg_mspark_tp::split_state(pw.t, *m->tp.ud);
+                if ((int) st.axis >= 0 && (int) st.axis < GGML_MAX_DIMS)
+                {
+                    const size_t slab = pw.t->nb[(int) st.axis + 1];
+                    step = std::max<size_t>(1, chunk / slab) * slab;
+                }
+            }
+            for (size_t off = 0; off < pw.bytes; off += step)
+                jobs.push_back({ pw.t, pw.shard, pw.file_off + off, pw.tensor_off + off, std::min(step, pw.bytes - off) });
             total += pw.bytes;
         }
         std::atomic<size_t> done(0);
@@ -2734,7 +3689,8 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
                         done.load() / 1073741824.0, total / 1073741824.0, done.load() / 1073741824.0 / std::max(s, 1e-3));
             }
         });
-        const bool ok = upload_parallel(m->shards, jobs, load_threads, done);
+        std::mutex meta_set_mu;
+        const bool ok = upload_parallel(m->shards, jobs, load_threads, done, m->tp.n > 1 ? &meta_set_mu : nullptr);
         finished.store(true);
         progress.join();
         if (!ok) { tsg::report_load_refusal("[muse-spark] weight upload failed\n"); return nullptr; }
@@ -2897,7 +3853,6 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
     slot * s0 = slot_alloc(*m, false);
     if (!s0) { tsg::report_load_refusal("[muse-spark] KV cache for %d tokens does not fit\n", m->n_ctx); return nullptr; }
     m->active_slot = s0;
-    (void) ctx_is_hard_limit;
 
     // --- grow the GPU kernel-scratch pools to their prefill peak ----------
     // ggml-cuda keeps a per-device pool for kernel scratch (quantized
@@ -2922,9 +3877,105 @@ static model * load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubat
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(), warmed ? "" : " (failed)");
     }
 
-    fprintf(stderr, "[muse-spark] loaded %d layers on %d GPU(s) + host in %.1fs: ctx %d, sliding ring %d, ubatch %d, "
+    // --- pipelined prefill ----------------------------------------------------
+    {
+        pipeline_state & P = m->pipe;
+        const std::string mode = opt_get("TS_MUSE_SPARK_PIPELINE");
+        if (!mode.empty() && mode != "0" && mode != "1")
+        {
+            tsg::report_load_refusal("[muse-spark] TS_MUSE_SPARK_PIPELINE must be 0 or 1 (unset: automatic), not '%s'\n", mode.c_str());
+            return nullptr;
+        }
+        long ub = m->n_ubatch;                  // adaptive: the largest micro-batch
+        P.ubatch_fixed = false;
+        if (const std::string ubs = opt_get("TS_MUSE_SPARK_PIPELINE_UBATCH"); !ubs.empty())
+        {
+            char * end = nullptr;
+            errno = 0;
+            const long v = strtol(ubs.c_str(), &end, 10);
+            if (end == ubs.c_str() || *end != '\0' || errno == ERANGE || v < 1 || v > m->n_ubatch)
+            {
+                tsg::report_load_refusal("[muse-spark] TS_MUSE_SPARK_PIPELINE_UBATCH must be an integer in [1, %d] (the prefill ubatch), not '%s'\n",
+                                         m->n_ubatch, ubs.c_str());
+                return nullptr;
+            }
+            ub = v;
+            P.ubatch_fixed = true;
+        }
+        P.ubatch = ub;
+        P.forced = mode == "1";
+        // Overlap needs asynchronous copies between GPUs and streams that wait
+        // on another GPU's events (CUDA, ROCm, MUSA). Host experts stall the
+        // host thread inside every micro-batch, and the profiler synchronizes
+        // every node, so neither gains anything.
+        bool all_cuda = n_gpu > 0;
+        const char * gpu_reg = nullptr;
+        for (int d = 0; d < n_gpu; d++)
+        {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(m->backends[d]));
+            gpu_reg = reg ? ggml_backend_reg_name(reg) : "unknown";
+            all_cuda = all_cuda && reg && backend_matches(ggml_backend_reg_name(reg), "CUDA");
+        }
+        if (P.forced && n_gpu >= 2 && !all_cuda)
+        {
+            tsg::report_load_refusal("[muse-spark] TS_MUSE_SPARK_PIPELINE=1 needs GPUs whose streams can wait on another GPU's events "
+                                     "(CUDA, ROCm, MUSA); the %s backend's %d GPUs cannot run a pipelined prefill. "
+                                     "Unset the option (automatic) or set it to 0\n", gpu_reg ? gpu_reg : "unknown", n_gpu);
+            return nullptr;
+        }
+        const char * why = nullptr;
+        if (m->tp.n > 1) why = "tensor parallel: every GPU works on every layer";
+        else if (mode == "0") why = "TS_MUSE_SPARK_PIPELINE=0";
+        else if (env_long("TS_MUSE_SPARK_PROFILE", 0) > 0) why = "TS_MUSE_SPARK_PROFILE synchronizes every node";
+        else if (!P.forced && n_gpu < 2) why = "fewer than two GPUs";
+        else if (!P.forced && !all_cuda) why = "needs CUDA's asynchronous cross-GPU copies";
+        else if (!P.forced && n_cpu_moe > 0) why = "host experts stall each micro-batch";
+        P.enabled = why == nullptr;
+        if (P.enabled && n_gpu > 0 && env_flag("TS_MUSE_SPARK_WARM_POOLS", true))
+        {
+            // Build the pipeline's scheduler now rather than in the first request,
+            // and check that it engages: two fixed micro-batches, or four of the
+            // smallest adaptive ones.
+            const int64_t nt = std::min<int64_t>(P.ubatch_fixed ? 2 * P.ubatch : 4 * std::min<int64_t>(PIPE_MIN_UBATCH, P.ubatch),
+                                                 m->n_ctx);
+            std::vector<int32_t> toks((size_t) nt);
+            for (int64_t i = 0; i < nt; i++) toks[(size_t) i] = (int32_t) (1 + i % std::max<int32_t>(1, hp.n_vocab - 1));
+            const uint64_t before = P.n_calls;
+            forward(*m, toks.data(), nt, nullptr, false);
+            s0->n_past = 0;
+            std::fill(s0->swa_lab.begin(), s0->swa_lab.end(), -1);
+            m->graph_cache.clear();
+            if (P.n_calls == before)
+            {
+                P.enabled = false;
+                P.release();
+                why = "its warm-up did not run pipelined";
+            }
+        }
+        if (P.enabled)
+        {
+            if (P.stages.empty()) P.stages = pipe_stage_list(*m);
+            char rows[96];
+            if (P.ubatch_fixed) snprintf(rows, sizeof(rows), "%" PRId64 "-row micro-batches", P.ubatch);
+            else snprintf(rows, sizeof(rows), "micro-batches of a quarter of each prompt, %" PRId64 "-%" PRId64 " rows",
+                          std::min<int64_t>(PIPE_MIN_UBATCH, P.ubatch), P.ubatch);
+            if (P.sched)
+                fprintf(stderr, "[muse-spark] pipelined prefill: on (%s over %zu GPU stage(s), %d input copies)\n",
+                        rows, P.stages.size(), P.n_copies);
+            else
+                fprintf(stderr, "[muse-spark] pipelined prefill: on (%s over %zu GPU stage(s); its scheduler is built on first use)\n",
+                        rows, P.stages.size());
+        }
+        else
+            fprintf(stderr, "[muse-spark] pipelined prefill: off (%s); prompts run one %d-row micro-batch at a time\n", why, m->n_ubatch);
+    }
+
+    char placement[64];
+    if (m->tp.n > 1) snprintf(placement, sizeof(placement), "tensor-parallel over %d GPUs", m->tp.n);
+    else snprintf(placement, sizeof(placement), "on %d GPU(s)", n_gpu);
+    fprintf(stderr, "[muse-spark] loaded %d layers %s + host in %.1fs: ctx %d, sliding ring %d, ubatch %d, "
             "fused qkvg %s, op offload %s, host weights %.1f GiB\n",
-            hp.n_layer, n_gpu, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(),
+            hp.n_layer, placement, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(),
             m->n_ctx, m->swa_ring, m->n_ubatch, m->fused_qkvg ? "yes" : "no", m->op_offload ? "on" : "off",
             m->mmap_weight_bytes / 1073741824.0);
     return m.release();
@@ -2943,7 +3994,26 @@ TSG_EXPORT void * TSGgml_MuseSparkLoadModel(const char * gguf_path, int n_gpu, i
 {
     try
     {
-        return load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, ctx_is_hard_limit != 0, layer_split);
+        return load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, ctx_is_hard_limit != 0, layer_split, 0);
+    }
+    catch (const std::exception & e)
+    {
+        tsg::report_load_refusal("[muse-spark] load failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+/// TSGgml_MuseSparkLoadModel with tensor parallelism: tp > 1 splits every
+/// layer over the first tp CUDA GPUs (n_gpu and layer_split then do not apply);
+/// tp <= 1 is the layer split.
+TSG_EXPORT void * TSGgml_MuseSparkLoadModelTp(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch, int n_threads,
+                                              int n_cpu_moe, const char * backend_name, int ctx_is_hard_limit,
+                                              const char * layer_split, int tp)
+{
+    try
+    {
+        return load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, ctx_is_hard_limit != 0,
+                    layer_split, tp);
     }
     catch (const std::exception & e)
     {
@@ -3106,12 +4176,14 @@ TSG_EXPORT int TSGgml_MuseSparkSlotCopy(void * handle, int src_id, int dst_id)
     {
         const int64_t global_rows = std::min<int64_t>(s.cap_g, pad_to(std::max<int64_t>(s.n_past, 1), m->kv_pad));
         if (!slot_reserve_rows(*m, d, global_rows)) return 0;
+        std::vector<row_copy> copies;
         for (int il = 0; il < m->hp.n_layer; il++)
         {
             const int64_t rows = m->layers[(size_t) il].swa ? m->swa_ring : global_rows;
-            copy_cache_rows(s.k[(size_t) il], d.k[(size_t) il], rows);
-            copy_cache_rows(s.v[(size_t) il], d.v[(size_t) il], rows);
+            copies.push_back({ s.k[(size_t) il], d.k[(size_t) il], rows });
+            copies.push_back({ s.v[(size_t) il], d.v[(size_t) il], rows });
         }
+        if (!copy_cache_rows(*m, copies)) return 0;
         d.swa_lab = s.swa_lab;
         d.n_past = s.n_past;
         return 1;
@@ -3153,6 +4225,23 @@ TSG_EXPORT int TSGgml_MuseSparkTakeReclaimedSlots(void * handle, int32_t * out, 
 }
 
 /// Diagnostics: graphs built / reused, host expert bytes, CPU MoE layers.
+/// The micro-batch rows a prompt of n tokens starting at position p0 would
+/// prefill pipelined with (0: it would run one ubatch at a time), so the
+/// scheduler can size a lone prompt's steps to calls that pipeline.
+TSG_EXPORT int TSGgml_MuseSparkPipelinePlan(void * handle, int64_t p0, int64_t n)
+{
+    model * m = (model *) handle;
+    if (!m || p0 < 0 || n <= 0) return 0;
+    std::lock_guard<std::mutex> lk(m->mu);
+    const pipeline_state & P = m->pipe;
+    if (!P.enabled) return 0;
+    pipe_shape sh;
+    if (pipe_plan(*m, p0, n, &sh) != PIPE_OK || sh.p_last > m->n_ctx) return 0;
+    // A shape whose compute buffers did not fit is not retried (forward_pipelined).
+    if (P.fail_u && sh.u >= P.fail_u && sh.n_kv_g >= P.fail_kv_g && sh.n_kv_s >= P.fail_kv_s) return 0;
+    return (int) sh.u;
+}
+
 TSG_EXPORT int TSGgml_MuseSparkGetStats(void * handle, int64_t * out, int cap)
 {
     model * m = (model *) handle;
@@ -3164,5 +4253,14 @@ TSG_EXPORT int TSGgml_MuseSparkGetStats(void * handle, int64_t * out, int cap)
     out[3] = m->n_cpu_moe;
     out[4] = m->n_gpu;
     out[5] = (int64_t) m->slots.size();
-    return 6;
+    if (cap < 10) return 6;
+    out[6] = (int64_t) m->pipe.n_calls;       // prefill calls that ran pipelined
+    out[7] = (int64_t) m->pipe.n_ubatches;    // micro-batches they enqueued
+    out[8] = (int64_t) m->pipe.n_declines;    // calls that wanted to and could not
+    out[9] = m->pipe.enabled ? m->pipe.ubatch : 0;   // the fixed micro-batch, or the adaptive one's upper bound
+    if (cap < 11) return 10;
+    out[10] = m->pipe.enabled ? (int64_t) pipe_stage_list(*m).size() : 0;   // GPU stages a pipelined call spans
+    if (cap < 12) return 11;
+    out[11] = m->tp.n > 1 ? m->tp.n : 0;      // tensor-parallel degree (0: layer split)
+    return 12;
 }

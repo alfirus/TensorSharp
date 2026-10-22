@@ -8,16 +8,16 @@ TensorSharp 支持 [Unsloth 的 Muse-Spark-Open-816B-A42B 发布版](https://hug
 | 属性 | 实现 |
 |---|---|
 | 架构 | `muse-spark`，别名 `muse_spark` |
-| 解码器 | [MuseSparkModel](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.cs)；在 `ggml_cuda`/`ggml_vulkan` 上默认由[原生整模型执行器](#原生整模型执行器)运行 |
+| 解码器 | [MuseSparkModel](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.cs)；在 `ggml_cuda`/`ggml_vulkan` 上默认由[原生整模型执行器](#原生整模型执行器)运行，`ggml_cuda` 上的 `--tp N` 也是如此 |
 | 专家路径 | 原生执行器：在整模型图内每层一个 `mul_mat_id` 图。逐算子路径：[MuseSparkModel.Moe.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Moe.cs)，原生 `TSGgml_MuseSparkMoEFFNQuantF32` |
 | 图像 | 匹配的 Spark mmproj，共用 Muse-Glimmer 视觉编码器 |
 | 音频 | 未实现；投影器中带有音频塔并不会启用音频推理 |
-| GPU 放置 | 原生执行器：`--layer-split N` 把各层分配到 N 张 GPU，并按字节最小化方案放置专家栈。逐算子路径：`--tp N` 切分注意力并划分专家；`--layer-split N` 分配完整的层 |
-| 专家卸载 | 原生执行器：`TS_MUSE_SPARK_CPU_MOE=auto` 把显存放不下的专家栈留在按 NUMA 放置的主机内存中；`--n-cpu-moe N` 强制把前 N 层的专家放到主机。逐算子路径：`--n-cpu-moe N` 在 CPU 上运行前 N 层保留的原生专家栈 |
+| GPU 放置 | 原生执行器，最多 16 张 GPU：`--layer-split N` 把各层分配到 N 张 GPU，按字节最小化方案放置专家栈，并在各 GPU 之间[流水线化 prefill](#运行方式)；`ggml_cuda` 上的 `--tp N` 通过 ggml 的 meta 后端（llama.cpp `-sm tensor` 背后的机制）把每一层切分到 N 张 GPU（[详情](#原生执行器上的张量并行)）。逐算子路径（`TS_MUSE_SPARK_NATIVE=0`，以及 `ggml_vulkan` 上的 `--tp N`）：`--tp N` 切分注意力并划分专家；`--layer-split N` 分配完整的层 |
+| 专家卸载 | 原生执行器（按层切分；原生 `--tp` 把所有专家留在显存中）：`TS_MUSE_SPARK_CPU_MOE=auto` 把显存放不下的专家栈留在按 NUMA 放置的主机内存中；`--n-cpu-moe N` 强制把前 N 层的专家放到主机。逐算子路径：`--n-cpu-moe N` 在 CPU 上运行前 N 层保留的原生专家栈 |
 | KV 缓存 | 原生执行器：F16 逐序列槽位，滑动层使用环，全局层的行惰性增长。逐算子路径：F32/F16 线性 GQA 缓存；块量化 KV 会被拒绝 |
 | 连续批处理 | 原生执行器：跨序列槽位的批量 decode（文本与图像请求）以及新文本提示的批量 prefill。逐算子路径：使用 F32 KV 的打包分页文本前向 |
 | 前缀缓存 | 原生执行器：对话续写、已完成对话的回退，以及克隆到新对话中的共享系统提示检查点 |
-| 投机解码 | 通过 `--spec --spec-type ngram` 使用通用 n-gram 草稿器；不假定存在学习型 Muse Spark 草稿模型 |
+| 投机解码 | 通过 `--spec --spec-type ngram` 使用通用 n-gram 草稿器；不假定存在学习型 Muse Spark 草稿模型。原生 `--tp` 下不使用（[原因](#原生执行器上的张量并行)） |
 
 ## 原生整模型执行器
 
@@ -27,7 +27,9 @@ TensorSharp 支持 [Unsloth 的 Muse-Spark-Open-816B-A42B 发布版](https://hug
 [MuseSparkModel.Native.cs](../../TensorSharp.Models/Models/MuseSpark/MuseSparkModel.Native.cs)。
 它自行加载分片 GGUF，并为每个 micro-batch 提交一张横跨所有 GPU 与 CPU 的 GGML 图。它使用未修改的上游 ggml。
 后文各节描述的逐算子路径仍是参考实现：`TS_MUSE_SPARK_NATIVE=0` 选择它，
-`TS_MUSE_SPARK_NATIVE=1` 让 GGML CPU 后端也启用原生执行器。张量并行（`--tp`）始终走逐算子路径。
+`TS_MUSE_SPARK_NATIVE=1` 让 GGML CPU 后端也启用原生执行器。`--layer-split N` 以及 `ggml_cuda` 上的 `--tp N`
+都运行在这个执行器上，见[原生执行器上的张量并行](#原生执行器上的张量并行)；在 `ggml_vulkan` 上，
+`--tp N` 走[逐算子路径](#逐算子路径上的张量并行)。
 
 ### 运行方式
 
@@ -41,6 +43,7 @@ TensorSharp 支持 [Unsloth 的 Muse-Spark-Open-816B-A42B 发布版](https://hug
   并让留在主机上的字节尽可能少。主机上的专家字节数决定 decode 开销。
   `TS_MUSE_SPARK_CPU_MOE=auto` 启用这一方案；`--n-cpu-moe N` 则强制把前 N 层的专家放到主机。
   两者都不设置时，放不下的模型会被拒绝，提示信息会指明该选项。
+  在留在主机上的专家字节数最少的方案中，选出把各 GPU 填得最均匀的那一个。
   启动日志会打印每张 GPU 上的层以及主机上的专家栈（`6,7,...,18:gu,...,45:d`；`g`、`u`、`d` 各指一个专家栈）。
 - **主机专家。** 有两个或更多 NUMA 节点时，主机专家栈由绑定到各节点的线程拷贝进匿名内存，
   并由一个严格绑核的 CPU 线程池运行。ggml 的 CPU `mul_mat_id` 为每个工作线程分配固定的行区间，
@@ -57,6 +60,28 @@ TensorSharp 支持 [Unsloth 的 Muse-Spark-Open-816B-A42B 发布版](https://hug
   环已无法满足的回退会被拒绝，调度器改为重新 prefill。
 - **批处理。** 所有运行中请求的 decode 步共享一张图，使用逐序列的注意力掩码。
   同时到达的新文本提示在一张图中完成 prefill。图像 embedding 在图内替换各自的占位行。
+- **流水线 prefill。** 按层切分时，一次提示调用被切成等长的 micro-batch，GPU k 处理 micro-batch j 的同时，
+  GPU k+1 处理 j−1，与 llama.cpp 的流水线并行相同。调用运行在一个常驻的 ggml 调度器上，
+  使用四份轮换的输入副本、跨 GPU 事件和一个锁页暂存环。最后一个 micro-batch 用最后一个 token 的副本补齐；
+  补齐的行会被重写或清除标签，因此不会被读取。除非 `TS_MUSE_SPARK_PIPELINE_UBATCH` 固定了大小，
+  每次调用的 micro-batch 约为调用长度的四分之一，介于 512 行与 prefill ubatch（`TS_MUSE_SPARK_UBATCH`，2048）之间；
+  长上下文的掩码超出 96 MiB 暂存预算时会缩小（最小 128 行）。在十张 A40 上，一次 15,641 token 的调用
+  使用固定 512 行 micro-batch 耗时 15.3 s，自适应时为 10.2 s；一次 4K 调用分别为 4.5 s 和 3.7 s。
+  在有两张或更多 CUDA 家族（CUDA、ROCm、MUSA）GPU、没有主机专家、未设置 `TS_MUSE_SPARK_PROFILE` 且不是张量并行时，
+  流水线自动开启（`TS_MUSE_SPARK_PIPELINE`）；加载日志会显示 `[muse-spark] pipelined prefill: on (...)` 或 `off (原因)`。
+  无法流水线化的调用会按原因各记录一次 `pipelined prefill declined (原因)`，并逐个 micro-batch 运行：
+  即使最小的 micro-batch 掩码也超出预算、计算缓冲区放不下（在某个槽位释放内存之前，不再对该形状重试）、
+  没有设备内存容纳该调用的 K/V 行、没有锁页主机内存，或调用中含有图像行（图像 embedding 在图内替换 token 行）。
+  流水线调度器的缓冲区在内存准入中计为可回收，
+  并会在逐出保留槽位之前先被释放。
+- **单独提示的 prefill 步长。** 服务器中只有一个请求时，调度器会询问模型每个 prefill 步应有多大
+  （`ISoloPrefillBudgetModel`），答案可以超过 `TS_SCHED_MAX_BATCHED_TOKENS`。流水线 prefill 开启时，
+  Muse Spark 回答 8,192 个 token，并把不超过 2,048 的余数并入前一步，使任何短调用都不会单独填满并排空流水线；
+  调用无法流水线化时它回答 0，即沿用调度器自己的步长；会带有图像行的步也沿用调度器自己的步长。
+  在十张 A40 上，一次 8K 调用保持 16K 调用约 90% 的吞吐，
+  单独步进行期间到达的请求要等这一步完成（8K 时约 6 s）。设置 `TS_SCHED_SOLO_PREFILL_CHUNK`
+  会改用调度器的步长（受 `TS_SCHED_MAX_BATCHED_TOKENS` 限制）并关闭模型自选的步长；
+  只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会。引擎日志会说明采用的是哪一种。
 - **前缀缓存。** 已完成请求的槽位会被保留，并交给续写该对话的请求。
   它可以先被回退，因此重新生成的回答也能复用提示。
   聊天层共享前缀边界之前的 token（系统提示与工具声明）会被拷贝一次到检查点槽位，再克隆进每个新对话。
@@ -73,13 +98,77 @@ TensorSharp 支持 [Unsloth 的 Muse-Spark-Open-816B-A42B 发布版](https://hug
   因此加载时会运行一次满尺寸 prefill（`TS_MUSE_SPARK_WARM_POOLS`），让该池先达到峰值；
   没有这一步时，一连串并发请求之后的第一个 4K token 提示曾让服务器崩溃。
 
+### 原生执行器上的张量并行
+
+`ggml_cuda` 上的 `--tp N` 运行原生执行器，把每一层切分到前 N 张 CUDA GPU 上；用 `CUDA_VISIBLE_DEVICES` 选择 GPU。
+它基于上游 ggml 的 meta 后端（`ggml_backend_meta_device`），即 llama.cpp `-sm tensor` 背后的机制，不打 ggml 补丁。
+TensorSharp 在 [ggml_ops_muse_spark_tp.cpp](../../TensorSharp.GGML.Native/ggml_ops_muse_spark_tp.cpp)
+中提供切分方案（ctest `muse-spark-tp-split-plan`）。`TS_MUSE_SPARK_NATIVE=0` 则保留[逐算子路径](#逐算子路径上的张量并行)，
+`ggml_vulkan` 上的 `--tp N` 也走这条路径。
+
+- **切分方式。** 注意力按 KV 组切分：每张 GPU 持有其各组的 q 与 gate 行、k 与 v 行、K/V 缓存列，
+  以及注意力输出投影中对应的输入列。路由专家沿隐藏维度切分（gate 与 up 的行、down 的列），
+  单位是 down 投影的量化块向上取整到 128 元素的倍数，UD-IQ3_XXS 检查点为 256 元素；输出头按词表行切分。norm、路由器和潜空间投影在每张 GPU 上各有一份副本。
+  各份额沿用 llama.cpp 的分配方式并逐层轮换，因此 16 个 KV 组分到十张 GPU 上，每张 GPU 得到一到两个。
+  每层以两次 all-reduce 结束。
+- **集合通信。** 在后端创建通信器之前，TensorSharp 会探测 GPU 之间的对等拷贝。
+  如果对等访问被宣称可用但实际不工作（十张 A40 的测试主机即是如此），NCCL 以 `NCCL_P2P_DISABLE=1` 走共享内存传输。
+  显式设置的 `GGML_CUDA_ALLREDUCE` 优先；没有 NCCL 时，两张 GPU 使用 ggml 自带的 all-reduce，
+  更多 GPU 运行 meta 后端的对等拷贝 butterfly，与不带 NCCL 构建的 llama.cpp 相同。ggml 的 NCCL 路径以 BF16 归约超过 262,144 个元素的张量，
+  这覆盖 prefill 的 MoE 部分和，不涉及 decode。
+- **拒绝加载。** 以下情况会拒绝加载（退出码 2）：`TS_MUSE_SPARK_LAYER_SPLIT`；
+  `--n-cpu-moe N`（`TS_MUSE_SPARK_CPU_MOE=auto` 会把所有专家留在显存中）；`TS_MUSE_SPARK_PIPELINE=1`；
+  `TS_MUSE_SPARK_PROFILE`；大于 1 的 `TS_MUSE_SPARK_GRAPH_CACHE`；`TS_MUSE_SPARK_FUSE_QKVG=1`；
+  `TS_MUSE_SPARK_CPU_REPACK=1`；`TENSORSHARP_TP_DEVICES`（该路径不读取它）；N 超过模型的 16 个 KV 头、
+  超过 16 张 GPU 或超过可见的 GPU 数；GPU 型号不一致；以及某张 GPU 分不到 KV 组或专家行的方案。
+  GPU 在某个形状下无法运行的图算子会让该次调用带着原因失败，而不是中止进程，因为张量并行的层无法回退到 CPU。逐算子路径自己的设置
+  （`TS_MUSE_SPARK_PHASE_TIMING`、`TS_MUSE_SPARK_FUSE_QK_PREP`、`TS_MUSE_SPARK_REUSE_NORM_SCRATCH`、
+  `TS_MUSE_SPARK_KV_UPLOAD_2D`、`TS_MUSE_SPARK_FUSE_RESIDUALS`、`TS_MUSE_SPARK_TP_HOST_POOL`、
+  `TS_MUSE_SPARK_PREFILL_CHUNK`、`TS_MUSE_SPARK_SCRATCH_RESERVE_MIB`、`TS_MUSE_SPARK_RELEASE_GPU_SOURCE_PAGES`）
+  会在日志中统一列出一次，说明被忽略。
+- **内存。** 每张 GPU 持有自己的切片、镜像张量的一份副本（约 4.4 GB 的潜空间投影）以及整张图的计算缓冲区。
+  上下文按每张 GPU 封顶，与按层切分相同（见[十张及以上 GPU](#十张及以上-gpu)）。在十张 A40 上，
+  UD-IQ3_XXS 检查点在 32K 上下文、五个计划槽位下每张 GPU 占用 35.4–36.0 GiB 权重和 0.6 GiB K/V。
+  K/V 行增长和前缀检查点拷贝在 GPU 上以一张拷贝图完成，不经主机往返。
+- **关闭的功能。** 流水线 prefill 关闭，因为每张 GPU 都参与每一层。图缓存只保留一张图，
+  因为 meta 后端只为最后一张图保留各 GPU 的视图；出于同一原因不使用投机解码，
+  否则草稿验证图与 decode 图交替时每一步都要重建。
+
+[InferenceWeb.Tests/MuseSparkNativeTensorParallelTests.cs](../../InferenceWeb.Tests/MuseSparkNativeTensorParallelTests.cs)
+在 2、4、10 张 GPU 上与双精度参考解码器对照检查：K/V 行在滑动环回绕时增长的 prefill、decode、回退、
+三个槽位的批量 decode 和前缀检查点克隆，以及各项拒绝。[基准报告](../perf/muse-spark-vs-llama-cpp.md)（英文）
+解释了为什么在该主机上 `--tp` 的 prefill 受限于 all-reduce 传输，以及为什么长提示用按层切分更快。
+
+### 十张及以上 GPU
+
+- **对等连接上限。** 在带 NCCL 的 ggml 构建中（安装了 NCCL 时 TensorSharp 的 CMake 会启用它），
+  ggml-cuda 用一次 `cuMemSetAccess` 调用把每个内核 scratch 池分块授权给所有支持对等访问的 GPU，
+  而 CUDA 只允许每张 GPU 至多 8 个对等连接。在十张 A40 上，十张 GPU 都可见时每次 `ggml_cuda` 运行
+  都以 `peer mapping resources exhausted` 中止：`--tp 10` 直接中止，`--layer-split 10` 则在执行器的八 GPU 上限（见下）
+  不再先拒绝它之后中止。TensorSharp 的包装层
+  [ggml_ops_cuda_vmm_peer_guard.cpp](../../TensorSharp.GGML.Native/ggml_ops_cuda_vmm_peer_guard.cpp)
+  （以 `-Wl,--wrap=cuMemSetAccess` 链接，仅限 Linux；ctest `cuda-vmm-peer-guard`）捕获这一拒绝，撤销部分授权，
+  只授权给所属 GPU，并警告一次（`[CUDA] GPU N cannot share its kernel-scratch memory with ...`）。
+  GPU 之间的张量拷贝不使用该池。随后 NCCL 会在第一个通信器之前得到 `NCCL_P2P_DIRECT_DISABLE=1`，
+  除非操作者已设置它或开启了 `NCCL_P2P_DISABLE`。llama.cpp `7170cad` 在这样的主机上也会同样中止，
+  除非以 `-DGGML_CUDA_NCCL=OFF` 构建。
+- **GPU 数量。** 两种模式下原生执行器最多跨 16 张 GPU。请求更多，或多于可见的 GPU 数，会拒绝加载（退出码 2），
+  而不是在更少的 GPU 上运行。
+- **上下文封顶。** 未设置 `MAX_CONTEXT`（以及 `TS_MUSE_SPARK_PLAN_CTX_TOKENS`）且宣称的上下文（1,048,576 token）放不下时，
+  上下文被封顶为能放下的最大值（KV 对齐的倍数，至少 4,096 token），日志显示
+  `[muse-spark] context capped to N tokens (the GGUF advertises 1048576) ...; set MAX_CONTEXT to choose a size`。
+  设置了 `MAX_CONTEXT` 时，放不下的上下文会拒绝加载。
+
 ### 选项
 
 | 设置 | 默认值 | 作用 |
 |---|---|---|
-| `TS_MUSE_SPARK_NATIVE` | CUDA/Vulkan 上开启 | `0` 选择逐算子路径；`1` 在 GGML CPU 后端上启用执行器 |
+| `TS_MUSE_SPARK_NATIVE` | CUDA/Vulkan 上开启，CUDA 上的 `--tp` 也开启 | `0` 选择逐算子路径（`--tp` 也是）；`1` 在 GGML CPU 后端上启用执行器 |
 | `TS_MUSE_SPARK_CPU_MOE=auto` | 关闭 | 按字节最小化的逐专家栈放置（覆盖 `--n-cpu-moe`） |
+| `TS_MUSE_SPARK_LAYER_SPLIT` | 自动 | 按层切分时每张 GPU 的层数，以逗号分隔的非负数、总和为 62；严格解析，格式错误会拒绝加载。与 `--tp` 同时使用会被拒绝 |
 | `TS_MUSE_SPARK_UBATCH` | 2048 | prefill micro-batch 行数 |
+| `TS_MUSE_SPARK_PIPELINE` | 自动 | 流水线 prefill。未设置：有两张或更多 CUDA 家族 GPU（CUDA、ROCm、MUSA）、没有主机专家、未设置 `TS_MUSE_SPARK_PROFILE` 且没有 `--tp` 时开启。`1` 强制开启（在 CUDA 家族以外的多 GPU 后端上以及 `--tp` 下会被拒绝）；`0` 关闭；其他值会拒绝加载 |
+| `TS_MUSE_SPARK_PIPELINE_UBATCH` | 自适应 | 固定的流水线 micro-batch 行数，取 1 到 `TS_MUSE_SPARK_UBATCH` 之间的整数。未设置：约为每次调用的四分之一，从 512 行到 prefill ubatch，长上下文的掩码需要时缩小到 128 |
 | `TS_MUSE_SPARK_PLAN_SLOTS` | 1 | 放置方案中预留的滑动窗口环数；有并发请求时调高 |
 | `TS_MUSE_SPARK_PLAN_CTX_TOKENS` | 上下文长度 | 放置方案中为全局层 KV 预留的 token 数 |
 | `TS_MUSE_SPARK_VRAM_RESERVE_MB` | 2048 + ubatch/4 | 每张 GPU 为计算缓冲区保留的空间 |
@@ -93,21 +182,39 @@ TensorSharp 支持 [Unsloth 的 Muse-Spark-Open-816B-A42B 发布版](https://hug
 | `TS_MUSE_SPARK_HOST_MOE_TOKENS` | 16 | 2 到 N 个 token 的批次通过静态行内核运行主机专家；`0` 保留 ggml 的 `mul_mat_id` |
 | `TS_MUSE_SPARK_CPU_REPACK` | 关闭 | 对主机专家启用 ggml CPU 重打包；在这里没有加快 decode |
 | `TS_MUSE_SPARK_OP_OFFLOAD` | 仅在没有主机专家时开启 | 允许调度器在大批次时把主机权重拷贝到 GPU |
-| `TS_MUSE_SPARK_WARM_POOLS` | 有 GPU 时开启 | 加载时运行一次满尺寸 prefill，让 ggml-cuda 的内核 scratch 池在槽位占用内存之前达到峰值 |
+| `TS_MUSE_SPARK_WARM_POOLS` | 有 GPU 时开启 | 加载时运行一次满尺寸 prefill，让 ggml-cuda 的内核 scratch 池在槽位占用内存之前达到峰值。流水线 prefill 开启时，还会运行一次简短的流水线 prefill（两个固定或四个最小的自适应 micro-batch），构建流水线的调度器并确认它确实生效 |
 | `TS_MUSE_SPARK_EXEC_DEBUG` | 关闭 | 记录放置、图构建与内存决策 |
-| `TS_MUSE_SPARK_PROFILE` | 0 | 打印 N 张图的逐节点耗时 |
+| `TS_MUSE_SPARK_PROFILE` | 0 | 打印 N 张图的逐节点耗时；会关闭流水线 prefill，在 `--tp` 下会被拒绝 |
 
 ### 启动
 
-下面这套实测配置使用六张 A40 GPU（每张 46 GB）、280 GiB 内存上限和 48 个 CPU 的配额。
-32K 上下文和五个计划槽位为四个并发请求、共享前缀检查点和图像编码器留出了空间。
+实测配置使用十张 A40 GPU（每张 46 GB）和 8 个分片的 UD-IQ3_XXS 检查点（315.7 GiB 权重），所有专家都在显存中。
+32K 上下文和五个计划槽位为四个并发请求和共享前缀检查点留出了空间。
+同一条命令运行按层切分；把 `--layer-split 10` 换成 `--tp 10` 即为张量并行：
+
+```bash
+MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_CODE_EXEC=0 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model /workspace/Muse-Spark-Open-816B-A42B-GGUF/UD-IQ3_XXS/Muse-Spark-Open-816B-A42B-UD-IQ3_XXS-00001-of-00008.gguf \
+  --backend ggml_cuda --layer-split 10 \
+  --host 127.0.0.1 --port 8083 --no-webui --no-skills --no-multi-agent
+```
+
+按层切分在每张 GPU 上放置约 36 GiB，开启流水线 prefill，加载耗时 6.0 分钟。
+`--tp 10` 下每张 GPU 持有 35.4–36.0 GiB 权重和 0.6 GiB K/V，加载耗时 6.4 分钟。
+在该主机上两种运行都依赖[对等连接上限保护](#十张及以上-gpu)。
+
+#### 早期的六张 A40、CPU 专家卸载配置
+
+这套早期配置在六张 A40 GPU（每张 46 GB）上运行更大的 UD-Q3_K_XL 检查点，放不下的专家栈留在主机内存中，
+内存上限 280 GiB，CPU 配额 48 个。32K 上下文和五个计划槽位为四个并发请求、共享前缀检查点和图像编码器留出了空间。
 只计划四个槽位时，承载层数最多的那张 GPU 空间不足，四个并发请求中经常有一个丢失模板检查点，
 只能 prefill 整段提示：
 
 ```bash
 MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_MUSE_SPARK_CPU_MOE=auto \
 TS_MUSE_SPARK_DEV0_RESERVE_MB=3072 TS_CODE_EXEC=0 \
-dotnet TensorSharp.Server.Host.dll \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model /workspace/models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
   --mmproj /workspace/models/muse-spark/mmproj-Q8_0.gguf \
   --backend ggml_cuda --layer-split 6 --n-cpu-moe 21 \
@@ -117,29 +224,45 @@ dotnet TensorSharp.Server.Host.dll \
 `--n-cpu-moe 21` 会被 `TS_MUSE_SPARK_CPU_MOE=auto` 覆盖。该方案在六张 GPU 上分别放置 7、9、9、9、12 和 16 层，
 GPU 上共 240.4 GiB 权重，另有来自 33 层的 131.8 GiB 专家栈留在主机。
 加载约需 5 分钟；同一主机上 llama.cpp 以 `--load-mode none` 加载需要 21.5 分钟
-（它默认的内存映射加载在该内存上限内没有完成）。
+（它默认的内存映射加载在该内存上限内没有完成）。用这套配置得到的测量来自更早的构建，已被下面的十张 A40 结果取代。
 
 ### 实测结果
 
-使用上述配置，在同一台机器、同一检查点上与 llama.cpp `0a1ef309c` 对比。表中为三次重复的中位数；
-[完整报告](../perf/muse-spark-vs-llama-cpp.md)（英文）给出了测量方法、两种 llama.cpp 配置以及这次对比的局限。
+使用上面的十张 A40 配置，在同一台机器、同一检查点上与 llama.cpp `7170cad` 对比：驱动 595.91、CUDA 12.8、
+未修改的上游 ggml `da8e2a5`；llama.cpp 以 `-DGGML_CUDA_NCCL=OFF` 构建，因为它的 NCCL 构建在该主机上会遇到
+[对等连接上限导致的中止](#十张及以上-gpu)。该主机上 GPU 之间的对等访问被宣称可用但实际不工作，因此两个引擎都没有使用 P2P。
+吞吐与延迟数据为三次重复的中位数，每个夹具运行一次；比值大于 1.00x 表示 TensorSharp 更好。标为"见报告"的单元格请查看
+[完整报告](../perf/muse-spark-vs-llama-cpp.md)（英文），其中还有测量方法、各场景细节以及这次对比的局限。
 
-| 场景 | TensorSharp | llama.cpp | 比值 |
-|---|---:|---:|---:|
-| decode，单请求 | 11.05 tok/s | 9.92 tok/s | 1.11x |
-| 首 token 时间，短提示 | 1.11 s | 2.60 s | 2.35x |
-| prefill，4K / 16K token 提示 | 162 / 161 tok/s | 76 / 84 tok/s | 2.12x / 1.92x |
-| 四个并发请求，总输出 | 19.35 tok/s | 17.66 tok/s | 1.10x |
-| 2.3K token 对话的第二轮，首 token | 0.86 s | 1.60 s | 1.86x |
-| 共享 2.3K token 系统提示的新对话，首 token | 0.84 s | 1.14 s | 1.36x |
-| 答案校验夹具（`eng/muse-spark-validate.py`） | 15 / 16 | 13 / 16 | |
+| 场景 | TensorSharp `--layer-split 10` | llama.cpp `-sm layer` | 比值 | TensorSharp `--tp 10` | llama.cpp `-sm tensor` | 比值 |
+|---|---:|---:|---:|---:|---:|---:|
+| decode，单请求（tok/s） | 16.69 | 16.79 | 0.99x | 22.63 | 16.19 | 1.40x |
+| 首 token 时间，短提示（s） | 0.64 | 0.75 | 1.17x | 0.58 | 1.29 | 2.22x |
+| prefill，4K token 提示（tok/s） | 999.7 | 483.2 | 2.07x | 294.4 | 75.9 | 3.88x |
+| prefill，16K token 提示（tok/s） | 1346.8 | 826.1 | 1.63x | 295.2 | 见报告 | |
+| 四个并发请求，总输出（tok/s） | 33.65 | 33.04 | 1.02x | 45.73 | 见报告 | |
+| 2.3K token 对话的第二轮，首 token（s） | 0.45 | 0.91 | 2.00x | 0.46 | 见报告 | |
+| 共享 2.3K token 系统提示的新对话，首 token（s） | 0.48 | 0.64 | 1.34x | 0.51 | 见报告 | |
+| 答案校验夹具（`eng/muse-spark-validate.py`） | 13 / 14 | 12 / 14 | | 14 / 14 | 见报告 | |
+| 加载时间 | 6.0 分钟 | 14.4 分钟 | 2.4x | 6.4 分钟 | 14.7 分钟 | 2.3x |
 
-在 NUMA 均衡的主机内存下，llama.cpp 的单请求 decode 达到 10.72 tok/s，与 TensorSharp 相差不到 3%，
-但它的 prefill 降到 35 tok/s。
-TensorSharp 唯一失败的夹具是固定 512 token 的 decode。它的回答通顺，但在讲到冲突（collisions）之前就用完了 token 预算。
-复用 127 token 的模板检查点会改变 prefill 的批形状，因此贪心解码走上了与之前某个通过的构建不同的分支。
+按层切分适合长提示：流水线 prefill 让十张 GPU 都在处理同一个提示。它的单请求 decode 与 llama.cpp 持平
+（0.99x，在运行间波动范围内），因为两个引擎都让一个 token 依次经过十张 GPU。张量并行适合生成：
+它的 decode 速度是 llama.cpp 张量切分的 1.40 倍，是任一引擎按层切分的 1.35 倍。它的 prefill 停留在约 295 tok/s，
+因为该主机上的 all-reduce 走 NCCL 的共享内存传输，而 Muse Spark 在求和之前先对每个专家的输出做归一化，
+所以 MoE 的 all-reduce 要携带每个被选中专家的输出。
 
-## 张量并行
+在 teacher-forced 的 wikitext-2 上（相同的 token ID，12,276 个计分位置），按层切分的下一 token 分布与 llama.cpp 的
+平均 KL 散度为 0.0026，低于 llama.cpp 只改变 micro-batch 大小时与自身之间的 0.0028；由流水线 prefill 写入的前缀结果相同。
+`--tp 10` 处于这一噪声水平：其平均值 0.0031 比它高 9%，最大值也更高，而 p99 和 top-1 一致率更好；
+ggml 的 NCCL 路径以 BF16 对其 prefill 的 MoE 部分和求和。按层切分唯一失败的夹具是交错到达用例：一个请求在 512 个 token 中的第 322 个处以通顺的回答
+和文本结束 token 结束，这是贪心解码的分支，不是引擎故障；llama.cpp 的按层切分也没有通过这个用例。
+在上述工作之前，TensorSharp 在该主机上两条命令都无法运行，它早先的 `--tp` 路径 decode 速度为 1.9–2.4 tok/s。
+
+## 逐算子路径上的张量并行
+
+本节描述托管逐算子路径的张量并行：设置 `TS_MUSE_SPARK_NATIVE=0` 或后端为 `ggml_vulkan` 时，`--tp N` 使用它。
+在 `ggml_cuda` 上，`--tp N` 改为运行[原生执行器](#原生执行器上的张量并行)。
 
 `--tp N` 按完整的 GQA 头组切分 Q/K/V/gate 投影，并按输入列切分注意力输出投影。
 每张 GPU 并发计算自己的头，然后在 post-attention 归一化之前把各部分输出投影相加。
@@ -221,11 +344,11 @@ F16 走的是普通序列路径，不是打包 F32 批处理。
 配合式的 JSON 输出不能证明 schema 语法被强制执行。两个引擎的夹具通过数都不能确立通用模型质量的持平或优劣。
 
 生成的证据包括
-[F16 活动与未修改的配对分析](../validation/muse-spark/q3-final-v4r2-performance-complete/independent-audit.json)、
-[资源与实际使用摘要](../validation/muse-spark/q3-final-v4r2-performance-complete/completed-campaign-summary.json)、
-[失败的 F32 活动、串行重放与清理](../validation/muse-spark/q3-f32-nospec-failed-cleanup-v4r2-complete/SUMMARY.md)、
-[独立的 n-gram 续跑](../validation/muse-spark/recovery-ngram-offline-audit.json)
-以及[被挤出前缀的复用](../validation/muse-spark/recovery-prefix-offline-audit.json)。
+F16 活动与未修改的配对分析（`docs/validation/muse-spark/q3-final-v4r2-performance-complete/independent-audit.json`）、
+资源与实际使用摘要（`docs/validation/muse-spark/q3-final-v4r2-performance-complete/completed-campaign-summary.json`）、
+失败的 F32 活动、串行重放与清理（`docs/validation/muse-spark/q3-f32-nospec-failed-cleanup-v4r2-complete/SUMMARY.md`）、
+独立的 n-gram 续跑（`docs/validation/muse-spark/recovery-ngram-offline-audit.json`）
+以及被挤出前缀的复用（`docs/validation/muse-spark/recovery-prefix-offline-audit.json`）（本地验证记录，未提交到 Git）。
 这些被忽略的报告由验证过程生成，新的源码检出中可能不存在。记录的源码清单为
 `f8615e93fb90286076ce21e4db15c516735d722b457fb562beaaa7a46f940f56`；
 原生库 SHA256 为
@@ -233,13 +356,13 @@ F16 走的是普通序列路径，不是打包 F32 批处理。
 之后一项经独立验证的修复会在后端拆除/重建之前清理调用线程拥有的分页注意力会话；它不在这些整模型基准二进制中，
 而且这些新进程模型运行没有重建后端，因此这一生命周期发现不能解释 F32 非答案。
 其他线程上的工作者仍须在后端拆除之前排空；该修复不声称能清理每个线程的缓存。见
-[隔离的生命周期审计](../validation/muse-spark/lifecycle-completed-review/accepted-audit.json)和
-[最终已应用源码回执](../validation/muse-spark/final-applied-source/receipt.json)。
+隔离的生命周期审计 `docs/validation/muse-spark/lifecycle-completed-review/accepted-audit.json` 和
+最终已应用源码回执 `docs/validation/muse-spark/final-applied-source/receipt.json`（本地验证记录，未提交到 Git）。
 修复后的库上没有重跑整模型推理和计时。
 
 ## 启动分片模型
 
-把所选量化的所有分片放在同一目录中，并传入其中任意一个分片（`UD-Q4_K_XL` 有十二个；`UD-Q3_K_XL` 有十个）。
+把所选量化的所有分片放在同一目录中，并传入其中任意一个分片（`UD-Q4_K_XL` 有十二个；`UD-Q3_K_XL` 有十个；`UD-IQ3_XXS` 有八个）。
 TensorSharp 从第 1 个分片解析架构、分词器和模型设置，然后从完整的分片集合加载张量。
 后续分片只包含切分元数据，不是独立的模型。
 下面的 Q3 配置是五张 A40 GPU 的显式 F16 评估配置：每张 GPU 总内存 46,068 MiB、初始可用 45,490 MiB，
@@ -307,13 +430,13 @@ F32 KV 的存储是 F16 的两倍。每次对比都要让两个引擎的缓存�
 当更高的 CPU 卸载数能满足同一份基于头部的估算时，它会报告这个数；设置永远不会被自动更改。
 主机内存也必须容得下这些被卸载的专家。
 
-张量并行同样在加载权重之前根据描述符做规划。如果均匀的整专家数量能放进每个实测设备，它就保持均匀。
+逐算子路径的张量并行同样在加载权重之前根据描述符做规划。如果均匀的整专家数量能放进每个实测设备，它就保持均匀。
 否则它会分配连续的专家区间，以平衡扣除固定注意力/主干权重和同样的预留之后的剩余内存；
 rank 0 可以拥有更少的专家来容纳它的主干。预检和加载器使用同一份不可变的方案，启动日志会记录其数量和策略。
 如果任何设备的空闲内存无法获取，它会回退到均匀数量，并报告哪些检查不可用。
 这永远不会更改 `--n-cpu-moe`。它不会为视觉塔预留空间，也不能证明配置的最大上下文能放得下。
 
-Muse Spark CUDA TP 上下文每个 rank 至多保留八个可复用的主机 scratch 块，上限为 128 块、每块至多 8 MiB（共 1 GiB），按需分配。
+在逐算子路径上，Muse Spark CUDA TP 上下文每个 rank 至多保留八个可复用的主机 scratch 块，上限为 128 块、每块至多 8 MiB（共 1 GiB），按需分配。
 单设备、按层放置以及其他模型的池保持原有策略。`TS_MUSE_SPARK_TP_HOST_POOL=0` 选择原来的八块池，用于受控对比。
 设置 `TS_MUSE_SPARK_PHASE_TIMING=1` 时，前向报告会在阶段计时旁附带不可变的前/后主机池计数。
 这些计数衡量的是主机分配/复用，不是设备内存或内核时间。增加的保留量是有界的；对整模型性能的收益仍未测量。
@@ -335,7 +458,8 @@ Muse-Glimmer-30B 的投影器输出宽度不同，会被拒绝。OpenAI 兼容�
 这是测试配置，并不验证默认的自适应策略。接受率取决于提示/输出中的重复文本。
 在声称投机加速了某个负载之前，请核实实际的草稿提议和被接受的 token；仅仅启用该标志并不能证明加速。
 
-`TS_MUSE_SPARK_LAYER_SPLIT` 可选地为每张 GPU 指定一个正的层数，各数之和为 62。
+在逐算子路径上，`TS_MUSE_SPARK_LAYER_SPLIT` 可选地为每张 GPU 指定一个正的层数，各数之和为 62
+（原生执行器也接受 0；见[选项](#选项)）。
 没有它时，TensorSharp 按常驻权重字节数平衡连续的层组，并计入 CPU 专家卸载以及 embedding/输出矩阵。
 KV 缓存、图像编码器和计算 scratch 需要额外内存。
 层放置是在不同设备上依次执行相继的层组；它不会把一次矩阵乘切分到多张 GPU 上。
@@ -451,13 +575,15 @@ CPU 专家 scratch、源页面建议、加权 RMS scratch 以及头 norm/门控 
   更广的固定库套件通过了 27 个原生用例，以及新的托管通道 CPU Muse 95、CPU 后端/生命周期 25、CUDA Muse 23、
   CUDA 后端/生命周期 25，无失败或跳过。这些是重复的已有组件用例，不计入前面的覆盖总数。
   原始的绝对误差失败、有界的 CUDA 舍入诊断和仅出现在控制台的加载器审计失败仍保留在
-  [隔离证明](../validation/muse-spark/lifecycle-completed-review/accepted-audit.json)中。
+  隔离证明 `docs/validation/muse-spark/lifecycle-completed-review/accepted-audit.json`（本地验证记录，未提交到 Git）中。
   这是组件验证，不是修复后的整模型运行。
 - `eng/validation/validate-muse-spark-final-candidate.sh` 根据提供的已应用源码清单复现隔离构建、原生/组件门禁和 CPU arena 对比；
   它拒绝正在运行的完整服务器和复用的证据目录。仅调用这个脚本并不包含单独的广泛回归和后端回归结果。
   组件通过不能替代独立记录的运行时检查：已完成的五 GPU F16 活动、有运行时证据但存在未解决回答质量失败的打包 F32 调度，
   以及已通过的 n-gram 和被挤出前缀检查。
-- 当前的 TP 实现请使用 [`eng/validation/validate-muse-spark-tp.py`](../../eng/validation/validate-muse-spark-tp.py)。
+- 逐算子路径的 TP 实现请使用 [`eng/validation/validate-muse-spark-tp.py`](../../eng/validation/validate-muse-spark-tp.py)；
+  原生 `--tp` 则由 [MuseSparkNativeTensorParallelTests.cs](../../InferenceWeb.Tests/MuseSparkNativeTensorParallelTests.cs)
+  和 ctest `muse-spark-tp-split-plan` 覆盖。
   它运行已构建的 Linux 运行时，有显式的 CPU、rank 数、注意力、缓存和集合通信通道；`--list-lanes` 列出确切的清单和设备要求。
   默认包含所有必需通道；诊断通道是单独的，只跑子集不能确立整套通过。原生清单现在要求 32 个用例，
   包括缓存失败恢复和新的 F32 投影精度检查；这一要求并不表示新的设备检查已经通过。

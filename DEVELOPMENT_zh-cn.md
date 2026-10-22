@@ -348,7 +348,7 @@ TensorSharp/
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # 让该模型可被服务端托管的原生 per-sequence slot
 │   ├── Models/GlmDsa/           # GLM 5.x：原生执行器驱动、MLA + DSA indexer 逐算子参考实现、序列 slot、NextN/MTP 草稿头
 │   ├── Models/MuseGlimmer/      # Muse-Glimmer：融合整模型前向、视觉编码器、张量并行变体、DFlash 块级草稿器
-│   ├── Models/MuseSpark/        # Muse Spark：原生整模型执行器的托管驱动（MuseSparkModel.Native.cs）、带注意力/专家张量并行与整层放置的逐算子参考前向、视觉、前缀缓存
+│   ├── Models/MuseSpark/        # Muse Spark：原生整模型执行器（按层切分与 `--tp`）的托管驱动（MuseSparkModel.Native.cs）、带注意力/专家张量并行与整层放置的逐算子参考前向（`TS_MUSE_SPARK_NATIVE=0`、Vulkan 上的 `--tp`）、视觉、前缀缓存
 │   ├── Models/MiniMaxH3/        # MiniMax-H3 视频 + 联合 32 kHz 立体声音频：打包序列 DiT、Qwen3-VL 文本编码器与视觉塔、视频与音频 VAE、flow-match 调度器、pipeline
 │   ├── Models/WanVideo/         # Wan 2.1/2.2，仅视频：DiT、UMT5-XXL 文本编码器、因果 3D VAE、UniPC 调度器，以及不依赖 ggml 的 WanDirect* `cuda`/`cpu` 路径
 │   ├── Models/Video/            # 两个视频家族共同实现的接缝：IVideoGenerationModel、VideoGenerationParams/Progress、GeneratedVideoAudio、WAV 写出
@@ -384,7 +384,9 @@ TensorSharp/
 │   ├── ggml_ops_muse_glimmer.cpp          # Muse-Glimmer 整模型前向：decode 用持久图（供 ggml-cuda 捕获 CUDA 图）、prefill 用瞬时图，另含张量并行图
 │   ├── ggml_ops_muse_glimmer_vision.cpp   # Muse-Glimmer ViT 块的设备端实现（最大尺寸图像有 16,224 个 patch，逐算子派发会让每步都经宿主同步）
 │   ├── ggml_ops_dflash.cpp                # Muse-Glimmer DFlash 块级草稿器，每个投机步融合为一张图（草稿块 + 借用主干的 LM head）
-│   ├── ggml_ops_muse_spark_exec.cpp       # Muse Spark 原生整模型执行器：分片 GGUF 加载、整层与按专家栈放置、NUMA 本地主机专家、按 slot 的 F16 KV 与滑动窗口环、每个微批一张图、批处理 decode/prefill、slot 检查点
+│   ├── ggml_ops_muse_spark_exec.cpp       # Muse Spark 原生整模型执行器：分片 GGUF 加载、最多 16 张 GPU 的整层与按专家栈放置、NUMA 本地主机专家、按 slot 的 F16 KV 与滑动窗口环、每个微批一张图、按层切分的流水线 prefill、批处理 decode/prefill、slot 检查点、基于 ggml meta 后端的张量并行
+│   ├── ggml_ops_muse_spark_tp.cpp         # Muse Spark 原生张量并行切分方案：注意力按 KV 组、路由专家沿 n_ff、输出头按词表行（ctest `muse-spark-tp-split-plan`）
+│   ├── ggml_ops_cuda_vmm_peer_guard.cpp   # Linux `--wrap=cuMemSetAccess` 保护层：CUDA 的 8 个 peer 上限拒绝授权时，让 ggml-cuda 的 VMM 临时内存池只归其所属 GPU（ctest `cuda-vmm-peer-guard`）
 │   ├── ggml_ops_muse_spark{,_attention}.cpp # Muse Spark 逐算子路径：Q/K 预处理、norm/gate 与 post-norm 残差图、显式 F32 的 CUDA 注意力
 │   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 在 ggml-cuda 流上的融合自定义算子（及其 CPU 版本）
 │   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 稠密整模型 decode（CUDA graph 持久化）

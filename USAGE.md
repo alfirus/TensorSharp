@@ -66,7 +66,7 @@ for setup, extraction limits, citations and complete-original access.
 
 **GLM 5.x (`glm-dsa`) is another exception.** Its 744B-A40B MLA + sparse-attention MoE runs through a native whole-model ggml executor on `--backend ggml_cuda` / `ggml_vulkan` / `ggml_cpu` / `ggml_metal`, and through a managed per-op path on `--backend cpu` (100% managed, no native dependencies) and `--backend cuda`; `TS_GLM_NATIVE=0` selects the managed path on a GGML backend for an A/B. **GLM-5.3 (not Flash) is the same `glm-dsa` block shape as GLM-5.2** — 79 blocks (78 trunk + one NextN), 256 routed experts at top-8 plus one shared expert, MLA with the lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path, on the same backends, with no new code and no new flag; it is text only twice over, because the repo publishes no mmproj at any quant and `--mmproj` on `glm-dsa` is warned about and ignored rather than failing the run. A split GGUF is handled by `GgufFile` itself — point `--model` at the `-00001-of-` shard of the quant directory (six shards for GLM-5.2, seven and 236.4 GiB for GLM-5.3's UD-Q2_K_XL). MLX does not run it. See the [GLM card](docs/models/glm.md), and [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) for what differs.
 
-**Muse Spark (`muse-spark`) has a native whole-model executor as well.** The 816B-A42B Unsloth release runs on `--backend ggml_cuda` / `ggml_vulkan` through a TensorSharp-owned executor that submits one GGML graph per micro-batch across every GPU and the CPU, on unchanged upstream ggml. `--layer-split N` spreads its 62 layers over N local GPUs, and `TS_MUSE_SPARK_CPU_MOE=auto` places each expert stack so that as few bytes as possible stay on the host; with neither that nor `--n-cpu-moe N`, a checkpoint that does not fit is refused with a message naming the option. Concurrent requests share batched decode and prefill graphs over per-sequence F16 KV slots. `TS_MUSE_SPARK_NATIVE=0` selects the older managed per-op path, which `--tp N` always uses; `TS_MUSE_SPARK_NATIVE=1` opts `ggml_cpu` into the executor. The full-model measurements are on `ggml_cuda` (six A40 GPUs); Vulkan has none. As for any split GGUF, `--model` may name any shard: TensorSharp reads the metadata from shard 1 and the tensors from every shard. See the [Muse Spark card](docs/models/muse-spark.md) and the [llama.cpp comparison](docs/perf/muse-spark-vs-llama-cpp.md).
+**Muse Spark (`muse-spark`) has a native whole-model executor as well.** The 816B-A42B Unsloth release runs on `--backend ggml_cuda` / `ggml_vulkan` through a TensorSharp-owned executor that submits one GGML graph per micro-batch across every GPU and the CPU, on unchanged upstream ggml. `--layer-split N` spreads its 62 layers over N local GPUs (up to 16) and, on two or more CUDA GPUs with every expert in VRAM, pipelines each prompt's micro-batches across them (`TS_MUSE_SPARK_PIPELINE`). `--tp N` on `ggml_cuda` runs the same executor with every layer split over the first N CUDA GPUs (choose them with `CUDA_VISIBLE_DEVICES`) through upstream ggml's meta backend, the mechanism behind llama.cpp's `-sm tensor`; it keeps every expert in GPU memory. `TS_MUSE_SPARK_CPU_MOE=auto` places each expert stack of a layer split so that as few bytes as possible stay on the host; with neither that nor `--n-cpu-moe N`, a checkpoint that does not fit is refused with a message naming the option. Concurrent requests share batched decode and prefill graphs over per-sequence F16 KV slots. `TS_MUSE_SPARK_NATIVE=0` selects the older managed per-op path, which `--tp N` on `ggml_vulkan` also uses; `TS_MUSE_SPARK_NATIVE=1` opts `ggml_cpu` into the executor. The current full-model measurements are on `ggml_cuda` (ten A40 GPUs, UD-IQ3_XXS): against llama.cpp, `--layer-split 10` prefills a 4K-token prompt 2.07x as fast with decode level (0.99x), and `--tp 10` decodes 1.40x as fast as `-sm tensor`. Vulkan has none. As for any split GGUF, `--model` may name any shard: TensorSharp reads the metadata from shard 1 and the tensors from every shard. See the [Muse Spark card](docs/models/muse-spark.md) and the [llama.cpp comparison](docs/perf/muse-spark-vs-llama-cpp.md).
 
 ## Configuration file (CLI + Server)
 
@@ -942,7 +942,7 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TENSORSHARP_TP_DEGREE` | Local tensor-parallel degree (default `1`), equivalent to `--tp N`; never selects layer split. Unsupported model/backend combinations fail. |
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | Local GPU count for whole-layer placement, equivalent to `--layer-split N`; mutually exclusive with TP and distributed TP settings. |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Device ordinals for the Qwen 3.8 Flash Next shared GGML layer executor, comma-separated (e.g. `0,2`); independent of `TENSORSHARP_TP_DEVICES`. Native GLM/DeepSeek placement uses `CUDA_VISIBLE_DEVICES` instead. |
-| `TENSORSHARP_TP_DEVICES` | GPU ordinals the TP ranks map to, comma-separated (e.g. `0,2`; default `0..tp-1`). Used by TP on the GGML backends. |
+| `TENSORSHARP_TP_DEVICES` | GPU ordinals the TP ranks map to, comma-separated (e.g. `0,2`; default `0..tp-1`). Used by TP on the GGML backends. Muse Spark's native `--tp` on `ggml_cuda` uses the first N CUDA GPUs and refuses to load with this set; choose its GPUs with `CUDA_VISIBLE_DEVICES`. |
 | `TS_Q4E_LAYER_SPLIT` | Explicit per-GPU layer counts for the Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split, comma-separated (e.g. `20,28`), replacing the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
 | `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
@@ -967,7 +967,7 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TS_SCHED_MAX_BATCHED_TOKENS` | Scheduler per-step token budget (default: `4096`). |
 | `TS_SCHED_MAX_RUNNING_SEQS` | Maximum in-flight sequences (default: `16`). |
 | `TS_SCHED_PREFILL_CHUNK` | Per-request prefill cap in a mixed prefill+decode step (default: `256`); prefill-only steps fairly consume the full batched-token budget. |
-| `TS_SCHED_SOLO_PREFILL_CHUNK` | Prefill chunk size for the fresh (start_pos = 0) part of a SOLO prompt — one uncontended request gets big fused-prefill chunks (default: `8192`). |
+| `TS_SCHED_SOLO_PREFILL_CHUNK` | Prefill chunk size for the fresh (start_pos = 0) part of a SOLO prompt — one uncontended request gets big fused-prefill chunks (default: `8192`, bounded by `TS_SCHED_MAX_BATCHED_TOKENS`). A model with its own lone-prompt steps — Muse Spark with pipelined prefill: 8192 tokens, which may exceed `TS_SCHED_MAX_BATCHED_TOKENS` — sizes them unless this variable is set; a set value applies as described and turns the model's steps off. `TS_SCHED_MAX_BATCHED_TOKENS` alone does not. |
 | `TS_SCHED_NUM_BLOCKS` | Physical blocks in the engine block pool (default: `256`). |
 | `TS_SCHED_BLOCK_SIZE` | Tokens per block on the engine side (default: `16` for a family whose only cross-request reuse is its pages, Hunyuan Dense, Mistral 3 and Muse-Glimmer; `256` otherwise). |
 | `TS_SCHED_PREFIX_CACHE` | `0` disables all prompt reuse across requests: the Radix prefix cache's pages, retained end states and shared-prefix checkpoints. Reuse is isolated per conversation either way: another conversation's state is shared only up to the system-prompt-and-tools prefix (see [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#prompt-reuse-across-requests-conversation-scopes-and-media-identity)). Pages: a page written by a batched paged step is adopted in the model's paged storage (the request starts as a paged resident); a host-slab page is restored into the linear cache; a page that has neither form a request can read is not adopted and re-prefills. |
@@ -1762,8 +1762,11 @@ Notes:
   (`TS_MUSE_SPARK_HOST_NUMA=0` keeps the GGUF mapping); on the 2-socket test host that
   raised host expert bandwidth from about 100 to 165-174 GB/s. Batches of 2-16 tokens
   run host experts through a static-row kernel whose results match ggml's bit for bit.
-  On six A40s the plan put 131.8 GiB of the 374 GiB UD-Q3_K_XL checkpoint on the host,
-  and decode still reached 11.05 tok/s, 1.11x llama.cpp on the same machine. See the
+  In an earlier measurement on six A40s, the plan put 131.8 GiB of the 374 GiB
+  UD-Q3_K_XL checkpoint on the host and decode still reached 11.05 tok/s, 1.11x
+  llama.cpp in that run. Host experts keep automatic pipelined prefill off; the current
+  comparison, on ten A40s with every expert in GPU memory, is the
+  [llama.cpp comparison](docs/perf/muse-spark-vs-llama-cpp.md). See the
   [model card](docs/models/muse-spark.md#native-whole-model-executor).
 * **One-token host experts run on TensorSharp's own kernel.** ggml's CPU dot
   products, but on a team woken once per layer and parked as soon as the layer is
@@ -1912,7 +1915,7 @@ must be reachable between all nodes.
 | GPT OSS | ✅ | Attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path is expert-parallel (whole experts per rank, one batched `ggml_mul_mat_id` dispatch per projection per layer) and falls back to per-expert slicing only when the expert count does not divide the TP degree |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Still walks experts per token per rank on GGML (no expert parallelism yet) |
 | Muse-Glimmer | ✅ (`--tp 2` at most) | Its 2 KV heads cap the degree at 2; GGML CUDA / Vulkan only, and a DFlash drafter is declined under TP — the CLI warns and decodes plainly, the server refuses to start (see [Constraints](#constraints)) |
-| Muse Spark | ✅ (local only, per-op path) + layer split | `--tp N` on GGML CUDA / Vulkan splits Q/K/V/gate projections by whole GQA head groups and the attention output by input columns, and partitions routed experts whole; uneven partitions are allowed (nine GPUs for the published 128-query / 16-KV-head checkpoint), but each rank must own at least one KV group and expert. The router, latent projections, residual stream and output head run on rank 0. TP always takes the per-op path rather than the native executor and has no performance measurement; `--layer-split N` (the native executor's placement) is the measured mode. The two cannot be combined, and distributed groups are refused |
+| Muse Spark | ✅ (local only) + layer split | `--tp N` on GGML CUDA runs the native whole-model executor with every layer split over the first N CUDA GPUs (choose them with `CUDA_VISIBLE_DEVICES`; `TENSORSHARP_TP_DEVICES` is refused) through upstream ggml's meta backend, the mechanism behind llama.cpp's `-sm tensor`. Attention is split by KV group, routed experts along their hidden dimension in 256-element units and the output head by vocabulary rows; norms, router and latent projections are copied to every GPU, and each layer ends in two all-reduces. N may be uneven but at most the 16 KV heads, the GPUs must be identical, and every expert stays in GPU memory (`--n-cpu-moe N`, `TS_MUSE_SPARK_LAYER_SPLIT` and `TS_MUSE_SPARK_PIPELINE=1` are refused); pipelined prefill and speculation are off under it. On ten A40s `--tp 10` decodes at 22.63 tok/s, 1.40x llama.cpp's `-sm tensor`, while `--layer-split 10` prefills long prompts faster (see the [llama.cpp comparison](docs/perf/muse-spark-vs-llama-cpp.md) and the [model card](docs/models/muse-spark.md#tensor-parallelism-on-the-native-executor)). `TS_MUSE_SPARK_NATIVE=0`, and `--tp` on GGML Vulkan, keep the older per-op path: whole GQA head groups and whole experts per rank, router and output head on rank 0, `TENSORSHARP_TP_DEVICES` honoured. The two modes cannot be combined, and distributed groups are refused |
 | GLM 5.x | ✅ (local only) | GGML GPU backends only; the native TP path is local/single-process for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (`--tp-node-id` / `--tp-peers` are hard-refused for the whole family). GLM-5.2 shards MLA heads and hidden rows inside every routed expert. GLM-5.3-Flash also head-shards KDA with per-rank recurrent state; its MLA heads and routed-expert hidden rows are sharded likewise. Attention partials reduce before each nonlinear Sinkhorn hyper-connection. On GLM-5.3-Flash's eligible segmented fast path, routed-MoE partials reduce first, then each rank computes/adds the replicated shared expert locally; hyper-connections, pooled indexer, router, norms, dense layers and embedding also remain unsharded and execute per rank, while output norm / LM head stay on rank 0. CPU MoE, tracing, partial `TS_GLM_TP_SHARD`, oversubscription, or missing native hyper-connection kernels use the combined scheduler fallback, where the shared expert runs once on rank 0. Plain GLM-5.3 accepts `--tp N` on the same local terms and replicates the MLA and indexer caches on every rank, so `--tp` multiplies the KV footprint; nothing has ever been run on it at `--tp N>1` — the only recorded arithmetic is a non-fit, `--tp 8` wanting 41.7 GiB per rank against 46 GB cards — so treat it as an accepted mode rather than a validated configuration, and note that `--spec` is refused there whenever `--tp N>1`. Use `--layer-split N` for whole-layer placement |
 | DeepSeek V4 Flash | layer split | Not tensor parallelism: the whole-model executors bin-pack contiguous runs of whole layers against each device's free VRAM, and `--layer-split N` only caps how many GPUs that split uses |
 | DeepSeek V4.1 Flash | partial TP | `--layer-split N` selects local whole-layer placement. Experimental routed-MoE TP (`--tp N`) runs on GGML CUDA; attention TP and distributed groups are unsupported. The two modes cannot be combined. |
@@ -1940,7 +1943,17 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend gg
 # Choose which physical GPUs the ranks map to
 TENSORSHARP_TP_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model <model.gguf> --backend ggml_cuda --tp 2
+
+# Muse Spark's native --tp uses the first N visible CUDA GPUs instead
+CUDA_VISIBLE_DEVICES=0,2 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
+    --model <muse-spark shard 1> --backend ggml_cuda --tp 2
 ```
+
+Muse Spark's native `--tp` on `ggml_cuda` is the exception to the per-rank
+layout above: one ggml meta backend spans the GPUs, and the all-reduce runs
+over NCCL when the build has it (over shared memory, `NCCL_P2P_DISABLE=1`, when
+a probe finds peer copies broken) or ggml's peer-copy exchange otherwise; an
+explicit `GGML_CUDA_ALLREDUCE` overrides that choice.
 
 **What to expect.** GGML TP started as a *capacity* feature — it lets a model
 that does not fit in one GPU's VRAM run entirely on GPUs — and fused per-rank
@@ -1985,7 +1998,7 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 
 | Variable | Effect |
 |---|---|
-| `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`) |
+| `TENSORSHARP_TP_DEVICES` | GPU ordinals per rank, e.g. `0,2` (default `0..tp-1`). Muse Spark's native `--tp` refuses it; use `CUDA_VISIBLE_DEVICES` there |
 | `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
 | `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
@@ -2002,6 +2015,7 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 - Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`.
 - Batched/continuous-batching forward under TP is implemented for Mistral 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.
 - **Muse-Glimmer** caps at `--tp 2`: it has 2 KV heads, and no model here replicates KV heads when `numKVHeads < tp`. A DFlash drafter is declined under TP (the CLI warns and decodes plainly; the server refuses to start, exit code 2), its KV-block pages work under TP too (the snapshot walks each layer's per-rank caches), and it requires the GGML CUDA/Vulkan backends — the fused per-rank plan needs a device collective that ggml-metal does not provide.
+- **Muse Spark**'s native `--tp` (`ggml_cuda`) does not need an even split: N may go up to its 16 KV heads (16 KV groups over 10 GPUs gives each GPU one or two, rotating per layer), and the experts split along their hidden dimension in 256-element units. It keeps the executor's sequence slots, batched decode, retained conversations and shared-prefix checkpoints; K/V row growth and checkpoint copies run on the GPUs. It refuses to load rather than run a plan it cannot honour: unlike GPUs, a GPU left without a KV group or expert rows, or a graph op the GPUs cannot run (a tensor-parallel layer cannot fall back to the CPU).
 
 ### Cluster tuning & diagnostics
 
@@ -2024,6 +2038,15 @@ Startup logs make the topology explicit: the local group prints
 `Tensor parallelism: N GPUs (<device names>)`, P2P demotions print a
 `TP: P2P disabled…` / self-test warning, and every distributed node prints
 `[TcpCommunicator] Rank r/N connected to all peers.` once the mesh is complete.
+
+More than eight GPUs: CUDA allows a GPU at most 8 peer connections, and an NCCL
+build of ggml-cuda grants each kernel-scratch pool chunk to every peer-capable GPU
+at once, which aborted every `ggml_cuda` run on ten GPUs (`peer mapping resources
+exhausted`). TensorSharp's Linux build wraps `cuMemSetAccess` without patching
+ggml: on that refusal the chunk stays private to its own GPU, a one-time
+`[CUDA] GPU N cannot share its kernel-scratch memory with ...` warning is printed,
+and NCCL gets `NCCL_P2P_DIRECT_DISABLE=1` unless it is already set or
+`NCCL_P2P_DISABLE` is on. Tensor copies between GPUs do not use that pool.
 
 ### Redis-backed shared state
 
@@ -2198,7 +2221,7 @@ The full picture, including the native loader's own knobs, is in the
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
 | Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI and server) |
-| GPU ordinals used by the TP ranks (GGML backends) | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
+| GPU ordinals used by the TP ranks (GGML backends; Muse Spark's native `--tp` takes the first N visible CUDA GPUs, so use `CUDA_VISIBLE_DEVICES`) | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
 | Explicit per-GPU layer counts for the `qwen4exp` layer split (`--layer-split N`) | automatic VRAM balance | `TS_Q4E_LAYER_SPLIT=20,28` | — |
 | Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI and server; the server must be node `0`) |
 | Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI and server) |

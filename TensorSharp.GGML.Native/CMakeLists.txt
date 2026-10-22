@@ -322,6 +322,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_embeddings.cpp
     ggml_ops_glm_dsa.cpp
     ggml_ops_muse_spark_exec.cpp
+    ggml_ops_muse_spark_tp.cpp
     ggml_ops_dsv4_fused_cpu.cpp
     ggml_ops_paged_attention.cpp
     ggml_ops_tensor_parallel.cpp
@@ -383,6 +384,32 @@ else()
     add_library(GgmlOps SHARED ${TSG_GGMLOPS_SOURCES})
 endif()
 
+# With NCCL, ggml-cuda's VMM scratch pool shares every chunk with all
+# peer-capable GPUs, which CUDA refuses past eight peers per GPU. Every target
+# that links the static ggml-cuda routes ggml's cuMemSetAccess through
+# TensorSharp's guard (see ggml_ops_cuda_vmm_peer_guard.cpp) instead of a
+# patched ggml. GNU ld and lld rewrite the references inside the static
+# ggml-cuda archive too; a NO_VMM build never calls it. Windows builds have no
+# NCCL, so there the file only supplies the no-op NCCL policy.
+function(tsg_add_cuda_vmm_peer_guard target)
+    target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ggml_ops_cuda_vmm_peer_guard.cpp")
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    if (TSG_USE_NCCL)
+        target_compile_definitions(${target} PRIVATE TSG_GGML_CUDA_NCCL=1)
+    endif()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT GGML_CUDA_NO_VMM)
+        target_compile_definitions(${target} PRIVATE TSG_CUDA_VMM_PEER_GUARD=1)
+        get_target_property(TSG_GUARD_TYPE ${target} TYPE)
+        if (TSG_GUARD_TYPE STREQUAL "SHARED_LIBRARY")
+            target_compile_definitions(${target} PRIVATE TSG_CUDA_VMM_PEER_GUARD_HIDDEN=1)
+        endif()
+        target_link_options(${target} PRIVATE "$<HOST_LINK:LINKER:--wrap=cuMemSetAccess>")
+        target_link_libraries(${target} PRIVATE CUDA::cuda_driver)
+    endif()
+endfunction()
+
 if (WIN32)
     # Re-export the statically-linked ggml C API so the managed layer
     # (TensorSharp.Backends.GGML/Interop/GgmlApi.cs) can P/Invoke it directly.
@@ -422,6 +449,7 @@ endif()
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
     target_link_libraries(GgmlOps PRIVATE CUDA::cublas)
+    tsg_add_cuda_vmm_peer_guard(GgmlOps)
     if (TSG_HAVE_CUDNN)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
         # Deliberately NOT linked -- resolved with LoadLibrary/dlopen at run time.
@@ -621,6 +649,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_executable(GgmlOpsDsv41EngramTest tests/dsv41_engram_test.cpp)
     add_test(NAME deepseek41-engram-hash-lookup COMMAND GgmlOpsDsv41EngramTest)
+    add_executable(GgmlOpsMuseSparkTpSplitTest tests/muse_spark_tp_split_test.cpp ggml_ops_muse_spark_tp.cpp)
+    target_include_directories(GgmlOpsMuseSparkTpSplitTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsMuseSparkTpSplitTest PRIVATE ggml-base)
+    add_test(NAME muse-spark-tp-split-plan COMMAND GgmlOpsMuseSparkTpSplitTest)
     add_executable(GgmlOpsDsv41EngramGgufTest tests/dsv41_engram_gguf_test.cpp)
     target_link_libraries(GgmlOpsDsv41EngramGgufTest PRIVATE ggml-base)
     add_test(NAME deepseek41-engram-embedded-gguf COMMAND GgmlOpsDsv41EngramGgufTest)
@@ -1169,4 +1201,35 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS AND TENSORSHARP_GGML_NATIVE_ENABLE_CUDA 
         ggml-cuda ggml-cpu ggml-base CUDA::cudart ${CMAKE_DL_LIBS})
     add_test(NAME cuda-f32-row-gather COMMAND GgmlOpsTpCollectiveGatherTest)
     set_tests_properties(cuda-f32-row-gather PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+endif()
+
+# ggml-cuda's scratch pool on every visible GPU through GgmlOps, i.e. through
+# the cuMemSetAccess guard that keeps 10+ peer-capable GPUs working.
+if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS AND TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND
+    CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT GGML_CUDA_NO_VMM)
+    add_executable(GgmlOpsCudaVmmPeerGuardTest tests/cuda_vmm_peer_guard_test.cpp)
+    target_include_directories(GgmlOpsCudaVmmPeerGuardTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsCudaVmmPeerGuardTest PRIVATE GgmlOps CUDA::cudart)
+    if (TSG_USE_NCCL)
+        # ggml then asks to share pool memory, so the wrapper must be what saved it.
+        target_compile_definitions(GgmlOpsCudaVmmPeerGuardTest PRIVATE TSG_GGML_CUDA_NCCL=1)
+    endif()
+    add_test(NAME cuda-vmm-peer-guard COMMAND GgmlOpsCudaVmmPeerGuardTest)
+    set_tests_properties(cuda-vmm-peer-guard PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+endif()
+
+# Test executables that link the static ggml-cuda themselves (instead of only
+# GgmlOps) need the same guard, or they abort on 10+ peer-capable GPUs; it also
+# supplies tsg::tp_cuda_respect_vmm_peer_limit to those compiling the TP probes.
+if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS AND TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+    get_property(TSG_ALL_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(TSG_TARGET IN LISTS TSG_ALL_TARGETS)
+        get_target_property(TSG_TARGET_TYPE ${TSG_TARGET} TYPE)
+        get_target_property(TSG_TARGET_LIBS ${TSG_TARGET} LINK_LIBRARIES)
+        if (TSG_TARGET_TYPE STREQUAL "EXECUTABLE" AND TSG_TARGET_LIBS AND
+            ("ggml-cuda" IN_LIST TSG_TARGET_LIBS OR "ggml" IN_LIST TSG_TARGET_LIBS))
+            tsg_add_cuda_vmm_peer_guard(${TSG_TARGET})
+        endif()
+    endforeach()
 endif()

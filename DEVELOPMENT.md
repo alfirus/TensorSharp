@@ -466,7 +466,7 @@ TensorSharp/
 │   │   └── DeepSeek4Model.PerSeqCache.cs   # Native per-sequence slots that make the model servable
 │   ├── Models/GlmDsa/           # GLM 5.x: native-executor driver, MLA + DSA indexer per-op reference, sequence slots, NextN/MTP draft head
 │   ├── Models/MuseGlimmer/      # Muse-Glimmer: fused whole-model forward, vision encoder, tensor-parallel variants, DFlash block drafter
-│   ├── Models/MuseSpark/        # Muse Spark: managed driver for the native whole-model executor (MuseSparkModel.Native.cs), the per-op reference forward with attention/expert tensor parallelism and layer placement, vision, prefix cache
+│   ├── Models/MuseSpark/        # Muse Spark: managed driver for the native whole-model executor in layer split and `--tp` (MuseSparkModel.Native.cs), the per-op reference forward with attention/expert tensor parallelism and layer placement (`TS_MUSE_SPARK_NATIVE=0`, `--tp` on Vulkan), vision, prefix cache
 │   ├── Models/MiniMaxH3/        # MiniMax-H3 video + joint 32 kHz stereo audio: packed-sequence DiT, Qwen3-VL text encoder + vision tower, video and audio VAEs, flow-match scheduler, pipeline
 │   ├── Models/WanVideo/         # Wan 2.1/2.2, video only: DiT, UMT5-XXL text encoder, causal 3D VAE, UniPC scheduler, plus the ggml-independent WanDirect* `cuda`/`cpu` path
 │   ├── Models/Video/            # The seam both video families implement: IVideoGenerationModel, VideoGenerationParams/Progress, GeneratedVideoAudio, WAV writing
@@ -502,7 +502,9 @@ TensorSharp/
 │   ├── ggml_ops_muse_glimmer.cpp          # Muse-Glimmer whole-model forward: persistent decode graph (so ggml-cuda captures it) + transient prefill graph + tensor-parallel graphs
 │   ├── ggml_ops_muse_glimmer_vision.cpp   # Muse-Glimmer ViT block on-device (a max-size image is 16,224 patches, so per-op dispatch synchronizes through the host)
 │   ├── ggml_ops_dflash.cpp                # Muse-Glimmer DFlash block drafter fused into one graph per speculative step (draft blocks + the trunk's borrowed LM head)
-│   ├── ggml_ops_muse_spark_exec.cpp       # Muse Spark native whole-model executor: split-GGUF load, layer and per-stack expert placement, NUMA-local host experts, per-slot F16 KV with sliding rings, one graph per micro-batch, batched decode/prefill, slot checkpoints
+│   ├── ggml_ops_muse_spark_exec.cpp       # Muse Spark native whole-model executor: split-GGUF load, layer and per-stack expert placement on up to 16 GPUs, NUMA-local host experts, per-slot F16 KV with sliding rings, one graph per micro-batch, pipelined layer-split prefill, batched decode/prefill, slot checkpoints, tensor parallelism on ggml's meta backend
+│   ├── ggml_ops_muse_spark_tp.cpp         # Muse Spark native tensor-parallel split plan: attention by KV group, routed experts along n_ff, output head by vocabulary rows (ctest `muse-spark-tp-split-plan`)
+│   ├── ggml_ops_cuda_vmm_peer_guard.cpp   # Linux `--wrap=cuMemSetAccess` guard: keeps ggml-cuda's VMM scratch pool private to its GPU when CUDA's 8-peer limit refuses a grant (ctest `cuda-vmm-peer-guard`)
 │   ├── ggml_ops_muse_spark{,_attention}.cpp # Muse Spark per-op path: Q/K preparation, norm/gate and post-norm residual graphs, explicit-F32 CUDA attention
 │   ├── ggml_ops_dsv4_fused.cu / _cpu.cpp  # DeepSeek V4 fused custom ops on ggml-cuda's stream (and their CPU counterparts)
 │   ├── ggml_ops_gemma4_decode.cpp         # Gemma 4 dense whole-model decode (CUDA-graph persisted)

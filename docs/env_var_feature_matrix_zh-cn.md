@@ -46,7 +46,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（Qwen 3.5/3.6/3.8、Gemma 4、GPT-OSS） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配 | `64` | 不适用 | 否 |
 | `TS_SCHED_DISABLE_BATCHED` | 全部 | `1` 让所有模型都走按序列 KV-swap 路径，投机解码也一样（`--no-continuous-batching`） | 关闭 | `0`, `1` | 是 |
 | `TS_SCHED_PREFIX_CACHE` | 全部自回归模型 | `0` 关闭准入时的全部提示复用（Radix 前缀缓存：页面、保留的终态与公共检查点在同一个索引里）。`--no-prefix-cache`（CLI 与服务端）会设置它，并同时跳过共享提示的启动预热，以及服务端的检查点文件 | 启用（`1`） | 未注册 | 否 |
-| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
+| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | 全部 | 调度器预算：每步 token 数、同时运行的序列数、有 decode 在跑时的 prefill 分块（服务端 `--prefill-chunk-size`）、solo prefill 分块、块池块数、每块 token 数（只靠页面做跨请求复用的家族为 16，其余为 256）、decode 时间片。有自己单请求步长的模型——启用流水化 prefill 的 Muse Spark：8192——在未设置 `TS_SCHED_SOLO_PREFILL_CHUNK` 时自行决定步长；设置了该变量则按文档生效并关闭模型自己的步长，只设置 `TS_SCHED_MAX_BATCHED_TOKENS` 不会关闭它。见[配置表](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md#配置) | `4096` / `16` / `256` / `8192` / `256` / `16` 或 `256` / `256` | 未注册 | 否 |
 | `TS_SCHED_STOP_REPETITION` | 全部 | `0` 时陷入循环的生成会一直跑到 token 上限，而不是以 `repetition` 结束原因停止 | 启用（`1`） | 未注册 | 否 |
 
 本节的 executor 级开关（`TS_SCHED_DISABLE_BATCHED`、`TS_PER_SEQ_FUSED`、
@@ -217,7 +217,7 @@ Qwen 3.5 家族的 DFlash / DFlash2 块级草稿器；实验性的 DeepSeek V4.1
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
-| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer、Muse Spark（仅 n-gram）（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
+| `TS_SPEC` | Qwen 3.5/3.6/3.8、GLM 5.2、GLM-5.3、GLM-5.3-Flash（仅 n-gram）、Gemma 4、Qwen 3.8 Flash Next、DeepSeek V4 / V4.1、Muse-Glimmer、Muse Spark（仅 n-gram，其原生 `--tp` 下不启用）（CLI + 服务端） | 为单序列启用投机解码 | 关闭（`0`） | 未注册 | 否 |
 | `TS_SPEC_TYPE` | 同上全部 | 投机算法：`auto` \| `draft-head` \| `block` \| `ngram` | `auto` | 未注册 | 否 |
 | `TS_SPEC_DRAFT` | 同上全部 | 每个投机步最多起草的 token 数（1-64） | `8` | 未注册 | 否 |
 | `TS_SPEC_PMIN` | 同上全部 | 草稿置信度门限；含义随算法而定 | 按算法（`0.15` / `0.35` / `0`） | 未注册 | 否 |
@@ -252,13 +252,15 @@ Muse Spark 原生整模型执行器的选择与容量规划由以下开关控制
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时基线 | 扫描取值 | 默认是否扫描 |
 |---|---|---|---|---|---|
-| `TS_MUSE_SPARK_NATIVE` | Muse Spark | `0` 选择逐算子路径；`1` 让 `ggml_cpu` 也运行原生执行器。`--tp` 总是走逐算子路径 | `ggml_cuda` / `ggml_vulkan` 上开启 | 未注册 | 否 |
-| `TS_MUSE_SPARK_CPU_MOE` | Muse Spark（原生） | `auto` 逐个放置专家栈，尽可能多地留在 GPU 上、让主机上的字节尽可能少；覆盖 `--n-cpu-moe` | 关闭 | 未注册 | 否 |
+| `TS_MUSE_SPARK_NATIVE` | Muse Spark | `0` 选择逐算子路径；`1` 让 `ggml_cpu` 也运行原生执行器。`ggml_cuda` 上的 `--tp N` 由原生执行器通过 ggml 的 meta 后端在前 N 张 CUDA GPU 上做张量并行（用 `CUDA_VISIBLE_DEVICES` 选择；`TENSORSHARP_TP_DEVICES` 会被拒绝）；`0` 保留逐算子 TP 路径，`ggml_vulkan` 上的 `--tp` 总是走该路径 | `ggml_cuda` / `ggml_vulkan` 上开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_CPU_MOE` | Muse Spark（原生） | `auto` 逐个放置专家栈，尽可能多地留在 GPU 上、让主机上的字节尽可能少；覆盖 `--n-cpu-moe`。原生 `--tp` 下所有专家都留在显存中 | 关闭 | 未注册 | 否 |
 | `TS_MUSE_SPARK_PLAN_SLOTS` | Muse Spark（原生） | 放置规划中预留的滑动窗口环数；设为并发数再加一（留给共享前缀检查点） | `1` | 未注册 | 否 |
 | `TS_MUSE_SPARK_UBATCH` | Muse Spark（原生） | prefill 微批行数；放不下的计算图会把该次调用拆成减半的微批 | `2048` | 未注册 | 否 |
 | `TS_MUSE_SPARK_DEV0_RESERVE_MB` | Muse Spark（原生） | 在 GPU 0 上额外预留的内存，例如给视觉编码器 | `0` | 未注册 | 否 |
 | `TS_MUSE_SPARK_HOST_NUMA` | Muse Spark（原生） | `0` 让主机专家保留在 GGUF 映射中，而不是复制到 NUMA 本地并由绑核工作线程计算 | 有两个及以上 NUMA 节点时开启 | 未注册 | 否 |
-| `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark（原生，GPU） | `0` 跳过加载时的满尺寸 prefill；该 prefill 让 ggml-cuda 的内核 scratch 池在 slot 占用内存之前先长到峰值 | 有 GPU 时开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_WARM_POOLS` | Muse Spark（原生，GPU） | `0` 跳过加载时的满尺寸 prefill；该 prefill 让 ggml-cuda 的内核 scratch 池在 slot 占用内存之前先长到峰值；启用流水化 prefill 时，加载还会跑一次短的流水化 prefill（`0` 同样跳过它），建好流水线的调度器并确认它能生效 | 有 GPU 时开启 | 未注册 | 否 |
+| `TS_MUSE_SPARK_PIPELINE` | Muse Spark（原生，按层切分） | 流水化 prefill：一次 prompt 调用被切成若干微批，GPU k 处理一个微批时 GPU k+1 处理前一个。未设置 = 自动（两张及以上 GPU、全部为 CUDA 系、没有主机专家、未设置 `TS_MUSE_SPARK_PROFILE`、不是 `--tp` 时开启）；`1` 强制开启（多 GPU 的非 CUDA 后端与 `--tp` 下会拒绝加载）；`0` 关闭；其他取值拒绝加载。加载日志会打印 `pipelined prefill: on (...)` 或 `off (原因)` | 自动 | 未注册 | 否 |
+| `TS_MUSE_SPARK_PIPELINE_UBATCH` | Muse Spark（原生，流水化 prefill） | 流水化 prefill 的固定微批行数，取值为 [1, `TS_MUSE_SPARK_UBATCH`] 内的整数，其他值拒绝加载。未设置 = 自适应：约为每次调用的四分之一，介于 512 行与 prefill ubatch 之间；长上下文的掩码超出暂存预算时会更小（最少 128 行） | 自适应 | 未注册 | 否 |
 
 ## 矩阵外的 DeepSeek V4 / V4.1 开关
 
@@ -330,7 +332,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TENSORSHARP_TP_DEGREE` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 把模型切分到本机多少张 GPU（Megatron-LM 列/行并行） | `1`（单 GPU） | 未注册 | 否 |
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | 支持按层切分的架构 | 本地整层放置的 GPU 数，等价于 `--layer-split N`；与 TP 参数互斥 | `1` | 未注册 | 否 |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器 | 逗号分隔的设备序号，例如 `0,2`；独立于 `TENSORSHARP_TP_DEVICES`；原生 GLM/DeepSeek 使用 `CUDA_VISIBLE_DEVICES` | `0..N-1` | 未注册 | 否 |
-| `TENSORSHARP_TP_DEVICES` | GGML 后端上的本地 TP | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`） | `0..tp-1` | 未注册 | 否 |
+| `TENSORSHARP_TP_DEVICES` | GGML 后端上的本地 TP | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`）。Muse Spark 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时拒绝加载；那里请用 `CUDA_VISIBLE_DEVICES` | `0..tp-1` | 未注册 | 否 |
 | `TENSORSHARP_TP_NODE_ID` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 多节点分布式 TP 中本节点的 0 起始编号；必须与 `TENSORSHARP_TP_PEERS` 一起设置 | 未设置（关闭） | 未注册 | 否 |
 | `TENSORSHARP_TP_PEERS` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔）；必须与 `TENSORSHARP_TP_NODE_ID` 一起设置 | 未设置（关闭） | 未注册 | 否 |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 仅分布式 TP | 各节点向 peer 重试连接多久后放弃 | `120` 秒 | 未注册 | 否 |

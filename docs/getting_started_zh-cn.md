@@ -61,9 +61,11 @@ DeepSeek V4 / V4.1 的按层切分改用独立的 `--layer-split N` 参数：每
 按层切分仅支持单节点，不能与 `--tp-node-id` / `--tp-peers` 组合。
 现有按层切分命令需将 `--tp N` 改为 `--layer-split N`，或设置
 `TENSORSHARP_LAYER_SPLIT_DEGREE=N`。未配置两种模式时默认使用单设备。GLM 5.x 的 `--layer-split N` 选择整层放置，
-GGML GPU 后端上的 `--tp N` 则选择原生本地张量并行路径。Muse Spark 的原生整模型执行器使用
-`--layer-split N`（配合 `TS_MUSE_SPARK_CPU_MOE=auto`，把放不进显存的专家栈放到主机内存），
-`--tp N` 则选择它的逐算子张量并行路径；见[实测的六 GPU 配置](models/muse-spark_zh-cn.md)。
+GGML GPU 后端上的 `--tp N` 则选择原生本地张量并行路径。Muse Spark 的原生整模型执行器在最多
+16 张 GPU 上运行两种模式：`--layer-split N`（配合 `TS_MUSE_SPARK_CPU_MOE=auto`，把放不进显存的
+专家栈放到主机内存），以及 `ggml_cuda` 上通过上游 ggml 的 meta 后端切分每层的 `--tp N`。
+`ggml_vulkan` 上的 `--tp N` 或设置 `TS_MUSE_SPARK_NATIVE=0` 时，选择它的逐算子张量并行路径。见
+[启动配置](models/muse-spark_zh-cn.md#启动)与[十 GPU 对比](perf/muse-spark-vs-llama-cpp.md)（英文）。
 对 Qwen-Image-2.1，`--tp N` 只切分扩散 Transformer（DiT），文本 / 视觉编码器与 VAE 留在第一张 GPU 上。请先安装 CUDA 工具包，然后：
 
 ```bash
