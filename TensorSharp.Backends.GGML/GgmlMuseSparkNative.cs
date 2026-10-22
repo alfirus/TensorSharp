@@ -26,10 +26,10 @@ namespace TensorSharp.GGML
         }
 
         [DllImport(DllName, CallingConvention = Conv)]
-        private static extern IntPtr TSGgml_MuseSparkLoadModel([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
+        private static extern IntPtr TSGgml_MuseSparkLoadModelTp([MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
             int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int ctxIsHardLimit,
-            [MarshalAs(UnmanagedType.LPUTF8Str)] string layerSplit);
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string layerSplit, int tp);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern void TSGgml_MuseSparkSetOption([MarshalAs(UnmanagedType.LPUTF8Str)] string name,
@@ -100,14 +100,19 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_MuseSparkGetStats(IntPtr handle, long[] stats, int cap);
 
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int TSGgml_MuseSparkPipelinePlan(IntPtr handle, long p0, long n);
+
         /// <param name="nGpu">GPUs to spread the layers over; 0 = every visible device.</param>
         /// <param name="nCpuMoe">Leading layers whose routed experts stay in system RAM; -1 offloads the fewest that fit.</param>
         /// <param name="backendName">ggml backend registry name ("CUDA", "Vulkan", "CPU").</param>
         /// <param name="layerSplit">Optional comma-separated layer count per GPU.</param>
+        /// <param name="tp">GPUs to split every layer over (tensor parallelism through ggml's meta
+        /// backend, CUDA only); 0 or 1 for a layer split over <paramref name="nGpu"/> GPUs.</param>
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
-            string backendName, bool ctxIsHardLimit, string layerSplit)
-            => TSGgml_MuseSparkLoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty,
-                ctxIsHardLimit ? 1 : 0, layerSplit ?? string.Empty);
+            string backendName, bool ctxIsHardLimit, string layerSplit, int tp = 0)
+            => TSGgml_MuseSparkLoadModelTp(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty,
+                ctxIsHardLimit ? 1 : 0, layerSplit ?? string.Empty, tp);
 
         /// <summary>Override (or with a null value, clear) a native option. Takes precedence over the
         /// process environment, which .NET cannot update for native code on Linux.</summary>
@@ -160,11 +165,18 @@ namespace TensorSharp.GGML
         public static int TakeReclaimedSlots(IntPtr handle, int[] buffer)
             => TSGgml_MuseSparkTakeReclaimedSlots(handle, buffer, buffer.Length);
 
-        /// <summary>[graphs built, graphs reused, host weight bytes, CPU-MoE layers, GPUs, slots].</summary>
+        /// <summary>[graphs built, graphs reused, host weight bytes, CPU-MoE layers, GPUs, slots,
+        /// pipelined prefill calls, their micro-batches, pipelined prefills declined,
+        /// pipelined prefill micro-batch rows (0: off), GPU stages a pipelined prefill spans (0: off),
+        /// tensor-parallel degree (0: layer split)].</summary>
+        /// <summary>Micro-batch rows a prompt of <paramref name="n"/> tokens starting at position
+        /// <paramref name="p0"/> would prefill pipelined with; 0 when it would run one ubatch at a time.</summary>
+        public static int PipelinePlan(IntPtr handle, long p0, long n) => TSGgml_MuseSparkPipelinePlan(handle, p0, n);
+
         public static long[] GetStats(IntPtr handle)
         {
-            var stats = new long[6];
-            return TSGgml_MuseSparkGetStats(handle, stats, stats.Length) == 6 ? stats : null;
+            var stats = new long[12];
+            return TSGgml_MuseSparkGetStats(handle, stats, stats.Length) == 12 ? stats : null;
         }
     }
 }

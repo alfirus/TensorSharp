@@ -14,7 +14,7 @@ internal static class MuseSparkArchitecture
         Factory = c => new MuseSparkModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
         MultiGpu = MultiGpuMode.TensorParallel,
         SupportsLayerSplit = true,
-        MultiGpuLimitation = "muse-spark uses attention tensor parallelism and whole-expert parallelism in one process; whole-layer placement remains available separately.",
+        MultiGpuLimitation = "muse-spark splits every layer over the GPUs in one process (--tp; native on ggml_cuda, the per-op path elsewhere); whole-layer placement (--layer-split) remains available separately.",
         SupportsDistributedTensorParallel = false,
         ProjectorFileHints = new[] { "*mmproj*Muse*Spark*.gguf", "*mmproj*.gguf" },
     };

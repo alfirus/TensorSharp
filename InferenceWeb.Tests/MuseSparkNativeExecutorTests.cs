@@ -19,7 +19,8 @@ public sealed class MuseSparkNativeExecutorTests : IDisposable
     [
         "TS_MUSE_SPARK_NATIVE", "MAX_CONTEXT", "TS_MUSE_SPARK_KV_PAD", "TS_MUSE_SPARK_UBATCH",
         "TS_MUSE_SPARK_SWA_REWIND", "TS_MUSE_SPARK_FUSE_QKVG", "TS_MUSE_SPARK_SWA_FULL", "TS_MUSE_SPARK_SLOT_INIT_ROWS",
-        "TS_MUSE_SPARK_HOST_MOE_TOKENS",
+        "TS_MUSE_SPARK_HOST_MOE_TOKENS", "TS_MUSE_SPARK_PIPELINE", "TS_MUSE_SPARK_PIPELINE_UBATCH",
+        "TS_MUSE_SPARK_LAYER_SPLIT",
     ];
     private readonly Dictionary<string, string> _old = Saved.ToDictionary(n => n, Environment.GetEnvironmentVariable);
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ts-muse-spark-native-" + Guid.NewGuid().ToString("N"));
@@ -44,6 +45,7 @@ public sealed class MuseSparkNativeExecutorTests : IDisposable
         // Global K/V rows start at 8 and double while sequences grow, so every
         // test also crosses several row reallocations (and their graph rebuilds).
         Environment.SetEnvironmentVariable("TS_MUSE_SPARK_SLOT_INIT_ROWS", "8");
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT", null);
     }
 
     public void Dispose()
@@ -111,6 +113,117 @@ public sealed class MuseSparkNativeExecutorTests : IDisposable
         model.ResetKVCache();
         Close(_fixture.Reference(tokens[5..12]), model.Forward(tokens[5..12]));
     }
+
+    /// <summary>Pipelined prefill (forward_pipelined): the equal micro-batches of one call are
+    /// enqueued back to back on one scheduler with rotating input copies, the last one padded
+    /// past the call's end. Logits after the prefill, and every decode step that reads the K/V
+    /// rows it wrote (over the rows the padding touched, and on the CPU, whose 4-row pad gives a
+    /// 24-row ring, across the sliding ring's wrap), must match the independent decoder. On GPUs
+    /// the 256-row pad keeps every window and the ring at 256 rows here; the growing-window
+    /// variants below cover windows that change inside one call.</summary>
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void CpuPipelinedPrefillMatchesReference() => PipelineCheck(BackendType.GgmlCpu, 1);
+
+    [CudaFact(GgmlBackend = BackendType.GgmlCuda)]
+    public void CudaPipelinedPrefillMatchesReference() => PipelineCheck(BackendType.GgmlCuda, 1);
+
+    [MultiCudaFact(2, GgmlBackend = BackendType.GgmlCuda)]
+    public void MultiCudaPipelinedPrefillAcrossGpusMatchesReference() => PipelineCheck(BackendType.GgmlCuda, 2);
+
+    private void PipelineCheck(BackendType backend, int gpus)
+    {
+        if (backend != BackendType.GgmlCpu) Environment.SetEnvironmentVariable("TS_MUSE_SPARK_KV_PAD", null);
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_PIPELINE", "1");
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_PIPELINE_UBATCH", "4");
+        // One layer per GPU: a stage on each, whatever the devices' free memory.
+        if (gpus > 1) Environment.SetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT", OneLayerPerGpu(gpus));
+        using var model = new MuseSparkModel(_fixture.Write(Path.Combine(_dir, Guid.NewGuid() + ".gguf")), backend,
+            layerSplitDegree: gpus);
+        // On GPUs the load already ran one pipelined warm-up; count from here.
+        long[] before = model.NativeStatsForTests();
+        Assert.NotNull(before);
+        int[] tokens = Tokens(48, 9);
+        // 14 tokens: four 4-row micro-batches, the last padded with two copies of
+        // the final token; the decode steps then rewrite the padded rows.
+        Close(_fixture.Reference(tokens[..14]), model.Forward(tokens[..14]));
+        for (int end = 15; end <= 18; end++)
+            Close(_fixture.Reference(tokens[..end]), model.Forward([tokens[end - 1]]));
+
+        // 32 tokens from position 0: eight micro-batches, and the logits come from the
+        // pipeline itself (on the CPU the 24-row sliding ring wraps during the call).
+        model.ResetKVCache();
+        Close(_fixture.Reference(tokens[..32]), model.Forward(tokens[..32]));
+        for (int end = 33; end <= 40; end++)
+            Close(_fixture.Reference(tokens[..end]), model.Forward([tokens[end - 1]]));
+
+        // A pipelined call that resumes a sequence mid-window.
+        Assert.True(model.TryTruncateKVCache(36));
+        Close(_fixture.Reference(tokens[..48]), model.Forward(tokens[36..48]));
+
+        // All three prefills really ran pipelined: 4 + 8 + 3 micro-batches, none declined.
+        long[] stats = model.NativeStatsForTests();
+        Assert.NotNull(stats);
+        Assert.Equal(3, stats[6] - before[6]);
+        Assert.Equal(15, stats[7] - before[7]);
+        Assert.Equal(0, stats[8] - before[8]);
+        Assert.Equal(backend == BackendType.GgmlCpu ? 0 : gpus, stats[10]);
+    }
+
+    private static string OneLayerPerGpu(int gpus)
+        => string.Join(",", Enumerable.Repeat(MuseSparkSyntheticModelBuilder.Layers / gpus, gpus));
+
+    /// <summary>Pipelined prefill whose K/V windows grow inside one call: with the GPUs' 256-row
+    /// pad, 64-row ubatches and a 1024-token context, a 650-token prompt runs as 11 micro-batches
+    /// whose global window grows 256 -> 512 -> 768 within the scheduler reserved for the last one,
+    /// while the 256-row sliding ring wraps and later micro-batches wait on earlier ones' copy
+    /// slots (more than the scheduler's input copies are in flight). A second call with smaller
+    /// windows reuses the reservation. With <paramref name="globalFirst"/> the first GPU holds
+    /// only the global (NoPE) layer, so it never reads positions.</summary>
+    [CudaFact(GgmlBackend = BackendType.GgmlCuda)]
+    public void CudaPipelinedPrefillGrowingWindowsMatchesReference() => GrowingWindowCheck(1, globalFirst: false);
+
+    [MultiCudaFact(2, GgmlBackend = BackendType.GgmlCuda)]
+    public void MultiCudaPipelinedPrefillGrowingWindowsMatchesReference() => GrowingWindowCheck(2, globalFirst: false);
+
+    [MultiCudaFact(2, GgmlBackend = BackendType.GgmlCuda)]
+    public void MultiCudaPipelinedPrefillGlobalOnlyFirstStageMatchesReference() => GrowingWindowCheck(2, globalFirst: true);
+
+    private void GrowingWindowCheck(int gpus, bool globalFirst)
+    {
+        const int context = 1024;
+        var fixture = new MuseSparkSyntheticModelBuilder(contextLength: context, slidingFirst: !globalFirst);
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_KV_PAD", null);
+        Environment.SetEnvironmentVariable("MAX_CONTEXT", context.ToString());
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_UBATCH", "64");
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_PIPELINE", "1");
+        Environment.SetEnvironmentVariable("TS_MUSE_SPARK_PIPELINE_UBATCH", "64");
+        if (gpus > 1) Environment.SetEnvironmentVariable("TS_MUSE_SPARK_LAYER_SPLIT", OneLayerPerGpu(gpus));
+        using var model = new MuseSparkModel(fixture.Write(Path.Combine(_dir, Guid.NewGuid() + ".gguf")), BackendType.GgmlCuda,
+            layerSplitDegree: gpus);
+        long[] before = model.NativeStatsForTests();
+        Assert.NotNull(before);
+        int[] tokens = Tokens(700, 11);
+
+        // 650 tokens: 11 micro-batches of 60 rows, the last padded with 10 copies of token 649.
+        Close(fixture.Reference(tokens[..650]), model.Forward(tokens[..650]), LongTolerance);
+        for (int end = 651; end <= 654; end++)
+            Close(fixture.Reference(tokens[..end]), model.Forward([tokens[end - 1]]), LongTolerance);
+
+        // Resume at 600 with 100 tokens: 2 micro-batches of 50 rows, windows within the reservation.
+        Assert.True(model.TryTruncateKVCache(600));
+        Close(fixture.Reference(tokens[..700]), model.Forward(tokens[600..700]), LongTolerance);
+
+        long[] stats = model.NativeStatsForTests();
+        Assert.NotNull(stats);
+        Assert.Equal(2, stats[6] - before[6]);
+        Assert.Equal(13, stats[7] - before[7]);
+        Assert.Equal(0, stats[8] - before[8]);
+        Assert.Equal(64, stats[9]);
+        Assert.Equal(gpus, stats[10]);
+    }
+
+    // Hundreds of positions of F16 K/V against the double-precision oracle.
+    private const float LongTolerance = 2e-2f;
 
     [GgmlFact(BackendType.GgmlCpu)]
     public void CpuBatchedDecodeOverSlotsMatchesIndependentSequences() => BatchedCheck(BackendType.GgmlCpu);

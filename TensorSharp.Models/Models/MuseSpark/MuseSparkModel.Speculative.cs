@@ -11,7 +11,10 @@ namespace TensorSharp.Models;
 // use this target contract without loading any extra weights.
 public partial class MuseSparkModel : ISpeculativeTarget
 {
-    public bool SpeculationProfitable => IsGgmlBackend;
+    // Under native --tp the executor keeps one graph (ggml's meta backend holds
+    // per-GPU views only for the graph it ran last), so alternating draft-verify
+    // and decode graphs would rebuild every step.
+    public bool SpeculationProfitable => IsGgmlBackend && _nativeTpDegree == 0;
     public int SpecPrefillChunkSize => _prefillChunk;
     public int SpecMaxDraftTokens => Math.Max(0, _prefillChunk - 1);
     public bool SpecVerifyPersistsAcceptedKv => true;
