@@ -207,7 +207,7 @@ The sampler no longer trusts the result either. A non-finite velocity fails the 
 
 #### Flash attention on shapes a backend has no kernel for
 
-`ggml_backend_graph_compute` never asks `ggml_backend_supports_op`. A `GGML_OP_FLASH_ATTN_EXT` node that ggml-cuda has no kernel for therefore reaches `ggml_cuda_flash_attn_ext`, which ends the process with `ggml-cuda/fattn.cu:730: fatal error` (`BEST_FATTN_KERNEL_NONE`). At ggml 456172ec (the unmodified revision `eng/Dockerfile.gb10` pins; a default build tracks `master`, see [Prerequisites](#prerequisites)) `ggml_cuda_get_best_fattn_kernel` returns none when:
+`ggml_backend_graph_compute` never asks `ggml_backend_supports_op`. A `GGML_OP_FLASH_ATTN_EXT` node that ggml-cuda has no kernel for therefore reaches `ggml_cuda_flash_attn_ext`, which ends the process with `ggml-cuda/fattn.cu:730: fatal error` (`BEST_FATTN_KERNEL_NONE`). At ggml 456172ec, `ggml_cuda_get_best_fattn_kernel` returns none when:
 
 - the K head size is not 40, 64, 72, 80, 96, 112, 128 or 256 (with an equal V head size), nor 192 (V 128), 320 (V 256), 512 or 576 (V 512);
 - the head size is 192, 320, 512 or 576 and the grouped-query path does not apply: that needs a query/KV head ratio of at least 2 (a multiple of 8 for 192, of 32 for 320), a mask, no ALiBi, a KV length that is a multiple of 256 (`FATTN_KQ_STRIDE`) and every `nb[1..3]` of the unquantized Q/K/V/mask divisible by 16;
@@ -262,7 +262,9 @@ The macOS 27 SDK compiles Metal shaders as Metal 4.1 by default, and its address
 
 `eng/Dockerfile.gb10` builds this checkout's main solution and native GGML/CUDA
 code on a **native Linux ARM64 Docker builder**. It pins CUDA 13.0.2 components, .NET SDK
-10.0.401 and unmodified GGML revision `456172ec733a135778adcd32d00e576a58232e45`.
+10.0.401 and unmodified GGML revision `da8e2a54b919557b816b1c2beb432ccb766f7ce0`.
+This revision provides the CUDA MMQ precision configuration API used by
+TensorSharp's Q8 activation kernels; keep the fetched upstream checkout unchanged.
 Precision kernels remain in TensorSharp-owned code; the build checks that the
 fetched ggml working tree is unchanged.
 The SDK and clean Ubuntu images are pinned by digest; NVIDIA's signed repository
