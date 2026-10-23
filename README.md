@@ -25,7 +25,7 @@ Current source covers text and reasoning, multimodal input, embeddings, image ge
 - **Agent Skills and code tools.** `TensorSharp.AgentHost` adds file, shell and document workflows. The [17 bundled skills](docs/agent_skills.md) include research, documents, TDD, design interviews and handoff; `find-skills` searches, inspects and installs additional skills when network access is enabled. Server and TensorAgent chats also support [bounded sub-agent delegation](docs/multi_agent.md) with private workspaces and read-only defaults.
 - **Personal knowledge collections.** [Upload files or nested folders, and import saved chats with their attachments and artifacts](docs/knowledge-system.md). Select collections per chat, retrieve cited excerpts with page/row/time locations, preview originals, or let code agents open full datasets. Local BM25 works by default; optional GGUF embeddings add semantic search, and compatible media models index images, audio and sampled video. Extraction status and warnings show coverage limits.
 - **Steer an active response.** Submit a new instruction while the CLI, server Web UI or TensorAgent is reasoning or answering. The next response uses the conversation, partial output and your guidance; Stop remains available.
-- **Recorded comparisons.** Benchmarks against `llama.cpp` use identical GGUF files and hardware; results apply to the measured model, backend and workload. On ten A40 GPUs, the 816B [Muse Spark](docs/models/muse-spark.md) prefills a 4K-token prompt 2.07× as fast as llama.cpp with layer split, and decodes 1.40× as fast with tensor parallelism. See [Benchmarks](docs/benchmarks.md).
+- **Latest recorded comparisons.** [DeepSeek V4.1 Flash 1017](docs/models/deepseek41.md) on five A40 GPUs and [Muse Spark](docs/models/muse-spark.md) on ten have workload-specific comparisons against llama.cpp. In the matched ~1.8K DeepSeek prompt, exact TP5 prefill was 3.23× the reference rate; default approximate YOCO was 5.50× with a measured quality trade-off. See [Benchmarks](docs/benchmarks.md) for the exact settings, slower cells and limitations.
 - **TensorAgent apps.** Local chat, attachments, skills and saved work on phones and desktops. See the [Mac/Windows installation guide](docs/tensoragent_desktop.md) and [app coverage notes](TensorAgent/README.md).
 
 ## Learn with the books
@@ -127,22 +127,24 @@ What each run shows, step by step: [Screenshots](docs/showcase.md).
 
 ## Benchmarks
 
-TensorSharp and `llama.cpp` run identical GGUF files on the same NVIDIA RTX 3080 Laptop GPU (16 GB), each on its GGML CUDA and Vulkan builds. Each number is TensorSharp's speedup over llama.cpp on the same backend (geomean, single-stream, greedy, MTP off); above 1.0× means TensorSharp is faster.
+Latest recorded comparisons, audited on **2026-10-23**. DeepSeek V4.1 Flash 1017 was measured on **five A40 46 GB GPUs** on October 22–23; Muse Spark's **ten-A40** report was refreshed October 22 (its exact measurement date is not recorded). These are different models and workloads, not a combined engine speedup.
 
-| Model | Backend | decode | prefill | TTFT |
-|---|---|---:|---:|---:|
-| Gemma 4 E4B it (Q8_0, dense multimodal) | CUDA | 1.02× | **1.28×** | **1.27×** |
-| Gemma 4 E4B it (Q8_0, dense multimodal) | Vulkan | 1.00× | 1.05× | 1.03× |
-| Gemma 4 12B it (QAT UD-Q4_K_XL, dense) | CUDA | 1.04× | **1.17×** | **1.16×** |
-| Gemma 4 12B it (QAT UD-Q4_K_XL, dense) | Vulkan | **1.21×** | 1.04× | 1.03× |
-| Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE) | CUDA | 0.98× | **1.28×** | **1.27×** |
-| Qwen 3.6 35B-A3B (UD-IQ2_XXS, MoE) | Vulkan | 0.87× | 1.04× | 1.03× |
-| Qwen 3.6 27B (UD-IQ2_XXS, dense) | CUDA | **1.07×** | 0.96× | 0.95× |
-| Qwen 3.6 27B (UD-IQ2_XXS, dense) | Vulkan | 1.02× | 0.85× | 0.84× |
+| Model / placement / workload | TensorSharp tok/s | llama.cpp tok/s | Ratio |
+|---|---:|---:|---:|
+| DeepSeek 1017, TP5, ~1.8K prefill, **exact** | 563.9 | 174.6 | **3.23×** |
+| DeepSeek 1017, TP5, ~1.8K prefill, **approximate YOCO default** | 960.5 | 174.6 | **5.50×** |
+| DeepSeek 1017, TP5, ~7.3K prefill, **exact** | 549.7 | 225.7 | **2.44×** |
+| DeepSeek 1017, TP5, ~7.3K prefill, **approximate YOCO default** | 1,000.7 | 225.7 | **4.43×** |
+| Muse Spark, layer split 10, 4,075-token prefill | 999.7 | 483.2 | **2.07×** |
+| Muse Spark, layer split 10, 15,767-token prefill | 1,346.8 | 826.1 | **1.63×** |
+| Muse Spark, TP10, one-request decode | 22.63 | 16.19 | **1.40×** |
+| Muse Spark, TP10, four-request aggregate output | 45.73 | 24.49 | **1.87×** |
 
-The largest model with a recorded head-to-head is the 816B Muse Spark on ten A40 GPUs (UD-IQ3_XXS), against llama.cpp's matching mode. Layer split decodes level (0.99×) and prefills 2.07× / 1.63× as fast at 4K / 16K tokens; `--tp 10` decodes 1.40× and prefills a 4K-token prompt 3.88× as fast ([report](docs/perf/muse-spark-vs-llama-cpp.md)).
+**DeepSeek:** UD-IQ2_XXS, 32,768-token context, one request, 256 output tokens, greedy/thinking off; prefill uses internal server timers, not HTTP TTFT. TensorSharp TP5 is compared with the reference's supported layer split. Default YOCO is approximate: wikitext-2 perplexity was 2.4978, versus 2.4811 with exact prefill and 2.4697 for llama.cpp. **5.50× applies only to that approximate ~1.8K prefill cell**, not decode or general engine performance. [Model, method and provenance](docs/models/deepseek41.md#unsloths-deepseek-v41-flash-1017-ggufs).
 
-What these numbers mean, how to rerun them, and the head-to-heads of models too large for this GPU: [Benchmarks](docs/benchmarks.md).
+**Muse Spark:** UD-IQ3_XXS, 32,768-token context, F16 KV, greedy/thinking off; matching placement modes, 32 output tokens for long-prompt prefill and 256 for short decode / concurrent requests. Prefill is uncached prompt tokens divided by streamed TTFT. Layer-split decode was slightly slower: 16.69 vs 16.79 tok/s (0.99×). On this host P2P was broken and llama.cpp tensor split ran without NCCL, while TensorSharp used NCCL; that limits the TP comparison. [Full report](docs/perf/muse-spark-vs-llama-cpp.md).
+
+Methods, repetitions, quality trade-offs and build limitations: [Benchmarks](docs/benchmarks.md). No new benchmark runs are claimed; these results do not qualify every backend or the published release binaries.
 
 ## Documentation
 
@@ -154,7 +156,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [TensorSharp and TensorAgent book guide](docs/BOOK.md) | Building LLM Inference Engines and Agentic Runtimes from Scratch, plus From Tensors to Tokens: introductions, Amazon links, and repository reading paths |
 | [Getting started](docs/getting_started.md) | The full first-run guide: the .NET SDK on each platform, every backend, multi-GPU and multi-node runs, NVIDIA DGX Spark, embeddings, choosing a backend, and making it fast |
 | [Supported models](docs/supported_models.md) | Implemented model families and their validation scope: example GGUFs, modalities, thinking, tools, and speculative decoding |
-| [Benchmarks](docs/benchmarks.md) | TensorSharp against llama.cpp on the same GPU and files, and the head-to-heads of larger models |
+| [Benchmarks](docs/benchmarks.md) | Latest scoped DeepSeek 1017 and Muse Spark comparisons, including approximation, quality and build limits |
 | [Screenshots](docs/showcase.md) | The CLI, the Web UI, and TensorAgent on iPhone and Mac at work, with what each run did |
 | [Model Downloads](MODEL_DOWNLOADS.md) | Per-model `huggingface-cli` download + run quick reference (quant tiers, projectors, companions) |
 | [Usage](USAGE.md) | Full CLI reference (options, interactive REPL, JSONL batch), server hosting, logging, HTTP API examples, backends, and the env-var matrix |
@@ -169,8 +171,6 @@ New here? The sections above are all you need to get running. Everything else is
 | [Browser automation skill (Playwright)](docs/playwright_agent.md) | Running the bundled `playwright` skill, which drives a browser through `@playwright/cli` via `skills_run`: the flags it needs, the macOS Chromium-sandbox config, account handoff, and TensorAgent desktop hosting (not iOS) |
 | [Speculative decoding](docs/speculative_decoding.md) | The three-layer design (model adapter / algorithm / speculator weights), the shipped `auto` / `draft-head` / `block` / `ngram` algorithms, and what to write to add a new one |
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
-| [Engine comparison report](docs/engine_comparison_report.md) | Full per-scenario TensorSharp vs llama.cpp tables |
-| [ggml_metal vs llama.cpp](docs/perf/metal-vs-llama-cpp.md) | Head-to-head prefill/decode on Apple Silicon, the four graph-construction gaps it found, and what each was worth |
 | [Muse Spark vs llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | The 816B MoE on ten A40 GPUs, in layer split and tensor parallelism: setup, per-scenario results, teacher-forced quality, and the limits of the comparison |
 | [Test/benchmark matrix runner](TensorSharp.TestMatrix/README.md) | Sweep model × backend × feature × env-var cells and generate regression reports |
 | [Server API examples](TensorSharp.Server.Host/API_EXAMPLES.md) | Complete curl and Python examples for the server surface |

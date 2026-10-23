@@ -63,10 +63,8 @@ BM25 检索不需要嵌入模型。可选 GGUF 嵌入增加语义检索；聊天
   `TS_DSV41_ALLOW_NON_CUDA_GPU=1`；`mlx` 会拒绝该检查点。新下载请使用[模型卡片](models/deepseek41_zh-cn.md#下载修复后的-q2_kq5_k-检查点)中固定的十个分片的修复版 Q2_K/Q5_K：
   它保留敏感 mHC 矩阵与 Engram 门控的精度，并包含 Engram 权重与哈希常量，TensorSharp 直接读取，无需旁挂文件。
   普通/DSpark 的有限文本与图像检查已在双 GPU 按层切分和路由专家 TP 下通过，但不构成通用质量或性能验证。
-  Q2_K 与 Q4_K_M 的历史测试与这些检查分别记录；Q4_K_M 的两张 Engram 表各 51.5 GiB。
-  在 8x46 GB 上，这些表留在主机内存映射中，路由专家需要卸载到 CPU（见
-  [Q4_K_M 吞吐报告](perf/deepseek41-q4km-throughput.md)；量化报告
-  `docs/validation/deepseek41-quants/README.md`（本地验证记录，未提交到 Git））。`--layer-split N` 选择本地整层放置；实验性的 routed-MoE 张量并行使用
+  量化与放置取决于检查点；当前配置与验证限制见[模型卡片](models/deepseek41_zh-cn.md)。量化报告
+  `docs/validation/deepseek41-quants/README.md` 为本地验证记录，未提交到 Git。`--layer-split N` 选择本地整层放置；实验性的 routed-MoE 张量并行使用
   `--tp N`。历史七分片实测比按层切分慢，但不代表修复版
   十分片检查点的性能。并发请求各有独立槽位；融合 `ggml_cuda` 执行器把解码 token 合成一张图，CPU、DSpark 与串行
   选项仍走逐槽前向。批量和单独 GEMM 可在近似并列的 logits 中选出不同 token；吞吐与隔离检查分别记录在卡片中。V4.1 的 DSpark 属于实验性功能：`--draft-model` 只能在 `ggml_cuda`
@@ -383,7 +381,7 @@ TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS、macOS 与 Windows 应用�
 3. 调高级开关前先降低分辨率或帧数。MiniMax-H3 必须 `--cfg 1.0`，默认 20 步；减少基础步数是质量与速度权衡，并非蒸馏配方。想在 FL2VA 上只跑 8 或 4 步，请加上 LightX2V [Turbo 插件](models/minimax-h3_zh-cn.md#turbo-插件)（`--lora config/lora/minimax-h3-fl2v-turbo-8step.json`），它把步数固定为其配方。LTX 保持固定两阶段步数；降低输出尺寸也会降低首阶段尺寸，可能损害人脸/手部细节。
 4. 文本任务只有在模型和负载适合时，再尝试投机解码、CPU MoE offload 或 `--tp N`。
 
-测量数据与限制条件见[引擎对比报告](engine_comparison_report.md)、[Apple Silicon 上 ggml_metal 对比 llama.cpp](perf/metal-vs-llama-cpp.md)、[模型卡片](models/README_zh-cn.md)、[功能说明](../FEATURES_zh-cn.md)和[环境变量功能矩阵](env_var_feature_matrix_zh-cn.md)。
+当前发布的测量数据与限制条件见[性能数据](benchmarks_zh-cn.md)。实现细节见[ggml_metal 技术记录](perf/metal-vs-llama-cpp.md)、[模型卡片](models/README_zh-cn.md)、[功能说明](../FEATURES_zh-cn.md)和[环境变量功能矩阵](env_var_feature_matrix_zh-cn.md)。
 
 ## 详细内容
 

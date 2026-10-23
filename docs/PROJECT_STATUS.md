@@ -72,12 +72,10 @@ These architecture families carry limits worth knowing before you plan around th
   weights and hash constants, which TensorSharp reads directly without a sidecar.
   Bounded plain/DSpark text and image probes passed under both two-GPU layer split
   and routed-expert TP; they do not establish broad quality or performance.
-  Historical Q2_K and Q4_K_M tests are recorded separately from those checks; at Q4_K_M the
-  two Engram tables are 51.5 GiB each. On 8x46 GB they stay host mappings, and
-  the checkpoint needs routed-expert CPU offload (see the
-  [Q4_K_M throughput report](perf/deepseek41-q4km-throughput.md); the
-  quantization report, `docs/validation/deepseek41-quants/README.md`, is local
-  validation evidence, not committed).
+  Quantization and placement depend on the checkpoint; use the
+  [model card](models/deepseek41.md) for the current profiles and their validation limits.
+  The quantization report, `docs/validation/deepseek41-quants/README.md`, is local
+  validation evidence, not committed.
   `--layer-split N` selects local whole-layer placement; experimental routed-MoE
   tensor parallelism uses `--tp N`. Historical
   seven-shard measurements were slower than layer split; they do not qualify the
@@ -530,7 +528,7 @@ The short version is:
 3. Reduce resolution or frame count before changing advanced flags. MiniMax-H3 requires `--cfg 1.0` and defaults to 20 steps; fewer base steps trade quality for speed and are not a distilled recipe. For 8 or 4 steps on FL2VA, add a LightX2V [Turbo plug-in](models/minimax-h3.md#turbo-plug-ins) (`--lora config/lora/minimax-h3-fl2v-turbo-8step.json`), which fixes the step count to its recipe. LTX keeps its fixed two-stage schedule; lowering output size also lowers the first pass and can hurt face/hand detail.
 4. For text workloads, try speculative decoding, CPU MoE offload, or `--tp N` only when the model and workload benefit.
 
-For measurements and caveats, read the [engine comparison report](engine_comparison_report.md), [ggml_metal vs llama.cpp on Apple Silicon](perf/metal-vs-llama-cpp.md), [model cards](models/README.md), [feature guide](../FEATURES.md), and [environment-variable matrix](env_var_feature_matrix.md).
+For current published measurements and caveats, read [Benchmarks](benchmarks.md). Implementation details are in the [ggml_metal technical note](perf/metal-vs-llama-cpp.md), [model cards](models/README.md), [feature guide](../FEATURES.md), and [environment-variable matrix](env_var_feature_matrix.md).
 
 ## Where details live
 

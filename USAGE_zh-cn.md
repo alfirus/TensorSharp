@@ -1551,8 +1551,7 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
   （`6,7,...,18:gu,...,45:d`）。在有两个及以上 NUMA 节点的主机上，主机专家栈会被复制到固定绑核的
   工作线程本地的内存中（`TS_MUSE_SPARK_HOST_NUMA=0` 则保留 GGUF 映射）；在双路测试主机上，这让主机
   专家带宽从约 100 GB/s 提升到 165-174 GB/s。2-16 个 token 的批次通过一个静态行内核计算主机专家，
-  结果与 ggml 逐位一致。在早期的六张 A40 测量中，该规划把 374 GiB 的 UD-Q3_K_XL checkpoint 中的
-  131.8 GiB 放在主机上，decode 仍达到 11.05 tok/s，为该次运行中 llama.cpp 的 1.11 倍。有主机专家时
+  结果与 ggml 逐位一致。有主机专家时
   自动流水化 prefill 不会开启；当前的对比（十张 A40，专家全部在显存中）见 [llama.cpp 对比报告](docs/perf/muse-spark-vs-llama-cpp.md)（英文）。详见
   [模型卡片](docs/models/muse-spark_zh-cn.md#原生整模型执行器)。
 * **单 token 的主机专家走 TensorSharp 自己的内核。** 用的仍是 ggml 的 CPU 点积，但

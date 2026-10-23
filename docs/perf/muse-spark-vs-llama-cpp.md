@@ -9,19 +9,20 @@ multi-GPU modes each engine offers:
 - **Tensor parallelism.** Every layer split across all ten GPUs: TensorSharp's
   `--tp 10` against llama.cpp's `-sm tensor`.
 
+**Provenance:** this report was refreshed on 2026-10-22. The measurement date
+and a frozen TensorSharp benchmark commit were not recorded; the setup below
+identifies the working-tree base and changes that were measured.
+
 The same checkpoint, machine and requests were used for every run. Each engine
 ran alone on the machine, one after the other. Ratios above 1.00x mean
 TensorSharp is better: higher throughput or lower latency.
 
-It replaces the earlier six-GPU report, which measured a UD-Q3_K_XL checkpoint
-with experts offloaded to the host, and a TensorSharp build that preceded
-everything described under [What changed in TensorSharp](#what-changed-in-tensorsharp).
-
 ## Summary
 
-Both TensorSharp modes match or beat the corresponding llama.cpp mode in every
-measured scenario but one, single-request decode in layer split, which is
-level (0.99x, within run-to-run noise).
+Results depend on the workload and multi-GPU mode. Layer-split single-request
+decode is close (0.99x), and its four-request aggregate throughput is 1.02x
+despite lower per-request decode throughput (0.91x). The prefill and
+tensor-parallel results below show larger differences on this host.
 
 - **Layer split** is the mode for long prompts. Prefill runs at 1,000 tok/s on
   a 4K prompt and 1,347 tok/s on a 16K prompt, 2.07x and 1.63x llama.cpp,
@@ -102,7 +103,7 @@ are medians of two (each of its 16K prompts takes over three minutes).
 | Scenario | What it measures |
 |---|---|
 | Short prompt | A ~167-token prompt and 256 generated tokens: decode speed |
-| Long prompt 4K / 16K | A document with one fact in the middle, then a question about it: prefill speed and the answer |
+| Long prompt 4K / 16K | A document with one fact in the middle, then a question about it; output capped at 32 tokens: prefill speed and the answer |
 | 4 concurrent requests | Four short prompts at once, 256 tokens each: aggregate throughput |
 | Multi-turn KV reuse | A ~2.3K-token system prompt, then a second turn of the same conversation |
 | Shared system prompt | Four new conversations that share one ~2.3K-token system prompt (an agent pattern) |

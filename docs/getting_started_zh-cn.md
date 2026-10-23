@@ -4,6 +4,18 @@
 
 > [TensorSharp](../README_zh-cn.md) 文档的一部分。README 的[快速开始](../README_zh-cn.md#快速开始)是本页的精简版。
 
+## 什么时候适合尝试 TensorSharp
+
+下载模型前，先选择一个入门任务：
+
+| 你的目标 | 从这里开始 | 集成前确认 |
+|---|---|---|
+| 将推理或聊天嵌入 C#/.NET 应用 | [引擎与聊天包分层](../DEVELOPMENT_zh-cn.md#项目--nuget-包分层)及 [CLI 主程序](../TensorSharp.Cli/Program.cs) | 模型与后端必须支持所需功能；原生 GPU 后端还需要相应运行库。 |
+| 让兼容 OpenAI 或 Ollama 的客户端使用本地模型 | [服务端 API 示例](../TensorSharp.Server.Host/API_EXAMPLES_zh-cn.md) | 对照客户端检查文档中的端点与请求字段；工具调用、推理和媒体能力取决于模型。 |
+| 在自己的硬件上尝试本地文本推理 | 下文的 [Gemma 4](models/gemma4_zh-cn.md) 首次运行步骤 | 下载前检查权重大小及运行内存、后端支持和发布版本。 |
+
+仅用 CPU 时，`cpu` 是托管的可移植与调试路径，`ggml_cpu` 使用原生算子。有 GPU 时先看[选择后端](#选择后端)，再核对[模型支持表](supported_models_zh-cn.md)与模型卡片。[Muse Spark](models/muse-spark_zh-cn.md) 和 [DeepSeek V4.1](models/deepseek41_zh-cn.md) 多 GPU 示例各有内存与后端要求，其测量结果不能预测笔记本表现。验证限制及晚于所用发布的功能见[项目状态](PROJECT_STATUS_zh-cn.md)。
+
 ## 安装与首次运行
 
 **使用 TensorAgent 桌面应用：** 打开[最新发布](https://github.com/zhongkaifu/TensorSharp/releases/latest)，展开 **Assets**，选择 `tensoragent-desktop-<version>-osx-arm64.dmg`（Apple Silicon，macOS 14+），或 `tensoragent-desktop-<version>-win-x64-cpu.msi` / `win-x64-cuda.msi`（Windows x64）。也提供 PKG 与 ZIP。桌面包包含 .NET 运行库；Windows 缺少 WebView2 时需另外安装。权重通过 **☰ → 模型 → 下载 → 使用** 下载，内置模型最低需要 12 GB 系统内存。安装、校验、首次聊天、工具与故障排查详见[桌面版用户指南](tensoragent_desktop_zh-cn.md)。历史发布可能没有桌面资源，需等待使用更新后 Release Binaries 工作流的发布。
@@ -33,7 +45,7 @@ dotnet --list-sdks
 
 更多细节见 [.NET 跨平台安装概览](https://learn.microsoft.com/zh-cn/dotnet/core/install/)或[开发 → 前置要求](../DEVELOPMENT_zh-cn.md#前置要求)。
 
-然后即可在已验证的原生 GGML 快速路径（Gemma 4 E4B）上约 30 秒跑起来。其他前置包括 `git`、`curl`、[CMake](https://cmake.org/download/) 3.20+（原生 GGML 库由它来配置和构建；Windows 上 Visual Studio 的“C++ CMake tools for Windows”组件自带一份，构建脚本会自动找到），以及所选 GPU 后端的工具链（见 [开发 → 前置要求](../DEVELOPMENT_zh-cn.md#前置要求)）。推荐的公开文件是 [`gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf)（7.48 GiB）；纯文本推理无需投影器。
+下面的源码构建示例在原生 GGML 路径上运行 Gemma 4 E4B；请为 7.48 GiB 下载与首次原生构建预留时间。其他前置包括 `git`、`curl`、[CMake](https://cmake.org/download/) 3.20+（原生 GGML 库由它来配置和构建；Windows 上 Visual Studio 的“C++ CMake tools for Windows”组件自带一份，构建脚本会自动找到），以及所选 GPU 后端的工具链（见 [开发 → 前置要求](../DEVELOPMENT_zh-cn.md#前置要求)）。推荐的公开文件是 [`gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf)（7.48 GiB）；纯文本推理无需投影器。
 
 **Windows + NVIDIA（PowerShell）**
 

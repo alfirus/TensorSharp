@@ -209,9 +209,8 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 输入时，加上 `--mmproj models/muse-spark/mmproj-Q8_0.gguf` 与
 `TS_MUSE_SPARK_DEV0_RESERVE_MB=3072`，后者在 GPU 0 上为图像编码器留出余量。GPU 较少时，按层
 切分配合 `TS_MUSE_SPARK_CPU_MOE=auto` 让尽可能多的专家栈留在 GPU 上，其余放到主机内存；如果
-既没有它，也没有 `--n-cpu-moe N`，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。早先
-一套六张 A40 的[配置](docs/models/muse-spark_zh-cn.md#早期的六张-a40cpu-专家卸载配置)就这样运行
-10 个分片的 UD-Q3_K_XL，131.8 GiB 专家栈放在主机内存中。
+既没有它，也没有 `--n-cpu-moe N`，放不下的 checkpoint 会被拒绝加载，错误信息会指明该选项。
+[当前对比](docs/perf/muse-spark-vs-llama-cpp.md)没有测量 CPU 卸载。
 `--tp N` 让全部专家留在 GPU 上。`TS_MUSE_SPARK_NATIVE=0` 会选回较早的逐算子路径，
 `ggml_vulkan` 上的 `--tp N` 也走这条路径。无权重投机解码用 `--spec --spec-type ngram`；原生
 `--tp` 路径不使用投机解码。该配置下与 llama.cpp 的对比见

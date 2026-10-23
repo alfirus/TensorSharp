@@ -177,9 +177,23 @@ MAX_CONTEXT=32768 TS_DSV41_ENGRAM_WARM=1 \
   --backend ggml_cuda --layer-split 5 --host 127.0.0.1 --port 5000
 ```
 
-Measured on five A40s (CUDA 12.8 toolkit, driver 595.91) against unsloth's
-llama.cpp (`be8365722ea432809818fa21a4ecebfac2e7d298`, `-ngl 99 -sm layer -lm dio`),
-ggml `da8e2a5`, page cache evicted before every load. TensorSharp runs its
+### Measurements from October 22–23, 2026 UTC
+
+The campaign used five 46 GB A40s (CUDA 12.8 toolkit, driver 595.91), a
+96-core host with 503 GB RAM and a 233.8 GiB container limit including page
+cache, and NFS model storage. It compared against unsloth's
+llama.cpp (`be8365722ea432809818fa21a4ecebfac2e7d298`, `-ngl 99 -sm layer -lm dio`).
+TensorSharp used unmodified ggml `da8e2a54b919557b816b1c2beb432ccb766f7ce0`;
+the reference fork uses its own in-tree ggml. Page cache was evicted before
+every load. TensorSharp measurements used `ae60abf6` plus the
+then-uncommitted campaign changes and native library SHA-256 prefix
+`04bc9dd748378492`. The implementation was subsequently committed as
+`7f26e2d1`; these are not measurements rerun at that commit or a published
+release. After review fixes, native build `8b910b29e88d6891` confirmed the
+2,048-random-token default TP cell at 1,046.3 prefill / 36.2 decode tok/s,
+not a rerun of the complete server matrix.
+
+TensorSharp runs its
 defaults, which include YOCO bounded replay (approximate prefill, see below);
 the "exact" rows set `TS_DSV41_YOCO_KEEP=0`. TensorSharp's synthetic figures
 are the best of three runs and llama.cpp's are llama-bench means (TensorSharp's
@@ -201,7 +215,36 @@ four-request row: `-c 65536 -np 4`):
 | Server decode with the DSpark drafter (mean tok/s) | 44.1 / 43.5 | 55.0 / 51.2 | 41.3 / 40.8 |
 | Four concurrent ~1.8K-token requests, 256 tokens each (batch wall s) | 27.3-33.1 | 21.2-25.5 | 43.3-46.8 |
 
-On a short code prompt (58 tokens, 512 generated) the drafter reached 80%
+For each server prompt size, one warmup was discarded before three measured
+requests. The two longer workloads contain 1,747–1,812 and 7,181–7,375 input
+tokens, with the same source-text slices and token counts in both engines and
+256 generated tokens per request. Each request has a unique first line to
+prevent prefix reuse. Prefill rates use each engine's internal prompt-evaluation
+timer (`prompt_eval_duration` for TensorSharp, `timings.prompt_ms` for
+llama.cpp), not streamed HTTP TTFT. The exact and approximate TP results are:
+
+| Single-request workload | TensorSharp TP, exact prefill | TensorSharp TP, default YOCO | llama.cpp layer split |
+|---|---:|---:|---:|
+| ~1.8K-token prompt, prefill median (tok/s) | 563.9 | 960.5 | 174.6 |
+| ~7.3K-token prompt, prefill median (tok/s) | 549.7 | 1,000.7 | 225.7 |
+| Decode after ~1.8K tokens, median (tok/s) | 35.4 | 35.5 | 29.6 |
+| Decode after ~7.3K tokens, median (tok/s) | 35.6 | 35.7 | 33.0 |
+
+Here “exact” means YOCO truncation is disabled, not bitwise agreement between
+engines. Exact TP prefill is 3.23× / 2.44× the reference rate on these two
+workloads; default YOCO is 5.50× / 4.43× and changes the output distribution.
+The llama.cpp server observations came from an earlier session. Its three
+~1.8K prefill rates were 69.8, 174.6 and 183.8 tok/s; the stall was not
+investigated. These small-sample medians are not a universal speedup.
+
+The four-request row is default YOCO only. Its three whole-batch wall times
+have medians 28.26 s (layer split), 22.61 s (TP), and 44.52 s (llama.cpp),
+for 1,024 output tokens per batch. TensorSharp's concurrent per-request
+decode timers apportion shared batch time, so they are not used for a
+cross-engine throughput comparison. The DSpark row uses means, and acceptance
+depends on the generated text, which YOCO can change.
+
+In an earlier 1017 CLI run on a short code prompt (58 tokens, 512 generated), the drafter reached 80%
 acceptance and 60.2 tok/s with layer split and exact prefill (llama.cpp `--spec-type draft-dspark`:
 51.6 tok/s at 3 drafted tokens). Teacher-forced wikitext-2 perplexity on
 identical tokens, 4,608-token windows with the first 2,304 tokens prefilled
@@ -211,7 +254,10 @@ chunks: llama.cpp 2.4697; TensorSharp 2.4970 with layer split and 2.4978 with
 divergence from llama.cpp's distributions is 0.0172 under the default and 0.0160
 exact (top-1 agreement 96.2% / 96.3%). TP and layer split differ from each
 other by a mean KL divergence of 0.0005 with exact prefill and 0.0004 under the
-default. Before the YOCO and TP work, a build
+default. On this same 23,030-scored-token sample, TP's default perplexity is
+0.67% above exact TP and 1.14% above llama.cpp; exact TP is 0.46% above
+llama.cpp. This is a wikitext-2 quality sample, not a general quality guarantee.
+Before the YOCO and TP work, a build
 with only the layout support and none of the speed changes measured 2.4752 and
 0.0167 (exact prefill); per chunk, the final exact build's perplexity
 difference from it is not significant (t = 1.02) and its KL divergence is lower
@@ -410,37 +456,6 @@ CPU graph work and host reduction can still affect latency. The current CLI
 also accepts `--cpu-moe-threads N`; use the same value if supplying both, since
 the positive environment value takes precedence in the native loader.
 
-**Historical reproduction only:** the following eight-A40 launch preserves the
-original seven-shard checkpoint paths and measured settings. It is not the
-recommended new download or a measurement of Q2_K-Q5:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
-  TS_DSV4_UBATCH=1024 KV_CACHE_DTYPE=f16 TS_CPU_MOE_THREADS=32 \
-  TS_DSV41_SPARSE_FA=1 TS_DSV41_COMPACT_RAW_GATHER=1 \
-  TS_DSV41_ENGRAM_WARM=1 TS_DSV41_ENGRAM_THREADS=16 TS_DSV4_PERF=1 \
-  TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
-  TS_SCHED_PREFILL_CHUNK=1024 TS_SCHED_SOLO_PREFILL_CHUNK=1024 \
-  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /workspace/models/deepseek41-q2/DeepSeek-V4.1-Flash-Q2_K-00001-of-00007.gguf \
-  --mmproj /workspace/models/deepseek41-q2/deepseek41.vision.gguf \
-  --backend ggml_cuda --layer-split 8 --n-cpu-moe 0 --cpu-moe-threads 32 \
-  --host 127.0.0.1 --port 5000 --max-tokens 2048
-```
-
-The measured launch record
-`docs/validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json` (local validation evidence, not committed)
-contains the original VM paths, binary hashes and environment. This profile
-passed 138/138 inference cases; its throughput and limits are recorded below.
-Compact gathering remains opt-in, with its documented floating-point
-differences. That record's `TS_DSV41_SPARSE_FA=1` selected ggml's
-mask-compacted flash-attention kernel: its results were recorded with the initial
-V4.1 support (`3347b06b`), before TensorSharp's owned F32 attention existed,
-whose sparse prefill is now the default (see [Backends](#backends)). Its
-19.985/80.240 s long-prompt times are therefore not a measurement of the current
-attention path. Startup and page warming are excluded from the inference
-measurements.
-
 Without an explicit thread setting, a GPU-only V4.1 load uses the caller's
 `TS_DSV4_THREADS` value, defaulting to at most 32; CPU expert offload instead
 uses the detected available CPU parallelism. Earlier native builds did not
@@ -545,7 +560,7 @@ without a separate gate/up completion fence; errors drain every rank before
 returning control to the caller. Full-model throughput must still be measured
 for the chosen placement and transport.
 
-The September 29, 2026 UTC check used six PCIe A40s, the repaired ten-shard
+An earlier September 29, 2026 UTC host-driven transport check used six PCIe A40s, the repaired ten-shard
 EngramQ5/Q2_K checkpoint, context 4096, F16 KV, host Engram tables with warming
 disabled, and `NCCL_P2P_DISABLE=1`. Each placement had one process start and five
 identical fixed-input rows: 512 prefill tokens and 128 decode tokens. Candidate native
@@ -553,20 +568,11 @@ identical fixed-input rows: 512 prefill tokens and 128 decode tokens. Candidate 
 remained unchanged at `353b63b4…`. All three runs produced the same complete
 128-token untimed greedy chain as the original layer-split baseline.
 
-| Placement | First row prefill / decode, tok/s | Median rows 2–5 prefill / decode, tok/s | All five prefill rows, tok/s range | All five decode rows, tok/s range |
-|---|---:|---:|---:|---:|
-| Original `--layer-split 6` | 53.3 / 13.1 | 363.05 / 30.20 | 53.3–502.6 | 13.1–30.3 |
-| `--tp 6`, adaptive host threshold 16 | 19.7 / 9.8 | 209.75 / 19.95 | 19.7–280.7 | 9.8–26.2 |
-| `--tp 6`, forced device gather, threshold 0 | 37.7 / 10.3 | 196.75 / 18.20 | 37.7–302.0 | 10.3–22.8 |
+That host-driven experiment predates the device-resident exchange above and
+does not select the fastest current placement. Its raw timing rows remain in
+the [validation report](../deepseek41_validation.md#full-checkpoint-routed-moe-tp).
 
-Use `--layer-split 6` for throughput on this VM and workload. The adaptive
-transport's decode median was 1.096× the forced-device median, but the row
-variation and single start per configuration do not establish a stable or
-general speedup. Both TP runs stayed at a sampled 1740 MHz SM clock and P0;
-later rows had no measured major faults. The remaining timing variation was
-not attributed to a specific cause.
-
-During these timing rows, container memory was about 255 GiB for TP versus
+In that experiment, container memory was about 255 GiB for TP versus
 70 GiB for layer split. File cache accounted for about 252 versus 68 GiB;
 anonymous memory was about 1.6–1.7 versus 0.8–0.9 GiB. TP upload scratch is
 bounded, but uploaded routed-weight pages remained in reclaimable file cache:
@@ -676,18 +682,11 @@ residency and fail if it does not fit. `TS_DSV41_ENGRAM_THREADS`,
 `TS_DSV41_ENGRAM_WARM` and `TS_DSV41_ENGRAM_RANDOM` only affect host mappings;
 startup notes when one is set on the GPU-resident path.
 
-Measured on eight A40s with a cold prompt each time, so every prompt selects
-rows it has not touched before:
-
-| Engram placement | Prefill tok/s | Decode tok/s |
-|---|---:|---:|
-| Host mapping, no warming | 207-221 | 28.0-29.2 |
-| Host mapping, `TS_DSV41_ENGRAM_WARM=1` | 506-528 | 34.5-35.2 |
-| GPU-resident (default) | 532-541 | 35.6-35.9 |
-
-The GPU-resident path also removes the 130-second whole-table warm from
-startup and the 60.1 GiB of host page cache the warm path depends on. All three
-paths produced identical text at temperature 0 on the determinism check.
+GPU-resident tables avoid a host-table warm, but their capacity cost depends
+on the checkpoint. The 1017 five-A40 measurements above use host-mapped
+Q5_K tables; the older eight-A40 Q2_K throughput figures are not a prediction
+for that layout. Earlier placement checks produced identical text at
+temperature 0 across host mapping with and without warming and GPU residency.
 
 That is argmax stability rather than bitwise agreement: ggml's CPU and CUDA
 Q2_K dequantizers evaluate the same expression, but the device one may contract
@@ -814,12 +813,13 @@ Registering the two backends side by side instead splits the graph wherever the
 backend changes, which a V4.1 layer does about fourteen times. A decode graph
 was cut into 565 splits of roughly six nodes each, and the scheduler performs a
 blocking host synchronization at every boundary. Wrapping brings that to one
-split per GPU:
+split per GPU. The earlier dispatch diagnostic below isolates this mechanism;
+it is not a 1017 full-model benchmark:
 
-| | Splits per decode graph | Decode compute | Decode tok/s |
-|---|---:|---:|---:|
-| Side-by-side backends | 565 / 577 | 26.6-27.1 ms | 35.6 |
-| Wrapping backend | 8 | 23.2-23.5 ms | 41.1 |
+| | Splits per decode graph | Decode compute |
+|---|---:|---:|
+| Side-by-side backends | 565 / 577 | 26.6-27.1 ms |
+| Wrapping backend | 8 | 23.2-23.5 ms |
 
 Prefill is unchanged by this, as expected: a prefill split already does
 milliseconds of work, so a per-boundary synchronization was noise there. Set
@@ -938,9 +938,8 @@ can allocate or efficiently serve it.
 ### Token-batched decode
 
 When several sequences decode at once, all of their tokens run in **one graph**
-instead of one graph each. A decode step is dominated by reading the weights
-(~9.8 GiB a token at Q4_K_M) and by the ~2,200 small kernels that read them, and
-batching pays both once: only the parts that touch a sequence's own state fork
+instead of one graph each. Batching shares weight reads and kernel launches:
+only the parts that touch a sequence's own state fork
 per slot, which for V4.1 means the sliding-window ring, the compressor state,
 the lightning indexer's selection and the attention itself. The Engram lookup
 needs no fork at all -- its staged rows are already one column per token, so a
@@ -948,16 +947,11 @@ slot is just a column, hashed against that slot's own history.
 
 The saving is bounded by routing: each token picks its own 6 of 384 experts, so
 the routed-expert reads do not overlap between slots and only the dense
-projections, the shared expert and the output head are shared. Measured on eight
-A40s at Q4_K_M, aggregate decode throughput:
+projections, the shared expert and the output head are shared. Use the 1017
+whole-batch wall times above for the measured concurrent workload; the older
+Q4_K_M throughput sweep is not a current-model concurrency estimate.
 
-| concurrent requests | serial decode | token-batched decode |
-|---:|---:|---:|
-| 1 | 22.8 | 28.9 |
-| 2 | 24.8 | 39.3 |
-| 4 | 24.3 | 48.9 |
-| 8 | 26.5 | 48.5 |
-
+Earlier batching correctness diagnostics also show why output checks matter.
 Batching changes GEMM shapes, so a batched step and a solo step are not
 bit-identical and a near-tie in the logits can pick a different token. Solo
 decode repeated its own output on 6 of 6 greedy prompts; a batched step matched
@@ -975,9 +969,9 @@ selections really are separate.
 
 `TS_DSV4_VRAM_RESERVE_MB` overrides the per-device headroom the layer-split
 packer leaves unspent. The default prices the indexer's top-k transients, one
-microbatch of activations and a 2 GiB floor. Holding back too much is not free:
-on the eight-A40 VM at Q4_K_M, 5,240 MiB forced three layers of routed experts
-onto the host and 3,174 MiB needs one, worth 350 -> 480 prefill tok/s.
+microbatch of activations and a 2 GiB floor. Excess headroom can force more
+routed-expert layers onto the host; inspect the placement log for the chosen
+checkpoint instead of reusing an older Q4_K_M throughput estimate.
 
 Both that reserve and the raw sliding-window ring grow with the prefill
 micro-batch, so with `TS_DSV4_UBATCH` unset the loader prices the split once per
@@ -1027,7 +1021,8 @@ this loader used to do - makes every file descriptor read one chunk and then jum
 `threads x chunk`, 1 GiB at the defaults. Readahead is per descriptor, so none of
 the sixteen streams is sequential.
 
-Measured on eight A40s with the Q4_K_M release on a MooseFS mount, cold (every
+The following earlier loader I/O diagnostic used the Q4_K_M release on eight
+A40s with a MooseFS mount; it is not a 1017 startup-time measurement. It was cold (every
 run preceded by evicting all 414 GiB of shards from the page cache, alternating
 the two orders twice each):
 
@@ -1036,7 +1031,7 @@ the two orders twice each):
 | one contiguous run per thread | **141-147 s** (2.0-2.1 GiB/s) | **144-155 s** |
 | shared cursor (`TS_DSV4_LOAD_CONTIGUOUS=0`) | 360-377 s (0.78-0.82 GiB/s) | 363-382 s |
 
-**2.5x.** `TensorSharp.Runtime/GgufReader.cs:330` records the same finding for the
+`TensorSharp.Runtime/GgufReader.cs:330` records the same mechanism for the
 managed GGUF prefault ("~3x slower on MooseFS"). Ranges are split by BYTES rather
 than job count, because a tensor's last chunk is a partial one; a thread that runs
 out steals from the BACK of the furthest-behind range so its victim keeps reading
@@ -1167,7 +1162,7 @@ than of the whole conversation. Two conditions bound it, both stated in
   21 MiB for the released checkpoint - and `TS_DSV41_REWIND_CHECKPOINT=0` turns
   it off, after which a rewind deeper than the live ring is declined.
 
-Measured on eight A40s with the Q4_K_M release (`--n-cpu-moe 2`, greedy, the
+An earlier cache-correctness diagnostic used eight A40s with the Q4_K_M release (`--n-cpu-moe 2`, greedy, the
 reported prompt then two `continue` turns, `TS_KV_DEBUG=1`), on 2026-09-11, when
 the CLI still planned its own reuse (`KVCache.PlanReuse`, which is what
 `TS_KV_DEBUG` prints). Since 2026-09-17 the CLI and the server both go through the
@@ -1176,11 +1171,11 @@ there. The divergence lands exactly where the policy puts it - in both turns the
 cache holds token 128821 (`<think>`) where the render holds 128822 (`</think>`),
 one token past `<｜Assistant｜>`:
 
-| turn | prompt tokens | matching prefix | plan | prefill |
-|---:|---:|---:|---|---:|
-| 1 | 38 | 0 (cold) | Reset | 970 ms |
-| 2 | 2,056 | 37, aligned to 36 | PartialReuse | 8,399 ms |
-| 3 | 5,841 | 2,055, aligned to 2,054 | PartialReuse | 17,058 ms |
+| turn | prompt tokens | matching prefix | plan |
+|---:|---:|---:|---|
+| 1 | 38 | 0 (cold) | Reset |
+| 2 | 2,056 | 37, aligned to 36 | PartialReuse |
+| 3 | 5,841 | 2,055, aligned to 2,054 | PartialReuse |
 
 Turn 2 recovers only a constant - the system block, the question and the
 assistant header - because the cache past that point is the first answer WITH its
@@ -1637,7 +1632,7 @@ prompts, JSON, tool round trips, agent workflows, concurrency, placement, and
 existing-model regression checks. Unsupported scenarios remain explicitly
 unverified.
 
-The latest managed stage passed **3,651/3,651 tests locally and on the requested
+An earlier managed validation stage passed **3,651/3,651 tests locally and on the requested
 VM**, with no skips, including 84 focused audio/image/API checks on both hosts.
 Coverage includes tool-history delimiter round trips, valid partial Unicode
 tokens, malformed UTF-8 rejection and image/audio request validation before
@@ -1660,7 +1655,7 @@ failure (`docs/validation/deepseek41/managed-correctness/README.md`, local
 validation evidence, not committed) are separate from full-checkpoint quality and
 performance results.
 
-The final layer and routed-TP profiles use native `6b3b5ab3…` and managed stage 3,651.
+The earlier layer and routed-TP correctness profiles use native `6b3b5ab3…` and managed stage 3,651.
 Layer split passed **138/138 inference cases**; routed TP passed **129/130**.
 The layer plan also includes eight concurrent long-context cases:
 
@@ -1677,16 +1672,11 @@ The layer plan also includes eight concurrent long-context cases:
 | Long retrieval at approximately 8k and 32k input tokens | 2/2 | 2/2 |
 | Four concurrent requests at each long-context size | 8/8 | Not in this profile |
 
-On the eight-A40 VM, the layer profile's median sustained decode was
-**34.83 tokens/s** for one request and **8.46 tokens/s per request** at concurrency
-four, with exactly 512 generated tokens per measured request. Time to first
-token was **19.985 s** for 7,706 input tokens and **80.240 s** for 30,585.
-The concurrent-long phase recorded 153,187 native prefill tokens including
-warmup and zero KV-pool preemptions.
-The decode results (`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-steady.json`), single-request long results
-(`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long.json`) and concurrent-long accounting
-(`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long-parallel-runs.json`), all in `docs/validation/deepseek41/full-checkpoint/`
-(local validation evidence, not committed), retain the measured scope and timing evidence.
+These are retained correctness records for older weights and binaries, not
+performance estimates for the 1017 checkpoint. The original timing and
+concurrent-long accounting remain in `docs/validation/deepseek41/full-checkpoint/`
+(local validation evidence, not committed); use the 1017 measurements above
+for this card's performance comparison.
 
 The previously failing named-thinking and thinking-agent cases now pass in both
 final profiles. In routed TP, one default-parallel agent request still issued
