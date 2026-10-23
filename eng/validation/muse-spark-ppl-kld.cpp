@@ -34,6 +34,13 @@
 //                 (prefills TOKENS in pieces ending at each SPLIT, then the rest: chunking sensitivity;
 //                  each ';'-separated spec runs on a fresh cache and prints its time)
 //   either        compare  A.lp16 B.lp16 TOKENS.bin   -> PPL of each, KL(A || B), top-1 agreement
+//   ppl-kld-ts    ts-dsv4  libGgmlOps.so MODEL.gguf TOKENS.bin CTX REF.lp16 N_GPU
+//                 (DeepSeek V4.1: the same comparison through TSGgml_Dsv4*; scored rows are decode steps.
+//                  PPL_TP must equal N_GPU when set. TS_DSV41_YOCO_KEEP is inherited - unset means the
+//                  loader's default bounded replay - and is recorded in the JSON line with the TP ranks,
+//                  KLD/NLL by offset after the prefill (0-127, 128-511, 512+). stderr adds exact
+//                  per-chunk sums, "[ts-dsv4] chunk-sums K nll A nll_ref B kld C scored N top1 M",
+//                  for paired per-chunk tests.)
 // PPL_UBATCH sets the micro-batch (default 512 in llama, ts and llama toplast;
 // 2048 in ts toplast). PPL_TP=N runs TensorSharp tensor-parallel over N GPUs
 // (its --tp) instead of the layer split over N_GPU. PPL_OUT makes the ts mode also write its own
@@ -580,12 +587,150 @@ static int run_ts_toplast(int argc, char ** argv)
     return 0;
 }
 
+// ts-dsv4: the same comparison for DeepSeek V4.1 (TSGgml_Dsv4*), whose Forward
+// returns only the last row's logits. Each chunk's unscored first half is one
+// prompt call; every scored row is then one decode step, i.e. what generation
+// runs. The llama and compare modes are model-independent and are shared.
+using dsv4_load_fn = void * (*)(const char *, int, int, int, int, const char *, int, const char *, int);
+using dsv4_forward_fn = int (*)(void *, const int32_t *, int, float *);
+
+static int run_ts_dsv4(int argc, char ** argv)
+{
+    if (argc != 8) throw std::runtime_error("ts-dsv4 libGgmlOps.so MODEL.gguf TOKENS.bin CTX REF.lp16 N_GPU");
+    void * lib = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    if (!lib) throw std::runtime_error(std::string("dlopen: ") + dlerror());
+    auto load = (dsv4_load_fn) dlsym(lib, "TSGgml_Dsv4LoadModel");
+    auto forward = (dsv4_forward_fn) dlsym(lib, "TSGgml_Dsv4Forward");
+    auto reset = (handle_fn) dlsym(lib, "TSGgml_Dsv4ResetChecked");
+    auto n_vocab_of = (handle_fn) dlsym(lib, "TSGgml_Dsv4VocabSize");
+    auto release = (free_fn) dlsym(lib, "TSGgml_Dsv4Free");
+    auto last_error = (err_fn) dlsym(lib, "TSGgml_GetLastError");
+    if (!load || !forward || !reset || !n_vocab_of || !release) throw std::runtime_error("missing TSGgml_Dsv4 exports");
+
+    const std::vector<int32_t> text = read_tokens(argv[4]);
+    const int ctx = std::atoi(argv[5]);
+    std::ifstream ref(argv[6], std::ios::binary);
+    lp_header hdr;
+    hdr.read(ref, argv[6]);
+    if ((int) hdr.w[3] != ctx) throw std::runtime_error("CTX differs from the reference's");
+    const chunks c = hdr.rebuild(text);
+    const char * tp = std::getenv("PPL_TP");
+    const auto t0 = std::chrono::steady_clock::now();
+    // n_cpu_moe 0: no routed-expert offload, the CLI's default (CpuMoeNone).
+    void * m = load(argv[3], std::atoi(argv[7]), ctx, env_ubatch(), 0, nullptr, 0, "CUDA", tp ? std::atoi(tp) : 0);
+    if (!m) throw std::runtime_error(std::string("load refused: ") + (last_error ? last_error() : "?"));
+    const auto t1 = std::chrono::steady_clock::now();
+    const int n_vocab = n_vocab_of(m);
+    if ((uint32_t) n_vocab != hdr.w[1]) throw std::runtime_error("vocab differs from the reference");
+
+    std::vector<float> logits((size_t) n_vocab);
+    std::vector<int32_t> chunk;
+    std::vector<double> lp;
+    std::vector<uint16_t> row((size_t) n_vocab), own((size_t) n_vocab);
+    std::ofstream out;
+    if (const char * path = std::getenv("PPL_OUT"))
+    {
+        out.open(path, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char *>(hdr.w), sizeof(hdr.w));
+    }
+    double nll = 0.0, nll_ref = 0.0, kld = 0.0, kld_max = 0.0;
+    long scored = 0, top1_same = 0;
+    std::vector<double> klds;
+    // Offset bins after the prefilled half: YOCO bounded replay narrows only
+    // the prompt's last positions' windows, so its cost sits in the first
+    // generated tokens, which a whole-chunk mean dilutes.
+    const int bin_edges[] = {0, 128, 512, 1 << 30};
+    double bin_kld[3] = {}, bin_nll[3] = {}, bin_nll_ref[3] = {};
+    long bin_count[3] = {};
+    for (int ci = 0; ci < c.n; ci++)
+    {
+        c.fill(ci, chunk);
+        const double chunk_nll = nll, chunk_nll_ref = nll_ref, chunk_kld = kld;
+        const long chunk_scored = scored, chunk_top1 = top1_same;
+        if (!reset(m)) throw std::runtime_error("reset failed");
+        if (forward(m, chunk.data(), c.first, logits.data()) != 0) throw std::runtime_error("prefill failed");
+        for (int i = c.first; i < ctx - 1; i++)
+        {
+            if (forward(m, chunk.data() + i, 1, logits.data()) != 0) throw std::runtime_error("decode failed");
+            log_softmax(logits.data(), n_vocab, lp);
+            if (out.is_open())
+            {
+                for (int k = 0; k < n_vocab; k++) own[(size_t) k] = to_half((float) lp[(size_t) k]);
+                out.write(reinterpret_cast<const char *>(own.data()), (std::streamsize) (own.size() * 2));
+            }
+            if (!ref.read(reinterpret_cast<char *>(row.data()), (std::streamsize) (row.size() * 2)))
+                throw std::runtime_error("reference file too short");
+            const int32_t next = chunk[(size_t) i + 1];
+            nll -= lp[(size_t) next];
+            nll_ref -= from_half(row[(size_t) next]);
+            double zr = 0.0;
+            for (int k = 0; k < n_vocab; k++) zr += std::exp((double) from_half(row[(size_t) k]));
+            const double lzr = std::log(zr);
+            double kl = 0.0;
+            int top_ref = 0, top_ts = 0;
+            for (int k = 0; k < n_vocab; k++)
+            {
+                const double lr = (double) from_half(row[(size_t) k]) - lzr;
+                kl += std::exp(lr) * (lr - lp[(size_t) k]);
+                if (lr > (double) from_half(row[(size_t) top_ref]) - lzr) top_ref = k;
+                if (lp[(size_t) k] > lp[(size_t) top_ts]) top_ts = k;
+            }
+            kld += kl;
+            kld_max = std::max(kld_max, kl);
+            klds.push_back(kl);
+            top1_same += top_ref == top_ts ? 1 : 0;
+            scored++;
+            const int offset = i - c.first;
+            for (int b = 0; b < 3; ++b)
+                if (offset >= bin_edges[b] && offset < bin_edges[b + 1])
+                {
+                    bin_kld[b] += kl;
+                    bin_nll[b] -= lp[(size_t) next];
+                    bin_nll_ref[b] -= from_half(row[(size_t) next]);
+                    ++bin_count[b];
+                }
+        }
+        std::fprintf(stderr, "[ts-dsv4] chunk %d/%d ppl %.4f (ref %.4f) mean KLD %.6f top-1 %.4f\n", ci + 1, c.n,
+                     std::exp(nll / scored), std::exp(nll_ref / scored), kld / scored, (double) top1_same / scored);
+        // Exact per-chunk sums for paired tests (the running line above rounds).
+        std::fprintf(stderr, "[ts-dsv4] chunk-sums %d nll %.9f nll_ref %.9f kld %.9f scored %ld top1 %ld\n", ci + 1,
+                     nll - chunk_nll, nll_ref - chunk_nll_ref, kld - chunk_kld, scored - chunk_scored,
+                     top1_same - chunk_top1);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    std::sort(klds.begin(), klds.end());
+    auto pct = [&](double q) { return klds[(size_t) std::min<double>(klds.size() - 1, q * (klds.size() - 1))]; };
+    std::string bins;
+    for (int b = 0; b < 3; ++b)
+    {
+        if (!bin_count[b]) continue;
+        char text[256];
+        std::snprintf(text, sizeof(text), "%s{\"from\":%d,\"to\":%d,\"scored\":%ld,\"kld_mean\":%.6f,"
+                      "\"nll_mean\":%.6f,\"nll_ref_mean\":%.6f}", bins.empty() ? "" : ",", bin_edges[b],
+                      b == 2 ? -1 : bin_edges[b + 1], bin_count[b], bin_kld[b] / bin_count[b],
+                      bin_nll[b] / bin_count[b], bin_nll_ref[b] / bin_count[b]);
+        bins += text;
+    }
+    // The run's own settings, so a JSON line says what it measured.
+    const char * yoco = std::getenv("TS_DSV41_YOCO_KEEP");
+    std::printf("{\"mode\":\"ts-dsv4\",\"chunks\":%d,\"ctx\":%d,\"scored\":%ld,\"ppl\":%.6f,\"ppl_reference\":%.6f,"
+                "\"kld_mean\":%.6f,\"kld_median\":%.6f,\"kld_p99\":%.6f,\"kld_max\":%.6f,\"top1_agreement\":%.6f,"
+                "\"tp\":%d,\"yoco_keep\":\"%s\",\"ubatch\":%d,\"kld_bins\":[%s],\"load_s\":%.1f,\"eval_s\":%.1f}\n",
+                c.n, ctx, scored, std::exp(nll / scored), std::exp(nll_ref / scored), kld / scored, pct(0.5), pct(0.99),
+                kld_max, (double) top1_same / scored, tp ? std::atoi(tp) : 0, yoco ? yoco : "default",
+                env_ubatch(), bins.c_str(), std::chrono::duration<double>(t1 - t0).count(),
+                std::chrono::duration<double>(t2 - t1).count());
+    release(m);
+    return 0;
+}
+
 int main(int argc, char ** argv)
 {
     try
     {
         if (argc >= 2 && std::strcmp(argv[1], "toplast") == 0) return run_ts_toplast(argc, argv);
         if (argc >= 2 && std::strcmp(argv[1], "compare") == 0) return run_compare(argc, argv);
+        if (argc >= 2 && std::strcmp(argv[1], "ts-dsv4") == 0) return run_ts_dsv4(argc, argv);
         if (argc != 8 || std::strcmp(argv[1], "ts") != 0)
         {
             std::fprintf(stderr, "usage: ts libGgmlOps.so MODEL.gguf TOKENS.bin CTX REF.lp16 N_GPU\n");

@@ -116,9 +116,115 @@ the repaired package. Do not attribute their hashes, 246.35 GiB size, approximat
 60 GiB Engram warming, quality results or throughput to Q2_K-Q5. Record the
 revision and all shard hashes with every new validation result.
 
+## Unsloth's DeepSeek-V4.1-Flash-1017 GGUFs
+
+[unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/60ad3651641b5c97679c807e064ab1d7a3ca1455)
+packages the 1017 checkpoint for llama.cpp. TensorSharp loads its files as
+published; they differ from the layout above in four ways, all handled by the
+loader:
+
+- The Engram tables are one tensor, `per_layer_token_embd.weight` (Q5_K, in its
+  own shard), described by `deepseek41.ple.*` metadata. The loader slices it
+  into the per-layer tables and compresses the raw `engram.pad_token_id`
+  through the token map, as `engram.py` does.
+- `blk.N.engram_gate.weight` stores Engram's `q_weight * k_weight` product, the
+  only form in which the reference uses the two.
+- The DSpark drafter `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` is a `dflash`
+  file. Its noise token, Markov rank, block size, expert counts and target
+  layers come from the target's `deepseek41.dspark.*` metadata, and a drafter
+  that disagrees with them is refused.
+- The vision tower ships as llama.cpp's `mmproj-BF16.gguf` / `mmproj-F16.gguf`
+  (`clip`, projector `deepseek41v`), which `--mmproj` loads directly; the image
+  tokens' routing biases come from the text shards (`blk.N.exp_probs_b_vl.bias`).
+
+Download one `--include` pattern per call (several patterns in one call matched
+only the root files with `hf` 2.2.0):
+
+```bash
+REPO=unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+REV=60ad3651641b5c97679c807e064ab1d7a3ca1455
+DIR=/workspace/DeepSeek-V4.1-Flash-1017-GGUF
+for pattern in "UD-IQ2_XXS/*" dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf mmproj-BF16.gguf; do
+  hf download $REPO --revision $REV --include "$pattern" --local-dir $DIR
+done
+(cd $DIR && sha256sum --check - <<'SHA256'
+22ad51c224e499883c1a753ad35719af44c296bbc8bcb9c931de6bdf950fa3aa  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf
+6880d0483490504a530b72686d79c92daa46e58ca5b71763bbfa3778d8a6131a  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00002-of-00006.gguf
+04b3ec7947255efaf789da77557da9180e93128948644828798d07b8a6e7a60a  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00003-of-00006.gguf
+318762f39cd7ebf03e3d7b30feaf938fab0464a9c2d6c0e0e99fc030bbfcd820  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00004-of-00006.gguf
+34fa48fbe2237b1b71a4f18a04bbe10946f6b1c76b7bbff21c76da630da677b6  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf
+406103485a7a7193337adee38b7178d3b636940aaa3ca033bc91e0d3687e3031  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf
+6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a  dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
+9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9  mmproj-BF16.gguf
+SHA256
+)
+```
+
+`mmproj-F16.gguf` (`dad8ad13f1d9a25757e121592d7b4f8ca83620d1172048004998b7c0b964b18e`)
+also loads; its matrices are converted back to BF16, which is exact except for
+weights that fell into F16's subnormal range. The UD-IQ2_XXS shards total
+300.5 GB, of which the Q5_K Engram table is 125.9 GiB. On five 46 GB A40s that
+table cannot be device-resident: it stays host-mapped, so the host (or container)
+memory limit must hold it, and `TS_DSV41_ENGRAM_WARM=1` reads it in during load
+instead of paging it in during the first requests.
+
+```bash
+MAX_CONTEXT=32768 TS_DSV41_ENGRAM_WARM=1 \
+  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model $DIR/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  --draft-model $DIR/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --mmproj $DIR/mmproj-BF16.gguf \
+  --backend ggml_cuda --layer-split 5 --host 127.0.0.1 --port 5000
+```
+
+Measured on five A40s (CUDA 12.8 toolkit, driver 595.91) against unsloth's
+llama.cpp (`be8365722ea432809818fa21a4ecebfac2e7d298`, `-ngl 99 -sm layer -lm dio`),
+ggml `da8e2a5`, page cache evicted before every load. TensorSharp runs its
+defaults, which include YOCO bounded replay (approximate prefill, see below);
+the "exact" rows set `TS_DSV41_YOCO_KEEP=0`. TensorSharp's synthetic figures
+are the best of three runs and llama.cpp's are llama-bench means (TensorSharp's
+own means are 0.4-5% lower at 2,048 and 8,192 tokens). Replacing `--layer-split 5` with
+`--tp 5` in the command selects routed-MoE tensor parallelism, the faster
+placement on this machine. Synthetic rows use random tokens;
+server rows send wikitext-2 summarization prompts with a unique first line,
+greedy, thinking off, to both servers at a 32,768-token context (llama.cpp's
+four-request row: `-c 65536 -np 4`):
+
+| Measurement | TensorSharp `--layer-split 5` | TensorSharp `--tp 5` | llama.cpp |
+| --- | ---: | ---: | ---: |
+| Prefill, 512 / 2,048 / 8,192 random tokens (tok/s) | 500.3 / 844.3 / 906.2 | 779.8 / 1,046.7 / 1,082.7 | 227.6 / 284.8 / 310.8 |
+| Same, exact prefill (tok/s) | 352.7 / 463.5 / 444.3 | 516.4 / 562.9 / 540.8 | |
+| Decode at depth 2,048 / 8,192 (tok/s) | 34.5 / 34.2 | 36.4 / 36.1 | 32.6 / 31.9 |
+| Server prefill, ~1.8K / ~7.3K-token prompts (median tok/s) | 697.4 / 762.8 | 960.5 / 1,000.7 | 174.6 / 225.7 |
+| Same, exact prefill (median tok/s) | 405.5 / 412.7 | 563.9 / 549.7 | |
+| Server decode after those prompts (median tok/s) | 33.8 / 34.0 | 35.5 / 35.7 | 29.6 / 33.0 |
+| Server decode with the DSpark drafter (mean tok/s) | 44.1 / 43.5 | 55.0 / 51.2 | 41.3 / 40.8 |
+| Four concurrent ~1.8K-token requests, 256 tokens each (batch wall s) | 27.3-33.1 | 21.2-25.5 | 43.3-46.8 |
+
+On a short code prompt (58 tokens, 512 generated) the drafter reached 80%
+acceptance and 60.2 tok/s with layer split and exact prefill (llama.cpp `--spec-type draft-dspark`:
+51.6 tok/s at 3 drafted tokens). Teacher-forced wikitext-2 perplexity on
+identical tokens, 4,608-token windows with the first 2,304 tokens prefilled
+(past the sparse-prefill gate) and the rest scored one token at a time, 10
+chunks: llama.cpp 2.4697; TensorSharp 2.4970 with layer split and 2.4978 with
+`--tp 5` under the default, 2.4820 and 2.4811 with exact prefill. Mean KL
+divergence from llama.cpp's distributions is 0.0172 under the default and 0.0160
+exact (top-1 agreement 96.2% / 96.3%). TP and layer split differ from each
+other by a mean KL divergence of 0.0005 with exact prefill and 0.0004 under the
+default. Before the YOCO and TP work, a build
+with only the layout support and none of the speed changes measured 2.4752 and
+0.0167 (exact prefill); per chunk, the final exact build's perplexity
+difference from it is not significant (t = 1.02) and its KL divergence is lower
+(t = -3.01). Raw records are local validation evidence under
+`docs/validation/deepseek41-1017/` (not committed).
+
 ## Prepare the optional vision companion
 
-The supplied GGUF conversion omits the vision tower, aligner, learned image
+With unsloth's 1017 GGUFs no preparation is needed: `--mmproj mmproj-BF16.gguf`
+encodes images bit for bit like a companion prepared from the official 1017
+checkpoint (`mmproj-F16.gguf` differs by F16's rounding of about 0.02% of the
+weights). The companion below is for conversions that carry no vision tower.
+The supplied smalinin GGUF conversion omits the vision tower, aligner, learned image
 delimiters and per-layer visual routing biases. The official release places
 the approximately 970 MB vision/aligner weights in an isolated shard, so these
 can be prepared without downloading the original text weights:
@@ -215,7 +321,10 @@ The earlier CPU-offload host's eight image checks remain preserved separately.
 
 ## Prepare the optional DSpark companion
 
-V4.1 requires a `deepseek41-dspark` artifact; V4 drafters are incompatible.
+V4.1 needs a V4.1 drafter: the `deepseek41-dspark` artifact prepared here, or the `dflash`
+file unsloth publishes with the 1017 GGUFs (see
+[Unsloth's DeepSeek-V4.1-Flash-1017 GGUFs](#unsloths-deepseek-v41-flash-1017-ggufs)).
+V4 drafters are incompatible.
 The official revision below isolates DSpark in shards 44–46 (7,933,129,808 bytes),
 so the original text model need not be downloaded:
 
@@ -353,19 +462,52 @@ GPUs; `--tp` accepts every degree from `2` through `8`, including `3`, `5`, and
 the number of GPUs it selects. `--tp` and `--layer-split` cannot be combined.
 
 In this mode, routed-expert gate/up matrices are partitioned along the FFN
-intermediate dimension, and down matrices along their output rows. Each rank
-receives the full SwiGLU activation before its down projection; the disjoint
+intermediate dimension, and down matrices along their output rows; every
+selected GPU computes its share concurrently. Each rank receives the full F32
+SwiGLU activation before its down projection; the disjoint
 output rows are then gathered without summing partial dot products. This keeps
 the down projection's reduction order, avoiding rounding changes that later
 activation quantization can amplify. Quantization blocks are never split, and
-uneven strips rotate across layers to balance storage. CUDA uses reusable pinned
-buffers for input/output transfers. Attention,
+uneven strips rotate across layers to balance storage. Attention,
 shared experts, and caches retain their layer placement. This is a partial
 tensor-parallel implementation; it does not shard attention or enable
-distributed tensor-parallel groups. Host transfers can limit throughput, so
-this option does not establish a speedup over layer split. The qualified full-checkpoint
-run below was slower than layer split; see also
-the [measured placement profiles](../deepseek41_validation.md#full-checkpoint-routed-moe-tp).
+distributed tensor-parallel groups.
+
+On `ggml_cuda` the routed-expert exchange is device-resident
+(`ggml_ops_deepseek41_tp_cuda.cu`). Each TP layer is a launch node and a gather
+node on the layer's own GPU: the launch stages the layer's activations and
+issues every rank, the GPU then computes the shared expert while the ranks run,
+and the gather waits for the ranks' output rows. Every transfer is staged
+through portable pinned host memory by each GPU's own copy engine and ordered
+only by CUDA events, so the host never waits inside a layer, and one thread per
+rank issues the ranks' work concurrently. Peer-to-peer access is not needed; it
+is advertised but broken on some PCIe hosts, including the five-A40 VM below.
+Outputs are bit-identical to the host-driven node this replaced and, per layer,
+to layer split's MoE (`GgmlOpsDsv41TpTest`, including `--model-dir` on the
+real checkpoint). A rank that fails, for example on a scratch allocation, turns
+that layer's output into NaNs and fails the request: the ranks that did issue
+work are drained, nothing waits forever, and the next request runs normally
+(`deepseek41-tp-resident-failure-cuda`).
+
+On five A40s with unsloth's UD-IQ2_XXS file, `--tp 5` prefills 2,048 random
+tokens at 1,046.7 tok/s with the default YOCO replay (562.9 with
+`TS_DSV41_YOCO_KEEP=0`) and decodes at 36.4 tok/s, against 844.3 (463.5) and
+34.5 for `--layer-split 5`. Before the device-resident exchange `--tp 5` ran
+402.3 tok/s prefill (exact) and 15.2 tok/s decode. On real-text server prompts
+of ~1.8K and ~7.3K tokens it prefills at 960.5 and 1,000.7 tok/s (median). Over
+teacher-forced wikitext-2 (4,608-token windows), TP's next-token distributions
+differ from layer split's by a mean KL divergence of 0.0005 with exact prefill
+and 0.0004 under the default (median 0, top-1 agreement 99.8%), against 0.016
+and 0.017 between either one and llama.cpp. unsloth's
+llama.cpp build has no working split of its own for this model: `-sm row`
+refuses to load (`device CUDA0 does not support split buffers`) and
+`-sm tensor` aborts while allocating the graph for its first prompt batch, so
+the comparison above is against its layer split. Decode stays close to layer
+split: in an nsys decode profile the Q8_0/Q6_K dense projections (attention,
+shared expert and output head), which stay on one GPU per layer, took 31% of
+GPU kernel time, and a token's six routed experts, at this quantization, 21%
+summed over all five GPUs. The host-driven measurements further below predate this change; see
+also the [measured placement profiles](../deepseek41_validation.md#full-checkpoint-routed-moe-tp).
 
 Before uploading a TP layer, its three routed-expert source ranges are read
 sequentially into the page cache with the existing `TS_DSV4_LOAD_THREADS` policy
@@ -389,8 +531,11 @@ an interrupted comparison with two starts per setting, not an uninterrupted
 ABBA trial. Partial boundary pages and MooseFS userspace/network/server caches
 were uncontrolled, so the ratio is not a cold-storage or universal speedup.
 
-When NCCL selects `NCCL_P2P_DISABLE=1`, batches of at most 16 tokens use the
-pinned host activation gather; larger batches use the private F32 NCCL gather.
+Without TensorSharp's fused CUDA backend (`TS_DSV4_FUSED=0`), the TP node runs on
+the CPU backend and drives the ranks from the host, synchronizing each phase.
+On that path, when NCCL selects `NCCL_P2P_DISABLE=1`, batches of at most 16 tokens use the
+pinned host activation gather; larger batches use the private F32 NCCL gather,
+which is created on first use.
 This threshold follows paired measurements on six PCIe A40s and is not applied
 to P2P-enabled configurations. `TS_DSV41_TP_HOST_TOKENS=0` forces the available
 device gather for comparison; values from 0 through 4096 set the host threshold.
@@ -424,16 +569,23 @@ not attributed to a specific cause.
 During these timing rows, container memory was about 255 GiB for TP versus
 70 GiB for layer split. File cache accounted for about 252 versus 68 GiB;
 anonymous memory was about 1.6–1.7 versus 0.8–0.9 GiB. TP upload scratch is
-bounded, but uploaded routed-weight pages remain in reclaimable file cache:
-`TS_DSV4_LOAD_DROP_CACHE` currently applies to ordinary layer uploads, not
-the private TP uploader. GPU capacity alone therefore does not establish that
+bounded, but uploaded routed-weight pages remained in reclaimable file cache:
+`TS_DSV4_LOAD_DROP_CACHE` then applied to ordinary layer uploads only. Since
+2026-10-23 the TP uploader follows the same rule, releasing each layer's source
+pages after its strips are uploaded when the sources and the host mappings would
+not fit the host allowance together (`[dsv41-tp] expert source page cache: ...`). GPU capacity alone therefore does not establish that
 a host-memory limit is sufficient; the observed 255 GiB is not a minimum RAM
 requirement. These sequential loads had different
 source-page residency and are not a controlled loading-latency comparison.
 
 The current output-row implementation passed numerical fixtures on two and six
 A40s, including F32, BF16, F16, Q2_K, Q3_K, Q4_K and Q6_K on two GPUs and real
-repaired-checkpoint expert weights on six. CPU fixtures cover degrees 2 through
+repaired-checkpoint expert weights on six. Output-row strips now align to 128,
+64 or 32 rows: the earlier 2-row fallback sent the 256-wide F16 fixture's down
+projections at three and five ranks through ggml's F16-accumulating fallback
+(relative L2 `2.8e-3`), which is why those two CUDA cases failed. On the five-A40
+VM the CUDA fixtures pass at 2, 3, 4 and 5 ranks, with the device-resident node
+and the launch/gather pair bit-identical to the host-driven node. CPU fixtures cover degrees 2 through
 8; seven- and eight-GPU runs were unavailable on the six-GPU validation VM.
 The final `473ee64d…` runtime passed six-GPU HTTP qualification with the repaired
 ten-shard Q2_K/Q5 checkpoint: 16 text responses matched the unchanged layer-split
@@ -688,13 +840,13 @@ execution investigation, `docs/validation/deepseek41/cli-gpu-execution/README.md
 On `ggml_cuda`, V4.1 attention runs TensorSharp's owned F32 kernels (ggml's CUDA
 flash attention narrows Q and the softmax weights to F16, and the cache
 quantization can amplify those lost bits). **Prefill is sparse by default** once
-a launch is wide and long: a chunk of more than 8 queries over at least 8,192
+a launch is wide and long: a chunk of more than 8 queries over at least 2,048
 keys (the raw window ring plus the visible compressed rows) attends only to each
 query's sliding window and indexer selection, at most 128 + 512 keys, through a
 mask-compacted kernel. Everything else keeps the dense kernels: single-token
 decode and every DSpark verify (6 rows) the split-key kernel, so a verify still
 commits exactly the cache rows decode would; shorter prefill the tiled one, so a
-prompt whose attention stays below 8,192 keys is unchanged bit for bit. A row
+prompt whose attention stays below 2,048 keys is unchanged bit for bit. A row
 with more visible keys than the bound falls back to a full scan, so the bound
 never drops a key.
 
@@ -706,16 +858,61 @@ reference the sparse kernel's maximum absolute error was 1.1e-7 (relative L2
 7.4e-7) and the tiled kernel's 8.9e-8 (4.8e-7). A sparse query is also
 independent of the other queries in its launch -- query 0 alone, in 9 queries
 and in 512 is bit-identical -- so a prompt's result does not depend on how
-prefill chunked it. `TS_DSV41_SPARSE_FA=0` restores tiled prefill.
+prefill chunked it into micro-batches. (Splitting a prompt into separate prefill
+CALLS is different under YOCO bounded replay, which keeps each call's own last
+140 positions; see below.) `TS_DSV41_SPARSE_FA=0` restores tiled prefill.
 
-This owned gate (more than 8 queries, at least 8,192 keys, F32 compacted kernel)
+CUDA runs these compacted launches on an MQA kernel: V4.1's 64 heads share one
+K=V head, so a block loads each key tile once for four heads instead of once
+per head. That made the sparse cost constant at 16.1-16.3 ms for 1,024 queries
+(`--benchmark-sparse 1024 KEYS 64 5 640`; 512 x 8,960 keys: 8.0 ms against the
+previous 34.4 ms, relative L2 5.2e-7), while tiled grows about 9 us per key
+(15.9 / 22.5 / 63.8 ms at 1,792 / 2,560 / 6,656 keys). The crossover is near
+1,800 keys, so the gate moved from 8,192 to 2,048 keys.
+
+This owned gate (more than 8 queries, at least 2,048 keys, F32 compacted kernel)
 is not the gate of ggml's flash-attention kernel, which the non-owned attention
 path uses (non-CUDA GPUs, the CPU backend). There `TS_DSV41_SPARSE_FA=1` still
 opts into ggml's mask-compacted flash attention for single-token batches or at
 least 16,384 keys, whose F16 operands measured up to 7.8e-4 relative L2 against
 the CPU oracle; that hint stays opt-in. Sparse attention reduces attention work;
-it does not eliminate cross-GPU copies of the shared compressed cache during
-prefill.
+it does not remove the cross-GPU copies of the shared compressed cache. On a
+layer split those copies are now only each step's new rows, written into a
+mirror on every GPU whose layers read the cache (`TS_DSV41_KV_MIRRORS`, on by
+default), instead of the selected rows or the whole visible cache on every read.
+Logits are bit-identical either way; five A40s decoded 32.6 -> 34.5 tok/s at a
+2K context.
+
+YOCO bounded replay, DeepInfer's YOCO prefill truncation, is on by default
+with DeepInfer's keep of 140 (`TS_DSV41_YOCO_KEEP`). From the first ratio-1 layer
+(layer 20 of 40) on, every layer reads the compressed cache that layer 20 writes
+from its attention input, so those layers run only over a prefill call's last 140
+positions, and each replayed position's sliding window is cut to the replay. That
+is an approximation. With unsloth's UD-IQ2_XXS file on five A40s
+(`--layer-split 5`, random tokens) it raised prefill from 352.7 to 500.3 tok/s at
+512 tokens, from 463.5 to 844.3 at 2,048 and from 444.3 to 906.2 at 8,192
+(`--tp 5`: 562.9 -> 1,046.7 and 540.8 -> 1,082.7). Teacher-forced wikitext-2 at
+4,608-token windows (2,304 tokens prefilled, the rest scored one token at a
+time, 10 chunks) moved perplexity from 2.4820 to 2.4970 (+0.6%; per chunk
+t = 4.85) and the mean KL divergence from llama.cpp from 0.0160 to 0.0172. The
+cost sits in the first tokens generated after a prompt: KL divergence 0.026 over
+the first 128 against 0.015 exact, 0.018 against 0.015 up to 512, and 0.016
+against 0.016 after that. With 2,560-token windows (1,280 prefilled) perplexity
+moved from 2.4867 to 2.5193. A passcode sentence planted at 10%, 50% and 90%
+depth of ~6.3K- and ~19K-token prompts was retrieved in all six cases with and
+without it. `TS_DSV41_YOCO_KEEP=0` runs every layer over every position. Decode
+steps, DSpark verifies and calls with image tokens always run every layer, and
+so does a one-token prefill micro-batch: with `TS_DSV4_UBATCH=1` the default
+notes that replay is inactive and an explicit value is refused. A rewind into
+the positions an earlier call skipped (more than 13 tokens before that call's
+end, and after its start) re-prefills instead of reusing the cache, and says so
+once in the log. The server prefills a long prompt in calls of up to 4,096
+tokens (fewer under concurrency), and each call keeps its own last 140
+positions. A checkpoint whose layout cannot replay runs exact prefill with one
+note under the default, and an explicit value is refused there; one with a
+sliding window wider than 132 tokens keeps at least the window + 8 by default.
+Only the ggml executor implements it: `--backend cuda` and `--backend cpu` note
+once that their prefill is the exact one and refuse an explicit non-zero value.
 
 `TS_DSV41_COMPACT_RAW_GATHER=1` opts into raw-window compaction for sparse
 single-token decode. It gathers the 128 visible raw rows on their owning GPU
@@ -1367,7 +1564,7 @@ original output limit retain precedence.
   `TS_DSV4_FUSED=0`, a loaded DSpark drafter or `TS_BATCHED_FUSED_DECODE=0`
   keeps them on per-slot forward calls.
 - V4.1 DSpark speculative decoding is experimental. The loader accepts a
-  `deepseek41-dspark` drafter (`--draft-model`) on
+  `deepseek41-dspark` or unsloth `dflash` drafter (`--draft-model`) on
   `ggml_cuda` and `ggml_cpu` only, refuses it on every other executor, and
   rejects V4 drafters. Synthetic integration tests
   (`DeepSeek41DsparkIntegrationTests`) and initial trained text/image HTTP
@@ -1429,8 +1626,9 @@ The implemented expert sharding uses unequal block-aligned partitions. The
 2304-wide dimension contains nine 256-element K-quant blocks: two ranks can
 use widths 1280 and 1024, and four ranks can use 768, 512, 512, and 512.
 Gate/up tensors split along that intermediate dimension for every expert;
-down tensors split along their input dimension, followed by host-staged
-reduction. Shared-expert and CPU-offload outputs are counted once. Current
+down tensors split along their output rows, each rank reading the complete
+hidden activations, so the rows are concatenated rather than summed.
+Shared-expert and CPU-offload outputs are counted once. Current
 ggml CUDA does not expose the old split-buffer interface; this path builds
 and executes the rank-local expert graphs explicitly.
 
