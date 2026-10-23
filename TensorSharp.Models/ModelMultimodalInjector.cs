@@ -1201,7 +1201,7 @@ namespace TensorSharp.Models
             if (imagePaths.Count == 0)
                 return inputTokens;
             if (!model.IsVisionEncoderLoaded)
-                throw new InvalidOperationException("Image input requires the prepared deepseek41.vision.gguf companion.");
+                throw new InvalidOperationException("Image input requires a V4.1 vision companion: --mmproj with the prepared deepseek41.vision.gguf or llama.cpp's deepseek41v mmproj.");
 
             int imageId = model.ImageTokenId;
             int placeholders = 0;

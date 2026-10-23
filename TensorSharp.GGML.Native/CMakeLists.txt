@@ -347,7 +347,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_matmul_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_attention_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_precision.cu)
-    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu ggml_ops_deepseek41_tp_cuda.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
     # Optional: the VAE falls back to ggml's im2col+GEMM when cuDNN is absent.
@@ -699,13 +699,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND NOT WIN32)
         target_compile_definitions(GgmlOpsDsv41TpTest PRIVATE TSG_GGML_USE_CUDA=1)
         target_sources(GgmlOpsDsv41TpTest PRIVATE ggml_ops_dsv4_fused.cu ggml_ops_matmul_precision.cu
-            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_tp_probe.cu)
+            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_tp_probe.cu
+            ggml_ops_deepseek41_tp_cuda.cu)
         target_include_directories(GgmlOpsDsv41TpTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cuda CUDA::cublas ${CMAKE_DL_LIBS})
         add_test(NAME deepseek41-quantized-strip-projections-cuda
                  COMMAND GgmlOpsDsv41TpTest --cuda 1 --quant-strip-only)
         set_tests_properties(deepseek41-quantized-strip-projections-cuda PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 600)
+        # A rank graph that throws on the device-resident exchange: rank 0,
+        # a worker rank, then both. A regression aborts or hangs, hence the
+        # timeout.
+        add_test(NAME deepseek41-tp-resident-failure-cuda
+                 COMMAND GgmlOpsDsv41TpTest --cuda 2 --resident-failure-only)
+        set_tests_properties(deepseek41-tp-resident-failure-cuda PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 600)
         # Multi-device tests are explicit: a one-GPU CI lane must not claim
         # that its skipped multi-device checks established tensor parallelism.
@@ -784,12 +792,20 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsDsv41RawGatherTest PRIVATE ggml-base)
     add_test(NAME deepseek41-compact-raw-gather COMMAND GgmlOpsDsv41RawGatherTest)
 
+    add_executable(GgmlOpsDsv41YocoTest tests/dsv41_yoco_test.cpp)
+    target_include_directories(GgmlOpsDsv41YocoTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek41-yoco-policy COMMAND GgmlOpsDsv41YocoTest)
     add_executable(GgmlOpsDsv41TruncateTest tests/dsv41_truncate_test.cpp)
     target_include_directories(GgmlOpsDsv41TruncateTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-truncate-guards COMMAND GgmlOpsDsv41TruncateTest)
     add_executable(GgmlOpsDsv41DsparkRingTest tests/dsv41_dspark_ring_test.cpp)
     target_include_directories(GgmlOpsDsv41DsparkRingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-dspark-ring-guards COMMAND GgmlOpsDsv41DsparkRingTest)
+    add_executable(GgmlOpsDsv41VisionClipTest tests/dsv41_vision_clip_test.cpp)
+    target_include_directories(GgmlOpsDsv41VisionClipTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsDsv41VisionClipTest PRIVATE GgmlOps ggml-base)
+    add_test(NAME deepseek41-vision-clip-mmproj COMMAND GgmlOpsDsv41VisionClipTest)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)

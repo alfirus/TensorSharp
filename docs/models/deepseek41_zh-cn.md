@@ -100,9 +100,100 @@ SHA256
 不能把它们的哈希、246.35 GiB 大小、约 60 GiB Engram 预热、质量结果或吞吐率归给
 Q2_K-Q5。每次新验证都须记录 revision 与全部分片哈希。
 
+## Unsloth 的 DeepSeek-V4.1-Flash-1017 GGUF
+
+[unsloth/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/60ad3651641b5c97679c807e064ab1d7a3ca1455)
+为 llama.cpp 打包了 1017 检查点。TensorSharp 按发布原样加载这些文件；它们与上文布局
+有四处不同，均由加载器处理：
+
+- Engram 表是一个张量 `per_layer_token_embd.weight`（Q5_K，独占一个分片），由
+  `deepseek41.ple.*` 元数据描述。加载器把它切成逐层的表，并像 `engram.py` 一样，
+  用 token 映射压缩原始的 `engram.pad_token_id`。
+- `blk.N.engram_gate.weight` 存的是 Engram 的 `q_weight * k_weight` 乘积，这也是参考
+  实现使用这两个权重的唯一方式。
+- DSpark 草稿器 `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` 是 `dflash` 文件。它的噪声
+  token、Markov 秩、块大小、专家数与目标层来自目标模型的 `deepseek41.dspark.*`
+  元数据，与之不符的草稿器会被拒绝。
+- 视觉塔以 llama.cpp 的 `mmproj-BF16.gguf` / `mmproj-F16.gguf`（`clip`，projector
+  `deepseek41v`）发布，`--mmproj` 可直接加载；图像 token 的路由偏置取自文本分片
+  （`blk.N.exp_probs_b_vl.bias`）。
+
+每次调用只传一个 `--include` 模式（`hf` 2.2.0 在一次调用中给多个模式时只匹配到了
+根目录文件）：
+
+```bash
+REPO=unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+REV=60ad3651641b5c97679c807e064ab1d7a3ca1455
+DIR=/workspace/DeepSeek-V4.1-Flash-1017-GGUF
+for pattern in "UD-IQ2_XXS/*" dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf mmproj-BF16.gguf; do
+  hf download $REPO --revision $REV --include "$pattern" --local-dir $DIR
+done
+(cd $DIR && sha256sum --check - <<'SHA256'
+22ad51c224e499883c1a753ad35719af44c296bbc8bcb9c931de6bdf950fa3aa  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf
+6880d0483490504a530b72686d79c92daa46e58ca5b71763bbfa3778d8a6131a  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00002-of-00006.gguf
+04b3ec7947255efaf789da77557da9180e93128948644828798d07b8a6e7a60a  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00003-of-00006.gguf
+318762f39cd7ebf03e3d7b30feaf938fab0464a9c2d6c0e0e99fc030bbfcd820  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00004-of-00006.gguf
+34fa48fbe2237b1b71a4f18a04bbe10946f6b1c76b7bbff21c76da630da677b6  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf
+406103485a7a7193337adee38b7178d3b636940aaa3ca033bc91e0d3687e3031  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf
+6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a  dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
+9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9  mmproj-BF16.gguf
+SHA256
+)
+```
+
+`mmproj-F16.gguf`（`dad8ad13f1d9a25757e121592d7b4f8ca83620d1172048004998b7c0b964b18e`）
+同样可以加载；其矩阵会转换回 BF16，除落入 F16 次正规数范围的权重外都是精确的。
+UD-IQ2_XXS 分片共 300.5 GB，其中 Q5_K Engram 表占 125.9 GiB。在五张 46 GB 的 A40 上，
+这张表无法驻留显存，只能主机映射，因此主机（或容器）内存上限必须容纳它；
+`TS_DSV41_ENGRAM_WARM=1` 会在加载时就把它读入，而不是在最初几个请求中按页调入。
+
+```bash
+MAX_CONTEXT=32768 TS_DSV41_ENGRAM_WARM=1 \
+  dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
+  --model $DIR/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  --draft-model $DIR/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
+  --mmproj $DIR/mmproj-BF16.gguf \
+  --backend ggml_cuda --layer-split 5 --host 127.0.0.1 --port 5000
+```
+
+在五张 A40（CUDA 12.8 工具链，驱动 595.91）上与 unsloth 的 llama.cpp
+（`be8365722ea432809818fa21a4ecebfac2e7d298`，`-ngl 99 -sm layer -lm dio`）对比测得，
+ggml 为 `da8e2a5`，每次加载前都清空页缓存。TensorSharp 使用默认设置，其中包括 YOCO
+有界重放（近似 prefill，见下文）；“精确”行设置了 `TS_DSV41_YOCO_KEEP=0`。TensorSharp 的合成
+测试数值取三次运行中的最好一次，llama.cpp 的数值为 llama-bench 的均值（TensorSharp 自身的均值在
+2,048 与 8,192 个 token 时低 0.4-5%）。把命令中的
+`--layer-split 5` 换成 `--tp 5` 即启用路由 MoE 张量并行，在这台机器上更快。合成测试行使用
+随机 token；服务端测试行向两个服务端发送 wikitext-2 摘要提示（首行各不相同），贪心解码、
+关闭思考，上下文均为 32,768 个 token（llama.cpp 的四并发行使用 `-c 65536 -np 4`）：
+
+| 测量项 | TensorSharp `--layer-split 5` | TensorSharp `--tp 5` | llama.cpp |
+| --- | ---: | ---: | ---: |
+| Prefill，512 / 2,048 / 8,192 个随机 token（tok/s） | 500.3 / 844.3 / 906.2 | 779.8 / 1,046.7 / 1,082.7 | 227.6 / 284.8 / 310.8 |
+| 同上，精确 prefill（tok/s） | 352.7 / 463.5 / 444.3 | 516.4 / 562.9 / 540.8 | |
+| 深度 2,048 / 8,192 处的 decode（tok/s） | 34.5 / 34.2 | 36.4 / 36.1 | 32.6 / 31.9 |
+| 服务端 prefill，约 1.8K / 7.3K token 提示（中位数 tok/s） | 697.4 / 762.8 | 960.5 / 1,000.7 | 174.6 / 225.7 |
+| 同上，精确 prefill（中位数 tok/s） | 405.5 / 412.7 | 563.9 / 549.7 | |
+| 上述提示之后的服务端 decode（中位数 tok/s） | 33.8 / 34.0 | 35.5 / 35.7 | 29.6 / 33.0 |
+| 使用 DSpark 草稿器的服务端 decode（均值 tok/s） | 44.1 / 43.5 | 55.0 / 51.2 | 41.3 / 40.8 |
+| 四个并发、约 1.8K token 的请求，各生成 256 个 token（整批耗时 s） | 27.3-33.1 | 21.2-25.5 | 43.3-46.8 |
+
+在一个简短的代码提示上（58 个 token，生成 512 个；按层切分、精确 prefill），草稿器接受率为 80%，速度 60.2 tok/s
+（llama.cpp `--spec-type draft-dspark` 每次起草 3 个 token 时为 51.6 tok/s）。在相同 token
+上做 teacher-forced 的 wikitext-2 困惑度：4,608 token 窗口，前 2,304 个 token 作为提示
+prefill（超过稀疏 prefill 门控），其余逐 token 打分，共 10 段。llama.cpp 为 2.4697；
+TensorSharp 在默认设置下按层切分为 2.4970、`--tp 5` 为 2.4978，精确 prefill 时为 2.4820 与
+2.4811。相对 llama.cpp 分布的平均 KL 散度默认为 0.0172，精确时为 0.0160（top-1 一致率
+96.2% / 96.3%）。TP 与按层切分之间的平均 KL 散度在精确 prefill 时为 0.0005，默认设置下为 0.0004。在 YOCO 与 TP 工作之前，只含布局
+支持、不含任何提速改动的构建为 2.4752 与 0.0167（精确 prefill）；按段配对，最终精确构建与它的
+困惑度差异不显著（t = 1.02），KL 散度更低（t = -3.01）。原始记录是 `docs/validation/deepseek41-1017/` 下的本地验证记录（未提交到
+Git）。
+
 ## 准备可选的视觉伴随文件
 
-已发布的 GGUF 转换过程丢掉了视觉塔、aligner、可学习的图像分隔符以及逐层的视觉路由
+使用 unsloth 的 1017 GGUF 时无需准备：`--mmproj mmproj-BF16.gguf` 对图像的编码与用官方
+1017 检查点准备的伴随文件逐位相同（`mmproj-F16.gguf` 因 F16 对约 0.02% 权重的舍入而略有
+差异）。下面的伴随文件用于不带视觉塔的转换。
+smalinin 发布的 GGUF 转换过程丢掉了视觉塔、aligner、可学习的图像分隔符以及逐层的视觉路由
 偏置。官方发布把约 970 MB 的视觉/aligner 权重放在一个独立分片里，因此可以在不下载
 原始文本权重的情况下准备它们：
 
@@ -179,7 +270,9 @@ WebM 或 MOV 采样。例如，消息的 content 数组里可以包含：
 
 ## 准备可选的 DSpark 伴随文件
 
-V4.1 需要 `deepseek41-dspark` 产物，不能使用 V4 草稿模型。以下官方 revision 将 DSpark
+V4.1 需要 V4.1 草稿器：即这里准备的 `deepseek41-dspark` 产物，或 unsloth 随 1017 GGUF
+发布的 `dflash` 文件（见[Unsloth 的 DeepSeek-V4.1-Flash-1017 GGUF](#unsloth-的-deepseek-v41-flash-1017-gguf)）。
+不能使用 V4 草稿模型。以下官方 revision 将 DSpark
 放在分片 44–46 中（7,933,129,808 字节），无需下载原始文本模型：
 
 ```bash
@@ -296,11 +389,33 @@ TensorSharp 默认按可用显存分配整层。用 `CUDA_VISIBLE_DEVICES` 精�
 
 在这种模式下，路由专家的 gate/up 矩阵沿 FFN 中间维切分，down 矩阵按输出行切分，并在所有
 选中的 GPU 上并发执行。先按 F32 精度拼接完整 SwiGLU 激活，再计算 down 的各输出行，最后
-拼接互不重叠的输出。这保留完整的点积归约次序，避免舍入差异被后续激活量化放大。注意力、共享专家与各类 cache 仍保持按层
-放置。这是一份部分实现的张量并行：它不切分注意力，也不支持分布式张量并行组。主机传输
-可能成为吞吐瓶颈，因此该选项并未证明比按层切分更快。下面通过校验的完整检查点运行
-比按层切分更慢；另见
-[实测放置配置](../deepseek41_validation.md#full-checkpoint-routed-moe-tp)。
+拼接互不重叠的输出。这保留完整的点积归约次序，避免舍入差异被后续激活量化放大。量化块从不被
+切开，不均匀的条带在各层之间轮换以平衡存储。注意力、共享专家与各类 cache 仍保持按层
+放置。这是一份部分实现的张量并行：它不切分注意力，也不支持分布式张量并行组。
+
+在 `ggml_cuda` 上，路由专家的交换驻留在设备侧（`ggml_ops_deepseek41_tp_cuda.cu`）。每个 TP
+层在本层 GPU 上是一个 launch 节点和一个 gather 节点：launch 暂存本层激活并下发到每个
+rank，本层 GPU 随后在各 rank 运行期间计算共享专家，gather 再等待各 rank 的输出行。每次
+传输都由各 GPU 自己的拷贝引擎经可移植的 pinned 主机内存中转，只用 CUDA event 排序，因此
+主机在层内从不等待，并且每个 rank 由一个线程并发下发。它不需要点对点访问；某些 PCIe
+主机（包括下面的五卡 A40 VM）声明了点对点访问，但实际不可用。输出与它所取代的主机驱动
+节点逐位相同，并在每一层与按层切分的 MoE 逐位相同（`GgmlOpsDsv41TpTest`，包括在真实
+检查点上的 `--model-dir`）。某个 rank 失败（例如临时缓冲分配失败）时，该层输出变为 NaN，
+请求失败：已经下发工作的 rank 会被排空，不会出现永久等待，下一个请求照常运行
+（`deepseek41-tp-resident-failure-cuda`）。
+
+在五张 A40 上用 unsloth 的 UD-IQ2_XXS 文件，`--tp 5` 在默认 YOCO 重放下以 1,046.7 tok/s
+prefill 2,048 个随机 token（`TS_DSV41_YOCO_KEEP=0` 时为 562.9），decode 为 36.4 tok/s；
+`--layer-split 5` 为 844.3（463.5）与 34.5。改为设备侧交换之前，`--tp 5` 的 prefill（精确）
+为 402.3 tok/s，decode 为 15.2 tok/s。在约 1.8K 与约 7.3K token 的真实文本服务端提示上，其
+prefill 中位数为 960.5 与 1,000.7 tok/s。在 teacher-forced 的 wikitext-2（4,608 token 窗口）
+上，TP 与按层切分的下一 token 分布之间平均 KL 散度在精确 prefill 时为 0.0005、默认设置下为
+0.0004（中位数 0，top-1 一致率 99.8%），而两者与 llama.cpp 之间为 0.016 与 0.017。unsloth 的 llama.cpp 构建在这个模型上没有可用的张量切分：
+`-sm row` 拒绝加载（`device CUDA0 does not support split buffers`），`-sm tensor` 在为第一个提示
+批次分配计算图时中止，因此上面的对比针对的是它的按层切分。decode 与按层切分接近：在一次 nsys
+decode 剖析中，每层仍在一张 GPU 上的 Q8_0/Q6_K 稠密投影（注意力、共享专家与输出头）占 GPU 内核
+时间的 31%，而在这个量化下每个 token 的六个路由专家在五张 GPU 上合计占 21%。下面的主机驱动
+测量早于这项改动；另见[实测放置配置](../deepseek41_validation.md#full-checkpoint-routed-moe-tp)。
 
 TP 每层上传之前，按 `TS_DSV4_LOAD_THREADS`（默认 16，每线程 64 MiB 临时缓冲）
 顺序读取当前层三个路由专家张量的文件范围，跳过已驻留的页面，避免 rank 跨行读取时触发
@@ -318,8 +433,10 @@ TP 每层上传之前，按 `TS_DSV4_LOAD_THREADS`（默认 16，每线程 64 Mi
 这是每种设置两次启动、途中中断的对照，并非连续的 ABBA 试验。部分边界页及 MooseFS
 用户态、网络和服务端缓存未受控，因此不能把该比值称为冷存储或通用加速比。
 
-当 NCCL 选择 `NCCL_P2P_DISABLE=1` 时，不超过 16 个 token 的批次使用可复用 pinned
-主机激活缓冲进行拼接，更大批次使用私有 F32 NCCL 拼接。该阈值来自六张 PCIe A40 的
+没有 TensorSharp 融合 CUDA 后端时（`TS_DSV4_FUSED=0`），TP 节点在 CPU 后端上由主机驱动
+各 rank，并在每个阶段同步。在这条路径上，当 NCCL 选择 `NCCL_P2P_DISABLE=1` 时，不超过
+16 个 token 的批次使用可复用 pinned 主机激活缓冲进行拼接，更大批次使用私有 F32 NCCL
+拼接（首次使用时才创建）。该阈值来自六张 PCIe A40 的
 配对实测，不会用于启用 P2P 的配置。`TS_DSV41_TP_HOST_TOKENS=0` 强制使用可用的设备
 拼接，便于对比；0 到 4096 的整数设置主机拼接阈值。`TS_GGML_TP_F32_NCCL=0` 对所有
 批次使用主机回退。两条路径均保持 F32 位模式。设备拼接沿 rank 的 CUDA stream 顺序
@@ -345,13 +462,18 @@ TP 每层上传之前，按 `TS_DSV4_LOAD_THREADS`（默认 16，每线程 64 Mi
 
 计时期间，TP 的容器内存约为 255 GiB，按层切分约为 70 GiB。其中文件缓存约为
 252 / 68 GiB，匿名内存约为 1.6–1.7 / 0.8–0.9 GiB。TP 上传临时缓冲有界，但已上传的
-路由权重页面仍保留在可回收的文件缓存中：`TS_DSV4_LOAD_DROP_CACHE` 目前仅作用于普通按层
-上传，不作用于私有 TP 上传路径。因此，显存足够并不代表主机内存限制也足够。
+路由权重页面当时仍保留在可回收的文件缓存中：`TS_DSV4_LOAD_DROP_CACHE` 当时仅作用于普通
+按层上传。自 2026-10-23 起，TP 上传路径遵循同一规则：当源页面与主机映射无法同时放入主机
+内存限额时，每层分片上传后即释放其源页面（日志 `[dsv41-tp] expert source page cache: ...`）。因此，显存足够并不代表主机内存限制也足够。
 观测到的 255 GiB 也不代表最低内存要求。这几次顺序加载的源页面驻留状态不同，不能作为
 受控的加载延迟对比。
 
 当前按输出行切分的实现通过了两张和六张 A40 的数值 fixture，包括双卡 F32、BF16、F16、
-Q2_K、Q3_K、Q4_K、Q6_K，以及六卡真实修复版检查点的专家权重。CPU fixture 覆盖 2 到 8 个
+Q2_K、Q3_K、Q4_K、Q6_K，以及六卡真实修复版检查点的专家权重。输出行分片现在按 128、64
+或 32 行对齐：此前的 2 行回退让 256 宽 F16 fixture 在三卡和五卡时的 down 投影走 ggml 以
+F16 累加的回退路径（相对 L2 `2.8e-3`），这正是那两个 CUDA 用例失败的原因。在五卡 A40 VM
+上，CUDA fixture 在 2、3、4、5 个 rank 下全部通过，设备驻留节点与 launch/gather 节点对
+都与主机驱动节点逐位相同。CPU fixture 覆盖 2 到 8 个
 rank；验证 VM 只有六张 GPU，未执行七卡与八卡 CUDA 测试。最终 `473ee64d…` 运行时
 使用修复版十分片 Q2_K/Q5 检查点通过六卡 HTTP 验证：16 个文本响应与未修改的按层
 切分基线完全相同，四个严格工具场景、三个图像场景全部通过，129,280 个首轮 prefill
@@ -513,11 +635,11 @@ prefill、分块大小 1/3/5/8 与 reset——不过那是 fixture 规模的对�
 
 在 `ggml_cuda` 上，V4.1 的 attention 运行 TensorSharp 自有的 F32 内核（ggml 的 CUDA flash
 attention 会把 Q 与 softmax 权重收窄到 F16，而 cache 量化可能放大丢失的这些位）。**prefill
-默认是稀疏的**，前提是调用既宽又长：超过 8 个 query、至少 8,192 个 key（原始窗口环加上可见的
+默认是稀疏的**，前提是调用既宽又长：超过 8 个 query、至少 2,048 个 key（原始窗口环加上可见的
 压缩行）的分块，每个 query 只经由掩码压缩内核关注自己的滑动窗口与索引器选中的行，最多
 128 + 512 个 key。其余情况保持稠密内核：单 token decode 与每次 DSpark verify（6 行）使用
 分 key 内核，因此 verify 提交的 cache 行仍与 decode 完全一致；更短的 prefill 使用分块
-（tiled）内核，因此 attention 始终低于 8,192 个 key 的提示词逐位不变。可见 key 多于上限的行
+（tiled）内核，因此 attention 始终低于 2,048 个 key 的提示词逐位不变。可见 key 多于上限的行
 会退回全行扫描，所以这个上限不会丢掉任何 key。
 
 在单张 A40 上实测（`GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill 512 33536 64 5`，
@@ -525,13 +647,44 @@ attention 会把 Q 与 softmax 权重收窄到 F16，而 cache 量化可能放�
 **34.1–34.3 ms**，分块为 **1,547–1,549 ms**。与分解的 F32 参考相比，稀疏内核的最大绝对误差为
 1.1e-7（相对 L2 7.4e-7），分块内核为 8.9e-8（4.8e-7）。稀疏 query 也与同一调用中的其他 query
 无关——query 0 单独计算、在 9 个 query 中、在 512 个 query 中逐位相同——因此提示词的结果不取决于
-prefill 如何分块。`TS_DSV41_SPARSE_FA=0` 恢复分块 prefill。
+prefill 如何切成 micro-batch。（在 YOCO 有界重放下，把提示拆成多次 prefill 调用则不同：每次调用
+保留各自的最后 140 个位置，见下文。）`TS_DSV41_SPARSE_FA=0` 恢复分块 prefill。
 
-这个自有门控（超过 8 个 query、至少 8,192 个 key、F32 压缩内核）与 ggml flash-attention
+CUDA 用 MQA 内核执行这些压缩调用：V4.1 的 64 个头共用一个 K=V 头，因此一个 block 每个 key 分块
+只加载一次、供四个头共用，而不是每个头各加载一次。这使稀疏开销在 1,024 个 query 时恒为
+16.1–16.3 ms（`--benchmark-sparse 1024 KEYS 64 5 640`；512 × 8,960 个 key：8.0 ms，此前为
+34.4 ms，相对 L2 5.2e-7），而分块内核每个 key 约增加 9 µs（1,792 / 2,560 / 6,656 个 key 时为
+15.9 / 22.5 / 63.8 ms）。交叉点约在 1,800 个 key，因此门控从 8,192 降到 2,048 个 key。
+
+这个自有门控（超过 8 个 query、至少 2,048 个 key、F32 压缩内核）与 ggml flash-attention
 内核的门控不同，后者由非自有的 attention 路径使用（非 CUDA GPU、CPU 后端）。在那里
 `TS_DSV41_SPARSE_FA=1` 仍然只在单个 query 或至少 16,384 个 key 时启用 ggml 的掩码压缩 flash
 attention，其 F16 运算与 CPU oracle 的相对 L2 实测最高 7.8e-4；该提示保持显式开启。稀疏
-attention 减少的是 attention 计算量，并不消除 prefill 期间共享压缩 cache 在 GPU 之间的拷贝。
+attention 减少的是 attention 计算量，并不消除共享压缩 cache 在 GPU 之间的拷贝。按层切分时，
+这些拷贝现在只是每一步新写入的行，写进每个读取该 cache 的 GPU 上的副本
+（`TS_DSV41_KV_MIRRORS`，默认开启），而不是每次读取时搬运选中的行或整个可见 cache。两种方式
+logits 逐位相同；五张 A40 在 2K 上下文的 decode 从 32.6 提到 34.5 tok/s。
+
+YOCO 有界重放（DeepInfer 的 YOCO prefill 截断）默认开启，取 DeepInfer 的 140
+（`TS_DSV41_YOCO_KEEP`）。从第一个 ratio 为 1 的层（40 层中的第 20 层）起，每一层读取的都是
+第 20 层由其 attention 输入写入的压缩 cache，因此这些层只处理一次 prefill 调用的最后 140 个
+位置，每个重放位置的滑动窗口被截到重放范围之内。这是近似。在五张 A40 上用 unsloth 的
+UD-IQ2_XXS 文件（`--layer-split 5`，随机 token），512 个 token 的 prefill 由 352.7 提到
+500.3 tok/s，2,048 个由 463.5 提到 844.3，8,192 个由 444.3 提到 906.2（`--tp 5`：562.9 ->
+1,046.7 与 540.8 -> 1,082.7）。在 4,608 token 窗口的 teacher-forced wikitext-2 上（prefill
+2,304 个 token，其余逐 token 打分，10 段），困惑度由 2.4820 变为 2.4970（+0.6%；按段 t = 4.85），
+相对 llama.cpp 的平均 KL 散度由 0.0160 变为 0.0172。代价集中在提示之后最先生成的 token 上：
+前 128 个的 KL 散度为 0.026（精确 prefill 为 0.015），到 512 个为 0.018（0.015），其后为
+0.016（0.016）。在 2,560 token 窗口（prefill 1,280 个）上，困惑度由 2.4867 变为 2.5193。在约
+6.3K 与约 19K token 提示的 10%、50%、90% 深度处埋入的口令句，开启与关闭时六次都能取回。
+`TS_DSV41_YOCO_KEEP=0` 让每一层处理每个位置。decode 步、DSpark 验证、含图像 token 的调用
+与单 token 的 prefill 微批始终让每一层处理每个位置：`TS_DSV4_UBATCH=1` 时默认值提示重放不生效，
+显式设值则拒绝加载。回退到先前某次调用跳过的位置（比该次调用的末尾早 13 个 token 以上，且在
+其起点之后）会重新 prefill 而不是复用 cache，并在日志中提示一次。服务端以每次最多 4,096 个
+token（并发时更少）的调用 prefill 长提示，每次调用各自保留最后 140 个位置。布局无法重放的
+检查点在默认值下以一条提示改走精确 prefill，显式设值则在那里被拒绝；滑动窗口宽于 132 个
+token 的检查点默认至少保留窗口 + 8。只有 ggml 执行器实现了它：`--backend cuda` 与
+`--backend cpu` 会提示一次其 prefill 为精确计算，并拒绝显式的非零值。
 
 默认上下文分配上限为 65,536 个 token，除非提供 `MAX_CONTEXT`。`TS_DSV4_UBATCH` 控制前向
 微批。不设置时，V4.1 在 ggml GPU 后端上由加载器选择：1024、512 或 256 中所需路由专家 CPU
@@ -1045,7 +1198,7 @@ V4.1 没有发布任何委派相关的实测结果。
   `--backend ggml_cpu`、`TS_DSV4_FUSED=0`、加载了 DSpark 草稿器或设置
   `TS_BATCHED_FUSED_DECODE=0` 时，仍走逐槽前向调用。
 - V4.1 的 DSpark 投机解码属于实验性功能。加载器只在 `ggml_cuda` 与 `ggml_cpu` 上接受
-  `deepseek41-dspark` 草稿器（`--draft-model`），在其他执行器上拒绝，
+  `deepseek41-dspark` 或 unsloth 的 `dflash` 草稿器（`--draft-model`），在其他执行器上拒绝，
   V4 的草稿模型也会被拒绝。合成测试（`DeepSeek41DsparkIntegrationTests`）以及真实草稿器在
   `ggml_cuda` 双 GPU 按层切分与实验性路由专家 TP 下的初步文本/图像 HTTP 检查已通过；
   大量磁盘换页下的通用质量与吞吐仍未获验证。另行进行的 24-token 文本/图像配对检查，
@@ -1084,7 +1237,7 @@ V4.1 没有发布任何委派相关的实测结果。
 
 已实现的专家切分使用不等宽的块对齐分区。2304 的中间维包含九个 256 元素的 K-quant 块：
 两个 rank 可取 1280 与 1024，四个 rank 可取 768、512、512、512。gate/up 张量对每个专家
-都沿该中间维切分；down 张量沿其输入维切分，随后经主机中转归约。共享专家与 CPU 卸载的
+都沿该中间维切分；down 张量按输出行切分，每个 rank 读取完整的隐藏激活，各行直接拼接而不求和。共享专家与 CPU 卸载的
 输出只计一次。当前的 ggml CUDA 不再暴露旧的 split-buffer 接口；这条路径显式构建并执行
 rank 局部的专家计算图。
 

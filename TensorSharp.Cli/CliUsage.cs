@@ -440,9 +440,12 @@ namespace TensorSharp.Cli
                     "A drafter that ships as its own GGUF, whatever its kind: DeepSeek V4's DSpark support " +
                     "module, the DFlash / DFlash2 drafters for Muse-Glimmer and Qwen 3.8, Gemma 4's " +
                     "per-token assistant head (gemma4-assistant), or Qwen 3.8 Flash Next's shared MTP head " +
-                    "(ggml_* backends only). DeepSeek V4.1 also loads a deepseek41-dspark drafter on ggml_cuda " +
-                    "or ggml_cpu - EXPERIMENTAL: validated only on synthetic fixtures, no trained V4.1 drafter " +
-                    "has been measured. The file's own general.architecture decides " +
+                    "(ggml_* backends only). DeepSeek V4.1 also loads a DSpark drafter on ggml_cuda or ggml_cpu, " +
+                    "either as deepseek41-dspark or as the dflash file published beside unsloth's " +
+                    "V4.1-Flash-1017 GGUFs (it must match the target's deepseek41.dspark.* metadata). Only the " +
+                    "dflash Q8_0 drafter has been measured, on ggml_cuda: 80% acceptance and about 1.7x decode on a " +
+                    "code prompt; deepseek41-dspark is validated on synthetic fixtures only. " +
+                    "The file's own general.architecture decides " +
                     "how it loads (a block drafter is fused before the layer split, a per-token head attaches " +
                     "after) - never its file name, and never a second flag. Naming the file IS the request: " +
                     "speculation turns on with it, no --spec needed, and an explicit --no-spec vetoes it. " +
