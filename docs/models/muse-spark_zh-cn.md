@@ -204,34 +204,12 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 `--tp 10` 下每张 GPU 持有 35.4–36.0 GiB 权重和 0.6 GiB K/V，加载耗时 6.4 分钟。
 在该主机上两种运行都依赖[对等连接上限保护](#十张及以上-gpu)。
 
-#### 早期的六张 A40、CPU 专家卸载配置
-
-这套早期配置在六张 A40 GPU（每张 46 GB）上运行更大的 UD-Q3_K_XL 检查点，放不下的专家栈留在主机内存中，
-内存上限 280 GiB，CPU 配额 48 个。32K 上下文和五个计划槽位为四个并发请求、共享前缀检查点和图像编码器留出了空间。
-只计划四个槽位时，承载层数最多的那张 GPU 空间不足，四个并发请求中经常有一个丢失模板检查点，
-只能 prefill 整段提示：
-
-```bash
-MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_MUSE_SPARK_CPU_MOE=auto \
-TS_MUSE_SPARK_DEV0_RESERVE_MB=3072 TS_CODE_EXEC=0 \
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /workspace/models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
-  --mmproj /workspace/models/muse-spark/mmproj-Q8_0.gguf \
-  --backend ggml_cuda --layer-split 6 --n-cpu-moe 21 \
-  --host 127.0.0.1 --port 8083 --no-webui --no-skills --no-multi-agent
-```
-
-`--n-cpu-moe 21` 会被 `TS_MUSE_SPARK_CPU_MOE=auto` 覆盖。该方案在六张 GPU 上分别放置 7、9、9、9、12 和 16 层，
-GPU 上共 240.4 GiB 权重，另有来自 33 层的 131.8 GiB 专家栈留在主机。
-加载约需 5 分钟；同一主机上 llama.cpp 以 `--load-mode none` 加载需要 21.5 分钟
-（它默认的内存映射加载在该内存上限内没有完成）。用这套配置得到的测量来自更早的构建，已被下面的十张 A40 结果取代。
-
 ### 实测结果
 
 使用上面的十张 A40 配置，在同一台机器、同一检查点上与 llama.cpp `7170cad` 对比：驱动 595.91、CUDA 12.8、
 未修改的上游 ggml `da8e2a5`；llama.cpp 以 `-DGGML_CUDA_NCCL=OFF` 构建，因为它的 NCCL 构建在该主机上会遇到
 [对等连接上限导致的中止](#十张及以上-gpu)。该主机上 GPU 之间的对等访问被宣称可用但实际不工作，因此两个引擎都没有使用 P2P。
-吞吐与延迟数据为三次重复的中位数，每个夹具运行一次；比值大于 1.00x 表示 TensorSharp 更好。标为"见报告"的单元格请查看
+吞吐与延迟数据为三次重复的中位数，llama.cpp 张量切分各行除外（两次）；每个夹具运行一次。比值大于 1.00x 表示 TensorSharp 更好。标为"见报告"的单元格请查看
 [完整报告](../perf/muse-spark-vs-llama-cpp.md)（英文），其中还有测量方法、各场景细节以及这次对比的局限。
 
 | 场景 | TensorSharp `--layer-split 10` | llama.cpp `-sm layer` | 比值 | TensorSharp `--tp 10` | llama.cpp `-sm tensor` | 比值 |

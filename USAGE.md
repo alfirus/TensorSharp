@@ -1762,9 +1762,7 @@ Notes:
   (`TS_MUSE_SPARK_HOST_NUMA=0` keeps the GGUF mapping); on the 2-socket test host that
   raised host expert bandwidth from about 100 to 165-174 GB/s. Batches of 2-16 tokens
   run host experts through a static-row kernel whose results match ggml's bit for bit.
-  In an earlier measurement on six A40s, the plan put 131.8 GiB of the 374 GiB
-  UD-Q3_K_XL checkpoint on the host and decode still reached 11.05 tok/s, 1.11x
-  llama.cpp in that run. Host experts keep automatic pipelined prefill off; the current
+  Host experts keep automatic pipelined prefill off; the current
   comparison, on ten A40s with every expert in GPU memory, is the
   [llama.cpp comparison](docs/perf/muse-spark-vs-llama-cpp.md). See the
   [model card](docs/models/muse-spark.md#native-whole-model-executor).

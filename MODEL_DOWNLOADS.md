@@ -229,9 +229,8 @@ passed `--no-webui --no-skills --no-multi-agent` and loaded no projector; for im
 which leaves GPU 0 room for the image encoder. On fewer GPUs, layer split with
 `TS_MUSE_SPARK_CPU_MOE=auto` keeps as many expert stacks on the GPUs as fit and puts the
 rest in host memory; without it (or `--n-cpu-moe N`), a checkpoint that does not fit is
-refused with a message naming the option. An earlier six-A40
-[profile](docs/models/muse-spark.md#earlier-six-a40-profile-with-cpu-expert-offload) ran
-the ten-shard UD-Q3_K_XL this way, with 131.8 GiB of expert stacks in host memory. `--tp N`
+refused with a message naming the option. CPU offload was not measured in the
+[current comparison](docs/perf/muse-spark-vs-llama-cpp.md). `--tp N`
 keeps every expert on the GPUs. `TS_MUSE_SPARK_NATIVE=0` selects the older per-op path,
 which `--tp N` on `ggml_vulkan` also uses. Weight-free speculation is
 `--spec --spec-type ngram`; the native `--tp` path decodes without it. Results against llama.cpp on this profile:

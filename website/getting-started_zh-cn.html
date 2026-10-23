@@ -85,7 +85,7 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release</
     <li><strong>Wan 视频，只有画面</strong> —— 基础的 <code>Wan2.2-TI2V-5B</code> 走官方配方 50 步 × 2 次 CFG = 100 次 DiT 前向；<em>Turbo</em> / <em>Lightning</em> / <em>FastWan</em> 权重在训练时就不使用引导，只需 4 次。TensorSharp 会从 DiT 文件名自动识别，不需要额外参数。在 M5 Pro 上，一段 1088×832 × 121 帧的图生视频，基础权重约需 3 h 30 m，Turbo 只需 <strong>17 m 30 s</strong> —— 命令完全相同，只是 <code>--model</code> 指向了不同的文件。</li>
     <li><strong>Qwen-Image-2.1</strong> —— 默认的 CFG 1 本身就是每步一次 Transformer 前向，因此杠杆在步数与尺寸。最大的杠杆是 <code>config/lora/</code> 中的步数蒸馏 LoRA 插件：<code>--lora config/lora/qwen-image-2.1-viggle-turbo.json</code> 会在首次使用时下载权重并自带配方，用 6 次 Transformer 前向代替 40 次（支持 4–8 步）；同目录还有 Pruna 8 步与 5 步、Fun-Acc 4 步预设。这四个适配器都采用 Qwen Research License（非商用）。其次是尺寸：出草图时用 <code>--width 1024 --height 1024</code>（潜在图像 token 数只有 2048×2048 默认值的四分之一）。不用蒸馏 LoRA 时，<code>--diffusion-steps 25</code> 就是直接减少步数的办法。</li>
   </ul>
-  <p>→ <a href="models-downloads_zh-cn.html#downloads">模型下载</a>（具体仓库与文件名）· <a href="benchmarks_zh-cn.html#wan">这些数字背后的实测</a> · <a href="benchmarks_zh-cn.html#qwen-image21">Qwen-Image-2.1 LoRA 耗时</a></p></div>
+  <p>→ <a href="models-downloads_zh-cn.html#downloads">模型下载</a>（具体仓库与文件名）· <a href="models-video_zh-cn.html#wan">这些数字背后的实测</a> · <a href="models-image_zh-cn.html#imagegen">Qwen-Image-2.1 LoRA 耗时</a></p></div>
 
   <p>LTX 2.5 Distilled 使用 <code>config/ltx-2.5-distilled.json</code> 自动下载五个校验文件；官方伴随文件需先获许可并配置 HF 令牌。先用 48 GB 实验档位与 1024×1024×17 预览，完整两阶段 8+3 配方由模型提供。 <a href="models-video_zh-cn.html#ltx-25">后端、条件与验证范围 →</a></p>
 

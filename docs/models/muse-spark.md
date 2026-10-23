@@ -293,34 +293,6 @@ loaded in 6.0 minutes. Under `--tp 10` each GPU held 35.4–36.0 GiB of weights
 and 0.6 GiB of K/V, and the load took 6.4 minutes. On that host both runs
 rely on the [peer-limit guard](#ten-or-more-gpus).
 
-#### Earlier six-A40 profile with CPU expert offload
-
-This earlier profile served the larger UD-Q3_K_XL checkpoint on six A40 GPUs
-(46 GB each), with the expert stacks that did not fit kept in host memory,
-under a 280 GiB memory limit and a 48-CPU quota. Its 32K context and five
-planned slots leave room for four concurrent requests, the shared-prefix
-checkpoint and the image encoder. With four planned slots, the GPU holding the
-most layers ran short, and one of four concurrent requests often lost the
-template checkpoint and prefilled its whole prompt:
-
-```bash
-MAX_CONTEXT=32768 TS_MUSE_SPARK_PLAN_SLOTS=5 TS_MUSE_SPARK_CPU_MOE=auto \
-TS_MUSE_SPARK_DEV0_RESERVE_MB=3072 TS_CODE_EXEC=0 \
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
-  --model /workspace/models/muse-spark/UD-Q3_K_XL/Muse-Spark-Open-816B-A42B-UD-Q3_K_XL-00001-of-00010.gguf \
-  --mmproj /workspace/models/muse-spark/mmproj-Q8_0.gguf \
-  --backend ggml_cuda --layer-split 6 --n-cpu-moe 21 \
-  --host 127.0.0.1 --port 8083 --no-webui --no-skills --no-multi-agent
-```
-
-`--n-cpu-moe 21` is overridden by `TS_MUSE_SPARK_CPU_MOE=auto`. The plan put
-7, 9, 9, 9, 12 and 16 layers on the six GPUs and 240.4 GiB of weights on them,
-plus 131.8 GiB of expert stacks on the host from 33 layers. Loading took about
-5 minutes, against 21.5 minutes for llama.cpp's `--load-mode none` load on the
-same host (its default memory-mapped load did not finish inside the memory
-limit). The measurements taken with this profile were made on an earlier build
-and are superseded by the ten-A40 results below.
-
 ### Measured results
 
 Measured with the ten-A40 profile above against llama.cpp `7170cad` on the
@@ -328,8 +300,8 @@ same machine and checkpoint: driver 595.91, CUDA 12.8, unchanged upstream ggml
 `da8e2a5`, and llama.cpp built with `-DGGML_CUDA_NCCL=OFF` because its NCCL
 build hits the [peer-limit abort](#ten-or-more-gpus) on that host. Peer access
 between the GPUs is advertised but does not work there, so neither engine used
-P2P. Throughput and latency figures are medians of three repeats; each
-fixture ran once. Ratios above 1.00x mean
+P2P. Throughput and latency figures are medians of three repeats, except
+llama.cpp tensor-split rows, which use two; each fixture ran once. Ratios above 1.00x mean
 TensorSharp is better. For cells marked "see report", see the
 [full report](../perf/muse-spark-vs-llama-cpp.md), which also has the method,
 the per-scenario detail and the limits of the comparison.
