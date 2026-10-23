@@ -4,6 +4,18 @@
 
 > Part of the [TensorSharp](../README.md) documentation. The README's [Quick Start](../README.md#quick-start) is the short version of this page.
 
+## When to try TensorSharp
+
+Choose a first task before downloading a checkpoint:
+
+| Your goal | Start here | Check before integrating |
+|---|---|---|
+| Embed inference or chat in a C#/.NET application | [Engine and chat package boundaries](../DEVELOPMENT.md#project--nuget-package-boundaries) and the [CLI host](../TensorSharp.Cli/Program.cs) | The model and backend must support the features you need; native GPU backends also need their runtime dependencies. |
+| Reuse an OpenAI- or Ollama-compatible client with a local model | [Server API examples](../TensorSharp.Server.Host/API_EXAMPLES.md) | Compare the documented endpoints and request fields with your client; tool calling, reasoning and media support depend on the model. |
+| Try local text inference on your own hardware | The [Gemma 4](models/gemma4.md) first run below | Check weight size plus working memory, backend support and the release revision before downloading. |
+
+For CPU-only use, `cpu` is the managed portability/debugging path and `ggml_cpu` uses native kernels. For a GPU, use [Pick a Backend](#pick-a-backend), then verify the [model support table](supported_models.md) and model card. The [Muse Spark](models/muse-spark.md) and [DeepSeek V4.1](models/deepseek41.md) multi-GPU examples have their own memory and backend requirements; their measurements do not predict laptop performance. Check [project status](PROJECT_STATUS.md) for validation limits and features newer than your release.
+
 ## Install and first run
 
 **For the TensorAgent Desktop app:** open the [latest release](https://github.com/zhongkaifu/TensorSharp/releases/latest), expand **Assets**, and choose `tensoragent-desktop-<version>-osx-arm64.dmg` (Apple Silicon, macOS 14+) or `tensoragent-desktop-<version>-win-x64-cpu.msi` / `win-x64-cuda.msi` (Windows x64). PKG and ZIP alternatives are available. Desktop packages include the .NET runtime; Windows also needs WebView2 if absent. Model weights download in **☰ → Models → Download → Use**, and the built-in catalog starts at 12 GB system RAM. Follow the [Desktop user guide](tensoragent_desktop.md) for installation, package verification, first chat, tools and troubleshooting. Older releases may lack Desktop assets until a release uses the updated Release Binaries workflow.
@@ -35,7 +47,7 @@ dotnet --list-sdks
 
 See the [cross-platform .NET install overview](https://learn.microsoft.com/en-us/dotnet/core/install/) or [Development → Prerequisites](../DEVELOPMENT.md#prerequisites) for more detail.
 
-Then get running in ~30 seconds on the verified native GGML fast path — Gemma 4 E4B. The other prerequisites are `git`, `curl`, [CMake](https://cmake.org/download/) 3.20+ (the native GGML library is configured and built with it — on Windows, Visual Studio's "C++ CMake tools for Windows" component ships one and the build will find it), and the toolchain for your GPU backend (see [Development → Prerequisites](../DEVELOPMENT.md#prerequisites)). The recommended public file is [`gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf) (7.48 GiB); text-only inference needs no projector.
+The first source-build example uses Gemma 4 E4B on the native GGML path. Allow time for the 7.48 GiB download and first native build. The other prerequisites are `git`, `curl`, [CMake](https://cmake.org/download/) 3.20+ (the native GGML library is configured and built with it — on Windows, Visual Studio's "C++ CMake tools for Windows" component ships one and the build will find it), and the toolchain for your GPU backend (see [Development → Prerequisites](../DEVELOPMENT.md#prerequisites)). The recommended public file is [`gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/gemma-4-E4B-it-Q8_0.gguf) (7.48 GiB); text-only inference needs no projector.
 
 **Windows + NVIDIA (PowerShell)**
 

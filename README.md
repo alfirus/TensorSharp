@@ -127,7 +127,7 @@ What each run shows, step by step: [Screenshots](docs/showcase.md).
 
 ## Benchmarks
 
-TensorSharp and `llama.cpp` run identical GGUF files on the same NVIDIA RTX 3080 Laptop GPU (16 GB), each on its GGML CUDA and Vulkan builds. Each number is TensorSharp's speedup over llama.cpp on the same backend (geomean, single-stream, greedy, MTP off); above 1.0× means TensorSharp is faster.
+**Historical laptop snapshot — TensorSharp `8a13852`.** The [archived per-scenario report](https://github.com/zhongkaifu/TensorSharp/blob/00c17e2fbb0882114301ad4589fa145dbada3753/docs/engine_comparison_report.md) records TensorSharp and `llama.cpp` using identical GGUF files on the same NVIDIA RTX 3080 Laptop GPU (16 GB), each on its GGML CUDA and Vulkan builds. Each number is TensorSharp's speedup over llama.cpp on the same backend (geomean, single-stream, greedy, MTP off); above 1.0× means TensorSharp is faster or has lower TTFT. These are historical results; the reference revision and raw per-cell data are not recorded in the repository. See [evidence limits](docs/benchmarks.md#historical-laptop-comparison-vs-llamacpp) before using them to assess current performance.
 
 | Model | Backend | decode | prefill | TTFT |
 |---|---|---:|---:|---:|
@@ -169,7 +169,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Browser automation skill (Playwright)](docs/playwright_agent.md) | Running the bundled `playwright` skill, which drives a browser through `@playwright/cli` via `skills_run`: the flags it needs, the macOS Chromium-sandbox config, account handoff, and TensorAgent desktop hosting (not iOS) |
 | [Speculative decoding](docs/speculative_decoding.md) | The three-layer design (model adapter / algorithm / speculator weights), the shipped `auto` / `draft-head` / `block` / `ngram` algorithms, and what to write to add a new one |
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
-| [Engine comparison report](docs/engine_comparison_report.md) | Full per-scenario TensorSharp vs llama.cpp tables |
+| [Laptop comparison report (historical)](https://github.com/zhongkaifu/TensorSharp/blob/00c17e2fbb0882114301ad4589fa145dbada3753/docs/engine_comparison_report.md) | Full per-scenario TensorSharp `8a13852` vs llama.cpp tables; evidence limits in [Benchmarks](docs/benchmarks.md) |
 | [ggml_metal vs llama.cpp](docs/perf/metal-vs-llama-cpp.md) | Head-to-head prefill/decode on Apple Silicon, the four graph-construction gaps it found, and what each was worth |
 | [Muse Spark vs llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | The 816B MoE on ten A40 GPUs, in layer split and tensor parallelism: setup, per-scenario results, teacher-forced quality, and the limits of the comparison |
 | [Test/benchmark matrix runner](TensorSharp.TestMatrix/README.md) | Sweep model × backend × feature × env-var cells and generate regression reports |

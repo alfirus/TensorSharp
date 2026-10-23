@@ -18,13 +18,13 @@
   <h1>Benchmarks &amp; Testing</h1>
   <p class="lede">How TensorSharp measures up against other inference engines on the same models and hardware — <code>llama.cpp</code> on text, <code>stable-diffusion.cpp</code> on image and video generation — plus the test harness that guards correctness.</p>
 
-  <h2 id="head-to-head">Head-to-head: TensorSharp vs llama.cpp</h2>
-  <p><strong>TensorSharp’s .NET runtime with native GGML execution compared with <code>llama.cpp</code></strong> — same GGUF files, same <strong>NVIDIA RTX 3080 Laptop GPU (16 GB)</strong>, one uniform OpenAI <code>/v1/chat/completions</code> surface, and <strong>both engines measured on their GGML CUDA and GGML Vulkan builds</strong> across short-prompt, long-context, and multi-turn chat scenarios. The figures below are the current checked-in run of the <code>benchmarks/engine_comparison</code> harness (<code>docs/engine_comparison_report.md</code>), reproducible on your own hardware.</p>
+  <h2 id="head-to-head">Historical laptop snapshot: TensorSharp vs llama.cpp</h2>
+  <p><strong>TensorSharp <code>8a13852</code> with native GGML execution compared with <code>llama.cpp</code></strong> — same GGUF files, same <strong>NVIDIA RTX 3080 Laptop GPU (16 GB)</strong>, one uniform OpenAI <code>/v1/chat/completions</code> surface, and <strong>both engines measured on their GGML CUDA and GGML Vulkan builds</strong> across short-prompt, long-context, and multi-turn chat scenarios. The figures below come from the <a href="https://github.com/zhongkaifu/TensorSharp/blob/00c17e2fbb0882114301ad4589fa145dbada3753/docs/engine_comparison_report.md">historical report at <code>00c17e2f</code></a>; they do not establish current performance. That report does not record the llama.cpp revision, and raw text-run data is unavailable in the repository, so full reproduction of this snapshot is not established.</p>
 
   <div class="card-grid">
     <div class="card"><div class="ic">🏆</div><h3>CUDA prefill &amp; TTFT</h3><p>Gemma 4 <strong>E4B</strong> prefills <strong>1.28×</strong> faster on geomean (up to <strong>1.39×</strong> on short prompts); the 2-bit Qwen 3.6 <strong>35B-A3B</strong> MoE matches it at <strong>1.28× prefill / 1.27× TTFT</strong>.</p></div>
     <div class="card"><div class="ic">💬</div><h3>Multi-turn prefill sweep</h3><p>On CUDA, follow-up turns prefill faster on <strong>every model</strong> — 1.27× (E4B), <strong>1.39×</strong> (12B), <strong>1.49×</strong> (35B-A3B), 1.11× (27B) — with first tokens up to <strong>1.47×</strong> sooner.</p></div>
-    <div class="card"><div class="ic">⚡</div><h3>CUDA decode: parity or better</h3><p>E4B <strong>1.02×</strong>, 12B <strong>1.04×</strong>, 27B <strong>1.07×</strong> geomean — long-context decode up to <strong>1.12×</strong> — and the 35B-A3B MoE within 2% (0.98×).</p></div>
+    <div class="card"><div class="ic">⚡</div><h3>CUDA decode: 0.98×–1.07×</h3><p>E4B <strong>1.02×</strong>, 12B <strong>1.04×</strong>, 27B <strong>1.07×</strong> geomean — long-context decode up to <strong>1.12×</strong> — and the 35B-A3B MoE about 2% slower (0.98×).</p></div>
     <div class="card"><div class="ic">🌋</div><h3>Vulkan dense decode 1.21×</h3><p>Gemma 4 <strong>12B</strong> decodes <strong>1.21×</strong> faster on the vendor-neutral Vulkan path (up to <strong>1.32×</strong> on long context), with prefill/TTFT at or above parity.</p></div>
   </div>
 
@@ -44,7 +44,7 @@
     </tbody>
   </table>
   </div>
-  <p>The headline wins come from TensorSharp's architecture-specific fast paths: fused whole-model prefill/verify graphs with fused FFN / attention kernels, fused whole-model decode, and the vLLM-style <a href="advanced.html#continuous-batching">paged KV cache with cross-request prefix sharing</a>. Even at extreme quantization the engine holds its own: on 2-bit IQ2_XXS weights the dense Qwen 3.6 27B decodes 1.07× (CUDA) / 1.02× (Vulkan) faster and the 35B-A3B MoE out-prefills llama.cpp by 1.28× — a result specific to these models and native GGML backends. The remaining sub-1.0× cells — chiefly Qwen 3.6 35B-A3B decode on Vulkan (0.87×), Qwen 3.6 27B dense prefill (0.96× CUDA / 0.85× Vulkan), and E4B long-prompt prefill on Vulkan (0.71×) — are active optimization targets rather than finished results.</p>
+  <p>These historical measurements describe the tested models, native GGML backends and workloads. The report does not isolate individual optimizations, so it cannot attribute the differences to a particular kernel or cache strategy. It records gaps as well as gains: Qwen 3.6 35B-A3B decode on Vulkan (0.87×), Qwen 3.6 27B dense prefill (0.96× CUDA / 0.85× Vulkan), and E4B long-prompt prefill on Vulkan (0.71×) were slower in this snapshot.</p>
 
   <p><strong>Beyond the text scenarios</strong> — the harness also supports tool-calling, structured-output (JSON), image / audio / video, MTP on/off, and parallel-request-scaling scenarios against the same servers. Qwen-Image-2.1 has its own TensorSharp vs <code>stable-diffusion.cpp</code> runner, <code>eng/validation/qwen-image21-bench.py</code> (<a href="#qwen-image21">results below</a>). Enable any of these cells with the harness flags documented in <code>benchmarks/engine_comparison</code>.</p>
 
@@ -287,7 +287,7 @@ bash TensorSharp.Server.Host/testdata/test_multiturn.sh</code></pre>
   <pre data-lang="bash"><code>dotnet build TensorSharp.TestMatrix/TensorSharp.TestMatrix.csproj -c Release
 dotnet run --project TensorSharp.TestMatrix -c Release -- --dry-run</code></pre>
 
-  <div class="callout note"><div class="ic">📊</div><p>Benchmark numbers depend heavily on hardware, model, quantization, and KV-cache dtype. Treat the figures above as a reproducible reference point on one machine, not a universal guarantee — run the built-in benchmark on your own hardware for the numbers that matter to you.</p></div>
+  <div class="callout note"><div class="ic">📊</div><p>Benchmark numbers depend heavily on hardware, model, quantization, and KV-cache dtype. Each comparison above has its own conditions and evidence limits; historical snapshots do not establish current performance. Run the built-in benchmark on your own hardware for the numbers that matter to you.</p></div>
 
   <div class="content-footer">
     <a href="distributed.html">← Multi-GPU &amp; Multi-Node</a>

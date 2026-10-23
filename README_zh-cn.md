@@ -126,7 +126,7 @@ TensorAgent 当前目录包含 39 个条目，按可搜索的模型家族分组�
 
 ## 性能数据
 
-TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）上运行相同的 GGUF 文件，两个引擎均分别在 GGML CUDA 与 Vulkan 构建上测量。下表为在相同后端上 TensorSharp 相对 llama.cpp 的加速比（几何平均、单流、贪心采样、关闭 MTP）；大于 1.0× 表示 TensorSharp 更快。
+**历史笔记本测试快照——TensorSharp `8a13852`。** [归档的逐场景报告](https://github.com/zhongkaifu/TensorSharp/blob/00c17e2fbb0882114301ad4589fa145dbada3753/docs/engine_comparison_report.md)记录了 TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）上运行相同 GGUF 文件的结果，两个引擎均分别在 GGML CUDA 与 Vulkan 构建上测量。下表为在相同后端上 TensorSharp 相对 llama.cpp 的加速比（几何平均、单流、贪心采样、关闭 MTP）；大于 1.0× 表示 TensorSharp 更快或 TTFT 更低。这是历史数据，仓库没有记录参照引擎的版本与逐单元原始数据；用于评估当前性能前，请先阅读[证据局限](docs/benchmarks_zh-cn.md#历史笔记本测试对比-llamacpp)。
 
 | 模型 | 后端 | decode | prefill | TTFT |
 |---|---|---:|---:|---:|
@@ -168,7 +168,7 @@ TensorSharp 与 `llama.cpp` 在同一块 NVIDIA RTX 3080 Laptop GPU（16 GB）�
 | [浏览器自动化技能（Playwright）](docs/playwright_agent.md)（英文） | 运行内置的 `playwright` 技能（经 `skills_run` 通过 `@playwright/cli` 驱动浏览器）：所需参数、macOS 上的 Chromium 沙箱配置、账号交接，以及 TensorAgent 桌面托管（不支持 iOS） |
 | [投机解码](docs/speculative_decoding.md)（英文） | 三层设计（模型适配层 / 算法 / 草稿权重）、已内置的 `auto` / `draft-head` / `block` / `ngram` 四种算法，以及新增一种算法需要写什么 |
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 哪些高影响运行时开关影响哪些模型、后端与提示类型 |
-| [引擎对比报告](docs/engine_comparison_report.md) | TensorSharp 对比 llama.cpp 的完整逐场景表格 |
+| [笔记本对比报告（历史快照）](https://github.com/zhongkaifu/TensorSharp/blob/00c17e2fbb0882114301ad4589fa145dbada3753/docs/engine_comparison_report.md) | TensorSharp `8a13852` 对比 llama.cpp 的完整逐场景表格；证据局限见[性能数据](docs/benchmarks_zh-cn.md) |
 | [ggml_metal 对比 llama.cpp](docs/perf/metal-vs-llama-cpp.md) | Apple Silicon 上 prefill / decode 的正面对比，找到的四处计算图构建差距，以及每一处的实际收益 |
 | [Muse Spark 对比 llama.cpp](docs/perf/muse-spark-vs-llama-cpp.md) | 816B MoE 在十块 A40 GPU 上的按层切分与张量并行测试：测试环境、逐场景结果、teacher-forced 质量与对比的局限 |
 | [测试 / 基准矩阵运行器](TensorSharp.TestMatrix/README_zh-cn.md) | 扫描 model × backend × feature × env-var 组合并生成回归报告 |

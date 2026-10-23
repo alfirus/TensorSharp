@@ -95,7 +95,7 @@
 
   <h2 id="performance">性能与扩展</h2>
   <ul>
-    <li><strong>与 llama.cpp 实测对比</strong> —— 对比使用相同 GGUF 文件与硬件；结果取决于模型、后端和工作负载。在当前的对比运行中（短提示 / 长上下文 / 多轮文本场景，两个引擎均分别在 GGML CUDA 与 Vulkan 构建上测量，可通过 <code>benchmarks/engine_comparison</code> 复现）：Gemma 4 E4B 与 2-bit 量化的 Qwen 3.6 35B-A3B MoE 在 CUDA 上 prefill 快 1.28×、首 token 早 1.27×（多轮提示最高 1.49×），Gemma 4 12B 在 Vulkan 上 decode 快 1.21×（长上下文最高 1.32×），四个模型中有三个的 CUDA decode 持平或更快（Qwen 3.6 27B 几何平均最高 1.07×）。→ <a href="benchmarks_zh-cn.html#head-to-head">同台基准测试</a></li>
+    <li><strong>笔记本历史对比</strong> —— TensorSharp <code>8a13852</code> 的原生 GGML 执行路径与 llama.cpp 在 RTX 3080 Laptop GPU 上使用相同 GGUF 文件，分别运行 CUDA 与 Vulkan。这份快照不能代表当前性能：llama.cpp 版本与文本测试原始数据不可用。→ <a href="benchmarks_zh-cn.html#head-to-head">结果与证据限制</a></li>
     <li><strong>GPU 加速</strong> —— GGML Metal（macOS）、GGML CUDA（Windows/Linux + NVIDIA）、GGML Vulkan（Windows/Linux + AMD/Intel/NVIDIA）、直接 CUDA/cuBLAS 后端，以及面向 Apple Silicon 的 MLX 后端 —— 均带 CPU 回退。→ <a href="backends_zh-cn.html">后端</a></li>
     <li><strong>连续批处理与分页 KV 缓存</strong> —— 块分页 KV 池、默认开启的基数树（radix tree）前缀缓存、可在批中接纳 / 抢占序列的迭代级调度器，以及原生融合分页注意力内核。分页 KV 缓存位于<em>主机内存</em>，因此并发换来的是容量与公平调度而非吞吐 —— 无论同时有多少条序列，批量分页路径都会在约 69 tok/s 处饱和。→ <a href="advanced_zh-cn.html#continuous-batching">深入了解</a></li>
     <li><strong>批量 / 并行推理</strong> —— 将 N 个序列打包进一次前向，配以分页 K/V 散写（Mistral 3、Gemma 4、GPT OSS、Qwen 3.5 / 3.6、Nemotron-H、Hunyuan Dense）。</li>
