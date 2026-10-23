@@ -200,7 +200,7 @@ MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本�
 
 #### 后端没有 kernel 的 flash-attention 形状
 
-`ggml_backend_graph_compute` 从不询问 `ggml_backend_supports_op`。因此 ggml-cuda 没有 kernel 的 `GGML_OP_FLASH_ATTN_EXT` 节点会一路走到 `ggml_cuda_flash_attn_ext`，以 `ggml-cuda/fattn.cu:730: fatal error`（`BEST_FATTN_KERNEL_NONE`）终止整个进程。在 ggml 456172ec（`eng/Dockerfile.gb10` 固定的未修改修订版；默认构建跟踪 `master`，见[前置要求](#前置要求)）中，`ggml_cuda_get_best_fattn_kernel` 在以下情况返回 none：
+`ggml_backend_graph_compute` 从不询问 `ggml_backend_supports_op`。因此 ggml-cuda 没有 kernel 的 `GGML_OP_FLASH_ATTN_EXT` 节点会一路走到 `ggml_cuda_flash_attn_ext`，以 `ggml-cuda/fattn.cu:730: fatal error`（`BEST_FATTN_KERNEL_NONE`）终止整个进程。在 ggml 456172ec 中，`ggml_cuda_get_best_fattn_kernel` 在以下情况返回 none：
 
 - K 的 head 大小不是 40、64、72、80、96、112、128 或 256（V 的 head 大小相同），也不是 192（V 为 128）、320（V 为 256）、512 或 576（V 为 512）；
 - head 大小为 192、320、512 或 576，但 grouped-query 路径不成立：它要求 query/KV head 之比至少为 2（192 时为 8 的倍数，320 时为 32 的倍数）、有 mask、没有 ALiBi、KV 长度是 256（`FATTN_KQ_STRIDE`）的倍数，并且未量化的 Q/K/V/mask 的每个 `nb[1..3]` 都能被 16 整除；
@@ -253,7 +253,8 @@ macOS 27 SDK 默认按 Metal 4.1 编译 Metal shader，其地址空间规则会�
 
 ### GB10 / DGX Spark 构建容器（实验性）
 
-`eng/Dockerfile.gb10` 在**原生 Linux ARM64 Docker 构建机**上构建本 checkout 的主解决方案与原生 GGML/CUDA 代码。它固定了 CUDA 13.0.2 组件、.NET SDK 10.0.401 以及未经修改的 GGML 修订版 `456172ec733a135778adcd32d00e576a58232e45`。精度相关 kernel 仍位于 TensorSharp 自有代码中；构建会检查获取到的 ggml 工作树未被修改。SDK 与干净的 Ubuntu 镜像按 digest 固定；NVIDIA 签名软件源提供显式指定版本的编译器、运行时与 cuBLAS 包，从而避免把完整 CUDA devel 镜像的 profiler 与无用数学库拉到小型托管 runner 上。未使用的 cuBLAS 静态库在安装层中删除；动态链接的 CUDA 库及其许可声明保持不变。Ubuntu 构建依赖从 Ubuntu 软件源安装。这是构建/开发镜像，不是部署镜像；下文的 `runtime` 与 `artifacts` target 负责生成并验证部署布局。
+`eng/Dockerfile.gb10` 在**原生 Linux ARM64 Docker 构建机**上构建本 checkout 的主解决方案与原生 GGML/CUDA 代码。它固定了 CUDA 13.0.2 组件、.NET SDK 10.0.401 以及未经修改的 GGML 修订版 `da8e2a54b919557b816b1c2beb432ccb766f7ce0`。
+该修订版提供 TensorSharp Q8 激活 kernel 使用的 CUDA MMQ 精度配置 API；获取的上游工作树必须保持未修改。精度相关 kernel 仍位于 TensorSharp 自有代码中；构建会检查获取到的 ggml 工作树未被修改。SDK 与干净的 Ubuntu 镜像按 digest 固定；NVIDIA 签名软件源提供显式指定版本的编译器、运行时与 cuBLAS 包，从而避免把完整 CUDA devel 镜像的 profiler 与无用数学库拉到小型托管 runner 上。未使用的 cuBLAS 静态库在安装层中删除；动态链接的 CUDA 库及其许可声明保持不变。Ubuntu 构建依赖从 Ubuntu 软件源安装。这是构建/开发镜像，不是部署镜像；下文的 `runtime` 与 `artifacts` target 负责生成并验证部署布局。
 
 在仓库根目录、可用的 ARM64 构建机上运行：
 
