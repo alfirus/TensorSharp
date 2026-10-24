@@ -1043,6 +1043,9 @@ namespace TensorSharp.Models
             "<|repo_name|>",
             "<|file_sep|>",
             "<｜end▁of▁sentence｜>",
+            // MiniMax-M2/M3 end of turn (llama-vocab.cpp, "minimax-m2/m3"); also their
+            // tokenizer.ggml.eos_token_id, listed for parity with llama.cpp's table.
+            "[e~[",
         };
 
         /// <summary>
@@ -1171,6 +1174,12 @@ namespace TensorSharp.Models
             // Jinja template contains bos_token and triggers the generic override.
             if (gguf.GetString("general.architecture") == "deepseek41")
                 addBos = false;
+            // MiniMax-M3's template opens every prompt with `]~!b[]~b]system` itself. It
+            // defines its own `bos_token` variable, which tripped the generic override
+            // above and duplicated `]~b]` in front of every prompt; the GGUF carries no
+            // add_bos_token key and llama.cpp adds none.
+            if (gguf.GetString("general.architecture") == "minimax-m3")
+                addBos = false;
             if (addBos && !addBosMetadata)
             {
                 Console.WriteLine(
@@ -1218,8 +1227,11 @@ namespace TensorSharp.Models
             string preType = tokenizerModel == "gemma4"
                 ? "gemma4"
                 : gguf.GetString("tokenizer.ggml.pre", null);
+            // The HF normalizer, recorded by the converter (MiniMax-M2/M3: NFC). llama.cpp
+            // applies it before pre-tokenization.
+            bool normalizeNfc = gguf.GetBool("tokenizer.ggml.normalizer.nfc", false);
             return new BpeTokenizer(vocabTokens, tokenTypes, merges,
-                bosId, eosIds.ToArray(), addBos, addEos, preType);
+                bosId, eosIds.ToArray(), addBos, addEos, preType, normalizeNfc);
         }
 
         protected virtual bool IsQuantizedLinearWeight(GgufTensorInfo info)
