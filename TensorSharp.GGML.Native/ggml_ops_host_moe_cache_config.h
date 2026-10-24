@@ -28,6 +28,11 @@ class HostMoeCacheConfiguration {
     std::uint64_t token_ = 0, next_;
     std::size_t ceiling_ = 0;
     std::uint64_t growth_generation_ = 0;
+    // Nonowning dispatch only. Predictor payload/controller is model-owned and
+    // must outlive this exclusive scope binding, including failed setup/ACK.
+    void* child_cookie_ = nullptr;
+    bool (*child_ready_)(void*) = nullptr;
+    bool (*child_reset_)(void*) = nullptr;
 public:
     explicit HostMoeCacheConfiguration(HostMoeCacheSettings defaults, std::uint64_t next = 1)
         : defaults_(defaults), current_(defaults), fast_budget_(defaults.budget), next_(next) {}
@@ -35,14 +40,28 @@ public:
     const HostMoeCacheSettings& settings() const noexcept { return current_; }
     bool owns(std::uint64_t token) const noexcept { return token != 0 && token == token_; }
     bool active() const noexcept { return token_ != 0; }
+    std::size_t maximum_budget() const noexcept { return ceiling_; }
     std::uint64_t growth_generation() const noexcept { return growth_generation_; }
+    void* child_cookie() const noexcept { return child_cookie_; }
+    std::uint64_t child_token(const void* cookie) const noexcept {
+        return cookie && child_cookie_ == cookie ? token_ : 0;
+    }
+    bool bind_child(std::uint64_t token, void* cookie, bool (*ready)(void*), bool (*reset)(void*)) noexcept {
+        if (!owns(token) || !cookie || !ready || !reset || (child_cookie_ && child_cookie_ != cookie)) return false;
+        child_cookie_ = cookie; child_ready_ = ready; child_reset_ = reset; return true;
+    }
+    bool detach_child(std::uint64_t token, void* cookie) noexcept {
+        if (!owns(token) || child_cookie_ != cookie || !child_ready_ || !child_ready_(cookie)) return false;
+        child_cookie_ = nullptr; child_ready_ = child_reset_ = nullptr; return true;
+    }
+    bool reset_child() noexcept { return !child_cookie_ || (child_reset_ && child_reset_(child_cookie_)); }
     static bool valid(HostMoeCacheSettings value) noexcept {
         return value.budget <= static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)())
             && value.layers > 0 && value.max_rows > 0 && value.max_rows <= kHostMoeCacheMaxGlmPrefillRows
             && value.max_decode_rows > 0 && value.max_decode_rows <= kHostMoeCacheMaxDecodeRows;
     }
     std::uint64_t begin(HostMoeCacheSettings value, bool cache_empty) noexcept {
-        if (token_ || !next_ || !cache_empty || !valid(value)) return 0;
+        if (token_ || child_cookie_ || !next_ || !cache_empty || !valid(value)) return 0;
         token_ = next_++;
         ceiling_ = value.budget;
         current_ = value;
@@ -62,12 +81,13 @@ public:
         return true;
     }
     template<class Release> bool end(std::uint64_t token, Release release) {
-        if (!owns(token)) return false;
+        if (!owns(token) || (child_cookie_ && (!child_ready_ || !child_ready_(child_cookie_)))) return false;
         release();
         current_ = defaults_;
         ceiling_ = 0;
         token_ = 0;
         growth_generation_ = 0;
+        child_cookie_ = nullptr; child_ready_ = child_reset_ = nullptr;
         fast_budget_.store(defaults_.budget, std::memory_order_relaxed);
         return true;
     }

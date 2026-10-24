@@ -319,6 +319,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_moe.cpp
     ggml_ops_host_moe_decode.cpp
     ggml_ops_host_moe_cache.cpp
+    ggml_ops_host_moe_vmm_weights.cpp
     ggml_ops_deepseek4.cpp
     ggml_ops_deepseek41_tp.cpp
     ggml_ops_deepseek41_vision.cpp
@@ -427,7 +428,7 @@ endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
-    target_link_libraries(GgmlOps PRIVATE CUDA::cublas)
+    target_link_libraries(GgmlOps PRIVATE CUDA::cublas CUDA::cuda_driver)
     if (TSG_HAVE_CUDNN)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
         # Deliberately NOT linked -- resolved with LoadLibrary/dlopen at run time.
@@ -672,6 +673,39 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsGlmGraphBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsGlmGraphBudgetTest PRIVATE Threads::Threads ggml ggml-cpu)
     add_test(NAME glm-graph-budget-vendor-types COMMAND GgmlOpsGlmGraphBudgetTest)
+    add_executable(GgmlOpsGlmLayerMajorGraphCapTest tests/glm_layer_major_graph_cap_test.cpp)
+    add_test(NAME glm-layer-major-graph-cap-policy COMMAND GgmlOpsGlmLayerMajorGraphCapTest)
+    add_executable(GgmlOpsGlmHostTokenEmbeddingTest tests/glm_host_token_embedding_test.cpp)
+    add_test(NAME glm-host-token-embedding-policy COMMAND GgmlOpsGlmHostTokenEmbeddingTest)
+    add_executable(GgmlOpsGlmCausalRouteNeighborTest tests/glm_causal_route_neighbor_test.cpp)
+    add_test(NAME glm-causal-route-neighbor-policy COMMAND GgmlOpsGlmCausalRouteNeighborTest)
+    add_executable(GgmlOpsGlmCausalRouteNeighborOwnerTest tests/glm_causal_route_neighbor_owner_test.cpp)
+    target_compile_definitions(GgmlOpsGlmCausalRouteNeighborOwnerTest PRIVATE TSG_GGML_TEST_HOOKS=1)
+    target_link_libraries(GgmlOpsGlmCausalRouteNeighborOwnerTest PRIVATE Threads::Threads)
+    add_test(NAME glm-causal-route-neighbor-owner COMMAND GgmlOpsGlmCausalRouteNeighborOwnerTest)
+    set_tests_properties(glm-causal-route-neighbor-policy glm-causal-route-neighbor-owner PROPERTIES TIMEOUT 60)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_executable(GgmlOpsHostTokenEmbeddingTest tests/host_token_embedding_test.cpp)
+        target_include_directories(GgmlOpsHostTokenEmbeddingTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsHostTokenEmbeddingTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cudart)
+        add_test(NAME glm-host-token-embedding-cuda-q4k COMMAND GgmlOpsHostTokenEmbeddingTest)
+        set_tests_properties(glm-host-token-embedding-cuda-q4k PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        add_executable(GgmlOpsGlmLayerMajorDeviceBatonTest tests/glm_layer_major_device_baton_test.cpp)
+        target_include_directories(GgmlOpsGlmLayerMajorDeviceBatonTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsGlmLayerMajorDeviceBatonTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cudart)
+        add_test(NAME glm-layer-major-device-baton COMMAND GgmlOpsGlmLayerMajorDeviceBatonTest)
+        set_tests_properties(glm-layer-major-device-baton PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+    add_executable(GgmlOpsGlmFlashMtpPolicyTest tests/glm_flash_mtp_policy_test.cpp)
+    add_test(NAME glm-flash-mtp-policy COMMAND GgmlOpsGlmFlashMtpPolicyTest)
+    add_executable(GgmlOpsGlmVerifiedPrefixPolicyTest tests/glm_verified_prefix_policy_test.cpp)
+    add_test(NAME glm-verified-prefix-policy COMMAND GgmlOpsGlmVerifiedPrefixPolicyTest)
     add_executable(GgmlOpsHostMoeCacheIdentityTest tests/host_moe_cache_identity_test.cpp)
     add_test(NAME host-moe-cache-pooled-identity COMMAND GgmlOpsHostMoeCacheIdentityTest)
     add_executable(GgmlOpsGlmExpertBoundaryTest tests/glm_expert_boundary_test.cpp)
@@ -768,10 +802,55 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME host-moe-cache-host-timing COMMAND GgmlOpsHostMoeCacheTimingTest)
     add_executable(GgmlOpsHostMoeFileReadPlanTest tests/host_moe_file_read_plan_test.cpp)
     add_test(NAME host-moe-cache-coalesced-file-read-plan COMMAND GgmlOpsHostMoeFileReadPlanTest)
+    add_executable(GgmlOpsHostMoeFileRingTest tests/host_moe_file_ring_test.cpp)
+    target_link_libraries(GgmlOpsHostMoeFileRingTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-cache-exact-file-ring COMMAND GgmlOpsHostMoeFileRingTest)
+    add_executable(GgmlOpsHostMoeDownOverlapTest tests/host_moe_down_overlap_test.cpp)
+    target_include_directories(GgmlOpsHostMoeDownOverlapTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME host-moe-prefill-down-overlap-policy COMMAND GgmlOpsHostMoeDownOverlapTest)
+    set_tests_properties(host-moe-prefill-down-overlap-policy PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsHostMoePayloadCacheTest tests/host_moe_payload_cache_test.cpp)
+    target_include_directories(GgmlOpsHostMoePayloadCacheTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(GgmlOpsHostMoePayloadCacheTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-payload-cache COMMAND GgmlOpsHostMoePayloadCacheTest)
+    add_executable(GgmlOpsHostMoeImmutableCacheTest tests/host_moe_immutable_cache_test.cpp)
+    target_include_directories(GgmlOpsHostMoeImmutableCacheTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(GgmlOpsHostMoeImmutableCacheTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-immutable-cache COMMAND GgmlOpsHostMoeImmutableCacheTest)
+    add_executable(GgmlOpsHostMoeRamProbationTest tests/host_moe_ram_probation_test.cpp)
+    target_include_directories(GgmlOpsHostMoeRamProbationTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(GgmlOpsHostMoeRamProbationTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-ram-probation COMMAND GgmlOpsHostMoeRamProbationTest)
+    add_executable(GgmlOpsHostMoeMappedRamTest tests/host_moe_mapped_ram_test.cpp)
+    target_include_directories(GgmlOpsHostMoeMappedRamTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(GgmlOpsHostMoeMappedRamTest PRIVATE TSG_GGML_TEST_HOOKS)
+    target_link_libraries(GgmlOpsHostMoeMappedRamTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-mapped-ram COMMAND GgmlOpsHostMoeMappedRamTest
+        --fixture-dir "${CMAKE_CURRENT_SOURCE_DIR}/../artifacts/native-mapped-ram-tests")
+    set_tests_properties(host-moe-immutable-cache host-moe-mapped-ram PROPERTIES TIMEOUT 120)
+    add_executable(GgmlOpsHostMoeVictimPolicyTest tests/host_moe_victim_policy_test.cpp)
+    target_link_libraries(GgmlOpsHostMoeVictimPolicyTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-selective-victim-policy COMMAND GgmlOpsHostMoeVictimPolicyTest)
+    add_executable(GgmlOpsHostMoeLayerPrefetchTest tests/host_moe_layer_prefetch_test.cpp)
+    target_include_directories(GgmlOpsHostMoeLayerPrefetchTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(GgmlOpsHostMoeLayerPrefetchTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-layer-prefetch COMMAND GgmlOpsHostMoeLayerPrefetchTest)
+    set_tests_properties(host-moe-cache-exact-file-ring PROPERTIES TIMEOUT 30)
     add_executable(GgmlOpsHostMoeDirectReadPlanTest tests/host_moe_direct_read_plan_test.cpp)
     add_test(NAME host-moe-cache-bounded-direct-read-plan COMMAND GgmlOpsHostMoeDirectReadPlanTest)
     add_executable(GgmlOpsHostMoePhaseQuotaTest tests/host_moe_phase_quota_test.cpp)
     add_test(NAME host-moe-cache-phase-quotas COMMAND GgmlOpsHostMoePhaseQuotaTest)
+    add_executable(GgmlOpsHostMoeVmmPlanTest tests/host_moe_vmm_plan_test.cpp)
+    add_test(NAME host-moe-vmm-plan-ownership COMMAND GgmlOpsHostMoeVmmPlanTest)
+    add_executable(GgmlOpsHostMoeVmmCachePlanTest tests/host_moe_vmm_cache_plan_test.cpp)
+    target_include_directories(GgmlOpsHostMoeVmmCachePlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME host-moe-vmm-cache-slot-policy COMMAND GgmlOpsHostMoeVmmCachePlanTest)
+    add_executable(GgmlOpsHostMoeMissReadOrderTest tests/host_moe_miss_read_order_test.cpp)
+    target_include_directories(GgmlOpsHostMoeMissReadOrderTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME host-moe-miss-read-order COMMAND GgmlOpsHostMoeMissReadOrderTest)
+    set_tests_properties(host-moe-miss-read-order PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsHostMoeDecodeStagingPolicyTest tests/host_moe_decode_staging_policy_test.cpp)
+    add_test(NAME host-moe-scalar-staging-policy COMMAND GgmlOpsHostMoeDecodeStagingPolicyTest)
     add_executable(GgmlOpsHostMoeGroupQuotaTest tests/host_moe_group_quota_test.cpp)
     add_test(NAME host-moe-cache-measured-group-quotas COMMAND GgmlOpsHostMoeGroupQuotaTest)
     add_executable(GgmlOpsHostMoeCacheConfigTest tests/host_moe_cache_config_test.cpp)
@@ -787,7 +866,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     set_tests_properties(host-moe-cache-row-route-policy PROPERTIES TIMEOUT 30)
 
     add_executable(GgmlOpsHostMoeExpertCacheTest
-        tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp)
+        tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp ggml_ops_host_moe_vmm_weights.cpp)
     target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_TEST_HOOKS)
     target_include_directories(GgmlOpsHostMoeExpertCacheTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
@@ -810,22 +889,73 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME host-moe-expert-cache-invalid-budget-overflow
         COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget "18446744073709551616")
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_executable(GgmlOpsHostMoeVmmWeightsTest
+            tests/host_moe_vmm_weights_test.cpp ggml_ops_host_moe_vmm_weights.cpp)
+        target_compile_definitions(GgmlOpsHostMoeVmmWeightsTest PRIVATE
+            TSG_GGML_TEST_HOOKS TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsHostMoeVmmWeightsTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsHostMoeVmmWeightsTest PRIVATE
+            ggml-cuda ggml-cpu ggml-base CUDA::cuda_driver CUDA::cudart)
+        foreach(TSG_VMM_QUANT q8_0 iq1_m iq2_xxs)
+            add_test(NAME host-moe-vmm-weights-${TSG_VMM_QUANT}
+                COMMAND GgmlOpsHostMoeVmmWeightsTest --quantization ${TSG_VMM_QUANT})
+            set_tests_properties(host-moe-vmm-weights-${TSG_VMM_QUANT} PROPERTIES
+                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endforeach()
+        foreach(TSG_VMM_PROFILE glm_g3 glm_g4 glm_g11 coarse_q8)
+            add_test(NAME host-moe-vmm-weights-${TSG_VMM_PROFILE}
+                COMMAND GgmlOpsHostMoeVmmWeightsTest --profile ${TSG_VMM_PROFILE})
+            set_tests_properties(host-moe-vmm-weights-${TSG_VMM_PROFILE} PROPERTIES
+                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endforeach()
         target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_USE_CUDA=1)
-        target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cuda)
+        target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cuda CUDA::cuda_driver)
+        add_test(NAME glm-selected-vmm-cache-three-groups COMMAND GgmlOpsHostMoeExpertCacheTest --vmm-cache)
+        set_tests_properties(glm-selected-vmm-cache-three-groups PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm-selected-vmm-cache-pressure COMMAND GgmlOpsHostMoeExpertCacheTest --vmm-cache-pressure)
+        set_tests_properties(glm-selected-vmm-cache-pressure PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm-selected-file-read-sort-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --file-read-sort)
+        set_tests_properties(glm-selected-file-read-sort-q8 PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm-selected-causal-route-neighbor COMMAND GgmlOpsHostMoeExpertCacheTest --causal-route-neighbor)
+        set_tests_properties(glm-selected-causal-route-neighbor PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_executable(GgmlOpsHostMoeSplitLifecycleTest
-            tests/host_moe_split_lifecycle_test.cpp ggml_ops_host_moe_cache.cpp)
+            tests/host_moe_split_lifecycle_test.cpp ggml_ops_host_moe_cache.cpp ggml_ops_host_moe_vmm_weights.cpp)
         target_compile_definitions(GgmlOpsHostMoeSplitLifecycleTest PRIVATE TSG_GGML_TEST_HOOKS TSG_GGML_USE_CUDA=1)
         target_include_directories(GgmlOpsHostMoeSplitLifecycleTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
-        target_link_libraries(GgmlOpsHostMoeSplitLifecycleTest PRIVATE ggml-cpu ggml-base ggml-cuda)
+        target_link_libraries(GgmlOpsHostMoeSplitLifecycleTest PRIVATE ggml-cpu ggml-base ggml-cuda CUDA::cuda_driver)
         add_test(NAME glm-selected-split-lifecycle-q8 COMMAND GgmlOpsHostMoeSplitLifecycleTest --split-lifecycle)
         add_test(NAME glm-selected-phase-three-groups COMMAND GgmlOpsHostMoeSplitLifecycleTest --phase-quotas)
+        add_test(NAME glm-selected-phase-decode-rebalance COMMAND GgmlOpsHostMoeSplitLifecycleTest --phase-quotas --decode-rebalance)
+        set_tests_properties(glm-selected-phase-decode-rebalance PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm-selected-phase-rebalance-retain-peer
+            COMMAND GgmlOpsHostMoeSplitLifecycleTest --phase-rebalance-retain-peer --decode-rebalance)
+        add_test(NAME glm-selected-phase-rebalance-retain-peer-guard
+            COMMAND GgmlOpsHostMoeSplitLifecycleTest --phase-rebalance-retain-peer)
+        set_tests_properties(glm-selected-phase-rebalance-retain-peer glm-selected-phase-rebalance-retain-peer-guard
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm-selected-phase-file-ring COMMAND GgmlOpsHostMoeSplitLifecycleTest --phase-quotas --ring-prefill)
+        set_tests_properties(glm-selected-phase-file-ring PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME glm-selected-phase-capacity-recovery COMMAND GgmlOpsHostMoeSplitLifecycleTest --phase-growth)
+        set_tests_properties(glm-selected-phase-capacity-recovery PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_test(NAME glm-selected-measured-three-groups COMMAND GgmlOpsHostMoeSplitLifecycleTest --group-quotas)
         add_test(NAME glm-selected-split-lifecycle-iq1
             COMMAND GgmlOpsHostMoeSplitLifecycleTest --split-lifecycle --quantization iq1_m)
         add_test(NAME glm-selected-split-lifecycle-iq2
             COMMAND GgmlOpsHostMoeSplitLifecycleTest --split-lifecycle --quantization iq2_xxs)
         add_test(NAME glm-selected-compact-prefill-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-compact-prefill)
+        add_test(NAME host-moe-prefill-down-overlap-cuda-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-down-overlap)
+        add_test(NAME host-moe-prefill-down-overlap-cuda-iq1
+            COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-down-overlap --quantization iq1_m)
+        add_test(NAME host-moe-prefill-down-overlap-cuda-iq2
+            COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-down-overlap --quantization iq2_xxs)
+        set_tests_properties(host-moe-prefill-down-overlap-cuda-q8 host-moe-prefill-down-overlap-cuda-iq1
+            host-moe-prefill-down-overlap-cuda-iq2 PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_test(NAME glm-selected-compact-prefill-iq1
             COMMAND GgmlOpsHostMoeExpertCacheTest --glm-compact-prefill --quantization iq1_m)
         add_test(NAME glm-selected-compact-prefill-iq2
@@ -860,6 +990,43 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             glm-selected-bulk-full-union-iq2 PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_test(NAME glm-selected-scalar-large-file-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-scalar-file-window)
         add_test(NAME glm-selected-scalar-large-file-iq1 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-scalar-file-window --quantization iq1_m)
+        add_test(NAME glm-selected-scalar-staging72-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --scalar-staging)
+        add_test(NAME glm-selected-scalar-staging72-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --scalar-staging --quantization iq2_xxs)
+        add_test(NAME glm-selected-scalar-staging72-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --scalar-staging)
+        set_tests_properties(glm-selected-scalar-staging72-q8 glm-selected-scalar-staging72-iq2
+            glm-selected-scalar-staging72-pageable PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            ENVIRONMENT "TS_HOST_MOE_DECODE_STAGING_72MB=1")
+        set_tests_properties(glm-selected-scalar-staging72-pageable PROPERTIES
+            ENVIRONMENT "TS_HOST_MOE_DECODE_STAGING_72MB=1;GGML_CUDA_NO_PINNED=1")
+        add_test(NAME glm-selected-prefill-ring72-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-staging)
+        add_test(NAME glm-selected-prefill-ring72-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-staging --quantization iq2_xxs)
+        add_test(NAME glm-selected-prefill-ring72-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-staging)
+        add_test(NAME glm-selected-prefill-ring72-combined COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-staging --combined-staging)
+        set_tests_properties(glm-selected-prefill-ring72-q8 glm-selected-prefill-ring72-iq2
+            glm-selected-prefill-ring72-pageable glm-selected-prefill-ring72-combined
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+            ENVIRONMENT "TS_HOST_MOE_PREFILL_RING_72MB=1;TS_HOST_MOE_DECODE_STAGING_72MB=0")
+        set_tests_properties(glm-selected-prefill-ring72-pageable PROPERTIES
+            ENVIRONMENT "TS_HOST_MOE_PREFILL_RING_72MB=1;TS_HOST_MOE_DECODE_STAGING_72MB=0;GGML_CUDA_NO_PINNED=1")
+        set_tests_properties(glm-selected-prefill-ring72-combined PROPERTIES
+            ENVIRONMENT "TS_HOST_MOE_PREFILL_RING_72MB=1;TS_HOST_MOE_DECODE_STAGING_72MB=1")
+        add_test(NAME glm-selected-prefill-coalesce16-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-coalesce16)
+        add_test(NAME glm-selected-prefill-coalesce16-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-coalesce16 --quantization iq2_xxs)
+        add_test(NAME glm-selected-prefill-coalesce16-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --prefill-ring-coalesce16)
+        set_tests_properties(glm-selected-prefill-coalesce16-q8 glm-selected-prefill-coalesce16-iq2
+            glm-selected-prefill-coalesce16-pageable PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
+            ENVIRONMENT "TS_HOST_MOE_PREFILL_RING_72MB=1;TS_HOST_MOE_PREFILL_RING_COALESCE16=1;TS_HOST_MOE_DECODE_STAGING_72MB=0")
+        set_tests_properties(glm-selected-prefill-coalesce16-pageable PROPERTIES
+            ENVIRONMENT "TS_HOST_MOE_PREFILL_RING_72MB=1;TS_HOST_MOE_PREFILL_RING_COALESCE16=1;TS_HOST_MOE_DECODE_STAGING_72MB=0;GGML_CUDA_NO_PINNED=1")
+        add_test(NAME glm-selected-scalar-file-ring-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-scalar-file-window --ring-reads)
+        add_test(NAME glm-selected-scalar-file-ring-iq1 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-scalar-file-window --ring-reads --quantization iq1_m)
+        add_test(NAME glm-selected-compact-file-ring-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-compact-prefill --ring-reads)
+        add_test(NAME glm-selected-compact-file-ring-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --glm-compact-prefill --ring-reads --quantization iq2_xxs)
+        add_test(NAME glm-selected-scalar-file-ring-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --glm-scalar-file-window --ring-reads)
+        set_tests_properties(glm-selected-scalar-file-ring-pageable PROPERTIES ENVIRONMENT "GGML_CUDA_NO_PINNED=1")
+        set_tests_properties(glm-selected-scalar-file-ring-q8 glm-selected-scalar-file-ring-iq1
+            glm-selected-compact-file-ring-q8 glm-selected-compact-file-ring-iq2 glm-selected-scalar-file-ring-pageable
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_test(NAME glm-selected-pool-largest-quota-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --pooled-quota)
         add_test(NAME glm-selected-pool-largest-quota-iq1 COMMAND GgmlOpsHostMoeExpertCacheTest --pooled-quota --quantization iq1_m)
         set_tests_properties(glm-selected-scalar-large-file-q8 glm-selected-scalar-large-file-iq1
@@ -872,6 +1039,43 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_test(NAME host-moe-expert-cache-cuda-lfu COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --lfu)
         set_tests_properties(host-moe-expert-cache-cuda-lfu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME host-moe-expert-cache-cuda-file-read COMMAND GgmlOpsHostMoeExpertCacheTest --file-read)
+        add_test(NAME host-moe-ram-cache-cuda-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        if(WIN32)
+            add_test(NAME host-moe-mapped-ram-cuda-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --mapped-ram-cache)
+            add_test(NAME host-moe-mapped-ram-cuda-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --mapped-ram-cache --quantization iq2_xxs)
+            add_test(NAME host-moe-mapped-ram-cuda-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --mapped-ram-cache)
+            set_tests_properties(host-moe-mapped-ram-cuda-q8 host-moe-mapped-ram-cuda-iq2
+                host-moe-mapped-ram-cuda-pageable PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_MAPPED=1;TS_HOST_MOE_RAM_CACHE_MAPPED_EXCLUSIVE_QUOTA=1;TS_HOST_MOE_RAM_CACHE_MAPPED_QUOTA_MB=2048")
+            set_tests_properties(host-moe-mapped-ram-cuda-pageable PROPERTIES
+                ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_MAPPED=1;TS_HOST_MOE_RAM_CACHE_MAPPED_EXCLUSIVE_QUOTA=1;TS_HOST_MOE_RAM_CACHE_MAPPED_QUOTA_MB=2048;GGML_CUDA_NO_PINNED=1")
+        endif()
+        add_test(NAME host-moe-victim-cache-cuda-q8 COMMAND GgmlOpsHostMoeExpertCacheTest --victim-cache)
+        add_test(NAME host-moe-victim-cache-cuda-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --victim-cache --quantization iq2_xxs)
+        add_test(NAME host-moe-victim-cache-cuda-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --victim-cache)
+        set_tests_properties(host-moe-victim-cache-cuda-q8 host-moe-victim-cache-cuda-iq2
+            host-moe-victim-cache-cuda-pageable PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_VICTIM=1")
+        set_tests_properties(host-moe-victim-cache-cuda-pageable PROPERTIES
+            ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_VICTIM=1;GGML_CUDA_NO_PINNED=1")
+        add_test(NAME host-moe-ram-cache-cuda-iq2 COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache --quantization iq2_xxs)
+        add_test(NAME host-moe-ram-cache-cuda-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        set_tests_properties(host-moe-ram-cache-cuda-q8 host-moe-ram-cache-cuda-iq2
+            host-moe-ram-cache-cuda-pageable PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        set_tests_properties(host-moe-ram-cache-cuda-pageable PROPERTIES ENVIRONMENT "GGML_CUDA_NO_PINNED=1")
+        add_test(NAME host-moe-ram-cache-cuda-direct-lease COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        add_test(NAME host-moe-ram-cache-cuda-pinned-lease COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        add_test(NAME host-moe-ram-cache-cuda-pinned-fallback COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        add_test(NAME host-moe-ram-cache-cuda-direct-lease-lru COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        add_test(NAME host-moe-ram-cache-cuda-pinned-ring COMMAND GgmlOpsHostMoeExpertCacheTest --ram-cache)
+        set_tests_properties(host-moe-ram-cache-cuda-direct-lease host-moe-ram-cache-cuda-pinned-lease
+            host-moe-ram-cache-cuda-pinned-fallback host-moe-ram-cache-cuda-direct-lease-lru
+            host-moe-ram-cache-cuda-pinned-ring PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        set_tests_properties(host-moe-ram-cache-cuda-direct-lease PROPERTIES ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_DIRECT_UPLOAD=1;TS_HOST_MOE_RAM_CACHE_FREQUENCY=1")
+        set_tests_properties(host-moe-ram-cache-cuda-pinned-lease PROPERTIES ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_PINNED=1;TS_HOST_MOE_RAM_CACHE_FREQUENCY=1")
+        set_tests_properties(host-moe-ram-cache-cuda-pinned-fallback PROPERTIES ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_PINNED=1;TS_HOST_MOE_RAM_CACHE_FREQUENCY=1;GGML_CUDA_NO_PINNED=1")
+        set_tests_properties(host-moe-ram-cache-cuda-direct-lease-lru PROPERTIES ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_DIRECT_UPLOAD=1;TS_HOST_MOE_RAM_CACHE_FREQUENCY=0")
+        set_tests_properties(host-moe-ram-cache-cuda-pinned-ring PROPERTIES ENVIRONMENT "TS_HOST_MOE_RAM_CACHE_PINNED=1;TS_HOST_MOE_RAM_CACHE_FREQUENCY=1;TS_HOST_MOE_EXPERT_CACHE_RING_READS=1")
         add_test(NAME host-moe-expert-cache-cuda-file-lfu COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --file-read --lfu)
         set_tests_properties(host-moe-expert-cache-cuda-file-lfu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME host-moe-expert-cache-cuda-iq1-m-file-read COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --file-read)
@@ -982,7 +1186,29 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsQ8PrecisionCpuTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME cpu-q8-f32-projection COMMAND GgmlOpsQ8PrecisionCpuTest)
+    add_executable(GgmlOpsQ8HcCompactPolicyTest tests/q8_hc_compact_policy_test.cpp)
+    target_include_directories(GgmlOpsQ8HcCompactPolicyTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME cpu-q8-hc-compact-policy COMMAND GgmlOpsQ8HcCompactPolicyTest)
+    set_tests_properties(cpu-q8-hc-compact-policy PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsQ8KdaCompactPolicyTest tests/q8_kda_compact_policy_test.cpp)
+    target_include_directories(GgmlOpsQ8KdaCompactPolicyTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME cpu-q8-kda-compact-policy COMMAND GgmlOpsQ8KdaCompactPolicyTest)
+    set_tests_properties(cpu-q8-kda-compact-policy PROPERTIES TIMEOUT 30)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        # Exact ordered-HC experiment. No new production CUDA source/flags;
+        # the same owned precision unit provides test-only forced variants.
+        add_executable(GgmlOpsQ8HcCompactTest tests/q8_hc_compact_test.cpp ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8HcCompactTest PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
+        target_include_directories(GgmlOpsQ8HcCompactTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8HcCompactTest PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME cuda-q8-hc-compact-off COMMAND GgmlOpsQ8HcCompactTest --off)
+        add_test(NAME cuda-q8-hc-compact-on COMMAND GgmlOpsQ8HcCompactTest --on)
+        add_test(NAME cuda-q8-kda-compact-off COMMAND GgmlOpsQ8HcCompactTest --kda-off)
+        add_test(NAME cuda-q8-kda-compact-on COMMAND GgmlOpsQ8HcCompactTest --kda-on)
+        set_tests_properties(cuda-q8-hc-compact-off cuda-q8-hc-compact-on
+            cuda-q8-kda-compact-off cuda-q8-kda-compact-on PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
         add_executable(GgmlOpsCudaMatmulPrecisionTest tests/cuda_matmul_precision_test.cpp
             ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu)
@@ -1024,6 +1250,12 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(cuda-q8-f32-parallel-vector PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_test(NAME cuda-q8-f32-parallel-small-batch COMMAND GgmlOpsCudaQ8PrecisionTest --parallel-small-batch)
         set_tests_properties(cuda-q8-f32-parallel-small-batch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-ordered-small-batch COMMAND GgmlOpsCudaQ8PrecisionTest --ordered-small-batch)
+        set_tests_properties(cuda-q8-f32-ordered-small-batch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-ordered-gate-prefill COMMAND GgmlOpsCudaQ8PrecisionTest --ordered-gate-prefill)
+        set_tests_properties(cuda-q8-f32-ordered-gate-prefill PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-gate-prefill-tile16 COMMAND GgmlOpsCudaQ8PrecisionTest --gate-prefill-tile16)
+        set_tests_properties(cuda-q8-f32-gate-prefill-tile16 PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_test(NAME cuda-q8-f32-prefill-64 COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-64)
         add_test(NAME cuda-q8-f32-prefill-128 COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-128)
         add_test(NAME cuda-q8-f32-prefill-auto COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-auto)
@@ -1051,6 +1283,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_include_directories(GgmlOpsQ8OrderedVectorBench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsQ8OrderedVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_executable(GgmlOpsQ8OrderedSmallBatchBench tests/q8_ordered_small_batch_bench.cpp ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8OrderedSmallBatchBench PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
+        target_include_directories(GgmlOpsQ8OrderedSmallBatchBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8OrderedSmallBatchBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME cuda-q8-f32-ordered-small-batch-guards COMMAND GgmlOpsQ8OrderedSmallBatchBench --check)
+        set_tests_properties(cuda-q8-f32-ordered-small-batch-guards PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-ordered-gate-prefill-guards COMMAND GgmlOpsQ8OrderedSmallBatchBench --check-wide)
+        set_tests_properties(cuda-q8-f32-ordered-gate-prefill-guards PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-gate-tile-guards COMMAND GgmlOpsQ8OrderedSmallBatchBench --check-tiles)
+        set_tests_properties(cuda-q8-f32-gate-tile-guards PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-gate-tile16-guards COMMAND GgmlOpsQ8OrderedSmallBatchBench --check-gate-tile16)
+        set_tests_properties(cuda-q8-f32-gate-tile16-guards PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-gate-combined-guards COMMAND GgmlOpsQ8OrderedSmallBatchBench --check-gate-combined)
+        set_tests_properties(cuda-q8-f32-gate-combined-guards PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         # Standalone bounded row-dequantization + pedantic SGEMM exploration.
         # No model dispatch changes and no unconditional performance assertion.
         add_executable(GgmlOpsQ8PrefillBench tests/q8_prefill_bench.cu ggml_ops_q8_precision.cu)
@@ -1160,6 +1407,18 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsExpertFileSourceTest tests/expert_file_source_test.cpp)
     target_include_directories(GgmlOpsExpertFileSourceTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME expert-file-source-portable COMMAND GgmlOpsExpertFileSourceTest)
+    if (WIN32 AND MSVC)
+        add_executable(GgmlOpsExpertFileSourceViewTest tests/expert_file_source_view_test.cpp)
+        target_include_directories(GgmlOpsExpertFileSourceViewTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_compile_definitions(GgmlOpsExpertFileSourceViewTest PRIVATE TSG_GGML_TEST_HOOKS=1)
+        target_link_libraries(GgmlOpsExpertFileSourceViewTest PRIVATE Threads::Threads)
+        add_test(NAME expert-file-source-view-lifecycle COMMAND GgmlOpsExpertFileSourceViewTest)
+        set_tests_properties(expert-file-source-view-lifecycle PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+    endif()
+    add_executable(GgmlOpsHostMoeFileReadWorkersTest tests/host_moe_file_read_workers_test.cpp)
+    target_include_directories(GgmlOpsHostMoeFileReadWorkersTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsHostMoeFileReadWorkersTest PRIVATE Threads::Threads)
+    add_test(NAME host-moe-file-read-workers COMMAND GgmlOpsHostMoeFileReadWorkersTest)
     add_executable(GgmlOpsExpertFileSourceDirectTest tests/expert_file_source_direct_test.cpp)
     target_include_directories(GgmlOpsExpertFileSourceDirectTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME expert-file-source-direct COMMAND GgmlOpsExpertFileSourceDirectTest)

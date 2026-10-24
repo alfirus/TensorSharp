@@ -61,8 +61,15 @@ public sealed class RequestMemoryAdmission
     /// <summary>Optional allocation routing for a qualified serial execution
     /// adapter. Called under the model compute lock around one sequence's work.
     /// It must consume that sequence's envelope, dispose synchronously, and is
-    /// only supported with the per-sequence, non-speculative execution path.</summary>
+    /// supported with the per-sequence execution path. Speculation requires
+    /// the explicit <see cref="AllowSpeculativeSerialExecution"/> contract.</summary>
     public Func<SequenceState, IDisposable>? EnterSerialExecution { get; init; }
+
+    /// <summary>Explicit experimental adapter for one primary speculative
+    /// sequence. The adapter must forecast draft/verify/replay payloads and own
+    /// persistent draft graphs and recurrent snapshots. Prefixes, holders,
+    /// concurrent work and independent snapshots remain excluded.</summary>
+    public bool AllowSpeculativeSerialExecution { get; init; }
 
     /// <summary>Explicit shared-owner scope for one fused multi-request call.
     /// Every participating holder must already be prepared under its own
@@ -123,6 +130,13 @@ public sealed class RequestMemoryAdmission
 
     internal void ValidateConfiguration(SchedulerConfig config)
     {
+        if (AllowSpeculativeSerialExecution && (EnterSerialExecution == null || !HasPhysicalCheck
+            || UsePerSequenceHolders || config.MaxNumRunningSequences != 1 || config.EnablePrefixCaching
+            || config.KvSnapshots != null || !config.Speculation.Enabled
+            || !config.ResolveExecutionOptions().BatchedPathDisabled
+            || config.ResolveExecutionOptions().PerSeqFusedEnabled
+            || config.ResolveExecutionOptions().BatchedFusedDecodeEnabled))
+            throw new ArgumentException("Speculative admission requires one primary, scoped serial execution without prefixes, holders or block snapshots.", nameof(config));
         if (EstimateMaterializationPeak != null && (!UsePerSequenceHolders || !HasPhysicalCheck
             || !ReestimateAfterPhysicalCheck || AfterPrefixMaterialization == null))
             throw new ArgumentException("Materialization admission requires fenced independently owned holders and an execution transition.", nameof(config));

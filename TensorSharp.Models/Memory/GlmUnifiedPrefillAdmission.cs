@@ -118,11 +118,12 @@ internal static class GlmUnifiedPrefillAdmission
         InferenceMemoryBytes jointOwned, InferenceMemoryBytes requestOwned,
         long expertBudget, long expertMinimum, int maximumRows,
         Func<int, (InferenceMemoryBytes Joint, InferenceMemoryBytes Request)> estimate,
-        out GlmUnifiedPrefillCandidate selected)
+        out GlmUnifiedPrefillCandidate selected, int minimumRows = 1)
     {
         ArgumentNullException.ThrowIfNull(ledger); ArgumentNullException.ThrowIfNull(limits);
         ArgumentNullException.ThrowIfNull(estimate);
-        if (maximumRows is < 1 or > 1024 || expertMinimum < 0 || expertBudget < expertMinimum)
+        if (maximumRows is < 1 or > 1024 || minimumRows < 1 || minimumRows > maximumRows
+            || expertMinimum < 0 || expertBudget < expertMinimum)
             throw new ArgumentOutOfRangeException(nameof(maximumRows));
         if (jointOwned.Host < 0 || jointOwned.Device < 0 || requestOwned.Host < 0 || requestOwned.Device < 0)
             throw new ArgumentOutOfRangeException(nameof(jointOwned));
@@ -130,7 +131,7 @@ internal static class GlmUnifiedPrefillAdmission
         var device = ledger.Single(p => p.Pool == UnifiedMemoryModelSession.DevicePool);
         long hostLimit = Math.Min(host.Capacity, limits.Single(p => p.Pool == host.Pool).Bytes);
         long deviceLimit = Math.Min(device.Capacity, limits.Single(p => p.Pool == device.Pool).Bytes);
-        for (int rows = maximumRows; rows >= 1; --rows)
+        for (int rows = maximumRows; rows >= minimumRows; --rows)
         {
             var target = estimate(rows);
             if (target.Joint.Host < 0 || target.Joint.Device < 0 || target.Request.Host < 0 || target.Request.Device < 0)

@@ -5,21 +5,33 @@
 #include "host_moe_cache_lifecycle_test_hooks.h"
 #include "ggml_ops_moe_prefetch.h"
 #include "ggml_ops_file_source.h"
+#include "ggml_ops_host_moe_file_batch.h"
+#include "ggml_ops_host_moe_mapped_ram.h"
 #include "ggml_ops_moe_prefetch_policy.h"
 #include "ggml_ops_precision_policy.h"
 #include "ggml_ops_host_moe_cache_policy.h"
 #include "ggml_ops_shared_cache_budget.h"
+#include "glm_causal_route_neighbor_cache.h"
+#include "ggml_ops_parallel_read_pipeline.h"
+#include "ggml_ops_host_moe_down_overlap.h"
+#include "ggml_ops_host_moe_phase_quota.h"
+#include "ggml_ops_host_moe_file_ring.h"
+#include "dsv41_engram_io.h"
 #include "ggml-impl.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <stdexcept>
+#include <thread>
+#include <tuple>
 
 extern "C" int TSGgml_HostMoeExpertCacheBudgetKind();
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
@@ -35,11 +47,17 @@ extern "C" int TSGgml_UpdateHostMoeExpertCacheScope(std::uint64_t, std::int64_t,
 extern "C" int TSGgml_TrimHostMoeExpertCacheScope(std::uint64_t, std::int64_t, std::int64_t*);
 extern "C" int TSGgml_EndHostMoeExpertCacheScope(std::uint64_t, std::int64_t*);
 extern "C" int TSGgml_RegisterHostFileSource(const void*, std::int64_t, const char*, std::int64_t);
+extern "C" int TSGgml_HostMoeVmmWeightsVersion();
+extern "C" int TSGgml_HostMoeVmmWeightsHostPlan(int, int, int, std::int64_t, std::int64_t*);
+extern "C" int TSGgml_ConfigureHostMoeVmmWeights(std::uint64_t, int, int, int, std::int64_t);
+extern "C" int TSGgml_CloseHostMoeVmmWeights(std::uint64_t);
+extern "C" int TSGgml_HostMoeVmmWeightsStats(std::int64_t*, int);
 
 // This standalone target compiles the production cache implementation with
 // small bridge stubs; it never loads a model or depends on modified ggml code.
 namespace tsg
 {
+    HostMoePayloadCache::Stats host_moe_expert_cache_test_payload_stats();
     void host_moe_cpu_staging_release() {} // separate CPU staging fixture owns this path
     DeviceState g_device_states[TSG_MAX_DEVICES];
     std::atomic<int> g_device_count{1};
@@ -50,7 +68,18 @@ namespace tsg
     std::uint64_t g_test_prefetch_calls = 0;
     int g_test_copy_failure_countdown = 0;
     int g_test_file_failure_countdown = 0;
+    bool g_test_partial_file_failure = false; // Configured only while joined workers are idle.
+    bool g_test_parallel_file_reads = false; // Mapped fixture opts in while the pool is idle.
+    std::atomic<std::uint64_t> g_test_partial_file_reads{0};
+    std::atomic<std::uint64_t> g_test_parallel_file_active{0}, g_test_parallel_file_peak{0};
+    std::uint64_t g_test_parallel_file_calls = 0; // Submitting-thread observation only.
     std::uint64_t g_test_file_reads = 0;
+    std::uint64_t g_test_file_ring_calls = 0;
+    struct FileReadSpan { std::uint64_t source, offset; std::size_t bytes; };
+    bool g_test_capture_file_spans = false; // Changed only with joined readers idle.
+    std::mutex g_test_file_span_mutex;
+    std::vector<FileReadSpan> g_test_file_spans;
+    std::vector<std::size_t> g_test_file_window_counts;
     std::uint64_t g_test_direct_file_reads = 0;
     void set_last_error(const std::string& message) { std::fprintf(stderr, "%s\n", message.c_str()); }
     void clear_last_error() { }
@@ -107,6 +136,10 @@ namespace tsg
     std::size_t host_moe_expert_cache_test_physical_bytes();
     void host_moe_expert_cache_test_file_slice_limit(std::size_t bytes);
     std::size_t host_moe_expert_cache_test_file_workspace_bytes();
+    void host_moe_expert_cache_test_file_workspace_fail(int stage);
+    std::uint64_t host_moe_expert_cache_test_file_windows();
+    const void* host_moe_expert_cache_test_file_workspace_data();
+    bool host_moe_expert_cache_test_try_scalar_workspace();
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes);
     std::uint64_t host_moe_expert_cache_test_output_drains();
 #ifdef TSG_GGML_USE_CUDA
@@ -114,14 +147,100 @@ namespace tsg
     void read_expert_files(std::vector<ExpertReadTask>& tasks,
         const std::function<void(std::size_t)>& consume)
     {
+        if (g_test_parallel_file_reads) {
+            // Same prepare-on-workers/consume-on-caller scheduler as production.
+            // Keep other fixture modes' deliberate reverse completion unchanged.
+            static tsg_dsv41::engram_io_pool pool(8);
+            ++g_test_parallel_file_calls;
+            std::atomic<int> failure{g_test_file_failure_countdown};
+            g_test_file_failure_countdown = 0;
+            std::atomic<std::size_t> started{0};
+            const auto participants = (std::min)(tasks.size(), std::size_t(2));
+            pool.run_pipelined(tasks.size(), [&](std::size_t i) {
+                struct Active {
+                    Active() {
+                        const auto now = g_test_parallel_file_active.fetch_add(1) + 1;
+                        auto old = g_test_parallel_file_peak.load();
+                        while (old < now && !g_test_parallel_file_peak.compare_exchange_weak(old, now)) {}
+                    }
+                    ~Active() { g_test_parallel_file_active.fetch_sub(1); }
+                } active;
+                started.fetch_add(1, std::memory_order_release);
+                // Two starts establish actual concurrent callbacks without a
+                // scheduler-dependent timing assertion. Never wait unbounded.
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (started.load(std::memory_order_acquire) < participants) {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        throw std::runtime_error("Parallel mapped fixture worker rendezvous timed out");
+                    std::this_thread::yield();
+                }
+                if (failure.fetch_sub(1) == 1) {
+                    if (g_test_partial_file_failure && tasks[i].bytes > 1) {
+                        tasks[i].source->read(tasks[i].offset, tasks[i].destination, tasks[i].bytes/2);
+                        g_test_partial_file_reads.fetch_add(1);
+                    }
+                    throw std::runtime_error("Injected interrupted parallel expert file read");
+                }
+                tasks[i].prepare();
+                if (g_test_capture_file_spans) {
+                    std::lock_guard<std::mutex> lock(g_test_file_span_mutex);
+                    g_test_file_spans.push_back({tasks[i].source->identity(), tasks[i].offset, tasks[i].source_read_bytes});
+                }
+            }, [&](std::size_t i) {
+                if (tasks[i].direct_completed) ++g_test_direct_file_reads;
+                ++g_test_file_reads;
+                consume(i);
+            });
+            return;
+        }
         for (std::size_t i = tasks.size(); i-- > 0;) {
             if (g_test_file_failure_countdown > 0 && --g_test_file_failure_countdown == 0)
                 throw std::runtime_error("Injected interrupted expert file read");
             tasks[i].prepare();
+            if (g_test_capture_file_spans)
+                g_test_file_spans.push_back({tasks[i].source->identity(), tasks[i].offset, tasks[i].source_read_bytes});
             if (tasks[i].direct_completed) ++g_test_direct_file_reads;
             ++g_test_file_reads;
             consume(i);
         }
+    }
+    void read_expert_file_windows(std::vector<ExpertReadTask>& tasks,
+        const std::vector<std::size_t>& counts,
+        const std::function<void(std::size_t)>& before_slot,
+        const std::function<void(std::size_t)>& consume_window)
+    {
+        // Exercise real joined workers with the production scheduler, CUDA
+        // uploads and fences; the ordinary legacy helper above stays serial.
+        static tsg_dsv41::engram_io_pool pool(8);
+        ++g_test_file_ring_calls;
+        if (g_test_capture_file_spans) g_test_file_window_counts.push_back(counts.size());
+        std::vector<std::size_t> starts;
+        std::size_t total = 0;
+        for (const auto count : counts) { starts.push_back(total); total += count; }
+        if (total != tasks.size()) throw std::runtime_error("Invalid fixture ring task count");
+        std::atomic<int> failure{g_test_file_failure_countdown};
+        g_test_file_failure_countdown = 0;
+        std::atomic<std::uint64_t> completed{0};
+        struct Record { std::atomic<std::uint64_t>& count; ~Record() { g_test_file_reads += count.load(); } } record{completed};
+        run_bounded_parallel_read_pipeline(pool, counts, 2,
+            [&](std::size_t, std::size_t slot) { before_slot(slot); },
+            [&](std::size_t window, std::size_t job, std::size_t) {
+                auto& task = tasks[starts[window] + job];
+                if (failure.fetch_sub(1) == 1) {
+                    if (g_test_partial_file_failure && task.bytes > 1) {
+                        // Real authoritative bytes fill a strict prefix of the
+                        // selected merged run before the producer fails.
+                        task.source->read(task.offset, task.destination, task.bytes/2);
+                        g_test_partial_file_reads.fetch_add(1);
+                    }
+                    throw std::runtime_error("Injected interrupted expert file read");
+                }
+                task.prepare(); ++completed;
+                if (g_test_capture_file_spans) {
+                    std::lock_guard<std::mutex> lock(g_test_file_span_mutex);
+                    g_test_file_spans.push_back({task.source->identity(), task.offset, task.source_read_bytes});
+                }
+            }, [&](std::size_t window, std::size_t) { consume_window(window); });
     }
     void host_pin_split(const void*, std::size_t bytes,
         std::vector<std::pair<std::size_t, std::size_t>>& pieces)
@@ -580,9 +699,13 @@ namespace
         ggml_tensor* ids = nullptr;
         ggml_tensor* routes = nullptr;
         ggml_tensor* output = nullptr;
+        int scalar_channel_rows = 0;
 
-        explicit FullResidentGraph(const Weights& weights, int rows = 1)
+        explicit FullResidentGraph(const Weights& weights, int rows = 1, bool scalar_channels = false)
         {
+            require(!scalar_channels || (rows >= 1 && rows <= TSG_PRECISION_DECODE_COLUMNS),
+                "Reference scalar-channel width is unsupported");
+            scalar_channel_rows = scalar_channels ? rows : 0;
             const auto hidden = weights.segment.hidden, ff = weights.segment.n_ff;
             context = ggml_init({ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(256, false), nullptr, true});
             require(context != nullptr, "Could not allocate reference tensor metadata");
@@ -590,8 +713,9 @@ namespace
             auto* up = ggml_new_tensor_3d(context, weights.types[1], hidden, ff, weights.segment.num_experts);
             auto* down = ggml_new_tensor_3d(context, weights.types[2], ff, hidden, weights.segment.num_experts);
             for (auto* t : {gate, up, down}) { ggml_set_input(t); ggml_set_output(t); }
-            x = ggml_new_tensor_3d(context, GGML_TYPE_F32, hidden, 1, rows);
-            ids = ggml_new_tensor_2d(context, GGML_TYPE_I32, weights.segment.n_used, rows);
+            x = ggml_new_tensor_3d(context, GGML_TYPE_F32, hidden, scalar_channels ? rows : 1, scalar_channels ? 1 : rows);
+            ids = ggml_new_tensor_2d(context, GGML_TYPE_I32,
+                scalar_channels ? weights.segment.n_used * rows : weights.segment.n_used, scalar_channels ? 1 : rows);
             routes = ggml_new_tensor_3d(context, GGML_TYPE_F32, 1, weights.segment.n_used, rows);
             for (auto* t : {x, ids, routes}) ggml_set_input(t);
             // The outer Qwen host-MoE boundary keeps these source tensors live
@@ -607,6 +731,9 @@ namespace
             }
             auto* h = ggml_mul(context, ggml_silu(context, g), u);
             auto* parts = ggml_mul_mat_id(context, down, h, ids);
+            if (scalar_channels && rows > 1)
+                parts = ggml_cont(context, ggml_permute(context,
+                    ggml_reshape_3d(context, parts, hidden, rows, weights.segment.n_used), 0, 2, 1, 3));
             if (rows <= TSG_PRECISION_DECODE_COLUMNS) ggml_set_output(parts);
             auto* weighted = ggml_mul(context, parts, routes);
             auto* sum = ggml_view_2d(context, weighted, hidden, rows, weighted->nb[2], 0);
@@ -654,7 +781,14 @@ namespace
                 && probabilities.size() == static_cast<std::size_t>(ggml_nelements(routes)),
                 "Full bulk reference input geometry differs");
             ggml_backend_tensor_set(x, activation.data(), 0, activation.size() * sizeof(float));
-            ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(std::int32_t));
+            if (scalar_channel_rows > 1) {
+                const auto top = selected.size() / static_cast<std::size_t>(scalar_channel_rows);
+                std::vector<std::int32_t> channels(selected.size());
+                for (std::size_t row = 0; row != static_cast<std::size_t>(scalar_channel_rows); ++row)
+                    for (std::size_t k = 0; k != top; ++k)
+                        channels[k * scalar_channel_rows + row] = selected[row * top + k];
+                ggml_backend_tensor_set(ids, channels.data(), 0, channels.size() * sizeof(std::int32_t));
+            } else ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(std::int32_t));
             ggml_backend_tensor_set(routes, probabilities.data(), 0, probabilities.size() * sizeof(float));
             require(ggml_backend_graph_compute(g_backend, graph) == GGML_STATUS_SUCCESS, "Ordinary bulk reference failed");
             std::vector<float> result(static_cast<std::size_t>(ggml_nelements(output)));
@@ -2547,6 +2681,16 @@ namespace
         tsg::host_moe_expert_cache_release();
     }
 #endif
+#include "host_moe_ram_cache_fixture.inc"
+#include "host_moe_mapped_ram_fixture.inc"
+#include "host_moe_victim_cache_fixture.inc"
+#include "host_moe_decode_staging_fixture.inc"
+#include "host_moe_file_sort_fixture.inc"
+#include "host_moe_prefill_ring_staging_fixture.inc"
+#include "host_moe_ring_coalesce_fixture.inc"
+#include "host_moe_down_overlap_fixture.inc"
+#include "host_moe_vmm_cache_fixture.inc"
+#include "host_moe_causal_route_neighbor_fixture.inc"
 }
 
 int main(int argc, char** argv)
@@ -2571,7 +2715,8 @@ int main(int argc, char** argv)
         }
         Weights weights;
         bool cpu_only = false, prefetch = false, file_read = false, lfu = false, wide_prefill = false, scoped = false, arena = false, growth = false, bulk_union = false;
-        bool pooled_quota = false, scalar_file_window = false, compact_prefill = false, direct_reads = false, shrink = false;
+        bool pooled_quota = false, scalar_file_window = false, compact_prefill = false, direct_reads = false, shrink = false, ring_reads = false, ram_cache = false, victim_cache = false, scalar_staging = false;
+        bool prefill_ring_staging = false, combined_staging = false, ring_coalesce16 = false, mapped_ram = false, down_overlap = false, vmm_cache = false, vmm_pressure = false, file_sort = false, causal_neighbor = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
@@ -2584,6 +2729,19 @@ int main(int argc, char** argv)
             else if (std::strcmp(argv[arg], "--glm-compact-prefill") == 0) compact_prefill = true;
             else if (std::strcmp(argv[arg], "--glm-scalar-file-window") == 0) scalar_file_window = true;
             else if (std::strcmp(argv[arg], "--direct-reads") == 0) direct_reads = true;
+            else if (std::strcmp(argv[arg], "--ring-reads") == 0) ring_reads = true;
+            else if (std::strcmp(argv[arg], "--ram-cache") == 0) ram_cache = true;
+            else if (std::strcmp(argv[arg], "--mapped-ram-cache") == 0) mapped_ram = true;
+            else if (std::strcmp(argv[arg], "--victim-cache") == 0) victim_cache = true;
+            else if (std::strcmp(argv[arg], "--scalar-staging") == 0) scalar_staging = true;
+            else if (std::strcmp(argv[arg], "--prefill-ring-staging") == 0) prefill_ring_staging = true;
+            else if (std::strcmp(argv[arg], "--file-read-sort") == 0) { file_sort = true; prefill_ring_staging = true; combined_staging = true; }
+            else if (std::strcmp(argv[arg], "--prefill-down-overlap") == 0) down_overlap = true;
+            else if (std::strcmp(argv[arg], "--vmm-cache") == 0) vmm_cache = true;
+            else if (std::strcmp(argv[arg], "--vmm-cache-pressure") == 0) { vmm_cache = true; vmm_pressure = true; }
+            else if (std::strcmp(argv[arg], "--causal-route-neighbor") == 0) causal_neighbor = true;
+            else if (std::strcmp(argv[arg], "--prefill-ring-coalesce16") == 0) { ring_coalesce16 = true; prefill_ring_staging = true; }
+            else if (std::strcmp(argv[arg], "--combined-staging") == 0) combined_staging = true;
             else if (std::strcmp(argv[arg], "--trim") == 0 && trim_only) { }
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
             else if (std::strcmp(argv[arg], "--file-read") == 0) file_read = true;
@@ -2600,12 +2758,53 @@ int main(int argc, char** argv)
             }
             else throw std::runtime_error("Unsupported expert-cache test argument");
         }
+        require(!file_sort || argc == 2, "File-sort qualification uses one explicit Q8 real-file profile");
+        require(!causal_neighbor || argc == 2, "Causal-route qualification uses one exact generated-file profile");
+        set_environment("TS_HOST_MOE_CAUSAL_ROUTE_NEIGHBOR", causal_neighbor ? "1" : "0");
+        if (causal_neighbor) {
+            set_environment("TS_HOST_MOE_VMM_WEIGHTS", "0");
+            set_environment("TS_HOST_MOE_FILE_SOURCE_VIEW", "0");
+            set_environment("TS_HOST_MOE_FILE_SOURCE_VIEW_PREFETCH", "0");
+            set_environment("TS_HOST_MOE_DECODE_REBALANCE", "1");
+            set_environment("TS_HOST_MOE_DECODE_REBALANCE_RETAIN_PEER", "0");
+            set_environment("TS_HOST_MOE_PHASE_COLD_GROWTH", "0");
+            set_environment("TS_HOST_MOE_RAM_CACHE_MB", "0");
+            set_environment("TS_HOST_MOE_RAM_CACHE_VICTIM", "0");
+            set_environment("TS_HOST_MOE_DECODE_STAGING_72MB", "1");
+            set_environment("TS_HOST_MOE_PREFILL_RING_72MB", "1");
+            set_environment("TS_HOST_MOE_FILE_READ_WORKERS", "0");
+            set_environment("TS_HOST_MOE_FILE_RANDOM_ACCESS", "0");
+            set_environment("TS_HOST_MOE_EXPERT_CACHE_ORDERED_READS", "0");
+        }
+        set_environment("TS_HOST_MOE_FILE_READ_SORT", file_sort ? "1" : "0");
+        if (file_sort) {
+            set_environment("TS_HOST_MOE_EXPERT_CACHE_ORDERED_READS", "0");
+            set_environment("TS_HOST_MOE_RAM_CACHE_VICTIM", "0");
+            set_environment("TS_HOST_MOE_RAM_CACHE_MB", "0");
+            set_environment("TS_HOST_MOE_PREFILL_RING_72MB", "1");
+            set_environment("TS_HOST_MOE_DECODE_STAGING_72MB", "1");
+        }
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
         require(!direct_reads || scalar_file_window || compact_prefill,
             "Direct-read qualification requires complete scalar/short file-window lifecycle gates");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_DIRECT_READS", direct_reads ? "1" : "0");
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_RING_READS", prefill_ring_staging ? "2" : ring_reads ? "1" : "0");
+        if (causal_neighbor) set_environment("TS_HOST_MOE_EXPERT_CACHE_RING_READS", "2");
+        set_environment("TS_HOST_MOE_PREFILL_RING_COALESCE16", ring_coalesce16 ? "1" : "0");
+        set_environment("TS_HOST_MOE_PREFILL_DOWN_OVERLAP", down_overlap ? "1" : "0");
+        if (down_overlap) set_environment("TS_HOST_MOE_PREFILL_RING_72MB", "1");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_LFU", lfu ? "1" : "0");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFILL_ROWS", wide_prefill ? "128" : "");
+        if (vmm_cache) {
+            require(argc == 2, "VMM cache integration is a separate exact fixture profile");
+            set_environment("TS_HOST_MOE_VMM_WEIGHTS", "1");
+            set_environment("TS_HOST_MOE_DECODE_REBALANCE", "1");
+            set_environment("TS_HOST_MOE_DECODE_REBALANCE_RETAIN_PEER", "0");
+            set_environment("TS_HOST_MOE_PHASE_COLD_GROWTH", "0");
+            set_environment("TS_HOST_MOE_RAM_CACHE_MB", "0");
+            set_environment("TS_HOST_MOE_FILE_READ_WORKERS", "0");
+            set_environment("TS_HOST_MOE_FILE_RANDOM_ACCESS", "0");
+        }
         if (wide_prefill) set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", "32");
         if (scoped) scope_api_checks();
         weights.fill(0.5f);
@@ -2619,6 +2818,51 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+            if (causal_neighbor) {
+                host_moe_causal_route_neighbor_checks();
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (vmm_cache) {
+                host_moe_vmm_cache_checks(vmm_pressure);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (down_overlap) {
+                host_moe_down_overlap_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (prefill_ring_staging) {
+                if (ring_coalesce16) host_moe_prefill_ring_coalesce_checks(weights.types);
+                else host_moe_prefill_ring_staging_checks(weights.types, combined_staging, false, file_sort);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (scalar_staging) {
+                host_moe_scalar_staging_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (victim_cache) {
+                host_moe_victim_cache_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (ram_cache) {
+                host_moe_ram_cache_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+            if (mapped_ram) {
+#if defined(_WIN32)
+                host_moe_mapped_ram_checks(weights.types);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+#else
+                throw std::runtime_error("Mapped RAM fixture requires Windows");
+#endif
+            }
             if (compact_prefill) {
                 glm_compact_prefill_checks(weights.types);
                 ggml_backend_free(g_backend); g_backend = nullptr;

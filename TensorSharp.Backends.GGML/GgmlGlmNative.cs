@@ -22,7 +22,7 @@ namespace TensorSharp.GGML
         int BackendSplits, bool GraphReused, IReadOnlyList<int> Slots,
         IReadOnlyList<int> PositionsBefore, IReadOnlyList<int> PositionsAfter);
 
-    public static class GgmlGlmNative
+    public static partial class GgmlGlmNative
     {
         private const string DllName = "GgmlOps";
         private const CallingConvention Conv = CallingConvention.Cdecl;
@@ -62,6 +62,93 @@ namespace TensorSharp.GGML
             [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int tp, int ctxIsHardLimit, int loadMtp);
 
         [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmHostTokenEmbeddingVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern IntPtr TSGgml_GlmLoadModelWithHostTokenEmbedding(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string ggufPath,
+            int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string backendName, int tp, int ctxIsHardLimit, int loadMtp, int enabled);
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmHostTokenEmbeddingInfo(IntPtr handle, [Out] long[] values, int length);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmLayerMajorDeviceBatonVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmLayerMajorDeviceBatonEnabled();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmLayerMajorDeviceBatonClose(IntPtr handle);
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmLayerMajorDeviceBatonInfo(IntPtr handle, [Out] long[] values, int length);
+        public static void RequireLayerMajorDeviceBatonSupport()
+            => CompleteLayerMajorDeviceBatonHandshake(true,TSGgml_GlmLayerMajorDeviceBatonVersion,
+                TSGgml_GlmLayerMajorDeviceBatonEnabled,() => TSGgml_GlmLayerMajorDeviceBatonInfo(IntPtr.Zero,new long[12],12),
+                () => TSGgml_GlmLayerMajorDeviceBatonClose(IntPtr.Zero));
+        internal static void CompleteLayerMajorDeviceBatonHandshake(bool requested,Func<int> version,
+            Func<int> enabled,Func<int> nullInfo,Func<int> nullClose)
+        {
+            if (!requested) return;
+            try {
+                if (version() != 1 || enabled() != 1 || nullInfo() != 0 || nullClose() != 1)
+                    throw new NotSupportedException("Layer-major device baton requires native version1 and checked ownership.");
+            } catch (EntryPointNotFoundException error) {
+                throw new NotSupportedException("The native library lacks the checked layer-major Device bank.",error);
+            }
+        }
+        public static void CloseLayerMajorDeviceBaton(IntPtr handle)
+            => CompleteLayerMajorDeviceBatonClose(() => TSGgml_GlmLayerMajorDeviceBatonClose(handle));
+        internal static void CompleteLayerMajorDeviceBatonClose(Func<int> close)
+        {
+            if (close() != 1)
+                throw new InvalidOperationException("Layer-major Device bank cleanup retains its physical owner or checked ticket.");
+        }
+        public static long[] LayerMajorDeviceBatonInfo(IntPtr handle)
+        {
+            var info = new long[12];
+            if (TSGgml_GlmLayerMajorDeviceBatonInfo(handle,info,info.Length) != 1)
+                throw new InvalidOperationException("Cannot read layer-major Device bank ownership.");
+            return info;
+        }
+
+        public static int HostTokenEmbeddingVersion()
+        {
+            try { return TSGgml_GlmHostTokenEmbeddingVersion(); }
+            catch (Exception error) when (error is EntryPointNotFoundException or DllNotFoundException)
+            { throw new NotSupportedException("Host token embedding requires the matching native library.", error); }
+        }
+
+        /// <summary>Actual-handle profile data, never inferred from the process
+        /// flag. A missing/off certificate fails closed for the opt-in loader.</summary>
+        public static long[] HostTokenEmbeddingInfo(IntPtr handle)
+        {
+            var values = new long[12];
+            try
+            {
+                if (TSGgml_GlmHostTokenEmbeddingInfo(handle, values, values.Length) != 1)
+                    throw new NotSupportedException("The native GLM handle did not activate host token embedding.");
+                return values;
+            }
+            catch (Exception error) when (error is EntryPointNotFoundException or DllNotFoundException)
+            { throw new NotSupportedException("Host token embedding requires the matching native library.", error); }
+        }
+
+        /// <summary>Explicit immutable raw-row mode. The native loader also
+        /// requires exact environment opt-in and accounted allocation owners;
+        /// the legacy loader never silently adopts this mode.</summary>
+        public static IntPtr LoadModelWithHostTokenEmbedding(string ggufPath, int nGpu, int nCtx, int nUbatch,
+            int nThreads, int nCpuMoe, string backendName, int tp, bool ctxIsHardLimit)
+        {
+            if (HostTokenEmbeddingVersion() != 1)
+                throw new NotSupportedException("Host token embedding requires native profile 1.");
+            try
+            {
+                return TSGgml_GlmLoadModelWithHostTokenEmbedding(ggufPath, nGpu, nCtx, nUbatch, nThreads,
+                    nCpuMoe, backendName ?? string.Empty, tp, ctxIsHardLimit ? 1 : 0, 0, 1);
+            }
+            catch (Exception error) when (error is EntryPointNotFoundException or DllNotFoundException)
+            { throw new NotSupportedException("Host token embedding requires the matching native loader.", error); }
+        }
+
+        [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmVocabSize(IntPtr handle);
 
         [DllImport(DllName, CallingConvention = Conv)]
@@ -81,6 +168,27 @@ namespace TensorSharp.GGML
         public static bool ConfigureSharedGraphOwner(IntPtr handle, bool enabled)
             => TSGgml_GlmConfigureSharedGraphOwner(handle, enabled ? 1 : 0) != 0;
 
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmLayerMajorGraphCapVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmConfigureLayerMajorGraphCap(IntPtr handle, int profileVersion, long capBytes);
+
+        public static int LayerMajorGraphCapVersion()
+        {
+            try { return TSGgml_GlmLayerMajorGraphCapVersion(); }
+            catch (Exception error) when (error is EntryPointNotFoundException or DllNotFoundException)
+            { throw new NotSupportedException("Strict layer-major graph caps require the matching native library.", error); }
+        }
+
+        /// <summary>Latch an immutable payload cap on this actual handle before
+        /// its first graph. A version probe alone does not certify the handle.</summary>
+        public static bool ConfigureLayerMajorGraphCap(IntPtr handle, int profileVersion, long capBytes)
+        {
+            try { return TSGgml_GlmConfigureLayerMajorGraphCap(handle, profileVersion, capBytes) == 1; }
+            catch (Exception error) when (error is EntryPointNotFoundException or DllNotFoundException)
+            { throw new NotSupportedException("Strict layer-major graph caps require the matching native library.", error); }
+        }
+
         /// <summary>Quiescent graph-cache policy. trim=1 releases all graphs;
         /// trim=2 releases only prefill graphs. State slots and weights stay live.</summary>
         public static bool ConfigureGraphCache(IntPtr handle, int capacity, int trim = 0)
@@ -90,7 +198,84 @@ namespace TensorSharp.GGML
         private static extern int TSGgml_GlmTrimMappedResidency(IntPtr handle);
         public static bool TrimMappedResidency(IntPtr handle) => TSGgml_GlmTrimMappedResidency(handle) != 0;
         [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmTrimMappedResidencyVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmTrimMappedResidencyChecked(IntPtr handle);
+        public static void RequireCheckedMappedResidencySupport()
+            => ValidateCheckedMappedResidencySupport(TSGgml_GlmTrimMappedResidencyVersion,
+                () => TSGgml_GlmTrimMappedResidencyChecked(IntPtr.Zero));
+        internal static void ValidateCheckedMappedResidencySupport(Func<int> version, Func<int> nullProbe)
+        {
+            try
+            {
+                // The NULL probe is expressly side-effect-free and verifies
+                // the companion export before any real model is loaded.
+                if (version() != 1 || nullProbe() != 0)
+                    throw new NotSupportedException("Source views require checked mapped-residency interface version 1.");
+            }
+            catch (EntryPointNotFoundException error)
+            { throw new NotSupportedException("Source views require checked mapped-residency trimming before model load.", error); }
+        }
+        /// <summary>Quiescent source-view working-set hint. False is advisory;
+        /// invalid owner/state throws and never becomes a successful boolean hint.</summary>
+        public static bool TrimMappedResidencyChecked(IntPtr handle)
+            => CompleteCheckedMappedResidencyTrim(() => TSGgml_GlmTrimMappedResidencyChecked(handle));
+        internal static bool CompleteCheckedMappedResidencyTrim(Func<int> trim)
+        {
+            int result;
+            try { result = trim(); }
+            catch (EntryPointNotFoundException error)
+            { throw new NotSupportedException("Source views cannot fall back to legacy mapped-residency trimming.", error); }
+            return result switch
+            {
+                0 => false,
+                1 => true,
+                _ => throw new InvalidOperationException("Native GLM source-view pressure trim failed; its owner must be retained for checked cleanup.")
+            };
+        }
+        [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmSelectedExpertAdapterVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmFlashMtpAdapterVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmFlashMtpShapePlanVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmFlashMtpShapePlanEnabled(IntPtr handle);
+        public static bool SupportsFlashMtpShapePlan()
+        {
+            try { return TSGgml_GlmFlashMtpShapePlanVersion() == 1 && TSGgml_GlmFlashMtpShapePlanEnabled(IntPtr.Zero) == 0; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+        public static bool FlashMtpShapePlanEnabled(IntPtr handle) => TSGgml_GlmFlashMtpShapePlanEnabled(handle) == 1;
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmFlashMtpPrefixCommitVersion();
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmFlashMtpPrefixCommitEnabled(IntPtr handle);
+        [DllImport(DllName, CallingConvention = Conv, EntryPoint = "TSGgml_GlmCommitVerifiedPrefix")]
+        private static extern int TSGgml_GlmFlashMtpCommitVerifiedPrefix(IntPtr handle, int basePosition, int acceptedDrafts, int verifyDrafts);
+        public static bool SupportsFlashMtpPrefixCommit()
+        {
+            try { return TSGgml_GlmFlashMtpPrefixCommitVersion() == 1
+                && TSGgml_GlmFlashMtpPrefixCommitEnabled(IntPtr.Zero) == 0
+                && TSGgml_GlmFlashMtpCommitVerifiedPrefix(IntPtr.Zero, 0, 0, 1) == 0; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+        public static bool FlashMtpPrefixCommitEnabled(IntPtr handle) => TSGgml_GlmFlashMtpPrefixCommitEnabled(handle) == 1;
+        // Zero is a refusal before any state copy. A negative result is a
+        // failed commit, never permission to replay from a partly changed state.
+        public static int FlashMtpCommitVerifiedPrefix(IntPtr handle, int basePosition, int acceptedDrafts, int verifyDrafts)
+            => TSGgml_GlmFlashMtpCommitVerifiedPrefix(handle, basePosition, acceptedDrafts, verifyDrafts);
+        public static void RequireFlashMtpSupport()
+        {
+            try
+            {
+                if (TSGgml_GlmFlashMtpAdapterVersion() != 1 || TSGgml_GlmSelectedExpertAdapterVersion() != 8
+                    || TSGgml_GlmKdaSnapshotBytes(IntPtr.Zero) != -1)
+                    throw new NotSupportedException("Flash MTP requires its exact draft, verification and shared-budget native adapter.");
+            }
+            catch (EntryPointNotFoundException error)
+            { throw new NotSupportedException("Flash MTP requires the matching updated native library.", error); }
+        }
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmSelectedExpertGroupCount(IntPtr handle);
         [DllImport(DllName, CallingConvention = Conv)]
@@ -114,7 +299,7 @@ namespace TensorSharp.GGML
         }
         internal static void ValidateSelectedExpertAdapterVersion(int version)
         {
-            if (version != 7)
+            if (version is not (7 or 8))
                 throw new NotSupportedException("GLM selected-expert execution requires split scratch ownership, exact serialized phase borrowing and admitted prefill widths through 1024 with 8192 route elements (adapter version 7).");
         }
         /// <summary>Quiescent size-only native plan. Includes complete quantized
@@ -211,6 +396,8 @@ namespace TensorSharp.GGML
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern void TSGgml_GlmFree(IntPtr handle);
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmFreeChecked(IntPtr handle);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern unsafe int TSGgml_GlmQueueVisionRows(IntPtr handle, float* rows, int nRows, int index);
@@ -229,6 +416,19 @@ namespace TensorSharp.GGML
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern unsafe int TSGgml_GlmSpecForward(IntPtr handle, int* tokens, int nTokens,
             float* hOut, float* logitsOut, int allLogitsRows);
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern unsafe int TSGgml_GlmSpecForwardLayerMajor(IntPtr handle, int* tokens, int nTokens,
+            float* hOut, float* logitsOut, int chunkRows);
+        public static unsafe bool SpecForwardLayerMajor(IntPtr handle, int[] tokens, float[] hOut, float[] logitsOut, int chunkRows)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            ArgumentNullException.ThrowIfNull(hOut);
+            ArgumentNullException.ThrowIfNull(logitsOut);
+            if (tokens.Length == 0 || chunkRows <= 0 || hOut.LongLength < (long)tokens.Length * HiddenSize(handle)
+                || logitsOut.Length < VocabSize(handle)) throw new ArgumentException("Flash MTP layer-major buffers are too short.");
+            fixed (int* t = tokens) fixed (float* h = hOut) fixed (float* l = logitsOut)
+                return TSGgml_GlmSpecForwardLayerMajor(handle, t, tokens.Length, h, l, chunkRows) == 1;
+        }
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern unsafe int TSGgml_GlmMtpDraftStep(IntPtr handle, int token, float* hPrev, int pos,
@@ -245,6 +445,9 @@ namespace TensorSharp.GGML
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmKdaStateRestore(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern long TSGgml_GlmKdaSnapshotBytes(IntPtr handle);
 
         [DllImport(DllName, CallingConvention = Conv)]
         private static extern int TSGgml_GlmResetChecked(IntPtr handle);
@@ -383,6 +586,30 @@ namespace TensorSharp.GGML
             => TSGgml_GlmTakeReclaimedSlots(handle, buffer, buffer.Length);
 
         public static void Free(IntPtr handle) => TSGgml_GlmFree(handle);
+        public static void RequireCheckedFreeSupport()
+        {
+            try
+            {
+                if (TSGgml_GlmFreeChecked(IntPtr.Zero) != 1)
+                    throw new NotSupportedException("Native GLM checked disposal is unavailable.");
+            }
+            catch (EntryPointNotFoundException error)
+            { throw new NotSupportedException("Checked expert resources require native checked model disposal.", error); }
+        }
+        internal static bool CompleteCheckedFree(bool required, Func<int> checkedFree, Action legacyFree)
+        {
+            try { return checkedFree() == 1; }
+            catch (EntryPointNotFoundException error)
+            {
+                if (required) throw new NotSupportedException("Checked expert resources require native checked model disposal.", error);
+                legacyFree(); return true;
+            }
+        }
+        /// <summary>Refusal preserves the handle's actual native owner. Legacy
+        /// fallback is only for an older library when checked disposal is not
+        /// required; a present export returning failure never falls back.</summary>
+        public static bool FreeChecked(IntPtr handle, bool required)
+            => CompleteCheckedFree(required, () => TSGgml_GlmFreeChecked(handle), () => TSGgml_GlmFree(handle));
 
         // ---- NextN/MTP speculative decoding -------------------------------
 
@@ -443,6 +670,10 @@ namespace TensorSharp.GGML
         /// exists for the active slot (never taken, taken of another slot, or
         /// invalidated by a reset / free).</summary>
         public static int KdaStateRestore(IntPtr handle) => TSGgml_GlmKdaStateRestore(handle);
+
+        /// <summary>Actual live snapshot arenas, independent of snapshot validity.
+        /// Does not include graph workspace. A negative result means unavailable.</summary>
+        public static long KdaSnapshotBytes(IntPtr handle) => TSGgml_GlmKdaSnapshotBytes(handle);
 
         public static bool ResetChecked(IntPtr handle) => TSGgml_GlmResetChecked(handle) != 0;
     }

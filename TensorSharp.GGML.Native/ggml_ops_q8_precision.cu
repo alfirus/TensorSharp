@@ -2,7 +2,14 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_q8_precision.h"
 #include "ggml_ops_q8_prefill_policy.h"
+#include "ggml_ops_q8_ordered_policy.h"
+#include "ggml_ops_q8_hc_compact_policy.h"
+#include "ggml_ops_q8_kda_compact_policy.h"
 #include "ggml_ops_precision_policy.h"
+#if defined(TSG_GGML_TEST_HOOKS)
+#include "tests/q8_precision_test_hooks.h"
+#include "tests/q8_hc_compact_test_hooks.h"
+#endif
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-cuda/common.cuh"
@@ -11,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <atomic>
 
 namespace {
 // Diagnostic opt-in while model/prefill/decode qualification is in progress.
@@ -39,6 +47,39 @@ bool parallel_small_batch_enabled() {
     return enabled;
 }
 
+bool ordered_small_batch_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_ORDERED_SMALL_BATCH");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental K-ordered independent columns selected (2<=N<=8; K128/M8192 limited to N<=4).\n");
+        return selected;
+    }();
+    return enabled;
+}
+
+bool ordered_gate_prefill_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_ORDERED_GATE_PREFILL");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental K-ordered Flash gate prefill selected (K4096; M64/N9..336 or M128/N9..128).\n");
+        return selected;
+    }();
+    return enabled;
+}
+
+bool gate_prefill_tile16_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_GATE_PREFILL_TILE16");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental K-ordered Flash gate tile16 selected (K4096/M64-or128; N64..512, after ordered-column policy).\n");
+        return selected;
+    }();
+    return enabled;
+}
+
 int prefill_tile_columns() {
     static const int columns = [] {
         const char * value = std::getenv("TS_GGML_Q8_PREFILL_TILE");
@@ -52,6 +93,42 @@ int prefill_tile_columns() {
         return selected;
     }();
     return columns;
+}
+
+const TsgQ8HcOption & hc_compact_option() {
+    static const TsgQ8HcOption option = tsg_q8_hc_parse_option(std::getenv("TS_GGML_Q8_HC_COMPACT"));
+    return option;
+}
+
+const TsgQ8KdaOption & kda_compact_option() {
+    static const TsgQ8KdaOption option = tsg_q8_kda_parse_option(std::getenv("TS_GGML_Q8_KDA_COMPACT"));
+    return option;
+}
+
+// Successful enqueue only, once per selected variant/tile. This is not a
+// completion certificate or per-request/phase coverage. No clock or payload.
+std::atomic<unsigned> & hc_reported_bits() {
+    static std::atomic<unsigned> reported{0};
+    return reported;
+}
+void report_hc_compact(int variant, int columns, int tile) {
+    const unsigned bit = variant == 1 ? 1u : tile == 16 ? 2u
+        : tile == 32 ? 4u : tile == 64 ? 8u : 16u;
+    if ((hc_reported_bits().fetch_or(bit, std::memory_order_relaxed) & bit) != 0) return;
+    std::fprintf(stderr, "[q8-hc-compact] selected=%s inner=16384 rows=24 columns=%d tile_rows=%d tile_columns=%d ordered_fma=1 extra_payload_bytes=0 scope=launch_accepted_not_completion\n",
+        variant == 1 ? "row_warp" : "compact_tile", columns, variant == 1 ? 1 : 32, tile);
+}
+
+std::atomic<unsigned> & kda_reported_bits() {
+    static std::atomic<unsigned> reported{0};
+    return reported;
+}
+void report_kda_compact(int variant, int rows, int columns) {
+    const unsigned bit = 1u << ((rows == 64 ? 0 : 2) + (variant == 1 ? 0 : 1));
+    if ((kda_reported_bits().fetch_or(bit, std::memory_order_relaxed) & bit) != 0) return;
+    std::fprintf(stderr, "[q8-kda-compact] selected=%s inner=4096 rows=%d columns=%d tile_rows=%d tile_columns=%d ordered_fma=1 extra_payload_bytes=0 scope=launch_accepted_not_completion\n",
+        variant == 1 ? "row_warp" : "compact_tile", rows, columns,
+        variant == 1 ? 1 : 32, variant == 1 ? 1 : 16);
 }
 
 // One full warp per output row. The decoded Q8 product and F32 activation are
@@ -89,10 +166,18 @@ __global__ void q8_f32_vector_parallel(const char * weights, const char * input,
 // forbids assuming aligned 32/128-bit loads). One warp per CTA limits the active
 // rows competing for L1 while the remaining bytes in each row are consumed.
 // No barriers, shared/global scratch, input narrowing or parallel-K reduction.
+template<bool Batched>
 __global__ void q8_f32_vector(const char * weights, const char * input, float * output,
-        int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride, size_t input_column_stride) {
     const int row = int(blockIdx.x) * 32 + int(threadIdx.x);
     if (row >= rows) return;
+    // Each column is an independent scalar dot. Pair loads, decoded operands
+    // and increasing-K FMA order are exactly the N=1 path; no shared tile pads
+    // the unused columns and no synchronization or scratch is introduced.
+    if constexpr (Batched) {
+        input += size_t(blockIdx.y) * input_column_stride;
+        output += size_t(blockIdx.y) * rows;
+    }
     float sum = 0.0f;
     for (int block_index = 0; block_index < inner / 32; ++block_index) {
         const char * block = weights + size_t(row) * weight_stride + size_t(block_index) * 34;
@@ -107,6 +192,32 @@ __global__ void q8_f32_vector(const char * weights, const char * input, float * 
         }
     }
     output[row] = sum;
+}
+
+// Cooperative load only: one whole warp owns one row. ALL lanes execute both
+// shuffles; only lane0 accumulates. Every original FMA remains in increasing K
+// order. This is not the independent parallel-K reduction above. No shared or
+// global payload scratch; tensor layout/strides and caller lifetime stay intact.
+__global__ void q8_f32_hc_row_warp(const char * weights, const char * input, float * output,
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
+    const int row = int(blockIdx.x);
+    if (row >= rows) return; // Uniform for the complete32-thread CTA.
+    const int lane = int(threadIdx.x);
+    float sum = 0.0f;
+    for (int block_index = 0; block_index < inner / 32; ++block_index) {
+        const char * block = weights + size_t(row) * weight_stride + size_t(block_index) * 34;
+        const float scale = __half2float(*reinterpret_cast<const half *>(block));
+        const float weight = scale * float(*reinterpret_cast<const int8_t *>(block + 2 + lane));
+        const float activation = *reinterpret_cast<const float *>(
+            input + size_t(block_index * 32 + lane) * input_inner_stride);
+#pragma unroll
+        for (int k = 0; k < 32; ++k) {
+            const float w = __shfl_sync(0xffffffffu, weight, k);
+            const float x = __shfl_sync(0xffffffffu, activation, k);
+            if (lane == 0) sum = fmaf(w, x, sum);
+        }
+    }
+    if (lane == 0) output[row] = sum;
 }
 
 // Decode directly from the checkpoint's original 256-value/176-byte Q5_K
@@ -191,25 +302,27 @@ __global__ void q5_f32_narrow(const char * weights, const char * input, float * 
     if (lane == 0) output[row] = sum;
 }
 
-// Each CTA owns a 64-row output tile. Its 128 threads each accumulate four
-// rows and Columns/8 columns. Weight blocks widen once into shared memory and
+// Each CTA owns a TileRows-row output tile. Its128 threads each accumulate
+// TileRows/16 rows and Columns/8 columns. Weights widen once into shared memory
 // are reused across the entire column tile, preserving quantized residency.
 // Padding the shared-memory leading dimensions avoids transposed-load bank
 // conflicts. Within these tiled paths every output traverses K in the same order
 // for every column geometry; changing companions or moving a column to another
 // tile cannot change its reduction order. Q5 narrow reduction is separate above.
 // No split-K, atomics, source narrowing, or activation quants.
-template<int Columns, bool Q5 = false>
+template<int Columns, bool Q5 = false, int TileRows = 64>
 __global__ void q8_f32_tiled(const char * weights, const char * input, float * output,
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride) {
-    constexpr int TileRows = 64, TileInner = 32, ColumnParts = Columns / 8;
+    static_assert(TileRows == 32 || TileRows == 64, "Unsupported Q8 row tile");
+    static_assert(!Q5 || TileRows == 64, "Q5 keeps its original row tile");
+    constexpr int TileInner = 32, ColumnParts = Columns / 8, RowParts = TileRows / 16;
     __shared__ float ws[TileInner][TileRows + 1];
     __shared__ float xs[TileInner][Columns + 1];
     const int row_base = int(blockIdx.x) * TileRows;
     const int column_base = int(blockIdx.y) * Columns;
     const int row_lane = threadIdx.x % 16, column_lane = threadIdx.x / 16;
-    float sums[4][ColumnParts] = {};
+    float sums[RowParts][ColumnParts] = {};
     for (int base = 0; base < inner; base += TileInner) {
         for (int index = threadIdx.x; index < TileRows * TileInner; index += 128) {
             const int row = index / TileInner, k = index % TileInner;
@@ -237,20 +350,20 @@ __global__ void q8_f32_tiled(const char * weights, const char * input, float * o
         __syncthreads();
 #pragma unroll
         for (int k = 0; k < TileInner; ++k) {
-            float w[4], x[ColumnParts];
+            float w[RowParts], x[ColumnParts];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) w[r] = ws[k][row_lane + 16 * r];
+            for (int r = 0; r < RowParts; ++r) w[r] = ws[k][row_lane + 16 * r];
 #pragma unroll
             for (int c = 0; c < ColumnParts; ++c) x[c] = xs[k][column_lane + 8 * c];
 #pragma unroll
-            for (int r = 0; r < 4; ++r)
+            for (int r = 0; r < RowParts; ++r)
 #pragma unroll
             for (int c = 0; c < ColumnParts; ++c) sums[r][c] = fmaf(w[r], x[c], sums[r][c]);
         }
         __syncthreads();
     }
 #pragma unroll
-    for (int r = 0; r < 4; ++r)
+    for (int r = 0; r < RowParts; ++r)
 #pragma unroll
     for (int c = 0; c < ColumnParts; ++c) {
         const int row = row_base + row_lane + 16 * r;
@@ -259,20 +372,41 @@ __global__ void q8_f32_tiled(const char * weights, const char * input, float * o
     }
 }
 
-template<int Columns, bool Q5 = false>
+template<int Columns, bool Q5 = false, int TileRows = 64>
 void launch(const void * weights, const void * input, float * output,
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride, cudaStream_t stream) {
-    const dim3 grid(unsigned((int64_t(rows) + 63) / 64), unsigned((columns + Columns - 1) / Columns));
-    q8_f32_tiled<Columns, Q5><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+    const dim3 grid(unsigned((int64_t(rows) + TileRows - 1) / TileRows), unsigned((columns + Columns - 1) / Columns));
+    q8_f32_tiled<Columns, Q5, TileRows><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
         static_cast<const char *>(input), output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride);
 }
 
-template<bool Q5 = false>
+template<bool Q5 = false, int TileRows = 64>
 int automatic_tile(int rows, int columns, int & selected) {
     if (columns < 64) { selected = 32; return int(cudaSuccess); }
     struct DevicePolicy { int device, multiprocessors, active64, active128; };
+    if constexpr (TileRows == 32) {
+        // One bounded last-device metadata record; changing devices re-queries
+        // actual occupancy instead of retaining an unbounded heap cache.
+        thread_local DevicePolicy cached{-1, 0, 0, 0};
+        int device = -1;
+        auto status = cudaGetDevice(&device);
+        if (status != cudaSuccess) return int(status);
+        if (cached.device != device) {
+            DevicePolicy item{device, 0, 0, 0};
+            status = cudaDeviceGetAttribute(&item.multiprocessors, cudaDevAttrMultiProcessorCount, device);
+            if (status != cudaSuccess) return int(status);
+            status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64, Q5, TileRows>, 128, 0);
+            if (status != cudaSuccess) return int(status);
+            status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128, Q5, TileRows>, 128, 0);
+            if (status != cudaSuccess) return int(status);
+            cached = item;
+        }
+        selected = tsg_q8_hc_auto_columns(rows, columns, cached.multiprocessors,
+            cached.active64, cached.active128, TileRows);
+        return int(cudaSuccess);
+    } else {
     // Host metadata only; never retain device pointers or payload allocations.
     // Cache each device separately, without imposing a fixed maximum GPU count.
     thread_local std::vector<DevicePolicy> policies;
@@ -285,9 +419,9 @@ int automatic_tile(int rows, int columns, int & selected) {
         DevicePolicy item{device, 0, 0, 0};
         status = cudaDeviceGetAttribute(&item.multiprocessors, cudaDevAttrMultiProcessorCount, device);
         if (status != cudaSuccess) return int(status);
-        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64, Q5>, 128, 0);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64, Q5, TileRows>, 128, 0);
         if (status != cudaSuccess) return int(status);
-        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128, Q5>, 128, 0);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128, Q5, TileRows>, 128, 0);
         if (status != cudaSuccess) return int(status);
         policies.push_back(item); policy = &policies.back();
         std::fprintf(stderr, "[%s-f32] Automatic K-ordered prefill tiling: device=%d SMs=%d active64=%d active128=%d; no global scratch.\n",
@@ -295,6 +429,7 @@ int automatic_tile(int rows, int columns, int & selected) {
     }
     selected = tsg_q8_prefill_auto_columns(rows, columns, policy->multiprocessors, policy->active64, policy->active128);
     return int(cudaSuccess);
+    }
 }
 
 int q5_cuda_launch(const void * weights, const void * input, float * output,
@@ -328,15 +463,30 @@ int q5_cuda_launch(const void * weights, const void * input, float * output,
 }
 } // namespace
 
-int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * output,
+static int q8_cuda_launch(const void * weights, const void * input, float * output,
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
-        size_t input_column_stride, void * stream_pointer) {
+        size_t input_column_stride, void * stream_pointer, bool allow_experiments) {
     const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    const auto & hc = hc_compact_option();
+    const auto & kda = kda_compact_option();
+    if (!hc.valid || !kda.valid) return int(cudaErrorInvalidValue);
+    const int hc_variant = tsg_q8_hc_selected_variant(inner, rows, columns, allow_experiments && hc.enabled);
+    const int kda_variant = tsg_q8_kda_selected_variant(inner, rows, columns, allow_experiments && kda.enabled);
+    const bool ordered = allow_experiments
+        && ((tsg_q8_ordered_small_batch_shape(inner, rows, columns) && ordered_small_batch_enabled())
+            || (tsg_q8_ordered_gate_prefill_shape(inner, rows, columns) && ordered_gate_prefill_enabled()));
+    const bool gate_tile16 = allow_experiments && !ordered
+        && tsg_q8_gate_prefill_tile16_shape(inner, rows, columns) && gate_prefill_tile16_enabled();
     int tile = 32;
-    if (columns >= 64) {
+    if ((columns >= 64 || (hc_variant == 2 && columns > 16))
+            && !ordered && !gate_tile16 && kda_variant != 2) {
         tile = prefill_tile_columns();
-        if (tile == 0) {
-            const int status = automatic_tile(rows, columns, tile);
+        if (columns < 64) {
+            // Previously all explicit global tiles used32 below64 columns.
+            // Only the HC automatic fallback changes to16.
+            tile = tile == 0 ? 16 : 32;
+        } else if (tile == 0) {
+            const int status = hc_variant == 2 ? automatic_tile<false, 32>(rows, columns, tile) : automatic_tile(rows, columns, tile);
             if (status != int(cudaSuccess)) return status;
         }
     }
@@ -345,19 +495,57 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
         q8_f32_vector_parallel<false><<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
             static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
     }
+    else if (hc_variant == 1 || kda_variant == 1) {
+        q8_f32_hc_row_warp<<<unsigned(rows), 32, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+        const int status = int(cudaGetLastError());
+        if (status == int(cudaSuccess)) {
+            if (kda_variant == 1) report_kda_compact(1, rows, columns);
+            else report_hc_compact(1, columns, 1);
+        }
+        return status;
+    }
     else if (columns == 1) {
         const unsigned blocks = unsigned((int64_t(rows) + 31) / 32);
-        q8_f32_vector<<<blocks, 32, 0, stream>>>(static_cast<const char *>(weights),
-            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+        q8_f32_vector<false><<<blocks, 32, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
     }
     else if (columns <= 8 && parallel_small_batch_enabled()) {
         const dim3 grid(unsigned((int64_t(rows) + 3) / 4), unsigned(columns));
         q8_f32_vector_parallel<true><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
             static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
     }
+    else if (ordered) {
+        const dim3 grid(unsigned((int64_t(rows) + 31) / 32), unsigned(columns));
+        q8_f32_vector<true><<<grid, 32, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
+    }
+    else if (kda_variant == 2 && !gate_tile16) {
+        // Exact whitelist, fixed16 columns. No occupancy/device metadata query,
+        // payload scratch or general prefill-tile policy on this selected path.
+        launch<16, false, 32>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream);
+        const int status = int(cudaGetLastError());
+        if (status == int(cudaSuccess)) report_kda_compact(2, rows, columns);
+        return status;
+    }
+    else if (hc_variant == 2) {
+        const int selected_tile = tsg_q8_hc_compact_columns(columns, tile);
+        if (selected_tile == 16) launch<16, false, 32>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream);
+        else if (selected_tile == 64) launch<64, false, 32>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream);
+        else if (selected_tile == 128) launch<128, false, 32>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream);
+        else launch<32, false, 32>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream);
+        const int status = int(cudaGetLastError());
+        if (status == int(cudaSuccess)) report_hc_compact(2, columns, selected_tile);
+        return status;
+    }
     else if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
-    else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
+    else if (columns <= 16 || gate_tile16) launch<16>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
     else if (columns >= 128 && tile == 128) launch<128>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
@@ -368,7 +556,96 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
     return int(cudaGetLastError());
 }
 
+int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, void * stream_pointer) {
+    return q8_cuda_launch(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream_pointer, true);
+}
+
 #if defined(TSG_GGML_TEST_HOOKS)
+int tsg_matmul_q8_hc_cuda_test_selected(int inner, int rows, int columns,
+                                      int tile_columns, bool enabled) {
+    (void)tile_columns;
+    return tsg_q8_hc_selected_variant(inner, rows, columns, enabled);
+}
+
+unsigned tsg_matmul_q8_hc_cuda_test_reported() {
+    return hc_reported_bits().load(std::memory_order_relaxed);
+}
+
+int tsg_matmul_q8_kda_cuda_test_selected(int inner, int rows, int columns, bool enabled) {
+    return tsg_q8_kda_selected_variant(inner, rows, columns, enabled);
+}
+
+unsigned tsg_matmul_q8_kda_cuda_test_reported() {
+    return kda_reported_bits().load(std::memory_order_relaxed);
+}
+
+int tsg_matmul_q8_hc_cuda_test_launch(TsgQ8HcTestRoute route,
+        const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride,
+        size_t input_inner_stride, size_t input_column_stride,
+        int tile_columns, void * stream_pointer) {
+    if (!weights || !input || !output || inner <= 0 || inner % 32 != 0 || rows <= 0 || columns <= 0
+        || weight_stride < size_t(inner / 32) * 34 || weight_stride % 2 != 0
+        || input_inner_stride < 4 || input_inner_stride % 4 != 0
+        || input_column_stride < 4 || input_column_stride % 4 != 0) return int(cudaErrorInvalidValue);
+    const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    if (route == TsgQ8HcTestRoute::production) return q8_cuda_launch(weights, input, output,
+        inner, rows, columns, weight_stride, input_inner_stride, input_column_stride, stream_pointer, true);
+    if (route == TsgQ8HcTestRoute::row_warp) {
+        if (columns != 1) return int(cudaErrorInvalidValue);
+        q8_f32_hc_row_warp<<<unsigned(rows), 32, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+    } else if (route == TsgQ8HcTestRoute::control) {
+        if (columns == 1) {
+            const unsigned blocks = unsigned((int64_t(rows) + 31) / 32);
+            q8_f32_vector<false><<<blocks, 32, 0, stream>>>(static_cast<const char *>(weights),
+                static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
+        } else switch (tile_columns) {
+            case 8: launch<8>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 16: launch<16>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 32: launch<32>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 64: launch<64>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 128: launch<128>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            default: return int(cudaErrorInvalidValue);
+        }
+    } else if (route == TsgQ8HcTestRoute::compact_tile) {
+        switch (tile_columns) {
+            case 16: launch<16,false,32>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 32: launch<32,false,32>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 64: launch<64,false,32>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            case 128: launch<128,false,32>(weights,input,output,inner,rows,columns,weight_stride,input_inner_stride,input_column_stride,stream); break;
+            default: return int(cudaErrorInvalidValue);
+        }
+    } else return int(cudaErrorInvalidValue);
+    return int(cudaGetLastError());
+}
+
+int tsg_matmul_q8_cuda_launch_test_tile(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, int tile_columns, void * stream_pointer) {
+    const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    switch (tile_columns) {
+        case 16: launch<16>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream); break;
+        case 32: launch<32>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream); break;
+        case 64: launch<64>(weights, input, output, inner, rows, columns,
+            weight_stride, input_inner_stride, input_column_stride, stream); break;
+        default: return int(cudaErrorInvalidValue);
+    }
+    return int(cudaGetLastError());
+}
+
+int tsg_matmul_q8_cuda_launch_control(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, void * stream_pointer) {
+    return q8_cuda_launch(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream_pointer, false);
+}
+
 // Keep the previous implementation available only to native correctness tests;
 // no runtime switch or additional public C ABI changes production dispatch.
 int tsg_matmul_q8_cuda_launch_reference(const void * weights, const void * input, float * output,

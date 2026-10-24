@@ -84,7 +84,8 @@ internal static class GlmDsaSyntheticModelBuilder
     public static string WriteGlm5NextTpFixture(
         string path, int numHeads, bool quantizeAttentionOutput, int numLayers = 1,
         bool mixedAttention = false, bool routedExperts = false, bool quantizeExperts = false,
-        int contextLength = 256, int indexerTopK = 4, string architecture = "glm5next", float swigluClamp = 0)
+        int contextLength = 256, int indexerTopK = 4, string architecture = "glm5next", float swigluClamp = 0,
+        bool includeMtp = false, bool distinctMtpExperts = false)
     {
         const int hidden = 64;
         const int ffn = 64;
@@ -105,18 +106,21 @@ internal static class GlmDsaSyntheticModelBuilder
             throw new ArgumentException("Mixed attention requires at least one KDA and one MLA layer.");
         if (quantizeExperts && !routedExperts)
             throw new ArgumentException("Quantized experts require routedExperts.");
+        if (distinctMtpExperts && (!includeMtp || !quantizeExperts))
+            throw new ArgumentException("A distinct draft group requires quantized MTP experts.");
         if (!float.IsFinite(swigluClamp) || swigluClamp < 0) throw new ArgumentOutOfRangeException(nameof(swigluClamp));
         if (quantizeAttentionOutput && dInner % Q8Block != 0)
             throw new ArgumentException("The Q8_0 fixture's KDA width must contain whole quantization blocks.",
                 nameof(numHeads));
 
+        int blocks = checked(numLayers + (includeMtp ? 1 : 0));
         var tensors = new List<TensorSpec>
         {
             Gen("token_embd.weight", 0.02f, hidden, vocab),
             Gen("output_norm.weight", 0.2f, hidden),
             Gen("output.weight", 0.02f, hidden, vocab),
         };
-        for (int l = 0; l < numLayers; l++)
+        for (int l = 0; l < blocks; l++)
         {
             string p = $"blk.{l}.";
             tensors.AddRange(new[]
@@ -158,12 +162,13 @@ internal static class GlmDsaSyntheticModelBuilder
 
         // Optional verification fixture: preserve the existing all-KDA/dense
         // defaults byte-for-byte while exercising the production mixed layout.
-        var kvHeads = new uint[numLayers];
+        var kvHeads = new uint[blocks];
         const int expertFfn = 64; // TP2 leaves a whole Q8_0 block per rank.
-        for (int l = 0; l < numLayers; l++)
+        for (int l = 0; l < blocks; l++)
         {
             string p = $"blk.{l}.";
-            if (mixedAttention && l % 2 == 1)
+            bool draft = includeMtp && l == numLayers;
+            if (draft || (mixedAttention && l % 2 == 1))
             {
                 kvHeads[l] = 1;
                 tensors.RemoveAll(t => t.Name.StartsWith(p + "ssm_", StringComparison.Ordinal)
@@ -190,6 +195,20 @@ internal static class GlmDsaSyntheticModelBuilder
                 if (quantizeAttentionOutput) output.Type = GgmlType.Q8_0;
                 tensors.Add(output);
             }
+            if (draft)
+            {
+                // The Flash draft block uses plain residuals. Omitting these
+                // tensors is intentional: a loader that incorrectly applies
+                // the trunk HC requirements must fail this fixture.
+                tensors.RemoveAll(t => t.Name.StartsWith(p + "hc_", StringComparison.Ordinal));
+                tensors.AddRange(new[]
+                {
+                    Gen(p + "nextn.eh_proj.weight", 0.02f, 2 * hidden, hidden),
+                    Gen(p + "nextn.enorm.weight", 0.2f, hidden),
+                    Gen(p + "nextn.hnorm.weight", 0.2f, hidden),
+                    Gen(p + "nextn.shared_head_norm.weight", 0.2f, hidden),
+                });
+            }
             if (routedExperts)
             {
                 tensors.RemoveAll(t => t.Name == p + "ffn_gate.weight"
@@ -210,6 +229,8 @@ internal static class GlmDsaSyntheticModelBuilder
         if (quantizeExperts)
             foreach (var tensor in tensors)
                 if (tensor.Name.EndsWith("_exps.weight", StringComparison.Ordinal)) tensor.Type = GgmlType.Q8_0;
+        if (distinctMtpExperts)
+            tensors.Single(t => t.Name == $"blk.{numLayers}.ffn_down_exps.weight").Type = GgmlType.Q4_0;
 
         if (architecture is not ("glm5next" or "glm5-next"))
             throw new ArgumentException("Expected a GLM-5-Next GGUF architecture", nameof(architecture));
@@ -218,7 +239,7 @@ internal static class GlmDsaSyntheticModelBuilder
         {
             new KvStr  { Key = "general.architecture", V = a },
             new KvStr  { Key = "general.name", V = "tiny-glm5next-tp" },
-            new KvU32  { Key = $"{a}.block_count", V = (uint)numLayers },
+            new KvU32  { Key = $"{a}.block_count", V = (uint)blocks },
             new KvU32  { Key = $"{a}.context_length", V = (uint)contextLength },
             new KvU32  { Key = $"{a}.embedding_length", V = hidden },
             new KvU32  { Key = $"{a}.feed_forward_length", V = ffn },
@@ -237,7 +258,7 @@ internal static class GlmDsaSyntheticModelBuilder
 
             // These model-level fields are also required by the default
             // all-KDA/dense fixture.
-            new KvU32  { Key = $"{a}.leading_dense_block_count", V = routedExperts ? 0u : (uint)numLayers },
+            new KvU32  { Key = $"{a}.leading_dense_block_count", V = routedExperts ? 0u : (uint)blocks },
             new KvU32  { Key = $"{a}.expert_count", V = 4 },
             new KvU32  { Key = $"{a}.expert_used_count", V = 2 },
             new KvU32  { Key = $"{a}.expert_feed_forward_length", V = (uint)(routedExperts ? expertFfn : 32) },
@@ -257,8 +278,9 @@ internal static class GlmDsaSyntheticModelBuilder
             new KvF32  { Key = $"{a}.hyper_connection.epsilon", V = 1e-6f },
             new KvU32  { Key = $"{a}.vocab_size", V = vocab },
         };
+        if (includeMtp) kv.Add(new KvU32 { Key = $"{a}.nextn_predict_layers", V = 1 });
         if (swigluClamp > 0)
-            kv.Add(new KvF32Arr { Key = $"{a}.swiglu_clamp_exp", V = Enumerable.Repeat(swigluClamp, numLayers).ToArray() });
+            kv.Add(new KvF32Arr { Key = $"{a}.swiglu_clamp_exp", V = Enumerable.Repeat(swigluClamp, blocks).ToArray() });
 
         var tokens = new List<string>(vocab);
         foreach (int b in ByteToUnicode(vocab)) tokens.Add(char.ConvertFromUtf32(b));
@@ -495,7 +517,28 @@ internal static class GlmDsaSyntheticModelBuilder
         return path;
     }
 
-    private enum GgmlType { F32 = 0, Q8_0 = 8, IQ2_XXS = 16, IQ3_XXS = 18, IQ1_S = 19, IQ4_XS = 23, BF16 = 30 }
+    private enum GgmlType { F32 = 0, Q4_0 = 2, Q8_0 = 8, IQ2_XXS = 16, IQ3_XXS = 18, IQ1_S = 19, IQ4_XS = 23, BF16 = 30 }
+
+    // Deterministic legal Q4_0 blocks for the distinct-group ownership fixture.
+    // Numerical comparisons use the same file, not a different quantization.
+    private static byte[] QuantizeQ4Fixture(float[] data)
+    {
+        if (data.Length % 32 != 0) throw new ArgumentException("Whole Q4 blocks required.");
+        byte[] result = new byte[data.Length / 32 * 18];
+        for (int first = 0; first < data.Length; first += 32)
+        {
+            float maximum = 0;
+            for (int j = 0; j < 32; ++j) maximum = Math.Max(maximum, Math.Abs(data[first + j]));
+            Half scale = (Half)(maximum / 7);
+            ushort bits = BitConverter.HalfToUInt16Bits(scale);
+            int offset = first / 32 * 18;
+            result[offset] = (byte)bits; result[offset + 1] = (byte)(bits >> 8);
+            int Quant(int j) => scale == (Half)0 ? 8
+                : Math.Clamp((int)MathF.Round(data[first + j] / (float)scale), -8, 7) + 8;
+            for (int j = 0; j < 16; ++j) result[offset + 2 + j] = (byte)(Quant(j) | (Quant(j + 16) << 4));
+        }
+        return result;
+    }
 
     private const int Q8Block = 32;
     private const int Q8BlockBytes = 2 + Q8Block;   // f16 scale + 32 int8
@@ -598,6 +641,8 @@ internal static class GlmDsaSyntheticModelBuilder
             if (RawBytes != null) return RawBytes;
             if (Type == GgmlType.Q8_0)
                 return QuantizeQ8_0(Data, (int)Dims[0]);
+            if (Type == GgmlType.Q4_0)
+                return QuantizeQ4Fixture(Data);
             if (Type == GgmlType.BF16)
                 return EncodeBf16Fixture(Data);
             byte[] raw = new byte[Data.Length * sizeof(float)];

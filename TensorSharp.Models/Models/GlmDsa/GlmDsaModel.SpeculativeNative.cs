@@ -66,9 +66,17 @@ namespace TensorSharp.Models
                 float[] hBuf = hAllOut != null && hAllOut.LongLength >= needH ? hAllOut : EnsureSpecH(needH);
                 float[] lBuf = logitsOut != null && logitsOut.LongLength >= needL ? logitsOut : EnsureSpecLogits(needL);
 
+                int chunk = LayerMajorPrefillChunkTokens;
+                bool layerMajor = MemoryPolicy?.EnableGlmFlashMtp == true && !allLogitsRows
+                    && chunk > 0 && tokens.Length > chunk && _exec is NativeGlmExecutor;
+                PrepareUnifiedGraph(checked(_exec.NPast + tokens.Length),
+                    allLogitsRows ? tokens.Length : Math.Min(tokens.Length, layerMajor ? chunk : _nativeUbatch), false,
+                    allLogitsRows ? tokens.Length : 1, submittedTokens: tokens.Length, layerMajor: layerMajor);
                 BeforeGraphCall();
                 bool ok;
-                try { ok = _exec.SpecForward(tokens, hBuf, lBuf, allLogitsRows); }
+                try { ok = layerMajor
+                    ? ((NativeGlmExecutor)_exec).SpecForwardLayerMajor(tokens, hBuf, lBuf, chunk)
+                    : _exec.SpecForward(tokens, hBuf, lBuf, allLogitsRows); }
                 finally { AfterGraphCall(); }
                 if (!ok)
                     throw new InvalidOperationException("glm-dsa native speculative forward failed (see stderr).");
@@ -79,6 +87,9 @@ namespace TensorSharp.Models
                     Array.Copy(lBuf, 0, logitsOut, 0, Math.Min(logitsOut.LongLength, needL));
 
                 _cacheSeqLen = _exec.NPast;
+                // Match the ordinary forward's diagnostic boundary. The caller
+                // may reuse a larger verify buffer, but this path emits one row.
+                if (!allLogitsRows) DumpLogitsIfRequested(lBuf, vocab);
             }
         }
 
@@ -88,6 +99,7 @@ namespace TensorSharp.Models
             {
                 float[] lBuf = logitsOut ?? EnsureSpecLogits(Config.VocabSize);
                 float[] hBuf = hOut ?? EnsureSpecH(Config.HiddenSize);
+                PrepareUnifiedDraftGraph(checked(pos + 1), 1);
                 BeforeGraphCall();
                 bool ok;
                 try { ok = _exec.DraftStep(token, hPrev, pos, lBuf, hBuf); }
@@ -101,6 +113,22 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
+                int chunk = MemoryPolicy?.EnableGlmFlashMtp == true && LayerMajorPrefillChunkTokens > 0
+                    ? Math.Min(_nativeUbatch, LayerMajorPrefillChunkTokens) : _nativeUbatch;
+                if (MemoryPolicy?.EnableGlmFlashMtp == true && tokens.Length > chunk)
+                {
+                    // Every native chunk may introduce another retained draft
+                    // graph. Re-admit between chunks using its actual live
+                    // children, preserving the native chunk arithmetic/order.
+                    for (int offset = 0; offset < tokens.Length; offset += chunk)
+                    {
+                        int count = Math.Min(chunk, tokens.Length - offset);
+                        MtpCatchUpNative(tokens.AsSpan(offset, count).ToArray(),
+                            hRows.AsSpan(offset * Config.HiddenSize, count * Config.HiddenSize).ToArray(), startPos + offset);
+                    }
+                    return;
+                }
+                PrepareUnifiedDraftGraph(checked(startPos + tokens.Length), Math.Min(tokens.Length, _nativeUbatch), GlmUnifiedMtpGraphPurpose.CatchUp);
                 BeforeGraphCall();
                 bool ok;
                 try { ok = _exec.DraftCatchUp(tokens, hRows, startPos); }
@@ -123,6 +151,26 @@ namespace TensorSharp.Models
         // a speculative window is at most MtpMaxDraftTokens+1 rows.
         private float[] _specHScratch;
         private float[] _specLogitsScratch;
+        private Action<int, int, GlmUnifiedMtpGraphPurpose> _unifiedDraftAdmission;
+        internal void ConfigureUnifiedDraftAdmission(Action<int, int, GlmUnifiedMtpGraphPurpose> admission)
+            => _unifiedDraftAdmission = admission ?? throw new ArgumentNullException(nameof(admission));
+        internal long UnifiedSnapshotBytes()
+        {
+            lock (_nativeSync)
+            {
+                if (MemoryPolicy?.EnableGlmFlashMtp != true || _exec is not NativeGlmExecutor native)
+                    throw new InvalidOperationException("Flash MTP snapshot ownership requires its native executor.");
+                long bytes = native.KdaSnapshotBytes;
+                if (bytes < 0) throw new InvalidOperationException("Flash MTP native snapshot ownership is unavailable.");
+                return bytes;
+            }
+        }
+        private void PrepareUnifiedDraftGraph(int context, int rows, GlmUnifiedMtpGraphPurpose purpose = GlmUnifiedMtpGraphPurpose.DraftStep)
+        {
+            if (MemoryPolicy?.EnableGlmFlashMtp != true) return;
+            if (_unifiedDraftAdmission == null) throw new InvalidOperationException("Flash MTP draft admission is not configured.");
+            _unifiedDraftAdmission(context, rows, purpose);
+        }
 
         private float[] EnsureSpecH(long need)
         {

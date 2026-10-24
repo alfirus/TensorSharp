@@ -52,6 +52,82 @@ public sealed class GlmUnifiedMemoryGeometryTests : IDisposable
     }
 
     [Fact]
+    public void RegisteredExpertSourceBytesMatchRawTrunkRangesWithoutPlacementAllowancesOrDraft()
+    {
+        string path = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(Path.Combine(_directory, "source-ranges.gguf"),
+            4, true, numLayers: 2, mixedAttention: true, routedExperts: true, quantizeExperts: true,
+            contextLength: 256, indexerTopK: 256, includeMtp: true);
+        using var file = GgufFile.OpenForMemoryPlanning(path);
+        var plain = GlmUnifiedMemoryGeometry.Read(file);
+        var withDraft = GlmUnifiedMemoryGeometry.Read(file, includeMtp: true);
+        string[] parts = ["gate", "up", "down"];
+        string[] trunkNames = Enumerable.Range(0, 2)
+            .SelectMany(layer => parts.Select(part => $"blk.{layer}.ffn_{part}_exps.weight")).ToArray();
+        long rawTrunkBytes = trunkNames.Sum(name => file.GetTensorFileRegion(name).ByteLength);
+        long rawDraftBytes = parts.Sum(part => file.GetTensorFileRegion($"blk.2.ffn_{part}_exps.weight").ByteLength);
+
+        Assert.Equal(6, trunkNames.Length);
+        Assert.True(rawTrunkBytes > 0);
+        Assert.True(rawDraftBytes > 0);
+        Assert.Equal(rawTrunkBytes, plain.RawExpertSourceBytes);
+        Assert.Equal(rawTrunkBytes, withDraft.RawExpertSourceBytes);
+        Assert.NotNull(withDraft.Mtp);
+        Assert.NotEqual(rawTrunkBytes + rawDraftBytes, withDraft.RawExpertSourceBytes);
+        Assert.Equal(6L * (64L << 10), plain.ExpertSourceBytes - plain.RawExpertSourceBytes);
+        Assert.Equal(plain.ExpertSourceBytes, withDraft.ExpertSourceBytes);
+        // This fixture also has nonzero CUDA tensor tails. Neither their bytes
+        // nor the placement allowance may be mistaken for a registered range.
+        Assert.All(plain.ExpertLayerLayouts, layout => Assert.True(layout!.TensorTailBytes > 0));
+        var layout = plain.ExpertLayerLayouts[0]!;
+        var overflow = plain with
+        {
+            ExpertLayerLayouts = [layout with { Gate = layout.Gate with
+                { BytesPerExpert = long.MaxValue / plain.ExpertCount + 1 } }]
+        };
+        Assert.Throws<OverflowException>(() => overflow.RawExpertSourceBytes);
+    }
+
+    [Fact]
+    public void HostEmbeddingReadIsExplicitAndCannotDiscountAnUnqualifiedOrTiedCheckpoint()
+    {
+        string path = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(Path.Combine(_directory, "host-embedding-guard.gguf"),
+            4, true, numLayers: 2, mixedAttention: true, routedExperts: true, quantizeExperts: true);
+        using var file = GgufFile.OpenForMemoryPlanning(path);
+        var ordinary = GlmUnifiedMemoryGeometry.Read(file);
+        var explicitOff = GlmUnifiedMemoryGeometry.Read(file, hostTokenEmbedding: false);
+        Assert.False(ordinary.HostTokenEmbedding);
+        Assert.Equal(ordinary.DenseDeviceBytes, explicitOff.DenseDeviceBytes);
+        Assert.Equal(ordinary.SourceBytes, explicitOff.SourceBytes);
+        Assert.Equal(ordinary.GraphPeak(256, 1, false), explicitOff.GraphPeak(256, 1, false));
+        Assert.Throws<NotSupportedException>(() => GlmUnifiedMemoryGeometry.Read(file, hostTokenEmbedding: true));
+        Assert.Throws<NotSupportedException>(() => GlmUnifiedMemoryGeometry.Read(file, includeMtp: true, hostTokenEmbedding: true));
+        file.Tensors.Remove("output.weight");
+        Assert.Throws<NotSupportedException>(() => GlmUnifiedMemoryGeometry.Read(file, hostTokenEmbedding: true));
+        Assert.Equal(ordinary.DenseDeviceBytes, explicitOff.DenseDeviceBytes);
+    }
+
+    [Fact]
+    public void FlashDraftGeometryKeepsExpertsHostRoutedAndIncludesDenseWiringAndDraftKv()
+    {
+        string path = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(Path.Combine(_directory, "mtp.gguf"),
+            4, true, numLayers: 2, mixedAttention: true, routedExperts: true, quantizeExperts: true,
+            contextLength: 256, indexerTopK: 256, includeMtp: true);
+        using var file = GgufFile.OpenForMemoryPlanning(path);
+        var plain = GlmUnifiedMemoryGeometry.Read(file);
+        var spec = GlmUnifiedMemoryGeometry.Read(file, includeMtp: true);
+        Assert.Equal(plain.Layers, spec.Layers);
+        Assert.Equal(plain.ExpertLayerBytes, spec.ExpertLayerBytes);
+        Assert.NotNull(spec.Mtp);
+        Assert.True(spec.Mtp.ExpertSourceBytes > 0);
+        Assert.Equal(plain.DenseDeviceBytes + spec.Mtp.DenseDeviceBytes, spec.DenseDeviceBytes);
+        Assert.Equal(plain.KvBytesPerToken + 2 * plain.KvRow, spec.KvBytesPerToken);
+        Assert.Equal(256, spec.Mtp.MaximumContext);
+        Assert.True(spec.Mtp.ExpertLayout.SupportsSelectedTier);
+        file.Tensors.Remove("blk.2.nextn.eh_proj.weight");
+        Assert.Throws<NotSupportedException>(() => GlmUnifiedMemoryGeometry.Read(file, includeMtp: true));
+    }
+
+    [Fact]
     public void HeaderOnlyMixedExpertTriplesPreserveQuantizedPayloadAndRejectIncompleteTriples()
     {
         const string a = "glm5-next";

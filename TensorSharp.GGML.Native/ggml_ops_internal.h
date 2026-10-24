@@ -1305,9 +1305,11 @@ namespace tsg
     // x/weights both null reads hm.moe_in/hm.weights through CUDA row copies;
     // IDs stay on the host. out null writes hm.moe_out directly on CUDA;
     // otherwise the complete result is downloaded into out.
+    struct HostMoePrefetchHooks;
     int host_moe_cached_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                const float* weights, float* out, const char* kernel_name,
-                               ggml_backend_t explicit_backend = nullptr);
+                               ggml_backend_t explicit_backend = nullptr,
+                               const HostMoePrefetchHooks* prefetch_hooks = nullptr);
     // Decode prefetch (opt-in TS_HOST_MOE_DECODE_PREFETCH=1): a scalar seam
     // that knows the next host-expert layer's predicted experts starts reading
     // the ones that layer's cache lacks, overlapping this layer's work. The
@@ -1318,6 +1320,16 @@ namespace tsg
                                  ggml_backend_t explicit_backend);
     void host_moe_expert_cache_on_drop(const void* ptr);
     void host_moe_expert_cache_release_backend(ggml_backend_t backend);
+    // Exclusive VMM scope must finish checked cleanup before any model/backend
+    // destruction, including a configured arena with no published tables.
+    bool host_moe_vmm_model_release_ready() noexcept;
+    bool host_moe_vmm_requested() noexcept;
+    bool host_moe_file_source_view_requested() noexcept;
+    bool host_moe_file_source_view_model_release_ready() noexcept;
+    bool host_moe_file_source_view_execution_ready() noexcept;
+    // The GLM owner calls this only after proving its immutable Host1/cap0
+    // full-call validation/publication/failure guards and exact model profile.
+    bool host_moe_vmm_certify_model(ggml_backend_t backend) noexcept;
     void host_moe_expert_cache_stats(std::int64_t* reserved, std::int64_t* budget,
                                    std::int64_t* hits, std::int64_t* misses, std::int64_t* calls);
     bool host_moe_expert_cache_minimum_plan(const HostMoeSegment& hm, int rows,

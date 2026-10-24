@@ -20,6 +20,9 @@
 namespace {
 bool parallel_vector = false;
 bool parallel_small_batch = false;
+bool ordered_small_batch = false;
+bool ordered_gate_prefill = false;
+bool gate_prefill_tile16 = false;
 int prefill_tile = 32;
 bool parallel_columns(int columns) { return (parallel_vector && columns == 1) || (parallel_small_batch && columns >= 2 && columns <= 8); }
 enum class pattern { random, residual, large, subnormal, non_power_scale, decoded_weight_residual, long_cancellation };
@@ -188,7 +191,7 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
             require(reference.front() == canary && reference.back() == canary, "Q8 reference output canary changed");
             if (!parallel_columns(c.columns))
                 require(std::memcmp(reference.data() + 1, actual.data(), actual.size() * sizeof(float)) == 0,
-                    "Single-column Q8 kernel differs bitwise from previous K-ordered kernel");
+                    "Q8 kernel differs bitwise from previous K-ordered kernel");
             // Exercise the new raw launcher with output guards as well: graph
             // buffers alone would not catch a one-row tail overwrite.
             std::fill(reference.begin(), reference.end(), canary);
@@ -299,6 +302,56 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
             }
         }
     }
+    if (ordered_small_batch) {
+        // Every narrow width, row tails, padded Q8 rows and noncontiguous F32
+        // strides. check() compares all output bits against the original tile
+        // as well as the independent FP64 oracle, across changed input values.
+        for (int columns = 1; columns <= 8; ++columns) {
+            for (const auto shape : {std::array<int, 2>{32, 3}, {96, 65}, {1024, 129},
+                                     {4096, 64}, {4096, 128}, {128, 8192}}) {
+                test_case c;
+                c.inner = shape[0]; c.rows = shape[1]; c.columns = columns;
+                c.padded = c.interleaved = true; c.transposed = columns % 2 != 0;
+                c.data = pattern::non_power_scale;
+                execute(c);
+                c.padded = c.interleaved = c.transposed = false; c.pipeline = true;
+                execute(c);
+            }
+            for (pattern data : {pattern::residual, pattern::large, pattern::subnormal,
+                                  pattern::decoded_weight_residual}) {
+                test_case c;
+                c.inner = 64; c.rows = 33; c.columns = columns; c.data = data;
+                c.padded = c.interleaved = true;
+                execute(c);
+            }
+        }
+    }
+    if (ordered_gate_prefill || gate_prefill_tile16) {
+        // Exercise the actual gate shapes through the owned ggml operation,
+        // including padded/transposed activations and downstream graph reuse.
+        // The raw benchmark fixture separately covers every experimental width.
+        for (int rows : {64, 128}) for (int columns : {9, 33, 128, 512}) {
+            test_case c;
+            c.inner = 4096; c.rows = rows; c.columns = columns;
+            c.padded = c.interleaved = true; c.transposed = columns % 2 != 0;
+            c.data = pattern::non_power_scale;
+            execute(c);
+            // ggml_scale requires padded-1D input, so exercise graph pipelines
+            // separately from the arbitrary-stride projection contract.
+            c.padded = c.interleaved = c.transposed = false;
+            c.pipeline = true;
+            execute(c);
+        }
+        // Fine residuals and subnormals must survive the new launch geometry;
+        // all outputs still compare bit-for-bit with the original tile.
+        for (pattern data : {pattern::residual, pattern::large, pattern::subnormal,
+                              pattern::decoded_weight_residual}) {
+            test_case c;
+            c.inner = 4096; c.rows = 64; c.columns = 9; c.data = data;
+            c.padded = c.interleaved = true;
+            execute(c);
+        }
+    }
     // CTA row, column and activation-stride boundaries, including graph reuse.
     for (int columns : {1, 4, 8, 9, 16, 17, 31, 32, 33, 65}) {
         test_case c;
@@ -374,8 +427,8 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
     test_case c;
     c.inner = 384; c.rows = 73; c.columns = 1; c.target_column = 0;
     const auto reference = execute(c);
-    for (int columns : {2, 8, 9, 16, 17, 33, 65, 128, 129, 643}) {
-        if (columns == 2 && !parallel_vector) continue;
+    for (int columns : {2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 33, 65, 128, 129, 643}) {
+        if (columns >= 2 && columns < 8 && !parallel_vector && !ordered_small_batch) continue;
         if (columns >= 128 && prefill_tile == 32) continue;
         c.columns = columns;
         for (int position : {0, columns - 1}) {
@@ -447,10 +500,16 @@ void check_parallel_underflow(ggml_backend_t allocator, int columns) {
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch"
+        || std::string(argv[1]) == "--ordered-small-batch" || std::string(argv[1]) == "--ordered-gate-prefill"
+        || std::string(argv[1]) == "--gate-prefill-tile16"
         || std::string(argv[1]) == "--prefill-64" || std::string(argv[1]) == "--prefill-128"
         || std::string(argv[1]) == "--prefill-auto")), "Unexpected Q8 precision arguments");
     parallel_vector = argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch");
     parallel_small_batch = argc == 2 && std::string(argv[1]) == "--parallel-small-batch";
+    ordered_small_batch = argc == 2 && std::string(argv[1]) == "--ordered-small-batch";
+    ordered_gate_prefill = argc == 2 && std::string(argv[1]) == "--ordered-gate-prefill";
+    gate_prefill_tile16 = argc == 2 && std::string(argv[1]) == "--gate-prefill-tile16";
+    if (ordered_gate_prefill || gate_prefill_tile16) prefill_tile = 0;
     if (argc == 2 && std::string(argv[1]) == "--prefill-64") prefill_tile = 64;
     if (argc == 2 && std::string(argv[1]) == "--prefill-128") prefill_tile = 128;
     if (argc == 2 && std::string(argv[1]) == "--prefill-auto") prefill_tile = 0;
@@ -465,15 +524,24 @@ int main(int argc, char ** argv) {
 #ifdef _WIN32
     require(_putenv_s("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0") == 0, "Cannot configure Q8 test arithmetic");
     require(_putenv_s("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0") == 0, "Cannot configure Q8 batch arithmetic");
+    require(_putenv_s("TS_GGML_Q8_ORDERED_SMALL_BATCH", ordered_small_batch ? "1" : "0") == 0, "Cannot configure Q8 ordered batch");
+    require(_putenv_s("TS_GGML_Q8_ORDERED_GATE_PREFILL", ordered_gate_prefill ? "1" : "0") == 0, "Cannot configure Q8 ordered gate prefill");
+    require(_putenv_s("TS_GGML_Q8_GATE_PREFILL_TILE16", gate_prefill_tile16 ? "1" : "0") == 0, "Cannot configure Q8 gate tile16");
     require(_putenv_s("TS_GGML_Q8_PREFILL_TILE", prefill_tile ? std::to_string(prefill_tile).c_str() : "") == 0, "Cannot configure Q8 prefill tile");
 #else
     require(setenv("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0", 1) == 0, "Cannot configure Q8 test arithmetic");
     require(setenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0", 1) == 0, "Cannot configure Q8 batch arithmetic");
+    require(setenv("TS_GGML_Q8_ORDERED_SMALL_BATCH", ordered_small_batch ? "1" : "0", 1) == 0, "Cannot configure Q8 ordered batch");
+    require(setenv("TS_GGML_Q8_ORDERED_GATE_PREFILL", ordered_gate_prefill ? "1" : "0", 1) == 0, "Cannot configure Q8 ordered gate prefill");
+    require(setenv("TS_GGML_Q8_GATE_PREFILL_TILE16", gate_prefill_tile16 ? "1" : "0", 1) == 0, "Cannot configure Q8 gate tile16");
     require((prefill_tile ? setenv("TS_GGML_Q8_PREFILL_TILE", std::to_string(prefill_tile).c_str(), 1)
                          : unsetenv("TS_GGML_Q8_PREFILL_TILE")) == 0, "Cannot configure Q8 prefill tile");
 #endif
     std::printf("Q8 test arithmetic: %s\n", parallel_vector ? "experimental parallel-K vector; serial prefill" : "qualified K-ordered");
     if (parallel_small_batch) std::puts("Q8 test arithmetic: experimental parallel-K small batches N=2..8.");
+    if (ordered_small_batch) std::puts("Q8 test arithmetic: exact K-ordered independent columns N=2..8.");
+    if (ordered_gate_prefill) std::puts("Q8 test arithmetic: exact K-ordered Flash gate prefill K4096, M64/N9..336 or M128/N9..128.");
+    if (gate_prefill_tile16) std::puts("Q8 test arithmetic: exact K-ordered Flash gate tile16 K4096/M64-or128 N64..512.");
 #ifdef TSG_GGML_USE_CUDA
     const int devices = ggml_backend_cuda_get_device_count();
     if (devices == 0) return 77;

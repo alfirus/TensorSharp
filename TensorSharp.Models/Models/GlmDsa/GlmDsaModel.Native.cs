@@ -27,6 +27,24 @@ namespace TensorSharp.Models
         /// managed per-op path.</summary>
         private IGlmExecutor _exec;
         private readonly object _nativeSync = new object();
+        private Action _unifiedBeforeDispose;
+        internal bool UnifiedHostTokenEmbeddingCertified { get; private set; }
+
+        internal void ConfigureUnifiedBeforeDispose(Action beforeDispose)
+        {
+            ArgumentNullException.ThrowIfNull(beforeDispose);
+            lock (_nativeSync)
+            {
+                if (_exec is not NativeGlmExecutor || _unifiedBeforeDispose != null)
+                    throw new InvalidOperationException("The native GLM disposal owner is unavailable or already configured.");
+                ((NativeGlmExecutor)_exec).RequireCheckedDisposal();
+                _unifiedBeforeDispose = beforeDispose;
+            }
+        }
+        internal void PrepareUnifiedNativeDispose()
+        {
+            lock (_nativeSync) _unifiedBeforeDispose?.Invoke();
+        }
 
         /// <summary>True when a whole-model executor drives this instance.</summary>
         private bool UsesNativeExecutor => _exec != null;
@@ -116,6 +134,30 @@ namespace TensorSharp.Models
 
         private void InitNativeExecutor(string ggufPath, BackendType backend, int tpDegree, int layerSplitDegree, int maxContext)
         {
+            bool causalRouteNeighbor = MemoryPolicy?.EnableGlmCausalRouteNeighbor == true;
+            GlmUnifiedCausalRouteNeighborPlan.ValidateMode(causalRouteNeighbor,
+                Environment.GetEnvironmentVariable(GlmUnifiedCausalRouteNeighborPlan.EnvironmentVariable));
+            if (causalRouteNeighbor) GgmlGlmNative.RequireCausalRouteNeighborSupport();
+            bool deviceBaton = MemoryPolicy?.EnableGlmLayerMajorDeviceBaton == true;
+            GlmUnifiedLayerMajorDeviceBatonPlan.ValidateMode(deviceBaton,
+                Environment.GetEnvironmentVariable(GlmUnifiedLayerMajorDeviceBatonPlan.EnvironmentVariable));
+            if (deviceBaton) GgmlGlmNative.RequireLayerMajorDeviceBatonSupport();
+            bool fileSourceView = GgmlHostMoeExpertCacheScope.ResolveFileSourceViewMode(
+                Environment.GetEnvironmentVariable(GgmlHostMoeExpertCacheScope.FileSourceViewEnvironmentVariable));
+            bool requireCheckedFree = GgmlHostMoeExpertCacheScope.ResolveVmmWeightsMode(
+                Environment.GetEnvironmentVariable(GgmlHostMoeExpertCacheScope.VmmWeightsEnvironmentVariable))
+                | fileSourceView | deviceBaton | causalRouteNeighbor;
+            if (fileSourceView)
+            {
+                GgmlHostMoeExpertCacheScope.RequireFileSourceViewSupport();
+                GgmlGlmNative.RequireCheckedMappedResidencySupport();
+            }
+            if (requireCheckedFree) GgmlGlmNative.RequireCheckedFreeSupport();
+            ObserveNativeGraphTracing();
+            bool hostEmbedding = MemoryPolicy?.EnableGlmHostTokenEmbedding == true;
+            GlmUnifiedHostTokenEmbeddingPlan.ValidateMode(hostEmbedding,
+                Environment.GetEnvironmentVariable(GlmUnifiedHostTokenEmbeddingPlan.EnvironmentVariable));
+            GlmUnifiedHostTokenEmbeddingPlan.RequireSupport(hostEmbedding, GgmlGlmNative.HostTokenEmbeddingVersion);
             // --tp shards weights; --layer-split only changes whole-layer placement.
             int tp = tpDegree > 1 ? tpDegree : 1;
             _nativeTp = tp;
@@ -147,13 +189,30 @@ namespace TensorSharp.Models
             bool ctxIsHardLimit = MemoryPolicy != null || !string.IsNullOrWhiteSpace(
                 Environment.GetEnvironmentVariable("MAX_CONTEXT"));
 
-            IntPtr handle = GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
-                ResolveCpuMoeLayers(backend), BackendRegistryName(backend), tp, ctxIsHardLimit,
-                MemoryPolicy?.OmitEmbeddedDraftWeights != true && NativeMtpRequested());
+            IntPtr handle = hostEmbedding
+                ? GgmlGlmNative.LoadModelWithHostTokenEmbedding(ggufPath, nGpu, maxContext, nUbatch, nThreads,
+                    ResolveCpuMoeLayers(backend), BackendRegistryName(backend), tp, ctxIsHardLimit)
+                : GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
+                    ResolveCpuMoeLayers(backend), BackendRegistryName(backend), tp, ctxIsHardLimit,
+                    MemoryPolicy?.OmitEmbeddedDraftWeights != true && NativeMtpRequested());
             if (handle == IntPtr.Zero)
                 throw NativeLoadRefused("glm", ggufPath,
                     "TS_GLM_NATIVE=0 selects the per-op path instead of the native executor.");
-            _exec = new NativeGlmExecutor(handle);
+            _exec = new NativeGlmExecutor(handle, requireCheckedFree, requireCheckedMappedTrim: fileSourceView);
+            if (causalRouteNeighbor)
+                GlmUnifiedCausalRouteNeighborPlan.ValidateLoadedInfo(((NativeGlmExecutor)_exec).CausalRouteNeighborInfo);
+            if (deviceBaton) {
+                long none = 0;
+                if (GlmUnifiedLayerMajorDeviceBatonPlan.CompletedRelease(((NativeGlmExecutor)_exec).DeviceBatonInfo,ref none) != 0)
+                    throw new NotSupportedException("A newly loaded Device baton handle already owns a completed call.");
+            }
+            if (hostEmbedding)
+            {
+                // Adopt ownership before validation so constructor cleanup also
+                // owns a loaded handle with an incompatible certificate.
+                GlmUnifiedHostTokenEmbeddingPlan.ValidateLoadedInfo(((NativeGlmExecutor)_exec).HostTokenEmbeddingInfo);
+                UnifiedHostTokenEmbeddingCertified = true;
+            }
 
             _maxContextLength = _exec.ContextSize;
             // The native loader is the authority on whether the draft block
@@ -170,17 +229,26 @@ namespace TensorSharp.Models
 
         private float[] ForwardNative(int[] tokens)
         {
+            _g5nPrefixCommittedPosition = -1;
             lock (_nativeSync)
             {
                 if (_logitsBuffer == null || _logitsBuffer.Length != Config.VocabSize)
                     _logitsBuffer = new float[Config.VocabSize];
                 int chunk = LayerMajorPrefillChunkTokens;
                 bool layerMajor = chunk > 0 && tokens.Length > chunk && _exec is NativeGlmExecutor;
+                bool strictLayerMajor = _unifiedLayerMajorGraphCapBytes > 0 && layerMajor
+                    && GlmUnifiedLayerMajorGraphCapPlan.Select(tokens.Length, chunk, _exec.ContextSize, _exec.NPast,
+                        _exec is NativeGlmExecutor, _nativeTp,
+                        _unifiedHasQueuedVisionOverrides || VisionEncoder != null, ObserveNativeGraphTracing());
+                // This decision precedes graph admission. A profile-ineligible
+                // tail uses the broad ordinary strategy from the outset.
+                if (_unifiedLayerMajorGraphCapBytes > 0) layerMajor = strictLayerMajor;
                 if (ForwardLog && tokens.Length > 1)
                     Console.Error.WriteLine($"[glm-forward] pos={_exec.NPast} tokens={tokens.Length} " +
                         (layerMajor ? $"layer-major chunk={chunk}" : $"ubatch={_nativeUbatch}"));
                 PrepareUnifiedGraph(checked(_exec.NPast + tokens.Length),
-                    Math.Min(tokens.Length, layerMajor ? chunk : _nativeUbatch), false);
+                    Math.Min(tokens.Length, layerMajor ? chunk : _nativeUbatch), false,
+                    submittedTokens: tokens.Length, layerMajor: layerMajor, strictLayerMajor: strictLayerMajor);
                 BeforeGraphCall();
                 bool ok;
                 try { ok = layerMajor ? ForwardNativeLayerMajor((NativeGlmExecutor)_exec, tokens, chunk) : _exec.Forward(tokens, _logitsBuffer); }
@@ -205,13 +273,15 @@ namespace TensorSharp.Models
         private bool ForwardNativeLayerMajor(NativeGlmExecutor exec, int[] tokens, int chunk)
         {
             int result = exec.ForwardLayerMajor(tokens, _logitsBuffer, chunk);
-            if (result >= 0) return result == 1;
-            // This configuration keeps chunk order; still never exceed the
-            // admitted width the forward was granted for.
-            bool ok = true;
-            for (int offset = 0; ok && offset < tokens.Length; offset += chunk)
-                ok = exec.Forward(tokens.AsSpan(offset, Math.Min(chunk, tokens.Length - offset)).ToArray(), _logitsBuffer);
-            return ok;
+            return GlmUnifiedLayerMajorDeviceBatonPlan.Complete(result, _unifiedLayerMajorGraphCapBytes > 0,
+                MemoryPolicy?.EnableGlmLayerMajorDeviceBaton == true, () =>
+            {
+                // Ordinary legacy configurations retain admitted chunk order.
+                bool ok = true;
+                for (int offset = 0; ok && offset < tokens.Length; offset += chunk)
+                    ok = exec.Forward(tokens.AsSpan(offset, Math.Min(chunk, tokens.Length - offset)).ToArray(), _logitsBuffer);
+                return ok;
+            });
         }
 
         private void ResetNative()
@@ -294,11 +364,26 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
-            VisionEncoder?.Dispose();
-            lock (_nativeSync)
+            if (_unifiedBeforeDispose != null)
             {
-                _exec?.Dispose();
-                _exec = null;
+                lock (_nativeSync)
+                {
+                    // The guard may throw. Nothing is marked/disposed before it
+                    // passes, and native work cannot race checked retirement.
+                    _unifiedBeforeDispose?.Invoke();
+                    VisionEncoder?.Dispose();
+                    _exec?.Dispose(); _exec = null;
+                    _unifiedBeforeDispose = null;
+                }
+            }
+            else
+            {
+                VisionEncoder?.Dispose();
+                lock (_nativeSync)
+                {
+                    _exec?.Dispose();
+                    _exec = null;
+                }
             }
 
             // The per-op path's caches are this model's own tensors; the base

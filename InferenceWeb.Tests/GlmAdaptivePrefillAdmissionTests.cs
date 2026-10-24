@@ -206,13 +206,15 @@ public sealed class GlmAdaptivePrefillAdmissionTests
     [Theory]
     [InlineData(0)]
     [InlineData(6)]
-    [InlineData(8)]
+    [InlineData(9)]
     public void OldOrUnknownSelectedExpertAbiCannotSilentlyUseTheWiderManagedPlan(int version)
         => Assert.Throws<NotSupportedException>(() => GgmlGlmNative.ValidateSelectedExpertAdapterVersion(version));
 
-    [Fact]
-    public void MatchingSelectedExpertAbiPermitsTheWiderPolicyWithoutLoadingANativeModel()
-        => GgmlGlmNative.ValidateSelectedExpertAdapterVersion(7);
+    [Theory]
+    [InlineData(7)]
+    [InlineData(8)]
+    public void MatchingSelectedExpertAbiPermitsTheWiderPolicyWithoutLoadingANativeModel(int version)
+        => GgmlGlmNative.ValidateSelectedExpertAdapterVersion(version);
 
     [Fact]
     public void SelectionPrefersWidePrefillByReclaimingOnlyExpertSurplusWithoutAnyMutation()

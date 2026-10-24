@@ -155,10 +155,9 @@ namespace TensorSharp.Models
         /// the runtime cost governor in SpeculativeExecution still measures it and
         /// parks drafting if a particular prompt/context makes it a loss.
         ///
-        /// glm5next has no draft head of its own (its NextN block is not built),
-        /// so what arms there is the weight-free n-gram speculator; its verify is
-        /// the same one-graph trunk pass, and a rejected window is undone through
-        /// the KDA recurrent-state snapshot (GlmDsaModel.Glm5NextSpeculative.cs).
+        /// glm5next uses the same target verification and KDA snapshot rollback
+        /// for n-gram drafting and the explicitly enabled bounded Flash NextN
+        /// adapter (GlmDsaModel.Glm5NextSpeculative.cs).
         /// </summary>
         public bool SpeculationProfitable => true;
 
@@ -171,9 +170,11 @@ namespace TensorSharp.Models
         ///
         /// glm5next's KDA layers DO carry recurrent state that the verify advanced
         /// over the whole window, so there the executor must restore the snapshot
-        /// and re-forward the accepted prefix (the Qwen 3.5 / Qwen 3.8 contract).
+        /// and re-forward the accepted prefix, unless the bounded native Flash
+        /// experiment has already committed this window's captured state.
         /// </summary>
-        public bool SpecVerifyPersistsAcceptedKv => !IsGlm5NextArch;
+        public bool SpecVerifyPersistsAcceptedKv => !IsGlm5NextArch
+            || (_g5nPrefixCommittedPosition >= 0 && _g5nPrefixCommittedPosition == _cacheSeqLen && _g5nSnapValid);
 
         /// <summary>
         /// On a recurrent trunk every extra verify row is dearer than on a dense
@@ -184,6 +185,7 @@ namespace TensorSharp.Models
         /// glm-dsa proper keeps the shared default.
         /// </summary>
         public int SpecPreferredDraftWindow => IsGlm5NextArch ? 3 : 0;
+        public int SpecMaxDraftTokens => MemoryPolicy?.EnableGlmFlashMtp == true ? 2 : int.MaxValue;
 
         /// <summary>
         /// The native executor's SpecForward, snapshot and rewind all act on the
@@ -263,6 +265,7 @@ namespace TensorSharp.Models
         /// </summary>
         public void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            _g5nPrefixCommittedPosition = -1;
             ArgumentNullException.ThrowIfNull(tokens);
             if (tokens.Length == 0)
                 throw new ArgumentException("At least one token is required.", nameof(tokens));

@@ -23,6 +23,15 @@ int main()
     for (int rows = -1; rows <= 1025; ++rows) for (bool bulk : {false, true}) for (bool independent : {false, true})
         require(tsg::host_moe_cache_direct_read_phase(bulk, rows, independent)
             == (bulk && !independent && rows > 8 && rows <= 1024));
+    for (int request_rows : {1, 3, 8, 9, 128, 512, 1024}) {
+        // A wide request split into N1/N3/N8 groups remains a RAM scan,
+        // independent of direct-read eligibility and inner execution width.
+        require(tsg::host_moe_cache_ram_demand_admission(request_rows, false)
+            == (request_rows <= 8));
+        require(tsg::host_moe_cache_ram_demand_admission(request_rows, true));
+    }
+    require(!tsg::host_moe_cache_ram_demand_admission(0, false));
+    require(!tsg::host_moe_cache_ram_demand_admission(-1, true));
     require(tsg::host_moe_cache_routes_fit(88, 10));
     require(tsg::host_moe_cache_routes_fit(128, 10));
     require(tsg::host_moe_cache_routes_fit(64, 64));

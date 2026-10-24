@@ -30,6 +30,11 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
     int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
     size_t input_column_stride, void * stream);
 #if defined(TSG_GGML_TEST_HOOKS)
+// Production dispatch with the gate/ordered-column opt-ins disabled. Unlike
+// the original-tile oracle below, this preserves current automatic tiling.
+int tsg_matmul_q8_cuda_launch_control(const void * weights, const void * input, float * output,
+    int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+    size_t input_column_stride, void * stream);
 int tsg_matmul_q8_cuda_launch_reference(const void * weights, const void * input, float * output,
     int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
     size_t input_column_stride, void * stream);

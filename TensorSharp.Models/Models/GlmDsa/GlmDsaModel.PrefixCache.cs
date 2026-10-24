@@ -27,7 +27,22 @@ namespace TensorSharp.Models
         private IPrefixPayloadSink _prefixCacheSink;
         private Func<int, IDisposable?>? _unifiedPrefixCapture;
         private Func<long>? _unifiedPrefixSpareBytes;
+        private Func<IDisposable?>? _unifiedFreshPrimaryAdmission;
         private int _unifiedPrefixCaptureDiagnostics;
+        private int _unifiedTerminalRetentionDiagnostics;
+
+        // Donate-only sessions also need this: retaining the adopted primary
+        // requires a new physical primary even when public copies are disabled.
+        internal void ConfigureUnifiedFreshPrimaryAdmission(Func<IDisposable?> admission)
+        {
+            ArgumentNullException.ThrowIfNull(admission);
+            lock (_nativeSync)
+            {
+                if (!UsesNativeExecutor || MemoryPolicy == null || _nativeTp != 1)
+                    throw new NotSupportedException("Fresh-primary admission requires the admitted native single-device executor.");
+                _unifiedFreshPrimaryAdmission = admission;
+            }
+        }
 
         // Enable complete state copies only through the admitted session. The
         // native interface alone does not qualify other backends or TP models.
@@ -65,6 +80,18 @@ namespace TensorSharp.Models
                     $"[unified-memory] GLM prefix capture: outcome={outcome}, tokens={tokens}, destination={destination}, allocated-bytes={bytes}"));
             }
             catch { }
+        }
+
+        private void LogUnifiedTerminalRetention(bool retained, int tokens, bool neededPrimary)
+        {
+            if (_unifiedFreshPrimaryAdmission == null || _unifiedTerminalRetentionDiagnostics >= 8) return;
+            ++_unifiedTerminalRetentionDiagnostics;
+            try
+            {
+                Console.WriteLine(FormattableString.Invariant(
+                    $"[unified-memory] GLM terminal retention: outcome={(retained ? "retained" : "refused")}, tokens={tokens}, fresh-primary-required={neededPrimary}, primary={_primarySlot}, retained-slots={_retainedSlots?.Count ?? 0}"));
+            }
+            catch { } // Optional diagnostics cannot reject a completed request.
         }
 
         private readonly struct ExecutorSlotCopyStore(IGlmExecutor executor, GlmDsaModel? diagnostics = null,
@@ -194,8 +221,11 @@ namespace TensorSharp.Models
             {
                 if (!UsesNativeExecutor || _slotByRequest == null) return false;
                 _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
-                if (!SlotRetention.RetainSlot(_slotByRequest, _retainedSlots, requestId, payloadKey, length, SupportsKVCacheTruncation,
-                        ref _primarySlot, ref _activeSlotKey, new ExecutorGlmSlotStore(_exec)))
+                bool neededPrimary = _primarySlot < 0 && string.Equals(_activeSlotKey, requestId, StringComparison.Ordinal);
+                bool retained = SlotRetention.RetainSlot(_slotByRequest, _retainedSlots, requestId, payloadKey, length, SupportsKVCacheTruncation,
+                    ref _primarySlot, ref _activeSlotKey, new ExecutorGlmSlotStore(_exec), _unifiedFreshPrimaryAdmission);
+                LogUnifiedTerminalRetention(retained, length, neededPrimary);
+                if (!retained)
                     return false;
                 _cacheSeqLen = _exec.NPast;   // the selection may have moved to the primary
                 footprint = Footprint(_retainedSlots[payloadKey]);
@@ -210,7 +240,10 @@ namespace TensorSharp.Models
             {
                 if (!UsesNativeExecutor) return false;
                 _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
-                if (!SlotRetention.ConvertPrimarySlot(_retainedSlots, payloadKey, length, ref _primarySlot, ref _activeSlotKey, new ExecutorGlmSlotStore(_exec)))
+                bool retained = SlotRetention.ConvertPrimarySlot(_retainedSlots, payloadKey, length, ref _primarySlot, ref _activeSlotKey,
+                    new ExecutorGlmSlotStore(_exec), _unifiedFreshPrimaryAdmission);
+                LogUnifiedTerminalRetention(retained, length, neededPrimary: true);
+                if (!retained)
                     return false;
                 _cacheSeqLen = _exec.NPast;
                 footprint = Footprint(_retainedSlots[payloadKey]);

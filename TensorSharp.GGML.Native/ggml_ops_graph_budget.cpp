@@ -94,11 +94,12 @@ namespace {
     Registry& registry() { static auto* value = new Registry; return *value; }
 
     template<class Allocate>
-    ggml_backend_buffer_t allocate_owned(ggml_backend_buffer_type_t type, int rank, Allocate allocate)
+    ggml_backend_buffer_t allocate_owned(ggml_backend_buffer_type_t type, int rank, int kind, Allocate allocate)
     {
-        if (!type || rank < 0) return nullptr;
+        if (!type || rank < 0 || (kind != 2 && kind != 5 && kind != 7)) return nullptr;
         try {
             auto owner = std::make_shared<Owner>(type, rank);
+            owner->kind = kind;
             // Declaration order keeps all charges until the physical free,
             // including map-insertion failures and partial context-allocation failure.
             std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>
@@ -116,18 +117,24 @@ namespace {
 
 ggml_backend_buffer_t graph_budget_alloc_buffer(ggml_backend_buffer_type_t type, size_t bytes, int rank)
 {
-    return allocate_owned(type, rank, [&](const std::shared_ptr<Owner>& owner) {
+    return allocate_owned(type, rank, 2, [&](const std::shared_ptr<Owner>& owner) {
         // Bypass upstream's zero-size wrapper-buft dummy: even an empty buffer
         // must keep its original backend type, never a temporary wrapper address.
         return owner->allocate(bytes, [&] { return ggml_backend_buft_alloc_buffer(type, bytes); });
     });
 }
 
-ggml_backend_buffer_t graph_budget_alloc_ctx_tensors(ggml_context* context, ggml_backend_t backend, int rank)
+ggml_backend_buffer_t graph_budget_alloc_ctx_tensors(ggml_context* context, ggml_backend_t backend, int rank, int kind)
 {
     if (!context || !backend) return nullptr;
-    auto original = ggml_backend_get_default_buffer_type(backend);
-    return allocate_owned(original, rank, [&](const std::shared_ptr<Owner>& owner) {
+    return graph_budget_alloc_ctx_tensors_from_buft(context, ggml_backend_get_default_buffer_type(backend), rank, kind);
+}
+
+ggml_backend_buffer_t graph_budget_alloc_ctx_tensors_from_buft(ggml_context* context,
+    ggml_backend_buffer_type_t type, int rank, int kind)
+{
+    if (!context) return nullptr;
+    return allocate_owned(type, rank, kind, [&](const std::shared_ptr<Owner>& owner) {
         return ggml_backend_alloc_ctx_tensors_from_buft(context, &owner->type);
     });
 }
@@ -149,7 +156,7 @@ void graph_budget_free_buffer(ggml_backend_buffer_t buffer)
 
 ggml_gallocr_t graph_budget_gallocr_new(ggml_backend_buffer_type_t type, int rank, bool require_accounted, int kind)
 {
-    if (!type || rank < 0 || (kind != 2 && kind != 5)) return nullptr;
+    if (!type || rank < 0 || (kind != 2 && kind != 5 && kind != 7)) return nullptr;
     try {
         auto owner = std::make_shared<Owner>(type, rank);
         owner->gallocr = true;

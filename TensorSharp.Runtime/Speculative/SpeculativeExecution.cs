@@ -500,7 +500,14 @@ namespace TensorSharp.Runtime.Speculative
             // trunk that deferred post-verify state until this was known settles it
             // now, and that is what can turn the partial-acceptance branch below from
             // a whole second forward into a position rewind.
+            long tCommit0 = Stopwatch.GetTimestamp();
             _trunk.OnVerifyAccepted(m, k);
+            long commitTicks = Stopwatch.GetTimestamp() - tCommit0;
+            // Recurrent trunks can commit a captured prefix here. Include its
+            // copies in rollback timing instead of leaving them outside both
+            // phases merely because no accepted-prefix forward is needed.
+            if (m < k) Stats.RollbackTicks += commitTicks;
+            else Stats.VerifyTicks += commitTicks;
 
             // The tokens this step commits to the trunk: the verify batch's
             // accepted prefix plus the token it started from.

@@ -40,6 +40,7 @@ namespace TensorSharp.Server
         // disposed and replaced (DEC-37).
         private object _engineModel;
         private bool _disposed;
+        private volatile bool _admittedSpeculativePolicy;
 
         /// <summary>
         /// Engine sizing supplied by the host; null means
@@ -140,8 +141,13 @@ namespace TensorSharp.Server
                 SchedulerConfig cfg = SchedulerConfigOverride;
                 string cfgSource = cfg != null ? "host" : "environment";
                 cfg ??= SchedulerConfig.FromEnvironment();
+                // A unified session must qualify the remembered request before
+                // construction. Its admitted policy cannot be replaced afterward.
+                if (_lifecycle.UnifiedMemoryEnabled && _pendingSpeculation is { } requested)
+                    cfg = cfg.WithSpeculation(requested);
                 cfg = _lifecycle.ConfigureScheduler(model, cfg);
-                if (_lifecycle.UnifiedMemoryEnabled && _pendingSpeculation?.Enabled == true)
+                _admittedSpeculativePolicy = cfg.MemoryAdmission?.AllowSpeculativeSerialExecution == true;
+                if (_lifecycle.UnifiedMemoryEnabled && cfg.Speculation.Enabled && !_admittedSpeculativePolicy)
                     throw new NotSupportedException("Unified memory does not support speculative execution.");
                 _engine = new InferenceEngine(model, cfg, _logger)
                 {
@@ -152,7 +158,7 @@ namespace TensorSharp.Server
                 _engineModel = model;
                 // The most recent switch, in case it was written after this engine's
                 // configuration was read from the environment.
-                if (_pendingSpeculation is { } pending)
+                if (!_admittedSpeculativePolicy && _pendingSpeculation is { } pending)
                     _engine.UpdateSpeculation(pending);
                 var poolStats = _engine.PoolStats;
                 _logger.LogInformation(
@@ -225,8 +231,8 @@ namespace TensorSharp.Server
         public bool UpdateSpeculation(SpeculationOptions options)
         {
             options ??= SpeculationOptions.Disabled;
-            if (_lifecycle.UnifiedMemoryEnabled && options.Enabled)
-                throw new NotSupportedException("Unified memory does not support speculative execution.");
+            if (_lifecycle.UnifiedMemoryEnabled && (_admittedSpeculativePolicy || options.Enabled))
+                throw new NotSupportedException("Unified speculation policy is fixed by model loading; reload with a qualified policy to change it.");
             // Remembered as well as applied: a switch that lands while TryGetEngine is
             // building the engine (the gate held for the block-pool allocation, the
             // environment possibly read before the switch was written) is handed to
@@ -266,6 +272,7 @@ namespace TensorSharp.Server
                 // old model's policy replaced that (a draft head's "auto" became the
                 // previous model's "ngram", or the reverse, which declines speculation).
                 _pendingSpeculation = null;
+                _admittedSpeculativePolicy = false;
             }
         }
 

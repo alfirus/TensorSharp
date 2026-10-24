@@ -9,6 +9,16 @@ namespace TensorSharp.Models;
 /// state, context and workspace. It is not itself an allocation quota.</summary>
 public sealed record ModelMemoryPolicy
 {
+    /// <summary>Experimental bounded Flash NextN adapter. The session must
+    /// explicitly place draft weights and own draft graphs and KDA snapshots.</summary>
+    public bool EnableGlmFlashMtp { get; init; }
+    /// <summary>Immutable, explicitly qualified raw Q4_K token-row packing.
+    /// Requires the matching native loader and actual-handle certificate.</summary>
+    public bool EnableGlmHostTokenEmbedding { get; init; }
+    /// <summary>Experimental checked Device bank for one exact layer-major trunk call.</summary>
+    public bool EnableGlmLayerMajorDeviceBaton { get; init; }
+    /// <summary>Experimental model-owned, charged causal expert-cache metadata.</summary>
+    public bool EnableGlmCausalRouteNeighbor { get; init; }
     public ModelMemoryPolicy(int contextTokens, int prefillChunkTokens)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(contextTokens);

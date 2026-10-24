@@ -35,9 +35,8 @@
 // (TSGgml_GlmKdaStateCapture / Restore); the managed side only keeps the
 // position and the "restored" flag that make SpecRewindCache exact.
 //
-// GLM-5.3-Flash's own NextN block is NOT built (llama.cpp asserts that graph
-// unimplemented too, and the native loader prints a notice), so what this
-// enables is the weight-free n-gram speculator: `--spec --spec-type ngram`.
+// Both weight-free n-gram drafting and the explicitly enabled bounded Flash
+// NextN adapter share this target-state rollback contract.
 using System;
 using TensorSharp.Core;
 using TensorSharp.GGML;
@@ -68,6 +67,7 @@ namespace TensorSharp.Models
 
         private void Glm5NextInvalidateSnapshot()
         {
+            _g5nPrefixCommittedPosition = -1;
             _g5nSnapValid = false;
             _g5nSnapRestored = false;
             _g5nSnapPos = -1;
@@ -80,6 +80,7 @@ namespace TensorSharp.Models
             {
                 lock (_nativeSync)
                 {
+                    PrepareUnifiedDraftGraph(Math.Max(1, _exec.NPast + 1), 1, GlmUnifiedMtpGraphPurpose.Snapshot);
                     if (!_exec.KdaStateCapture())
                         throw new InvalidOperationException("glm5next: native KDA state capture failed (see stderr).");
                     _g5nSnapPos = _exec.NPast;
@@ -112,6 +113,7 @@ namespace TensorSharp.Models
 
         private void Glm5NextRestoreRecurrentState()
         {
+            _g5nPrefixCommittedPosition = -1;
             if (!_g5nSnapValid)
                 throw new InvalidOperationException(
                     "glm5next: no KDA recurrent snapshot to restore (SpecSnapshotRecurrentState was not called, " +

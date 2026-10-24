@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
 using System.Globalization;
 using TensorSharp.Memory;
+using TensorSharp.Memory.Planning;
 using TensorSharp.Models;
 
 namespace InferenceWeb.Tests;
@@ -203,6 +204,126 @@ public sealed class GlmUnifiedAdmissionDiagnosticsTests
         Assert.Equal(75, refreshed.Shortfall(Host, growth));
         Assert.Contains("host-available=1000, host-commit-limit=3000, host-commit-available=50, host-allocation-available=50",
             refreshed.Describe(growth));
+    }
+
+    [Theory]
+    [InlineData(true, 900, 512)]
+    [InlineData(false, 900, 512)]
+    [InlineData(true, 400, 12)]
+    [InlineData(false, 400, 12)]
+    public void NarrowSourceViewPrefillReselectsFromFreshPhysicsWithoutChangingOwnedCredit(
+        bool hintResult, long freshHostAvailable, int expectedRows)
+    {
+        var budget = new MemoryBudget([new(Host, 1000), new(Device, 1000)]);
+        using var joint = budget.Reserve([new(Host, 150), new(Device, 300)]);
+        using var request = budget.Reserve([new(Host, 50), new(Device, 100)]);
+        using var experts = budget.Reserve([new(Device, 100)]);
+        using var jointChildren = joint.TryTake([new(Host, 75), new(Device, 200)])!;
+        using var requestChildren = request.TryTake([new(Host, 25), new(Device, 50)])!;
+        jointChildren.Commit(); requestChildren.Commit(); experts.Commit();
+        var before = budget.Snapshot().ToArray();
+        var jointOwned = new InferenceMemoryBytes(150, 300);
+        var requestOwned = new InferenceMemoryBytes(50, 100);
+        (InferenceMemoryBytes Joint, InferenceMemoryBytes Request) Estimate(int rows)
+            => (new(438 + rows, 600), new(50, 100));
+        var initial = GlmUnifiedPhysicalObservation.Create(new(2000, 400, 1600, 650), before, 1000, 1000, 0, 0);
+        Assert.True(GlmUnifiedPrefillAdmission.TrySelect(initial.Ledger, initial.Limits,
+            jointOwned, requestOwned, 100, 100, 512, Estimate, out var narrow));
+        Assert.Equal(12, narrow.Rows); // A fitting width bypassed the old all-width refusal hint.
+        var widest = Estimate(512);
+        MemoryCharge[] growth = [new(Host, widest.Joint.Host - jointOwned.Host + widest.Request.Host - requestOwned.Host),
+            new(Device, widest.Joint.Device - jointOwned.Device + widest.Request.Device - requestOwned.Device)];
+        Assert.Equal(800, growth[0].Bytes); Assert.Equal(300, growth[1].Bytes);
+        bool attempted = false;
+        int hints = 0, samples = 0;
+        Assert.True(initial.TryRefreshNarrowSourceViewPrefill(true, narrow.Rows, 512, 0, growth, ref attempted,
+            () => { hints++; return hintResult; },
+            () => { samples++; return GlmUnifiedPhysicalObservation.Create(new(2000, freshHostAvailable, 1600, 650),
+                budget.Snapshot(), 1000, 1000, 0, 0); }, out var fresh));
+        Assert.True(GlmUnifiedPrefillAdmission.TrySelect(fresh.Ledger, fresh.Limits,
+            jointOwned, requestOwned, 100, 100, 512, Estimate, out var selected));
+        Assert.Equal(expectedRows, selected.Rows);
+        Assert.True(attempted); Assert.Equal(1, hints); Assert.Equal(1, samples);
+        Assert.False(fresh.TryRefreshNarrowSourceViewPrefill(true, 12, 512, 0, growth, ref attempted,
+            () => { hints++; return true; }, () => { samples++; return fresh; }, out _));
+        Assert.Equal(1, hints); Assert.Equal(1, samples);
+        Assert.Equal(before, budget.Snapshot().ToArray());
+        Assert.Equal(200, joint.LiveChildCharges.Single(c => c.Pool == Device).Bytes);
+        Assert.Equal(50, request.LiveChildCharges.Single(c => c.Pool == Device).Bytes);
+        Assert.Equal(100, experts.OwnedCharges.Single(c => c.Pool == Device).Bytes);
+    }
+
+    [Theory]
+    [InlineData(false, 12, 1, 0, 0, false)] // Mode OFF.
+    [InlineData(true, 512, 1, 0, 0, false)] // No accepted downsizing.
+    [InlineData(true, 12, 0, 1, 0, false)] // Device-only deficit.
+    [InlineData(true, 12, 1, 2, 1, false)] // Beyond admitted expert credit.
+    [InlineData(true, 12, 1, 1, 0, false)] // Existing expert floor cannot be spent.
+    [InlineData(true, 12, 0, 0, 0, false)] // No physical Host deficit.
+    [InlineData(true, 12, 1, 2, 2, true)] // Selector may reclaim this exact Device delta.
+    public void NarrowSourceViewHintHonorsModeWidthAndActualDeviceReclaimBound(bool sourceView,
+        int selectedRows, int hostDeficit, int deviceDeficit, long reclaimable, bool expected)
+    {
+        var ledger = new MemoryPoolSnapshot[] { new(Host, 1000, 100, 100), new(Device, 1000, 100, 100) };
+        var physical = GlmUnifiedPhysicalObservation.Create(new(2000, 125 - hostDeficit, 1600, 125 - deviceDeficit),
+            ledger, 1000, 1000, 0, 0);
+        MemoryCharge[] growth = [new(Host, 25), new(Device, 25)];
+        bool attempted = false;
+        int hints = 0, samples = 0;
+        Assert.Equal(expected, physical.TryRefreshNarrowSourceViewPrefill(sourceView, selectedRows, 512,
+            reclaimable, growth, ref attempted, () => { hints++; return true; },
+            () => { samples++; return physical; }, out var fresh));
+        Assert.Equal(expected, attempted);
+        Assert.Equal(expected ? 1 : 0, hints); Assert.Equal(hints, samples);
+        Assert.Equal(physical, fresh); // No synthetic Device or Host allowance.
+        Assert.Equal(deviceDeficit, fresh.Shortfall(Device, growth));
+    }
+
+    [Fact]
+    public void NarrowSourceViewHintUsesBothOwnedRootsAndReplacementFloorWithoutRefundingChildren()
+    {
+        var budget = new MemoryBudget([new(Host, 10000), new(Device, 10000)]);
+        using var joint = budget.Reserve([new(Host, 1000), new(Device, 2000)]);
+        using var request = budget.Reserve([new(Host, 200), new(Device, 300)]);
+        using var children = joint.TryTake([new(Host, 700), new(Device, 1500)])!;
+        using var requestChildren = request.TryTake([new(Host, 100), new(Device, 100)])!;
+        children.Commit(); requestChildren.Commit();
+        var before = budget.Snapshot().ToArray();
+        var replacement = GlmUnifiedPrefillAdmission.PreserveReplacement(new(400, 700), new(700, 1500), 2);
+        Assert.Equal(new InferenceMemoryBytes(900, 1850), replacement);
+        MemoryCharge[] growth = [new(Host, replacement.Host - 1000 + 600 - 200),
+            new(Device, replacement.Device - 2000 + 500 - 300)];
+        Assert.Equal(300, growth[0].Bytes); Assert.Equal(50, growth[1].Bytes);
+        var physical = GlmUnifiedPhysicalObservation.Create(new(20000, 600, 20000, 10000), before, 10000, 10000, 0, 0);
+        Assert.Equal(100, physical.Shortfall(Host, growth));
+        bool attempted = false;
+        Assert.True(physical.TryRefreshNarrowSourceViewPrefill(true, 12, 512, 0, growth, ref attempted, () => true,
+            () => GlmUnifiedPhysicalObservation.Create(new(20000, 700, 20000, 10000), budget.Snapshot(),
+                10000, 10000, 0, 0), out var fresh));
+        Assert.True(fresh.Fits(growth)); // Exact fresh allowance, no owned root counted twice.
+        Assert.Equal(before, budget.Snapshot().ToArray());
+        Assert.Equal(1500, joint.LiveChildCharges.Single(c => c.Pool == Device).Bytes);
+        Assert.Equal(100, request.LiveChildCharges.Single(c => c.Pool == Host).Bytes);
+    }
+
+    [Fact]
+    public void NarrowSourceViewHintCannotRepairConfiguredHostCeilingOrResampleAfterFatal()
+    {
+        var ledger = new MemoryPoolSnapshot[] { new(Host, 200, 100, 100), new(Device, 1000, 100, 100) };
+        var physical = GlmUnifiedPhysicalObservation.Create(new(2000, 1000, 1600, 800), ledger, 1000, 1000, 0, 0);
+        MemoryCharge[] growth = [new(Host, 25), new(Device, 25)];
+        bool attempted = false;
+        int hints = 0, samples = 0;
+        Assert.False(physical.TryRefreshNarrowSourceViewPrefill(true, 12, 512, 0, growth, ref attempted,
+            () => { hints++; return true; }, () => { samples++; return physical; }, out _));
+        Assert.False(attempted); Assert.Equal(0, hints); Assert.Equal(0, samples);
+        ledger = [new(Host, 1000, 100, 100), new(Device, 1000, 100, 100)];
+        physical = GlmUnifiedPhysicalObservation.Create(new(2000, 50, 1600, 800), ledger, 1000, 1000, 0, 0);
+        Assert.Throws<InvalidOperationException>(() => physical.TryRefreshNarrowSourceViewPrefill(true, 12, 512, 0,
+            growth, ref attempted, () => { hints++; throw new InvalidOperationException("checked fatal"); },
+            () => { samples++; return physical; }, out _));
+        Assert.True(attempted); Assert.Equal(1, hints); Assert.Equal(0, samples);
+        Assert.Equal(ledger, physical.Ledger);
     }
 
     [Theory]

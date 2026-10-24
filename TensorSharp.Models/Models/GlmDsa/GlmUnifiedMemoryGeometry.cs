@@ -3,6 +3,7 @@
 using System;
 using System.Globalization;
 using System.Linq;
+using TensorSharp.GGML;
 using TensorSharp.Memory.Planning;
 using TensorSharp.Runtime;
 
@@ -37,16 +38,33 @@ internal sealed record GlmUnifiedMemoryGeometry
     internal int ExpertFf { get; init; }
     internal int UsedExperts { get; init; }
     internal int ExpertCount { get; init; }
+    internal GlmUnifiedMtpGeometry? Mtp { get; init; }
+    // Set only after native capability and exact opt-in checks. A scalar call
+    // can retain this host arena through later multirow prefill calls.
+    internal bool ExpandedDecodeStaging { get; init; }
+    internal bool ExpandedPrefillRingStaging { get; init; }
+    internal bool HostTokenEmbedding { get; init; }
+    internal bool LayerMajorDeviceBaton { get; init; }
+    private long SharedHostWorkspaceBytes => checked(AdditionalFileStagingHostBytes
+        + (HostTokenEmbedding ? GlmUnifiedHostTokenEmbeddingPlan.PackBytes : 0));
+    private long AdditionalFileStagingHostBytes => ExpandedDecodeStaging || ExpandedPrefillRingStaging
+        ? GlmUnifiedFileStagingPlan.AdditionalHostBytes : 0;
     // Preserve source quantization, rather than forecasting a dequantized F32
     // weight copy. Dense-only layers have no routed triple.
     internal GlmUnifiedExpertLayout?[] ExpertLayerLayouts { get; init; } = [];
     internal long DenseDeviceBytes { get; init; }
     internal long[] ExpertLayerBytes { get; init; } = [];
     internal long ExpertSourceBytes => ExpertLayerBytes.Aggregate(0L, (a, b) => checked(a + b));
+    // Exact trunk file ranges registered by the selected-expert seam. The
+    // placement forecast above includes per-tensor allowances; those and CUDA
+    // tensor tails are not bytes in these independent source views.
+    internal long RawExpertSourceBytes => ExpertLayerLayouts.OfType<GlmUnifiedExpertLayout>()
+        .Aggregate(0L, (total, layout) => checked(total + layout.BytesPerExpert * ExpertCount));
     internal long SourceBytes { get; init; }
     internal long FixedStateBytes => checked(4L * RecurrentLayers *
         (3L * Heads * KdaDim * (ConvKernel - 1) + (long)Heads * KdaDim * KdaDim));
-    internal long KvBytesPerToken => checked(2L * AttentionLayers * (KvRow + 2L * IndexerDim));
+    internal long KvBytesPerToken => checked(2L * AttentionLayers * (KvRow + 2L * IndexerDim)
+        + (Mtp == null ? 0 : 2L * KvRow));
     // The native slot allocates all n_ctx rows, independent of output allowance.
     internal long SlotBytes(int context) => context > 0 && context <= DeclaredContextTokens
         ? checked(FixedStateBytes + KvBytesPerToken * context + (64L << 10) * Layers)
@@ -54,7 +72,8 @@ internal sealed record GlmUnifiedMemoryGeometry
 
     internal InferenceMemoryBytes Workspace(int context, int rows, int? outputRows = null)
     {
-        if (context <= 0 || context > DeclaredContextTokens || rows <= 0 || rows > 1024)
+        if (context <= 0 || context > DeclaredContextTokens || rows <= 0 || rows > 1024
+            || (HostTokenEmbedding && rows > GlmUnifiedHostTokenEmbeddingPlan.MaximumRows))
             throw new ArgumentOutOfRangeException(nameof(rows));
         int outputs = outputRows ?? rows;
         if (outputs < 1 || outputs > rows) throw new ArgumentOutOfRangeException(nameof(outputRows));
@@ -70,8 +89,15 @@ internal sealed record GlmUnifiedMemoryGeometry
             // Trunk intermediates and masks still scale with every input row.
             long logits = 4L * outputs * Vocab;
             long activation = logits + 4L * rows * (32L * Hidden * HyperConnections + 8L * ExpertFf * UsedExperts);
-            long device = (64L << 20) + masks + activation + FixedStateBytes;
-            long host = (32L << 20) + SelectedRouteScratchHostBytes + SelectedRouteMetadataHostBytes + logits
+            long device = (64L << 20) + masks + activation + FixedStateBytes
+                + (HostTokenEmbedding ? rows * GlmUnifiedHostTokenEmbeddingPlan.RowBytes : 0);
+            // N2 verification may retain the intermediate recurrent state in
+            // a separate persistent kind-7 arena. The GDN output additionally
+            // needs one largest-layer state in this kind-5 graph workspace.
+            // Persistent snapshots are forecast by the speculative owner.
+            if (Mtp?.PrefixStateCommit == true && rows == 2 && outputs == 2)
+                device = checked(device + 4L * Heads * KdaDim * KdaDim);
+            long host = (32L << 20) + SharedHostWorkspaceBytes + SelectedRouteScratchHostBytes + SelectedRouteMetadataHostBytes + logits
                 + 4L * rows * (8L * Hidden + 8L * ExpertFf * UsedExperts)
                 + 4L * context * rows;
             return new(host, device);
@@ -82,11 +108,16 @@ internal sealed record GlmUnifiedMemoryGeometry
     internal long LayerMajorHostBytes(int tokens)
         => tokens <= 0 ? 0 : checked(4L * Hidden * HyperConnections * tokens);
 
-    internal InferenceMemoryBytes GraphPeak(int context, int rows, bool batched, int generations = 2)
+    internal InferenceMemoryBytes GraphPeak(int context, int rows, bool batched, int generations = 2, int? outputRows = null)
     {
         if (generations < 1 || generations > 33) throw new ArgumentOutOfRangeException(nameof(generations));
-        var workspace = Workspace(context, rows, batched ? rows : 1);
-        return new(checked(generations * workspace.Host), checked(generations *
+        var workspace = Workspace(context, rows, outputRows ?? (batched ? rows : 1));
+        // One retained file arena serves every graph generation. Serial
+        // execution receives its allowance from Workspace in the request;
+        // joint execution needs it here, without multiplying the expansion.
+        long host = checked(generations * (workspace.Host - SharedHostWorkspaceBytes)
+            + SharedHostWorkspaceBytes);
+        return new(host, checked(generations *
             (workspace.Device + (batched ? (rows - 1L) * FixedStateBytes : 0))));
     }
 
@@ -131,8 +162,10 @@ internal sealed record GlmUnifiedMemoryGeometry
         return (long)Math.Max(0, Math.Min(slack, operatorMaximum));
     }
 
-    internal static GlmUnifiedMemoryGeometry Read(GgufFile file)
+    internal static GlmUnifiedMemoryGeometry Read(GgufFile file, bool includeMtp = false, bool hostTokenEmbedding = false)
     {
+        if (hostTokenEmbedding && includeMtp)
+            throw new NotSupportedException("Host token embedding cannot combine with MTP placement.");
         string a = file.GetString("general.architecture") ?? "";
         if (!GlmDsaArchitecture.IsGlm5Next(a))
             throw new NotSupportedException("Unified GLM requires glm5next or glm5-next metadata.");
@@ -208,11 +241,22 @@ internal sealed record GlmUnifiedMemoryGeometry
                 throw new NotSupportedException("Incomplete GLM routed expert triple at layer " + layer);
             expertLayouts[layer] = new(gate, up, down);
         }
-        return new() { Architecture = a, Layers = layers, DeclaredContextTokens = Int("context_length"),
+        var result = new GlmUnifiedMemoryGeometry { Architecture = a, Layers = layers, DeclaredContextTokens = Int("context_length"),
             RecurrentLayers = layout.Take(layers).Count(n => n == 0), Hidden = hidden, Heads = heads, Vocab = vocab,
             KvRow = kv, IndexerDim = idx, KdaDim = dim, ConvKernel = conv, HyperConnections = hc,
             ExpertFf = ff, UsedExperts = used, ExpertCount = experts, ExpertLayerLayouts = expertLayouts,
             DenseDeviceBytes = dense, ExpertLayerBytes = expertBytes, SourceBytes = source };
+        if (hostTokenEmbedding)
+        {
+            if (!file.Tensors.TryGetValue("output.weight", out var output))
+                throw new NotSupportedException("Host token embedding requires an explicit, separate GPU output tensor.");
+            GlmUnifiedHostTokenEmbeddingPlan.ValidateLayout(embedding.Type, embedding.Shape,
+                file.GetTensorFileRegion(embedding.Name), output.Shape, file.GetTensorFileRegion(output.Name));
+            return GlmUnifiedHostTokenEmbeddingPlan.Apply(result);
+        }
+        if (!includeMtp) return result;
+        var mtp = GlmUnifiedMtpGeometry.Read(file, result);
+        return result with { Mtp = mtp, DenseDeviceBytes = checked(result.DenseDeviceBytes + mtp.DenseDeviceBytes) };
     }
 }
 
@@ -229,17 +273,45 @@ public partial class GlmDsaModel
     // A shared-budget session retains one complete native graph. A replacement
     // may coexist during allocation, which the session forecasts separately.
     internal const int UnifiedGraphCacheCapacity = 1;
+    private int _unifiedGraphCacheCapacity = UnifiedGraphCacheCapacity;
     private int? _unifiedRetainedSlotLimit;
     private Action<GlmUnifiedGraphShape>? _unifiedGraphAdmission;
+    internal Action<int, int, int, int, bool>? UnifiedGraphMemoryDiagnosticContext { get; set; }
+    private bool _unifiedDecodeGraphReserveEnabled;
+    private long _unifiedLayerMajorGraphCapBytes;
+    // A queued image may be supplied directly without a loaded vision encoder.
+    // Keep this conservative latch for this model's lifetime.
+    private bool _unifiedHasQueuedVisionOverrides;
+    private static int _nativeGraphTracingObserved;
+    internal static int ResolveFlashMtpGraphCacheCapacity(string? configured)
+    {
+        if (string.IsNullOrEmpty(configured)) return 3;
+        if (!int.TryParse(configured, NumberStyles.None, CultureInfo.InvariantCulture, out int capacity)
+            || capacity is < 1 or > 16)
+            throw new ArgumentException("TS_GLM_FLASH_MTP_GRAPH_CACHE_ENTRIES must be an integer from 1 through 16.");
+        return capacity;
+    }
     internal static void ValidateUnifiedMemoryPolicy(ModelMemoryPolicy? policy, BackendType backend,
         int tp, int split, bool directCuda)
     {
+        bool hostEmbedding = GlmUnifiedHostTokenEmbeddingPlan.Resolve(
+            Environment.GetEnvironmentVariable(GlmUnifiedHostTokenEmbeddingPlan.EnvironmentVariable));
+        if (hostEmbedding && policy?.EnableGlmHostTokenEmbedding != true)
+            throw new NotSupportedException("Host token embedding requires an explicit unified GLM model policy; ordinary managed fallback is not authorized.");
+        if (policy?.EnableGlmHostTokenEmbedding == true)
+            GlmUnifiedHostTokenEmbeddingPlan.ValidateMode(true,
+                Environment.GetEnvironmentVariable(GlmUnifiedHostTokenEmbeddingPlan.EnvironmentVariable));
         if (policy == null) return;
         if (backend != BackendType.GgmlCuda || tp != 1 || split != 1 || directCuda
             || Environment.GetEnvironmentVariable("TS_GLM_NATIVE") == "0")
             throw new NotSupportedException("Unified GLM requires one native GGML CUDA device.");
-        if (!policy.OmitEmbeddedDraftWeights || policy.NativeMoeCpuLayers is null)
+        if ((!policy.OmitEmbeddedDraftWeights && !policy.EnableGlmFlashMtp) || policy.NativeMoeCpuLayers is null)
             throw new NotSupportedException("Unified GLM requires explicit trunk-only placement.");
+        if (policy.EnableGlmFlashMtp && (policy.OmitEmbeddedDraftWeights || policy.ContextTokens > 2048))
+            throw new NotSupportedException("Experimental Flash MTP requires explicit draft placement and context at most 2048.");
+        if (policy.EnableGlmHostTokenEmbedding && (policy.EnableGlmFlashMtp || !policy.OmitEmbeddedDraftWeights
+            || policy.PrefillChunkTokens > GlmUnifiedHostTokenEmbeddingPlan.MaximumRows))
+            throw new NotSupportedException("Host token embedding requires a trunk-only model with chunks at most 512.");
         if (policy.NativeMoeCpuLayers < 0 || policy.PrefillChunkTokens > 1024 || policy.DeviceExecutionReserveBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(policy));
     }
@@ -250,19 +322,35 @@ public partial class GlmDsaModel
         {
             if (_exec is not NativeGlmExecutor native || MemoryPolicy == null)
                 throw new NotSupportedException("Unified GLM needs its native memory-policy executor.");
-            if (!native.ConfigureGraphCache(UnifiedGraphCacheCapacity, 0)) throw new InvalidOperationException("Native GLM graph-cache policy was refused.");
+            // The entry limit never authorizes allocation: each retained graph
+            // remains charged to its native owner and replacements still pass
+            // the shared ledger and fresh physical-capacity checks.
+            _unifiedGraphCacheCapacity = MemoryPolicy.EnableGlmFlashMtp
+                ? ResolveFlashMtpGraphCacheCapacity(Environment.GetEnvironmentVariable("TS_GLM_FLASH_MTP_GRAPH_CACHE_ENTRIES"))
+                : UnifiedGraphCacheCapacity;
+            if (!native.ConfigureGraphCache(_unifiedGraphCacheCapacity, 0)) throw new InvalidOperationException("Native GLM graph-cache policy was refused.");
             if (!native.ConfigureSharedGraphOwner(true)) throw new InvalidOperationException("Native GLM shared graph ownership was refused.");
+            if (MemoryPolicy.EnableGlmFlashMtp)
+                Console.WriteLine($"[unified-memory] experimental Flash MTP graph-cache entry limit={_unifiedGraphCacheCapacity}; retained payload remains budget charged");
             _unifiedRetainedSlotLimit = retainedSlots;
         }
     }
-    internal void ConfigureUnifiedGraphAdmission(Action<GlmUnifiedGraphShape> admission)
+    internal void ConfigureUnifiedGraphAdmission(Action<GlmUnifiedGraphShape> admission, bool boundedDecodeReserve = false)
     {
         ArgumentNullException.ThrowIfNull(admission);
-        lock (_nativeSync) _unifiedGraphAdmission = admission;
+        lock (_nativeSync)
+        {
+            _unifiedGraphAdmission = admission;
+            _unifiedDecodeGraphReserveEnabled = boundedDecodeReserve;
+        }
     }
     internal int UnifiedExpertGroups
     {
         get { lock (_nativeSync) return _exec is NativeGlmExecutor native ? native.SelectedExpertGroups : 0; }
+    }
+    internal bool UnifiedMtpShapePlanEnabled
+    {
+        get { lock (_nativeSync) return _exec is NativeGlmExecutor native && native.FlashMtpShapePlanEnabled; }
     }
     internal long PlanUnifiedExpertMinimum(int rows)
     {
@@ -270,17 +358,64 @@ public partial class GlmDsaModel
             return _exec is NativeGlmExecutor native ? native.PlanSelectedExpertMinimum(rows)
                 : throw new NotSupportedException("Selected experts require the native GLM executor.");
     }
+    internal void PrepareUnifiedDeviceBatonDispose()
+    {
+        lock (_nativeSync) {
+            if (_exec is not NativeGlmExecutor native) throw new NotSupportedException("Device bank cleanup requires its original native executor.");
+            native.CloseDeviceBaton();
+        }
+    }
+    internal long[] UnifiedDeviceBatonInfo
+    {
+        get { lock (_nativeSync) return _exec is NativeGlmExecutor native ? native.DeviceBatonInfo
+            : throw new NotSupportedException("Device baton requires the native executor."); }
+    }
     internal void ConfigureUnifiedSelectedExperts()
     {
         lock (_nativeSync)
             if (_exec is not NativeGlmExecutor native || !native.ConfigureSelectedExperts(true))
                 throw new InvalidOperationException("Native GLM selected-expert scope does not match its measured cache plan.");
     }
-    private void PrepareUnifiedGraph(int context, int rows, bool batched)
+    internal void ConfigureUnifiedLayerMajorGraphCap(long capBytes)
+    {
+        if (!GlmUnifiedLayerMajorGraphCapPlan.ValidCap(capBytes)) throw new ArgumentOutOfRangeException(nameof(capBytes));
+        lock (_nativeSync)
+        {
+            if (_unifiedLayerMajorGraphCapBytes != 0 && _unifiedLayerMajorGraphCapBytes != capBytes)
+                throw new InvalidOperationException("The native layer-major graph cap is immutable for this handle.");
+            if (_exec is not NativeGlmExecutor native || MemoryPolicy == null || HasDraftHead
+                || VisionEncoder != null || _unifiedHasQueuedVisionOverrides || ObserveNativeGraphTracing())
+                throw new NotSupportedException("Strict layer-major graph caps require the ordinary native text trunk.");
+            _unifiedLayerMajorGraphCapBytes = GlmUnifiedLayerMajorGraphCapPlan.Certify(capBytes,
+                GgmlGlmNative.LayerMajorGraphCapVersion, native.ConfigureLayerMajorGraphCap);
+        }
+    }
+    private static bool ObserveNativeGraphTracing()
+    {
+        // The native layer selection is process-static. Once tracing has been
+        // observed, clearing its environment variable cannot qualify a later
+        // model for the ordinary graph-liveness forecast in this process.
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_GLM_TRACE"))
+            || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_GLM_TRACE_DUMP_DIR")))
+            System.Threading.Interlocked.Exchange(ref _nativeGraphTracingObserved, 1);
+        return System.Threading.Volatile.Read(ref _nativeGraphTracingObserved) != 0;
+    }
+    private void PrepareUnifiedGraph(int context, int rows, bool batched, int outputRows = 0,
+        int submittedTokens = 0, bool layerMajor = false, bool strictLayerMajor = false)
     {
         if (MemoryPolicy == null) return;
         if (_unifiedGraphAdmission == null) throw new InvalidOperationException("Unified GLM graph admission is not configured.");
-        _unifiedGraphAdmission(new(context, rows, batched));
+        UnifiedGraphMemoryDiagnosticContext?.Invoke(context, rows, outputRows, submittedTokens, layerMajor);
+        if (!_unifiedDecodeGraphReserveEnabled && !strictLayerMajor && MemoryPolicy?.EnableGlmLayerMajorDeviceBaton != true)
+        {
+            _unifiedGraphAdmission(new(context, rows, batched, outputRows));
+            return;
+        }
+        bool single = _unifiedDecodeGraphReserveEnabled && GlmUnifiedDecodeGraphPlan.SingleAcquire(submittedTokens, _nativeUbatch,
+            _exec is NativeGlmExecutor, _nativeTp, layerMajor,
+            _unifiedHasQueuedVisionOverrides || VisionEncoder != null, ObserveNativeGraphTracing());
+        _unifiedGraphAdmission(new(context, rows, batched, outputRows, submittedTokens, single, strictLayerMajor,
+            MemoryPolicy?.EnableGlmLayerMajorDeviceBaton == true && layerMajor));
     }
     internal bool CanReuseUnifiedSlot(string requestId, bool includeIdlePrimary = true)
     {
@@ -298,7 +433,7 @@ public partial class GlmDsaModel
     internal void TrimUnifiedGraphs(bool onlyPrefill = false)
     {
         lock (_nativeSync)
-            if (_exec is NativeGlmExecutor native && !native.ConfigureGraphCache(UnifiedGraphCacheCapacity, onlyPrefill ? 2 : 1))
+            if (_exec is NativeGlmExecutor native && !native.ConfigureGraphCache(_unifiedGraphCacheCapacity, onlyPrefill ? 2 : 1))
                 throw new InvalidOperationException("Native GLM idle graph reclamation was refused.");
     }
     internal void TrimUnifiedRetainedSlots(bool terminalOnly = false)
@@ -336,4 +471,5 @@ public partial class GlmDsaModel
     }
 }
 
-internal readonly record struct GlmUnifiedGraphShape(int ContextTokens, int Rows, bool Batched);
+internal readonly record struct GlmUnifiedGraphShape(int ContextTokens, int Rows, bool Batched, int OutputRows = 0,
+    int SubmittedTokens = 0, bool SingleNativeGraph = false, bool StrictLayerMajor = false, bool LayerMajor = false);

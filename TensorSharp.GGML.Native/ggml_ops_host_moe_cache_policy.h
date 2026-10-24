@@ -29,6 +29,16 @@ namespace tsg
             && rows > kHostMoeCacheMaxDecodeRows && rows <= kHostMoeCacheMaxGlmPrefillRows;
     }
 
+    // A wide request is a scan even when execution splits it into scalar or
+    // compact groups. Classify the original request so those groups cannot
+    // fill the demand cache and evict reusable decode payloads.
+    inline bool host_moe_cache_ram_demand_admission(int request_rows,
+        bool independent_decode_rows) noexcept
+    {
+        return request_rows > 0 && (request_rows <= kHostMoeCacheMaxDecodeRows
+            || independent_decode_rows);
+    }
+
     inline bool host_moe_cache_routes_fit(int rows, int selected, bool explicit_glm = false)
     {
         return rows > 0 && selected > 0

@@ -74,7 +74,7 @@ namespace TensorSharp.Runtime.Scheduling
             ArgumentNullException.ThrowIfNull(cfg);
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
             if (cfg.MemoryAdmission?.EnterSerialExecution != null
-                && (cfg.Speculation.Enabled || (cfg.MemoryAdmission.UsePerSequenceHolders
+                && ((cfg.Speculation.Enabled && !cfg.MemoryAdmission.AllowSpeculativeSerialExecution) || (cfg.MemoryAdmission.UsePerSequenceHolders
                     ? model is not IBatchedPagedModel { SupportsPerSequenceFusedForward: true }
                     : cfg.EnablePrefixCaching || !cfg.ResolveExecutionOptions().BatchedPathDisabled)))
                 throw new NotSupportedException("The serial request allocation adapter requires explicit per-sequence execution with prefix caching and speculation disabled.");
@@ -420,6 +420,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public void UpdateSpeculation(SpeculationOptions options)
         {
+            if (_scheduler.Config.MemoryAdmission?.AllowSpeculativeSerialExecution == true)
+                throw new NotSupportedException("The admitted speculative adapter has a fixed execution policy; create a new session to change speculation.");
             if (options?.Enabled == true && _scheduler.Config.MemoryAdmission?.EnterSerialExecution != null)
                 throw new NotSupportedException("The admitted serial memory adapter does not support speculative execution.");
             _commands.Writer.TryWrite(new EngineCommand
@@ -955,6 +957,11 @@ namespace TensorSharp.Runtime.Scheduling
 
             try
             {
+                // The linear speculative execution owns prompt hidden rows and
+                // draft/verify arrays under this request's peak reservation.
+                // Retire it before returning that credit. A failed disposal
+                // remains reachable and keeps the envelope for release retry.
+                _executor.ReleaseLinearSpeculativeContext(requestId);
                 batched?.OnSequenceReleased(requestId);
                 _executor.RadixCache?.Drain();
                 _scheduler.NotifyMemoryReleased(requestId);

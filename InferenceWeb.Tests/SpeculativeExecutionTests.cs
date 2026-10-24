@@ -22,7 +22,7 @@ using TensorSharp.Runtime.Speculative;
 
 namespace InferenceWeb.Tests;
 
-public class SpeculativeExecutionTests
+public partial class SpeculativeExecutionTests
 {
     private const int VocabSize = 64;
     private const int HiddenSize = 4;

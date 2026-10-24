@@ -3902,6 +3902,30 @@ TSG_TEST_EXPORT void TSGgml_TestGraphBudgetFree(void* buffer)
 {
     tsg::graph_budget_free_buffer(static_cast<ggml_backend_buffer_t>(buffer));
 }
+namespace {
+    std::mutex g_test_checked_ticket_mutex;
+    std::shared_ptr<tsg::SharedCacheCharge> g_test_checked_ticket;
+}
+// A single bounded ticket exercises the actual managed callback ABI. It owns
+// no model, device buffer or backend and does not prove physical allocation.
+TSG_TEST_EXPORT int TSGgml_TestCheckedCacheTicketReserve(int rank, int kind, int64_t bytes, int commit)
+{
+    std::lock_guard<std::mutex> lock(g_test_checked_ticket_mutex);
+    if (g_test_checked_ticket || bytes <= 0 || (commit != 0 && commit != 1)
+        || !tsg::SharedCacheCharge::checked_release_attached()) return 0;
+    auto ticket = tsg::SharedCacheCharge::reserve(rank, kind, static_cast<std::size_t>(bytes));
+    if (!ticket) return 0;
+    g_test_checked_ticket = std::move(ticket); // Keep even a failed commit until checked cleanup.
+    return !commit || g_test_checked_ticket->commit(static_cast<std::size_t>(bytes)) ? 1 : 0;
+}
+TSG_TEST_EXPORT int TSGgml_TestCheckedCacheTicketRelease()
+{
+    std::lock_guard<std::mutex> lock(g_test_checked_ticket_mutex);
+    if (!g_test_checked_ticket) return 1;
+    if (!g_test_checked_ticket->release_checked()) return 0;
+    g_test_checked_ticket.reset();
+    return 1;
+}
 #undef TSG_TEST_EXPORT
 #endif
 
@@ -3938,6 +3962,19 @@ TSG_EXPORT int TSGgml_AttachSharedCacheBudgetWithHost(void* context,
 {
     return tsg::SharedCacheCharge::attach(context, reserve, commit, release,
         include_graph_buffers != 0, true) ? 1 : 0;
+}
+
+// Checked owners need an explicit acknowledgment after physical cleanup. Older
+// void-release callbacks remain available for the existing allocation paths.
+TSG_EXPORT int TSGgml_AttachSharedCacheBudgetWithCheckedRelease(void* context,
+    tsg::SharedCacheCharge::Reserve reserve, tsg::SharedCacheCharge::Commit commit,
+    tsg::SharedCacheCharge::Release release, tsg::SharedCacheCharge::ReleaseChecked release_checked,
+    int include_graph_buffers, int include_host_buffers)
+{
+    if (!release_checked || (include_graph_buffers != 0 && include_graph_buffers != 1)
+        || (include_host_buffers != 0 && include_host_buffers != 1)) return 0;
+    return tsg::SharedCacheCharge::attach(context, reserve, commit, release,
+        include_graph_buffers != 0, include_host_buffers != 0, release_checked) ? 1 : 0;
 }
 
 // Cache payload accounting only: graph arenas, KV slots, backend pools and driver

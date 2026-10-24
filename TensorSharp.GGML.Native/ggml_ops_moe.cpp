@@ -34,6 +34,8 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_moe_prefetch.h"
 #include "ggml_ops_file_source.h"
+#include "ggml_ops_file_source_view_prefetch.h"
+#include "ggml_ops_file_read_workers.h"
 #include "ggml_ops_host_moe_file_batch.h"
 #include "dsv41_engram_io.h"
 
@@ -781,10 +783,39 @@ namespace
     // offloaded experts, 30 s of a 1818-token prefill whose GPU work took 1 s.
     // Faulted in concurrently first, the copy reads from the page cache. Nothing
     // is pinned or copied here; the pages stay evictable.
+    const HostMoeFileReadWorkerPlan& mapped_read_worker_plan()
+    {
+        static const auto plan = plan_host_moe_file_read_workers(
+            std::getenv("TS_HOST_MOE_FILE_READ_WORKERS"), available_cpu_parallelism());
+        return plan;
+    }
+
     tsg_dsv41::engram_io_pool& mapped_read_pool()
     {
-        static tsg_dsv41::engram_io_pool pool(std::min(16, available_cpu_parallelism()));
+        static tsg_dsv41::engram_io_pool pool(mapped_read_worker_plan().pool_slots);
         return pool;
+    }
+
+    void record_file_read_activity(const HostMoeFileReadWorkerPlan& plan,
+        const std::vector<ExpertReadTask>& tasks, bool success) noexcept
+    {
+        auto* activity = g_host_moe_file_read_activity;
+        if (!activity || tasks.empty()) return;
+        std::uint64_t source_bytes = 0;
+        if (success) for (const auto& task : tasks) {
+            if (task.source_read_bytes > (std::numeric_limits<std::uint64_t>::max)() - source_bytes) {
+                activity->valid = false; return;
+            }
+            source_bytes += task.source_read_bytes;
+            activity->add_view(task.file_view_activity.view_calls, task.file_view_activity.view_bytes,
+                task.file_view_activity.view_fallbacks, task.file_view_activity.buffered_bytes);
+        }
+        activity->add(plan, tasks.size(), source_bytes, success);
+        if (success) for (const auto& task : tasks) if (task.source_read_bytes) {
+            if (!task.source) { activity->valid = false; return; }
+            activity->observe_source_hint(task.source->random_access_hint(task.direct_bytes && task.direct_completed),
+                task.source_read_bytes);
+        }
     }
 
     void prefetch_mapped_buffers_impl(
@@ -2318,13 +2349,79 @@ namespace tsg
     void read_expert_files(std::vector<ExpertReadTask>& tasks,
         const std::function<void(std::size_t)>& consume)
     {
-        mapped_read_pool().run_pipelined(tasks.size(), [&](std::size_t i) {
+        const auto& plan = mapped_read_worker_plan();
+        const int prefetch = ExpertFileSourceViewPrefetch::option();
+        if (prefetch < 0) throw std::invalid_argument("TS_HOST_MOE_FILE_SOURCE_VIEW_PREFETCH must be unset,0 or1");
+        ExpertFileSourceViewPrefetchActivity prefetched;
+        std::mutex prefetch_mutex;
+        try {
+            mapped_read_pool().run_pipelined(tasks.size(), [&](std::size_t i) {
 #if defined(TSG_GGML_TEST_HOOKS)
-            if (g_moe_file_read_failure.exchange(0))
-                throw std::runtime_error("Injected expert file read failure");
+                if (g_moe_file_read_failure.exchange(0))
+                    throw std::runtime_error("Injected expert file read failure");
 #endif
-            tasks[i].prepare();
-        }, consume);
+                if (prefetch == 1) {
+                    ExpertFileSourceViewPrefetchActivity one;
+                    ExpertFileSourceViewPrefetch::prepare(&tasks[i], 1, one);
+                    // No OS call, source copy or consumer holds this lock.
+                    std::lock_guard<std::mutex> lock(prefetch_mutex);
+                    prefetched.add(one);
+                }
+                tasks[i].prepare();
+            }, consume);
+        } catch (...) { record_file_read_activity(plan, tasks, false); throw; }
+        record_file_read_activity(plan, tasks, true);
+        if (prefetch == 1 && g_host_moe_file_read_activity)
+            g_host_moe_file_read_activity->add_prefetch(prefetched.calls, prefetched.ranges,
+                prefetched.bytes, prefetched.failures);
+    }
+
+    void read_expert_file_windows(std::vector<ExpertReadTask>& tasks,
+        const std::vector<std::size_t>& counts,
+        const std::function<void(std::size_t)>& before_slot,
+        const std::function<void(std::size_t)>& consume_window)
+    {
+        std::vector<std::size_t> starts;
+        starts.reserve(counts.size());
+        std::size_t total = 0;
+        for (const auto count : counts) {
+            if (!count || total > tasks.size() || count > tasks.size() - total)
+                throw std::invalid_argument("Expert read window exceeds its task extent");
+            starts.push_back(total); total += count;
+        }
+        if (total != tasks.size()) throw std::invalid_argument("Expert read window leaves tasks uncovered");
+        const auto& plan = mapped_read_worker_plan();
+        const int prefetch = ExpertFileSourceViewPrefetch::option();
+        if (prefetch < 0) throw std::invalid_argument("TS_HOST_MOE_FILE_SOURCE_VIEW_PREFETCH must be unset,0 or1");
+        ExpertFileSourceViewPrefetchActivity prefetched_total;
+        std::mutex prefetch_mutex;
+        try {
+            run_bounded_parallel_read_pipeline(mapped_read_pool(), counts, 2,
+            [&](std::size_t window, std::size_t slot) {
+                before_slot(slot); // Existing H2D fence before any new source preparation.
+                (void)window;
+            },
+            [&](std::size_t window, std::size_t job, std::size_t) {
+#if defined(TSG_GGML_TEST_HOOKS)
+                if (g_moe_file_read_failure.exchange(0))
+                    throw std::runtime_error("Injected expert file read failure");
+#endif
+                auto& task = tasks[starts[window] + job];
+                if (prefetch == 1) {
+                    ExpertFileSourceViewPrefetchActivity one;
+                    ExpertFileSourceViewPrefetch::prepare(&task, 1, one);
+                    std::lock_guard<std::mutex> lock(prefetch_mutex);
+                    prefetched_total.add(one);
+                }
+                task.prepare();
+            }, [&](std::size_t window, std::size_t) {
+                consume_window(window);
+            });
+        } catch (...) { record_file_read_activity(plan, tasks, false); throw; }
+        record_file_read_activity(plan, tasks, true);
+        if (prefetch == 1 && g_host_moe_file_read_activity)
+            g_host_moe_file_read_activity->add_prefetch(prefetched_total.calls, prefetched_total.ranges,
+                prefetched_total.bytes, prefetched_total.failures);
     }
 
     void prefetch_mapped_ranges(const std::uint8_t* base,
@@ -2349,7 +2446,9 @@ namespace tsg
         if (!source) throw std::invalid_argument("Missing mapped upload source");
         constexpr std::size_t chunk = std::size_t(4) << 20;
         auto& pool = mapped_read_pool();
-        const std::size_t window = chunk * pool.threads();
+        // Preserve the original chunk/window geometry when only the optional
+        // number of concurrent preparations changes.
+        const std::size_t window = chunk * mapped_read_worker_plan().default_pool_slots;
         if (vram_log_enabled())
             std::fprintf(stderr, "[cache-upload] rank=%d bytes=%zu read_threads=%u window_bytes=%zu\n",
                 g_active_rank, bytes, pool.threads(), window);

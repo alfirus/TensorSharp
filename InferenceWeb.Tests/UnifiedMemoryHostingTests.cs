@@ -218,6 +218,38 @@ public sealed class UnifiedMemoryHostingTests : IDisposable
     }
 
     [Fact]
+    public void QualifiedSessionOwnsTheInitialSpeculationPolicyAndRejectsLaterDisableBeforeRememberingIt()
+    {
+        var budget = new MemoryBudget([new("ram", 1024)]);
+        var admitted = new SchedulerConfig
+        {
+            NumBlocks = 3, BlockSize = 16, MaxNumRunningSequences = 1, EnablePrefixCaching = false,
+            Speculation = new() { Enabled = true, SpeculatorName = SpeculatorRegistry.DraftHead, MaxDraftTokens = 2 },
+            ExecutionOptionsOverride = new() { BatchedPathDisabled = true, PerSeqFusedEnabled = false, BatchedFusedDecodeEnabled = false },
+            MemoryAdmission = new(budget, _ => []) { AllowSpeculativeSerialExecution = true,
+                BeforeAdmission = _ => [], EnterSerialExecution = _ => new EmptyScope() }
+        };
+        using var lifecycle = new ModelLifecycleService(NullLogger.Instance,
+            (_, _, _, _) => throw new InvalidOperationException(), (path, _, _) =>
+            {
+                var model = new FakeModel(path);
+                return new(model, _ => admitted, () => "fixture admitted policy", model.Dispose);
+            });
+        using var host = new InferenceEngineHost(lifecycle, NullLogger.Instance);
+        // Remembered before unified mode becomes active; the session must
+        // validate it rather than update an already-built immutable engine.
+        Assert.False(host.UpdateSpeculation(admitted.Speculation));
+        lifecycle.UnifiedMemoryEnabled = true;
+        lifecycle.LoadModel(ModelFile("qualified-spec.gguf"), null, "ggml_cuda");
+        Assert.NotNull(host.TryGetEngine());
+        Assert.Throws<NotSupportedException>(() => host.UpdateSpeculation(SpeculationOptions.Disabled));
+        Assert.Same(admitted.Speculation, host.PendingSpeculation);
+        host.Reset();
+    }
+
+    private sealed class EmptyScope : IDisposable { public void Dispose() { } }
+
+    [Fact]
     public void UnifiedModeRefusesAnUnscheduledModelInsteadOfFallingBack()
     {
         using var lifecycle = new ModelLifecycleService(NullLogger.Instance,

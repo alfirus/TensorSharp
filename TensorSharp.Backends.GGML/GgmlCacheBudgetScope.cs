@@ -44,9 +44,12 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private delegate int CommitCallback(IntPtr context, ulong token);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void ReleaseCallback(IntPtr context, ulong token);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int CheckedReleaseCallback(IntPtr context, ulong token);
     private static readonly ReserveCallback ReserveRoot = ReserveNative;
     private static readonly CommitCallback CommitRoot = CommitNative;
     private static readonly ReleaseCallback ReleaseRoot = ReleaseNative;
+    private static readonly CheckedReleaseCallback CheckedReleaseRoot = ReleaseNativeChecked;
     private readonly object _gate = new();
     private readonly object _lifecycleGate = new();
     private readonly MemoryBudget _budget;
@@ -58,6 +61,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         public readonly int Rank = rank, Kind = kind;
         public readonly long Bytes = bytes;
         public bool Committed;
+        public long GraphDiagnosticOriginCall;
     }
     private readonly Dictionary<ulong, Allocation> _allocations = new();
     private GCHandle _handle;
@@ -68,11 +72,78 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private BudgetReservation? _executionEnvelope;
     private AllocationOwner? _allocationOwner;
     private BudgetReservation? _sharedExpertEnvelope;
+    private BudgetReservation? _sharedHostExpertEnvelope;
     private BudgetReservation? _sharedJointEnvelope;
+    private BudgetReservation? _sharedSpeculativeEnvelope;
     private long _allocationRefusalCount;
     private GgmlAllocationRefusal? _firstAllocationRefusal, _lastAllocationRefusal;
+    private const string NoGraphDiagnosticContext = "call=0 context_tokens=0 admitted_rows=0 output_rows=0 submitted_tokens=0 layer_major=0";
+    private string _graphDiagnosticContext = NoGraphDiagnosticContext;
+    private long _graphDiagnosticCall;
+    private long _graphDiagnosticNextCall;
+    private Dictionary<int, long>? _graphDiagnosticPeaks;
+    /// <summary>Optional kind-5 payload-charge diagnostics. The writer runs under
+    /// the accounting gate and must not call native APIs. Writer failures are
+    /// ignored and never turn a successful allocation into a refusal.</summary>
+    public Action<string>? GraphMemoryDiagnosticWriter { get; set; }
     internal Action? BeforeExecutionOwnerAllocation { get; set; }
     internal Action? BeforeAllocationOwnerAllocation { get; set; }
+
+    /// <summary>Label the next synchronous managed forward, including its native
+    /// worker callbacks. Rows is its admitted maximum, not an observed inner
+    /// layer/chunk width. This changes no reservation or execution geometry.</summary>
+    public void SetGraphMemoryDiagnosticContext(int contextTokens, int rows, int outputRows,
+        int submittedTokens, bool layerMajor)
+    {
+        if (GraphMemoryDiagnosticWriter == null) return;
+        lock (_gate)
+        {
+            try
+            {
+                _graphDiagnosticCall = ++_graphDiagnosticNextCall;
+                _graphDiagnosticContext = FormattableString.Invariant($"call={_graphDiagnosticCall} context_tokens={contextTokens} admitted_rows={rows} output_rows={outputRows} submitted_tokens={submittedTokens} layer_major={(layerMajor ? 1 : 0)}");
+                WriteGraphMemoryDiagnostic("call-begin", 0, 0, 0, _graphDiagnosticCall);
+            }
+            catch { } // Diagnostics must not change model/accounting behavior.
+        }
+    }
+
+    /// <summary>End diagnostic attribution when the synchronous execution scope
+    /// leaves; later cache teardown is labelled call=0.</summary>
+    public void ClearGraphMemoryDiagnosticContext()
+    {
+        if (GraphMemoryDiagnosticWriter == null) return;
+        lock (_gate)
+        {
+            WriteGraphMemoryDiagnostic("call-end", 0, 0, 0, _graphDiagnosticCall);
+            _graphDiagnosticContext = NoGraphDiagnosticContext;
+            _graphDiagnosticCall = 0;
+        }
+    }
+
+    private void WriteGraphMemoryDiagnostic(string action, ulong token, int rank, long bytes, long originCall)
+    {
+        var writer = GraphMemoryDiagnosticWriter;
+        if (writer == null) return;
+        try
+        {
+            long pending = 0, committed = 0;
+            int allocations = 0;
+            foreach (var allocation in _allocations.Values)
+            {
+                if (allocation.Kind != 5 || allocation.Rank != rank) continue;
+                ++allocations;
+                if (allocation.Committed) committed = checked(committed + allocation.Bytes);
+                else pending = checked(pending + allocation.Bytes);
+            }
+            long owned = checked(pending + committed);
+            var peaks = _graphDiagnosticPeaks ??= new();
+            peaks.TryGetValue(rank, out long peak);
+            peaks[rank] = peak = Math.Max(peak, owned);
+            writer(FormattableString.Invariant($"[GLM-GRAPH-MEMORY] event={action} {_graphDiagnosticContext ?? NoGraphDiagnosticContext} origin_call={originCall} rank={rank} kind=5 token={token} bytes={bytes} allocations={allocations} pending_bytes={pending} committed_bytes={committed} owned_bytes={owned} peak_owned_bytes={peak} scope=instrumented_payload_charges_pending_is_not_physical_excludes_driver_pools"));
+        }
+        catch { } // Never let telemetry change callback success or ownership.
+    }
 
     /// <summary>Bounded failure telemetry: no growing event log or successful-allocation sampling.</summary>
     public (long Count, GgmlAllocationRefusal? First, GgmlAllocationRefusal? Last) AllocationRefusals
@@ -91,11 +162,19 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     /// not mmap residency or all host allocations.</summary>
     public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools,
         bool includeGraphBuffers, IEnumerable<string>? hostPools)
+        : this(budget, rankPools, includeGraphBuffers, hostPools, requireCheckedRelease: false) { }
+
+    /// <summary>Require a native checked-release bridge for owners that retain
+    /// their exact ticket after cleanup acknowledgment fails. Create durable
+    /// owners under EnterAllocationOwner with a session-lifetime reservation.</summary>
+    public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools,
+        bool includeGraphBuffers, IEnumerable<string>? hostPools, bool requireCheckedRelease)
     {
         ArgumentNullException.ThrowIfNull(budget);
         ArgumentNullException.ThrowIfNull(rankPools);
         _budget = budget;
         IncludesGraphBuffers = includeGraphBuffers;
+        IncludesCheckedRelease = requireCheckedRelease;
         _hostPools = hostPools?.ToArray() ?? [];
         if (hostPools != null && (_hostPools.Length == 0 || _hostPools.Distinct(StringComparer.Ordinal).Count() != _hostPools.Length))
             throw new ArgumentException("Map host staging to one or more distinct pools, or use null to exclude it.", nameof(hostPools));
@@ -114,7 +193,10 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             IntPtr reserve = Marshal.GetFunctionPointerForDelegate(ReserveRoot);
             IntPtr commit = Marshal.GetFunctionPointerForDelegate(CommitRoot);
             IntPtr release = Marshal.GetFunctionPointerForDelegate(ReleaseRoot);
-            int attached = IncludesHostBuffers
+            int attached = requireCheckedRelease
+                ? GgmlNative.AttachSharedCacheBudgetWithCheckedRelease(context, reserve, commit, release,
+                    Marshal.GetFunctionPointerForDelegate(CheckedReleaseRoot), includeGraphBuffers ? 1 : 0, IncludesHostBuffers ? 1 : 0)
+                : IncludesHostBuffers
                 ? GgmlNative.AttachSharedCacheBudgetWithHost(context, reserve, commit, release, includeGraphBuffers ? 1 : 0)
                 : includeGraphBuffers
                 ? GgmlNative.AttachSharedCacheBudgetEx(context, reserve, commit, release, 1)
@@ -125,6 +207,9 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         catch (Exception error)
         {
             _handle.Free();
+            if (requireCheckedRelease && error is EntryPointNotFoundException)
+                throw new NotSupportedException(
+                    "Checked cache ownership requires TSGgml_AttachSharedCacheBudgetWithCheckedRelease. Update the native library with the managed assemblies.", error);
             if (IncludesHostBuffers && error is EntryPointNotFoundException)
                 throw new NotSupportedException(
                     "Expert host-buffer budgeting requires a native library with TSGgml_AttachSharedCacheBudgetWithHost. Update the native library together with the managed assemblies.", error);
@@ -137,7 +222,9 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     public Exception? CallbackError { get { lock (_gate) return _callbackError; } }
     public int ActiveAllocations { get { lock (_gate) return _allocations.Count; } }
     /// <summary>Kind 0: lazy device copies; 1: preloaded weights; 2: graph/context
-    /// buffers; 3: native host staging; 4: selected-expert cache. Excludes uninstrumented driver/OS memory.</summary>
+    /// buffers; 3: native host staging; 4: selected-expert cache; 5: joint arena;
+    /// 6: retained host expert payload; 7: persistent speculative graphs/state.
+    /// Excludes uninstrumented driver/OS memory.</summary>
     public IReadOnlyList<GgmlAllocationUsage> AllocationUsage
     {
         get
@@ -149,6 +236,9 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         }
     }
     public bool IncludesGraphBuffers { get; }
+    /// <summary>Explicit opt-in to acknowledged native ticket release. Existing
+    /// void-release owners retain their original behavior.</summary>
+    public bool IncludesCheckedRelease { get; }
     public bool IncludesHostBuffers => _hostPools.Length != 0;
 
     /// <summary>Use one session-owned reservation for selected-expert cache
@@ -171,6 +261,25 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         }
     }
 
+    /// <summary>Persistent RAM expert payload has a separate owner from request
+    /// staging. Install/remove only while execution is quiescent and after the
+    /// previous cache's native payload has been released.</summary>
+    public void SetSharedHostExpertEnvelope(BudgetReservation? envelope)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_disposing || _executionEnvelope != null)
+                throw new InvalidOperationException("Shared host expert ownership changes require quiescent execution.");
+            if (ReferenceEquals(envelope, _sharedHostExpertEnvelope)) return;
+            if (_allocations.Values.Any(a => a.Kind == 6))
+                throw new InvalidOperationException("Host expert allocations still own the previous reservation.");
+            if (envelope != null && (!IncludesHostBuffers || !ReferenceEquals(envelope.Budget, _budget)))
+                throw new ArgumentException("Host expert cache needs this budget's host pool mapping.", nameof(envelope));
+            _sharedHostExpertEnvelope = envelope;
+        }
+    }
+
     /// <summary>Separate lifetime for a complete multi-request arena. Kind 5
     /// includes its state replicas as well as graph workspace; no individual
     /// request receives its refund when a participant finishes.</summary>
@@ -187,6 +296,25 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             if (envelope != null && !ReferenceEquals(envelope.Budget, _budget))
                 throw new ArgumentException("Joint arena belongs to a different budget.", nameof(envelope));
             _sharedJointEnvelope = envelope;
+        }
+    }
+
+    /// <summary>Persistent draft graphs and recurrent verification snapshots
+    /// retain this owner across request scopes. No incidental request or root
+    /// fallback is permitted for their dedicated native allocation kind.</summary>
+    public void SetSharedSpeculativeEnvelope(BudgetReservation? envelope)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_disposing || _executionEnvelope != null)
+                throw new InvalidOperationException("Shared speculative ownership changes require quiescent execution.");
+            if (ReferenceEquals(envelope, _sharedSpeculativeEnvelope)) return;
+            if (_allocations.Values.Any(a => a.Kind == 7))
+                throw new InvalidOperationException("Speculative allocations still own their previous reservation.");
+            if (envelope != null && (!IncludesGraphBuffers || !ReferenceEquals(envelope.Budget, _budget)))
+                throw new ArgumentException("Speculative state needs this budget's graph allocation mapping.", nameof(envelope));
+            _sharedSpeculativeEnvelope = envelope;
         }
     }
 
@@ -307,14 +435,20 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             {
                 if (bytes <= 0) return 0;
                 string[] pools;
-                if (kind == 3 && owner.IncludesHostBuffers)
+                if ((kind == 3 || kind == 6) && owner.IncludesHostBuffers)
                     pools = owner._hostPools;
                 else if ((uint)rank < (uint)owner._rankPools.Length
-                    && (kind == 0 || kind == 1 || kind == 4 || ((kind == 2 || kind == 5) && owner.IncludesGraphBuffers)))
+                    && (kind == 0 || kind == 1 || kind == 4 || ((kind == 2 || kind == 5 || kind == 7) && owner.IncludesGraphBuffers)))
                     pools = owner._rankPools[rank];
                 else return 0;
                 var charges = pools.Select(pool => new MemoryCharge(pool, bytes));
-                var allocationEnvelope = kind == 4 && owner._sharedExpertEnvelope != null
+                // A persistent RAM cache never borrows an incidental request
+                // envelope or root credit without its explicitly admitted owner.
+                if (kind == 6 && owner._sharedHostExpertEnvelope == null) return 0;
+                if (kind == 7 && owner._sharedSpeculativeEnvelope == null) return 0;
+                var allocationEnvelope = kind == 6 ? owner._sharedHostExpertEnvelope
+                    : kind == 7 ? owner._sharedSpeculativeEnvelope
+                    : kind == 4 && owner._sharedExpertEnvelope != null
                     ? owner._sharedExpertEnvelope : kind == 5 && owner._sharedJointEnvelope != null
                     ? owner._sharedJointEnvelope : owner._executionEnvelope;
                 reservation = allocationEnvelope == null ? owner._budget.TryReserve(charges)
@@ -326,10 +460,15 @@ public sealed class GgmlCacheBudgetScope : IDisposable
                     owner._allocationRefusalCount++;
                     owner._firstAllocationRefusal ??= refusal;
                     owner._lastAllocationRefusal = refusal;
+                    if (kind == 5) owner.WriteGraphMemoryDiagnostic("refused", 0, rank, bytes, owner._graphDiagnosticCall);
                     return 0;
                 }
                 ulong token = checked(++owner._nextToken);
-                owner._allocations.Add(token, new(reservation, rank, kind, bytes));
+                var allocation = new Allocation(reservation, rank, kind, bytes);
+                if (kind == 5 && owner.GraphMemoryDiagnosticWriter != null)
+                    allocation.GraphDiagnosticOriginCall = owner._graphDiagnosticCall;
+                owner._allocations.Add(token, allocation);
+                if (kind == 5) owner.WriteGraphMemoryDiagnostic("reserve", token, rank, bytes, allocation.GraphDiagnosticOriginCall);
                 return token;
             }
             catch (Exception ex)
@@ -350,23 +489,33 @@ public sealed class GgmlCacheBudgetScope : IDisposable
                 var allocation = owner._allocations[token];
                 allocation.Reservation.Commit();
                 allocation.Committed = true;
+                if (allocation.Kind == 5) owner.WriteGraphMemoryDiagnostic("commit", token,
+                    allocation.Rank, allocation.Bytes, allocation.GraphDiagnosticOriginCall);
                 return 1;
             }
             catch (Exception ex) { owner._callbackError ??= ex; return 0; }
         }
     }
-    private static void ReleaseNative(IntPtr context, ulong token)
+    private static void ReleaseNative(IntPtr context, ulong token) => ReleaseNativeChecked(context, token);
+
+    private static int ReleaseNativeChecked(IntPtr context, ulong token)
     {
         var owner = Owner(context);
         lock (owner._gate)
         {
             try
             {
-                if (!owner._allocations.TryGetValue(token, out var reservation)) return;
+                if (!owner._allocations.TryGetValue(token, out var reservation)) return 0;
                 reservation.Reservation.Dispose();
                 owner._allocations.Remove(token);
+                if (reservation.Kind == 5) owner.WriteGraphMemoryDiagnostic("release", token,
+                    reservation.Rank, reservation.Bytes, reservation.GraphDiagnosticOriginCall);
+                return 1;
             }
-            catch (Exception ex) { owner._callbackError ??= ex; }
+            // CallbackError blocks new reservations, but cleanup may retry the
+            // same retained token. Dispose is idempotent if its ledger release
+            // completed before a later notification failed.
+            catch (Exception ex) { owner._callbackError ??= ex; return 0; }
         }
     }
 }

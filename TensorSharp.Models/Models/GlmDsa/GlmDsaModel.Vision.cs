@@ -109,6 +109,7 @@ namespace TensorSharp.Models
                 {
                     if (!_exec.QueueVisionRows(data, rows, startPosition))
                         throw new InvalidOperationException("GLM native executor refused the prepared vision rows.");
+                    _unifiedHasQueuedVisionOverrides = true;
                 }
             }
             finally

@@ -2317,7 +2317,7 @@ namespace TensorSharp.Models
         /// same from the outside. The logit vector distinguishes them - a correct
         /// port stays highly correlated even when the argmax moves.
         /// </summary>
-        private float[] DumpLogitsIfRequested(float[] logits)
+        protected float[] DumpLogitsIfRequested(float[] logits, int? count = null)
         {
             // WarmUpKernels runs its own Forward calls (a dummy decode token and a
             // dummy prefill) BEFORE the real prompt. Dumping those compares two
@@ -2331,10 +2331,12 @@ namespace TensorSharp.Models
             string at = Environment.GetEnvironmentVariable("TS_DUMP_LOGITS_AT");
             if (!string.IsNullOrEmpty(at) && (!int.TryParse(at, out int position) || _cacheSeqLen != position))
                 return logits;
+            int length = count ?? logits.Length;
+            if (length < 0 || length > logits.Length) throw new ArgumentOutOfRangeException(nameof(count));
             _logitsDumped = true;
             using (var fs = new System.IO.FileStream(path, System.IO.FileMode.Create, System.IO.FileAccess.Write))
             using (var bw = new System.IO.BinaryWriter(fs))
-                foreach (float v in logits) bw.Write(v);
+                for (int i = 0; i < length; ++i) bw.Write(logits[i]);
             return logits;
         }
 

@@ -9,14 +9,19 @@ namespace tsg {
     // their ORIGINAL buft, context AND iface: CUDA/Metal use free_buffer identity
     // for device-copy dispatch. No backend interface is patched.
     ggml_backend_buffer_t graph_budget_alloc_buffer(ggml_backend_buffer_type_t type, std::size_t bytes, int rank);
-    ggml_backend_buffer_t graph_budget_alloc_ctx_tensors(ggml_context* context, ggml_backend_t backend, int rank);
+    ggml_backend_buffer_t graph_budget_alloc_ctx_tensors(ggml_context* context, ggml_backend_t backend, int rank, int kind = 2);
+    // Snapshot mirrors must use their original buffer type, which need not be
+    // the backend's default. Kind 7 requires an admitted speculation envelope.
+    ggml_backend_buffer_t graph_budget_alloc_ctx_tensors_from_buft(ggml_context* context,
+        ggml_backend_buffer_type_t type, int rank, int kind = 2);
     void graph_budget_free_buffer(ggml_backend_buffer_t buffer);
 
     // Single-buffer-type gallocr only. Use the matching allocate/free entry points;
     // calling upstream reserve/reserve_size/free directly bypasses ownership.
     // The owner serializes allocator mutation, not concurrent graph execution.
     // Kind 5 is reserved for the Qwen4Exp joint-sequence arena; ordinary graphs
-    // and per-sequence persistent state keep kind 2.
+    // and per-sequence persistent state keep kind 2. Kind 7 is separately
+    // admitted speculation state and cannot allocate without shared accounting.
     ggml_gallocr_t graph_budget_gallocr_new(ggml_backend_buffer_type_t type, int rank, bool require_accounted = false, int kind = 2);
     bool graph_budget_gallocr_alloc_graph(ggml_gallocr_t allocator, ggml_cgraph* graph);
     void graph_budget_gallocr_free(ggml_gallocr_t allocator);

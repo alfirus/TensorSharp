@@ -20,6 +20,18 @@ struct HostMoeCacheTiming {
     std::array<std::uint64_t, stages> nanoseconds{}, calls{};
     std::array<unsigned, stages> depth{};
     std::uint64_t file_bytes = 0, file_windows = 0, graph_submissions = 0;
+    std::uint64_t ring_calls = 0, ring_expanded_calls = 0;
+    std::uint64_t ring_arena_peak_bytes = 0, ring_slot_peak_bytes = 0;
+    std::uint64_t ring_coalesced_calls = 0, ring_read_tasks_before = 0, ring_read_tasks_after = 0;
+    std::uint64_t ring_coalesced_payload_bytes = 0, ring_coalesced_bytes = 0, ring_coalesced_read_cap_bytes = 0;
+    // Requested is the process option; remaining fields certify completed
+    // source-copy/upload invocations, not physical read issue order or SSD I/O.
+    std::uint64_t file_sort_requested = 0, file_sort_calls = 0, file_sort_changed_calls = 0;
+    std::uint64_t file_sort_misses = 0, file_sort_bytes = 0;
+    std::uint64_t file_sort_inversions_before = 0, file_sort_inversions_after = 0;
+    std::uint64_t file_view_requested = 0, file_prefetch_requested = 0;
+    std::uint64_t vmm_profile = 0, vmm_capacity = 0, vmm_physical_bytes = 0;
+    std::uint64_t vmm_pending_bytes = 0, vmm_quarantine_bytes = 0, vmm_certificate = 0;
 
     static bool enabled(const char* value) noexcept {
         return value && std::strcmp(value, "1") == 0;

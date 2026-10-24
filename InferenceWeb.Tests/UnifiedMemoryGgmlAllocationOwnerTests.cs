@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 using TensorSharp.Memory;
+using TensorSharp.Models;
 
 namespace InferenceWeb.Tests;
 
@@ -16,25 +17,29 @@ public sealed class UnifiedMemoryGgmlAllocationOwnerTests
         private delegate ulong Reserve(IntPtr context, int rank, int kind, long bytes);
         private delegate int Commit(IntPtr context, ulong token);
         private delegate void Release(IntPtr context, ulong token);
+        private delegate int ReleaseChecked(IntPtr context, ulong token);
         private readonly Reserve _reserve;
         private readonly Commit _commit;
         private readonly Release _release;
+        private readonly ReleaseChecked _releaseChecked;
         private readonly GCHandle _handle;
         internal GgmlCacheBudgetScope Scope { get; }
+        internal Exception? ExpectedCallbackError { get; set; }
         private static FieldInfo Field(string name) => typeof(GgmlCacheBudgetScope).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!;
         private static void Set(GgmlCacheBudgetScope scope, string name, object value) => Field(name).SetValue(scope, value);
         private static T Method<T>(string name) where T : Delegate =>
             typeof(GgmlCacheBudgetScope).GetMethod(name, BindingFlags.Static | BindingFlags.NonPublic)!.CreateDelegate<T>();
 
-        internal Callbacks(MemoryBudget budget)
+        internal Callbacks(MemoryBudget budget, bool host = false)
         {
             Scope = (GgmlCacheBudgetScope)RuntimeHelpers.GetUninitializedObject(typeof(GgmlCacheBudgetScope));
             Set(Scope, "_gate", new object()); Set(Scope, "_lifecycleGate", new object());
             Set(Scope, "_budget", budget); Set(Scope, "_rankPools", new[] { new[] { "device" } });
-            Set(Scope, "_hostPools", Array.Empty<string>());
+            Set(Scope, "_hostPools", host ? new[] { "host" } : Array.Empty<string>());
             Set(Scope, "_allocations", Activator.CreateInstance(Field("_allocations").FieldType)!);
             Set(Scope, "<IncludesGraphBuffers>k__BackingField", true);
             _reserve = Method<Reserve>("ReserveNative"); _commit = Method<Commit>("CommitNative"); _release = Method<Release>("ReleaseNative");
+            _releaseChecked = Method<ReleaseChecked>("ReleaseNativeChecked");
             _handle = GCHandle.Alloc(Scope);
         }
         internal ulong Allocate(long bytes, int kind = 2, bool onWorker = false)
@@ -54,11 +59,14 @@ public sealed class UnifiedMemoryGgmlAllocationOwnerTests
             return result;
         }
         internal void Free(ulong token) => _release(GCHandle.ToIntPtr(_handle), token);
+        internal int FreeChecked(ulong token) => _releaseChecked(GCHandle.ToIntPtr(_handle), token);
+        internal ulong TryReserve(long bytes, int kind) => _reserve(GCHandle.ToIntPtr(_handle), 0, kind, bytes);
         public void Dispose()
         {
             try
             {
-                Assert.Equal(0, Scope.ActiveAllocations); Assert.Null(Scope.CallbackError);
+                Assert.Equal(0, Scope.ActiveAllocations);
+                Assert.Same(ExpectedCallbackError, Scope.CallbackError);
                 Assert.Null(Field("_executionEnvelope").GetValue(Scope));
                 Assert.Null(Field("_allocationOwner").GetValue(Scope));
             }
@@ -67,6 +75,176 @@ public sealed class UnifiedMemoryGgmlAllocationOwnerTests
     }
     private static BudgetReservation Owner(MemoryBudget budget, long bytes = 100) => budget.Reserve([new("device", bytes)]);
     private static long Children(BudgetReservation owner) => Assert.Single(owner.LiveChildCharges).Bytes;
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CheckedReleaseAcknowledgesPendingAndCommittedExactTokens(bool committed)
+    {
+        var budget = new MemoryBudget([new("device", 200), new("host", 200)]);
+        using var callbacks = new Callbacks(budget, host: true);
+        using var persistent = budget.Reserve([new("host", 100)]);
+        ulong token;
+        using (callbacks.Scope.EnterAllocationOwner(persistent))
+            token = committed ? callbacks.Allocate(48, kind: 3, onWorker: true) : callbacks.TryReserve(48, 3);
+        Assert.NotEqual(0UL, token);
+        Assert.Equal(48, Children(persistent));
+        Assert.Equal(0, callbacks.FreeChecked(token + 100));
+        Assert.Equal(1, callbacks.Scope.ActiveAllocations);
+        Assert.Equal(1, callbacks.FreeChecked(token));
+        Assert.Equal(0, Children(persistent));
+        Assert.Equal(0, callbacks.Scope.ActiveAllocations);
+        Assert.Equal(0, callbacks.FreeChecked(token));
+    }
+
+    [Fact]
+    public void CheckedReleaseCanRetrySameTokenAfterLedgerReleaseButNotificationFailure()
+    {
+        var budget = new MemoryBudget([new("device", 200), new("host", 200)]);
+        using var callbacks = new Callbacks(budget, host: true);
+        using var persistent = budget.Reserve([new("host", 100)]);
+        ulong token;
+        using (callbacks.Scope.EnterAllocationOwner(persistent)) token = callbacks.Allocate(48, kind: 3);
+        persistent.Dispose(); // A live child remains charged after its owner closes.
+        Assert.Equal(48, budget.Snapshot().Single(pool => pool.Pool == "host").Committed);
+        _ = budget.ChangeSignal;
+        var failure = new OutOfMemoryException("checked release notification failure after refund");
+        budget.BeforeChangeNotification = () => throw failure;
+        callbacks.ExpectedCallbackError = failure;
+        Assert.Equal(0, callbacks.FreeChecked(token));
+        Assert.Same(failure, callbacks.Scope.CallbackError);
+        Assert.Equal(1, callbacks.Scope.ActiveAllocations); // Keep original token until acknowledged.
+        Assert.Equal(0, budget.Snapshot().Single(pool => pool.Pool == "host").Committed);
+        Assert.Equal(0UL, callbacks.TryReserve(1, 3)); // Sticky health failure blocks new work.
+        budget.BeforeChangeNotification = null;
+        Assert.Equal(1, callbacks.FreeChecked(token)); // Idempotent reservation disposal, then token removal.
+        Assert.Equal(0, callbacks.Scope.ActiveAllocations);
+        Assert.Equal(0, budget.Snapshot().Single(pool => pool.Pool == "host").Committed);
+        Assert.Same(failure, callbacks.Scope.CallbackError);
+        Assert.Equal(0, callbacks.FreeChecked(token));
+    }
+
+    private sealed class CountingDisposal(IDisposable? inner = null, bool failAfterDispose = false) : IDisposable
+    {
+        internal int Count { get; private set; }
+        public void Dispose()
+        {
+            ++Count; inner?.Dispose();
+            if (failAfterDispose) throw new IOException("batch host scope disposal failure");
+        }
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void BatchExecutionEndsDiagnosticAttributionOnSuccessAndException(bool failBody, bool failHostDispose)
+    {
+        var budget = new MemoryBudget([new("device", 200)]);
+        using var callbacks = new Callbacks(budget);
+        using var request = Owner(budget);
+        var lines = new List<string>();
+        callbacks.Scope.GraphMemoryDiagnosticWriter = lines.Add;
+        var host = new CountingDisposal(failAfterDispose: failHostDispose);
+        var native = new CountingDisposal(callbacks.Scope.EnterExecution(request));
+        var scopeType = typeof(GlmUnifiedMemoryModelSession).GetNestedType("OwnedExecution", BindingFlags.NonPublic)!;
+        var batch = (IDisposable)Activator.CreateInstance(scopeType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null,
+            [host, native, callbacks.Scope], null)!;
+        ulong retained = 0;
+        void Execute()
+        {
+            using (batch)
+            {
+                callbacks.Scope.SetGraphMemoryDiagnosticContext(33, 2, 0, 0, false);
+                retained = callbacks.Allocate(20, kind: 5, onWorker: true);
+                if (failBody) throw new IOException("batch body failure");
+            }
+        }
+        if (failBody || failHostDispose) Assert.Throws<IOException>(Execute);
+        else Execute();
+        Assert.Equal(1, host.Count);
+        Assert.Equal(1, native.Count);
+        Assert.Single(lines, line => line.Contains("event=call-end call=1 "));
+        Assert.Equal(20, Children(request));
+        callbacks.Free(retained);
+        Assert.Contains(lines, line => line.Contains("event=release call=0 ")
+            && line.Contains("origin_call=1 ") && line.Contains("owned_bytes=0 "));
+        Assert.Equal(0, Children(request));
+    }
+
+    [Fact]
+    public void GraphDiagnosticsDistinguishPendingCommitReleaseAndOriginalCallWithoutChangingOwnership()
+    {
+        var budget = new MemoryBudget([new("device", 200)]);
+        using var callbacks = new Callbacks(budget);
+        using var request = Owner(budget);
+        using var execution = callbacks.Scope.EnterExecution(request);
+        var lines = new List<string>();
+        callbacks.Scope.GraphMemoryDiagnosticWriter = lines.Add;
+        callbacks.Scope.SetGraphMemoryDiagnosticContext(1872, 512, 0, 1872, true);
+        ulong committed = callbacks.Allocate(20, kind: 5, onWorker: true);
+        ulong pending = callbacks.TryReserve(30, kind: 5);
+        Assert.NotEqual(0UL, pending);
+        ulong otherKind = callbacks.Allocate(7, kind: 2);
+        Assert.Equal(57, Children(request));
+        Assert.Contains(lines, line => line.Contains("event=reserve ") && line.Contains("bytes=20 ")
+            && line.Contains("pending_bytes=20 committed_bytes=0 owned_bytes=20"));
+        Assert.Contains(lines, line => line.Contains("event=commit ")
+            && line.Contains("pending_bytes=0 committed_bytes=20 owned_bytes=20"));
+        Assert.Contains(lines, line => line.Contains("event=reserve ")
+            && line.Contains("pending_bytes=30 committed_bytes=20 owned_bytes=50 peak_owned_bytes=50"));
+        Assert.All(lines, line => Assert.Contains("admitted_rows=512 output_rows=0 submitted_tokens=1872 layer_major=1", line));
+        callbacks.Scope.SetGraphMemoryDiagnosticContext(1873, 1, 0, 1, false);
+        callbacks.Free(pending);
+        Assert.Contains(lines, line => line.Contains("event=release call=2 ") && line.Contains("origin_call=1 ")
+            && line.Contains("pending_bytes=0 committed_bytes=20 owned_bytes=20 peak_owned_bytes=50"));
+        callbacks.Scope.ClearGraphMemoryDiagnosticContext();
+        callbacks.Free(committed); callbacks.Free(otherKind);
+        Assert.Contains(lines, line => line.Contains("event=release call=0 ") && line.Contains("origin_call=1 ")
+            && line.Contains("pending_bytes=0 committed_bytes=0 owned_bytes=0 peak_owned_bytes=50"));
+        Assert.DoesNotContain(lines, line => line.Contains("kind=2"));
+        Assert.Equal(0, Children(request));
+    }
+
+    [Fact]
+    public void FailingGraphDiagnosticWriterCannotChangeSuccessfulCallbacksOrQuotaRefusal()
+    {
+        var budget = new MemoryBudget([new("device", 200)]);
+        using var callbacks = new Callbacks(budget);
+        using var request = Owner(budget);
+        using var execution = callbacks.Scope.EnterExecution(request);
+        callbacks.Scope.GraphMemoryDiagnosticWriter = _ => throw new IOException("diagnostic writer failure");
+        callbacks.Scope.SetGraphMemoryDiagnosticContext(512, 512, 0, 512, false);
+        ulong token = callbacks.Allocate(80, kind: 5, onWorker: true);
+        Assert.Equal(0UL, callbacks.TryReserve(21, kind: 5));
+        Assert.Equal(80, Children(request));
+        Assert.Null(callbacks.Scope.CallbackError);
+        callbacks.Free(token);
+        callbacks.Scope.ClearGraphMemoryDiagnosticContext();
+        Assert.Null(callbacks.Scope.CallbackError);
+        Assert.Equal(0, Children(request));
+    }
+
+    [Fact]
+    public void UnconfiguredGraphDiagnosticsLeaveCallbacksUnlabelledAndAccountingUnchanged()
+    {
+        var budget = new MemoryBudget([new("device", 200)]);
+        using var callbacks = new Callbacks(budget);
+        using var request = Owner(budget);
+        using var execution = callbacks.Scope.EnterExecution(request);
+        callbacks.Scope.SetGraphMemoryDiagnosticContext(512, 512, 0, 512, true);
+        ulong silent = callbacks.Allocate(20, kind: 5);
+        callbacks.Free(silent);
+        var lines = new List<string>();
+        callbacks.Scope.GraphMemoryDiagnosticWriter = lines.Add;
+        callbacks.Scope.SetGraphMemoryDiagnosticContext(256, 1, 0, 1, false);
+        ulong observed = callbacks.Allocate(30, kind: 5);
+        callbacks.Free(observed);
+        callbacks.Scope.ClearGraphMemoryDiagnosticContext();
+        Assert.All(lines, line => Assert.Contains("call=1 ", line));
+        Assert.Equal(0, Children(request));
+    }
 
     [Fact]
     public void WorkerCheckpointAllocationsKeepPersistentOwnershipAfterRequestRelease()
@@ -192,5 +370,59 @@ public sealed class UnifiedMemoryGgmlAllocationOwnerTests
             callbacks.Free(state); callbacks.Free(expert); callbacks.Free(arena); callbacks.Free(restored);
         }
         callbacks.Scope.SetSharedExpertEnvelope(null); callbacks.Scope.SetSharedJointEnvelope(null);
+    }
+
+    [Fact]
+    public void RamExpertPayloadKeepsPersistentHostOwnerWhileStagingUsesTheRequest()
+    {
+        var budget = new MemoryBudget([new("device", 200), new("host", 300)]);
+        using var callbacks = new Callbacks(budget, host: true);
+        using var request = budget.Reserve([new("host", 40), new("device", 80)]);
+        using var retained = budget.Reserve([new("host", 200)]);
+        Assert.Equal(0UL, callbacks.TryReserve(10, 6)); // No implicit root/request fallback.
+        callbacks.Scope.SetSharedHostExpertEnvelope(retained);
+        ulong payload, staging;
+        using (callbacks.Scope.EnterExecution(request))
+        {
+            payload = callbacks.Allocate(150, 6, onWorker: true);
+            staging = callbacks.Allocate(32, 3, onWorker: true);
+            Assert.Equal(150, Children(retained));
+            Assert.Equal(32, request.LiveChildCharges.Single(c => c.Pool == "host").Bytes);
+            Assert.Throws<InvalidOperationException>(() => callbacks.Scope.SetSharedHostExpertEnvelope(null));
+        }
+        request.Dispose(); callbacks.Free(staging);
+        Assert.Equal(150, budget.Snapshot().Single(p => p.Pool == "host").Committed);
+        Assert.Throws<InvalidOperationException>(() => callbacks.Scope.SetSharedHostExpertEnvelope(null));
+        callbacks.Free(payload);
+        callbacks.Scope.SetSharedHostExpertEnvelope(null);
+        Assert.Equal(0UL, callbacks.TryReserve(10, 6));
+        Assert.Null(callbacks.Scope.CallbackError);
+    }
+
+    [Fact]
+    public void SpeculativeGraphsAndSnapshotsCannotBorrowRequestOrUnownedRootCredit()
+    {
+        var budget = new MemoryBudget([new("device", 400)]);
+        using var callbacks = new Callbacks(budget);
+        using var request = Owner(budget, 100);
+        using var retained = Owner(budget, 200);
+        using (callbacks.Scope.EnterExecution(request))
+            Assert.Equal(0UL, callbacks.TryReserve(10, 7));
+        callbacks.Scope.SetSharedSpeculativeEnvelope(retained);
+        ulong graph, snapshot;
+        using (callbacks.Scope.EnterExecution(request))
+        {
+            graph = callbacks.Allocate(80, 7, onWorker: true);
+            snapshot = callbacks.Allocate(90, 7, onWorker: true);
+            Assert.Equal(0, Children(request)); Assert.Equal(170, Children(retained));
+            Assert.Equal(0UL, callbacks.TryReserve(31, 7));
+            Assert.Throws<InvalidOperationException>(() => callbacks.Scope.SetSharedSpeculativeEnvelope(null));
+        }
+        request.Dispose();
+        Assert.Equal(170, Assert.Single(budget.Snapshot()).Committed);
+        Assert.Throws<InvalidOperationException>(() => callbacks.Scope.SetSharedSpeculativeEnvelope(null));
+        callbacks.Free(graph); callbacks.Free(snapshot);
+        callbacks.Scope.SetSharedSpeculativeEnvelope(null);
+        Assert.Equal(0UL, callbacks.TryReserve(10, 7));
     }
 }

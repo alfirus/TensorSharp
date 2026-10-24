@@ -67,6 +67,30 @@ internal readonly record struct GlmUnifiedPhysicalObservation(
         return true;
     }
 
+    /// <summary>Before accepting a narrower SourceView prefill, retry its
+    /// widest exact growth once against fresh hardware. Expert credit is only
+    /// the already-admitted amount which the existing selector may reclaim.</summary>
+    internal bool TryRefreshNarrowSourceViewPrefill(bool sourceView, int selectedRows, int maximumRows,
+        long reclaimableDeviceBytes, IReadOnlyList<MemoryCharge> widestGrowth, ref bool attempted,
+        Func<bool> trimHint, Func<GlmUnifiedPhysicalObservation> resample,
+        out GlmUnifiedPhysicalObservation refreshed)
+    {
+        refreshed = this;
+        ArgumentOutOfRangeException.ThrowIfNegative(reclaimableDeviceBytes);
+        if (!sourceView || attempted || selectedRows >= maximumRows
+            || Shortfall(Host, widestGrowth) <= 0
+            || Shortfall(Device, widestGrowth) > reclaimableDeviceBytes) return false;
+        var host = Ledger.Single(p => p.Pool == Host);
+        // A hint cannot repair a configured ledger ceiling. It can only
+        // improve the observed physical allowance within that same ceiling.
+        if ((decimal)host.Reserved + host.Committed + widestGrowth.Single(c => c.Pool == Host).Bytes
+            > host.Capacity) return false;
+        attempted = true; // Fatal checked errors escape before any resample.
+        _ = trimHint();
+        refreshed = resample(); // Even advisory false requires fresh evidence.
+        return true;
+    }
+
     internal string Describe(IReadOnlyList<MemoryCharge> growth)
     {
         var sample = this;

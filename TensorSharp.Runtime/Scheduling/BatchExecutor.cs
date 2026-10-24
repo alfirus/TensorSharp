@@ -168,6 +168,17 @@ namespace TensorSharp.Runtime.Scheduling
         // fresh full prefill from position 0.
         private SpecSeqContext? _specCtx;
 
+        /// <summary>Release request-owned speculative buffers before its memory
+        /// envelope is returned. Keep the context reachable if disposal fails,
+        /// so the engine can retry without losing its physical owner.</summary>
+        internal void ReleaseLinearSpeculativeContext(string? requestId = null)
+        {
+            if (_specCtx == null || (requestId != null
+                && !string.Equals(_specCtx.Seq.RequestId, requestId, StringComparison.Ordinal))) return;
+            _specCtx.Exec?.Dispose();
+            _specCtx = null;
+        }
+
         // One-time warning when --spec is requested but the model can't run its
         // accelerated MTP path on the current backend (speculation would be net-
         // negative), so the engine serves standard decode instead.
@@ -333,9 +344,15 @@ namespace TensorSharp.Runtime.Scheduling
                 LogPlanTransition(plan);
 
                 if (_scheduler.Config.MemoryAdmission?.EnterSerialExecution != null
+                    && !(_scheduler.Config.MemoryAdmission.AllowSpeculativeSerialExecution
+                        && plan.Candidates[0] == ExecutionPathKind.SpeculativePerSequence)
                     && (plan.Candidates[0] != (_scheduler.Config.MemoryAdmission.UsePerSequenceHolders
                         ? ExecutionPathKind.PerSequenceFused : ExecutionPathKind.PerSequence) || _scheduler.Config.Speculation.Enabled))
                     throw new NotSupportedException("The request allocation adapter requires non-speculative PerSequence execution. Select that path explicitly before submitting requests.");
+
+                if (_scheduler.Config.MemoryAdmission?.AllowSpeculativeSerialExecution == true
+                    && plan.Candidates[0] != ExecutionPathKind.SpeculativePerSequence)
+                    throw new NotSupportedException("The experimental speculative allocation adapter refused this execution path; plain fallback is not authorized.");
 
                 for (int i = 0; i < plan.Candidates.Count; i++)
                 {
@@ -1689,6 +1706,8 @@ namespace TensorSharp.Runtime.Scheduling
                         results.Add(mtpResult);
                         return results;
                     }
+                    if (_scheduler.Config.MemoryAdmission?.AllowSpeculativeSerialExecution == true)
+                        throw new InvalidOperationException("The admitted speculative adapter declined this request; plain execution is not an admitted fallback.");
                     // A context for this sequence that didn't serve the step is
                     // stale from here on: the plain Forward below advances the
                     // trunk without capturing the hidden states drafting needs.
@@ -1792,18 +1811,22 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 catch (Exception ex)
                 {
+                    // Dispose while the failing request still owns its peak.
+                    // A release failure is retried by the engine before refund.
+                    Exception failure = ex;
+                    try { ReleaseLinearSpeculativeContext(seq.RequestId); }
+                    catch (Exception release) { failure = new AggregateException(ex, release); }
                     _logger.LogError(ex, "Step failed for sequence {RequestId}", seq.RequestId);
                     results.Add(new SequenceStepResult
                     {
                         Sequence = seq,
-                        Error = ex,
+                        Error = failure,
                     });
                     // Reset ownership so the next step does a clean swap.
                     _currentOwner = null;
                     _ownerTokensInModel = 0;
                     _ownerForwardedTokens = 0;
-                    _specCtx = null;
-                    seq.Error = ex;
+                    seq.Error = failure;
                 }
             }
 
@@ -2001,8 +2024,11 @@ namespace TensorSharp.Runtime.Scheduling
         private SpeculationCostGovernor SharedGovernor => _sharedGovernor ??= new SpeculationCostGovernor();
 
         /// <summary>Whether a request can profit from drafting at all: it needs at
-        /// least two tokens to decode, or every proposal would be wasted.</summary>
-        private static bool CanSpeculate(SequenceState seq) => seq.MaxNewTokens >= 2;
+        /// least two tokens to decode, or every proposal would be wasted. The
+        /// explicitly admitted adapter keeps even a one-token warmup inside its
+        /// owned speculative context, where the decode window is capped at zero.</summary>
+        private bool CanSpeculate(SequenceState seq) => seq.MaxNewTokens >= 2
+            || (seq.MaxNewTokens == 1 && _scheduler.Config.MemoryAdmission?.AllowSpeculativeSerialExecution == true);
 
         private SpeculativeExecution? TryArmSpeculation(
             ISpeculativeTarget spec, SequenceState seq, ISpecTrunk? trunk, string trunkLabel)
@@ -2534,7 +2560,7 @@ namespace TensorSharp.Runtime.Scheduling
             // Any ownership change rebuilds the model's KV state (reset+inject
             // or live-cache adoption by a different request), which orphans the
             // MTP draft head's cache and pending hidden state.
-            _specCtx = null;
+            ReleaseLinearSpeculativeContext();
 
             // A step that forwarded the outgoing owner alone let it BORROW the
             // model's logits buffer (see ExecuteStepPerSequence), on the promise

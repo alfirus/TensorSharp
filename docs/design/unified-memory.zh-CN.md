@@ -4105,7 +4105,7 @@ dotnet run --project .\TensorSharp.Server.Host\TensorSharp.Server.Host.csproj -c
 | 前缀缓存与启动预热 | Qwen 默认最多 4 个公共检查点和 2 个会话末状态。GLM adapter 7 支持已准入完整状态副本；SDK26 本机实际公共副本预算为 1，另保留会话终态，物理压力下不保证永久驻留。新聊天同模式实测 1332/1340 命中；长终态续写与公共回退重算仍有输出差异，等价质量尚未闭合。一个公共槽仅预热首选模式，默认 thinking-on，环境变量可改变预热首选而不改变 UI／HTTP 的请求模式。无副本能力时仅初始化内核；`--no-prefix-cache` 关闭保留，但不关闭预算内预热。Qwen 保持思考一 token、独立 N2/N3 cohort、最后非思考一 token 的顺序及 startup-only prefill barrier。API `scope` 区分 `kernel-initialization` 与 `default-chat-prefix`，`completed` 仅代表串行阶段，`jointCompleted` 还须实际 execution ID、宽度和清理通过；当前 Qwen N3 失败不能据串行 completed 宣称预热全通过。磁盘 checkpoint 暂存与 SSD 生命周期仍未接入。 |
 | 跨引擎回收 | Runtime 支持多个引擎显式共享同一预算后的协同回收；此 CLI 会话创建独立预算，GGML 目前只允许一个活动预算作用域。此开关不等于自动跨模型、跨进程共享，也未实现全局成本驱动 LRU。 |
 | 主机 KV 状态降级 | Qwen 的非活动、已保留完整 holder 可在压力边界同步到已有、已计账的主机镜像，再释放其设备 attention/QSA/GDN/PLE 状态；失败保留权威状态和真实账本，不假设释放额度。真实 GPU 的恢复及续写资格单列。活动请求的块换页、预抢占恢复和 RAM→SSD 仍关闭；该完整 holder 降级不能替代这些能力。GLM 尚未接入这项降级。 |
-| 异步专家读取/传输/计算 | unified 会话使用显式作用域策略，默认关闭；旧 `TS_HOST_MOE_FILE_PIPELINE=1` 不覆盖该策略。程序化 `EnableAsyncExpertPrefill` 可启用已计账的 16 MiB 双槽、至少 64 行且 32 MiB 有效载荷的受支持 Qwen 单卡路径。初版 ABBA 回退保留为失败；并行读取候选在完整数值、时间线和独立安静 ABBA 中通过，128/512 token prefill 吞吐提高 39.81%/29.51%。最新公开 session 的共享预算 N1/N2 各一组开关对照、完整输出 token 与清理门通过；完整 Server/N3/图片及最新完整模型 Linux GPU 性能仍待验收，不能把局部计时外推为 HTTP 延迟。GLM 图尚未适配。 |
+| 异步专家读取/传输/计算 | unified 会话使用显式作用域策略，默认关闭；旧 `TS_HOST_MOE_FILE_PIPELINE=1` 不覆盖该策略。程序化 `EnableAsyncExpertPrefill` 可启用已计账的 16 MiB 双槽、至少 64 行且 32 MiB 有效载荷的受支持 Qwen 单卡路径。初版 ABBA 回退保留为失败；并行读取候选在完整数值、时间线和独立安静 ABBA 中通过，128/512 token prefill 吞吐提高 39.81%/29.51%。最新公开 session 的共享预算 N1/N2 各一组开关对照、完整输出 token 与清理门通过；完整 Server/N3/图片及最新完整模型 Linux GPU 性能仍待验收，不能把局部计时外推为 HTTP 延迟。GLM 未接入该整层文件/计算机制；Windows 精确选中专家的文件读取/H2D 双槽流水线及其宽 prefill 默认范围见 2026-10-15 后续实测。 |
 | MTP、draft、TP/层切分 | 拒绝启用；其额外模型、状态与多设备生命周期尚未通过本入口的请求峰值和共享预算验收。 |
 | 图像、视频、音频 | 匹配 projector 的图像准备进入独立预算准入；v7 候选的 Qwen35/Qwen4Exp 缩放使用 byte-domain 抗锯齿 bicubic，新增中间 scratch 一并计入峰值；独立像素及预算组件通过，实际模型验证尚未完成，原图不触发缩放的续写 EOS 仍未解决。视频/音频没有此入口的准备适配并明确拒绝；接线完成不等于全部尺寸、多图和任务通过。 |
 
@@ -5416,6 +5416,1619 @@ token），第二次命中嵌入缓存；整卡峰值 14.3 GB。合成两 block 
 541 MB（单路 186 MB，2.9 倍），因为两组工作集在共享的每层缓存中互相淘汰，未命中路径
 约 6 GB/s。即本机 decode 受读带宽限制，主题不同的并发会话分享一条流的吞吐；这不是
 联合路径的缺陷，只有更大的专家缓存或更快的存储能提高它。
+
+#### 2026-10-15：GLM 精确选中专家异步读取、KDA 图复用与 decode 配额修正
+
+本轮从 `12a9652e60a36b044723c211c7dccbf224bfef79` 冻结旧版 server，对同一台
+Windows 11 / RTX 3080 Laptop 16 GB、C 盘 GLM-5.3-Flash UD-IQ1_S 三分片复测。
+上游 ggml 仍为原样的 `3612c0af93f2cfc8f048295300a61187723b12ae`；全部实现
+位于 TensorSharp。原始日志、完整回复、logits 和二进制收据保存在忽略的
+`artifacts/perf/glm-async-20261015/`，测试工具保存在 `eng/validation/`。
+
+**异步读取的范围。** 已有下一层预测预取只支持普通单层专家表，GLM pooled/split
+表不走该路径。本次加入的是当前路由已经确定后的精确需求流水线：复用已计账、最多
+32 MiB 的文件 staging arena，分成两个带 CUDA event 的槽；后台读线程在上一槽
+上传时读取下一窗口。上传仍由调用线程按原投影/专家顺序提交，读线程写槽前等待其
+上次上传完成。成功发布、失败、退役之前都先 join 读线程并 drain backend，不额外
+读取猜测专家，也不改量化字节或算术。显式开关 `TS_HOST_MOE_EXPERT_CACHE_RING_READS`
+的 `0` 关闭、`1` 强制所有适用阶段、`2` 仅 GLM 宽预填充。未设置时仅 Windows 上
+大于 8 行、非独立 decode 的 GLM bulk prefill 自动启用；其他系统仍须显式选择。
+显式 direct/ordered 文件实验不被自动策略覆盖。整层文件/计算预取的
+`EnableAsyncExpertPrefill` 仍不适用于 GLM。
+
+强制 decode 也使用流水线的首轮实测，1872-token prefill 为 36.66 → 33.10 s，
+但 128-token decode 为 54.62 → 56.36 s，故默认只用于宽预填充。两臂读取的逻辑
+专家 payload 相同：该 prefill 81.487 GB，128-token decode 238.250 GB；这不是
+物理 SSD 流量，嵌套计时间隔也不能相加。失败候选及原始计时保留，没有把更高命中率
+或流水线重叠本身当成性能通过。
+
+**KDA 图复用。** 只含 KDA 的逐层 trunk 图不依赖历史 KV 长度，旧 key 却随提示位置
+跨 padding/sparse 边界变化并重复分配图。现在仅在执行区间完全为 KDA 时把无用的
+KV/sparse key 归一化，真实位置继续作为运行时输入；没有 attention mask 输入的图
+也不再构造整段 mask/pool 数组。MLA 与混合区间保留原几何。合成混合 KDA/MLA
+完整 logits、decode 续写、跨边界 allocator-refusal 用例验证精确相等；旧 DLL 的
+allocator-refusal 对照确实失败，新版通过。
+
+**decode 配额。** 上节再平衡条件只要求缺席组的“半份额”放得下，导致真实模型的
+3 层组仍保留约 2.75 GB，而 28 层组只得到 135 槽。现保留“大表超过目标 2 倍”
+及现有小表饥饿条件，但缺席组必须放得下完整份额，才允许保留超额表。CPU 回归用
+真实模型的三组字节/权重复现旧判断，CUDA fixture 验证实际退役、账本与精确输出，
+并保留“负担得起的完整 union 不得无故丢弃”的用例。路由重放只用于定位：256-token
+trace 上按正确组配额，模拟 LRU 未命中 payload 从 474.089 降到 326.074 GB；LFU
+为 326.091 GB，没有优势，因此未加入新的 LFU 淘汰策略。
+
+**合并候选的首轮安静实测（无 projector、关闭前缀缓存）。** 相同 1872-token 提示、
+32-token 接续，再运行相同 33-token 提示和 128-token 接续；两臂 chunk 宽度相同。
+
+| 指标 | 冻结基线 | KDA + 宽 prefill 流水线 + 配额修正 |
+|---|---:|---:|
+| 1872-token prefill | 36.988 s / 50.61 tok/s | 32.280 s / 57.99 tok/s |
+| 随后 32-token decode | 15.174 s / 2.11 tok/s | 14.034 s / 2.28 tok/s |
+| 短提示后 128-token decode | 56.007 s / 2.29 tok/s | 47.905 s / 2.67 tok/s |
+
+两个请求的完整 API message、完成状态和 token 计数均相同。1872-token 提示边界的
+154,880 个完整词表 float logits 全部有限且逐位一致，SHA-256 为
+`b1675b81e27eaddaed8312895bd0a3a2938db25133764ba07039898352b8f5f3`。
+这只证明所测边界与回复，没有覆盖每一步 decode logits 或任意任务质量。上述结果
+未控制 OS 页缓存冷热、样本较少、没有其他平台/多卡性能资格，不能外推为冷启动或
+数量级加速。
+
+**可归还的空闲专家额度。** 此前 scope 的不可变最大值等于启动 placement 的当前值，
+三请求完整槽位、最大联合图和前缀副本的未来预留一旦扣除，就算预填充结束释放了
+workspace 也不能再借给专家。现在仅在 adaptive prefill 与 capacity growth 都开启
+时区分最大许可和当前额度：上限受设备 ceiling、dense 权重 forecast 及用户专家上限
+约束，启动仍使用原计划额度；每次恢复按实际账本、当前物理余量和额外 128 MiB
+边界选择，增量不足 512 MiB 不扩容。最大许可本身不占账，也不提供额外物理信用。
+新文本准入沿用不可变专家下限；图跨 context 边界增长也能回收可选专家。图像准备
+与可选前缀复制先归还超过启动额度的借款，再采样物理余量并独立准入。不能把原生
+ticket 释放当作驱动已经释放的物理字节，也不会为扩容释放活动槽位或活动图。
+
+原生 pooled 表在预算增加后的窄 decode 上复用已有事务式 grow：同时计入 old+new
+峰值，保留以 source 和 expert ID 联合标识的热槽，D2D 完成并 fence 后发布新表、
+再退役旧表。每次预算增长代只尝试一次；准入、分配或复制失败保留旧表。宽 union
+的现有重建规则不变。这个保守策略可能因 old+new 无法共存而暂时用不满新额度，
+所以“managed ceiling 增加”不能替代原生实际容量证据；须检查 grow 或重新建表后的
+实际槽数、字节与账本。实模的 6047/6498 MiB 预算分别建立 242/579/83 与
+259/624/88 槽，均符合三组完整加权份额；不是仅提高了 managed 许可。
+
+扩容候选无前缀缓存的 128-token decode 为 **45.403 s / 2.82 tok/s**（冻结基线
+56.007 s / 2.29 tok/s），这一回复逐字相同。但自动预填充本轮因实时容量选为
+759/759/354，基线为 758/758/356：长提示的有界回复改变，首 token 虽相同，完整
+logits 的 max |diff| 为 2.07048、RMSE 为 0.38859，**该自动宽度对照不算数值通过**。
+此前已定位的宽度敏感普通量化 QKV 投影见上文；没有把差异直接宣布为无害舍入。
+随即增加相同 `TS_SCHED_PREFILL_CHUNK=512` 的两臂控制：四块均为
+512/512/512/336，1872-token prefill **38.191 → 34.029 s**，32-token decode
+**14.731 → 13.272 s**；完整有界回复相同，154,880 个 logits 全部有限、逐位相同，
+SHA-256 均为 `497c969504743b703f98c84998a210663af9af4bb973481a873ef2da6576ad85`。
+这证明所测相同执行宽度下的缓存变动保持原数值；不承诺不同 chunk 宽度的输出一致。
+
+并发压力验证另外发现 terminal donation 的新 primary 分配绕过借款回收：请求本身
+成功，但可选会话保留可能被原生 674 MiB 槽分配拒绝。现在两个实际新 primary
+分配点都在保留前置条件通过后调用独立 admission，先归还启动额度以上的借款，
+再按新物理采样为新槽保留 owner；原完成槽保留原账本所有权。没有新分配的纯 donation
+不额外收费，拒绝时保留原状态，原生 1 GiB 空闲保护不变。回调独立于 public copy
+配置，覆盖 donate-only 会话；测试覆盖可选拒绝、原生异常、选择失败及 scope 恢复失败。
+
+最终冻结部署 `final-bin`（含 terminal admission）在 **projector + 前缀缓存开启**
+的相同 quick 两请求上，完整 API message、状态及计数 **2/2 相同**；缓存命中 token
+均为零，没有把缓存命中误算成 prefill 加速：
+
+| 指标 | 冻结原版 | 最终部署 |
+|---|---:|---:|
+| 1872-token prefill | 39.467 s / 47.43 tok/s | 36.500 s / 51.29 tok/s |
+| 随后 32-token decode | 16.963 s / 1.89 tok/s | 15.623 s / 2.05 tok/s |
+| 短提示后 128-token decode | 60.320 s / 2.12 tok/s | 53.451 s / 2.39 tok/s |
+
+这是同机少量顺序样本，分别减少约 7.5%、7.9%、11.4% 时间；并非重复分布、冷盘、
+其他量化或其他设备的性能保证。projector 已加载，但上述性能请求只含文本；实际
+OCR 另按语义检查统计，不混入文本计时。
+
+**最终生命周期覆盖。** `final-three` 有 18 个真实 N=3 native step，取消一条后
+还有 46 个 N=2 step；取消完成、队列归零，两条 sibling 都完成 64-token 上限。
+它们的有界完整文本及全部实际 token frame 与修复前借款候选相同。最终日志明确
+出现 `outcome=retained, fresh-primary-required=True`，原失败的新槽路径已实际通过，
+不是只测了纯 donation。`final-prefix-reuse` 的较长请求越过保留阈值：近期会话的
+39-token 续问复用 33 token，旧会话作为 0-token 复用的重算参考；两者 16-token
+有界续写的 frame、文本、状态与计数相同。初始新会话公共缓存仍观测为 `[0,0,0]`，
+不记为 public-prefix 复用通过；旧 max8 短提示检查的失败证据也保留。
+
+测试按阶段保存而非把重叠套件累加：图复用的原生 CPU 完整数值/继续 decode
+套件 46/46；借款阶段 managed 106/106；最终 fresh-primary、slot-copy、owner 与
+容量套件 80/80（含 11 个新分配路径执行）；上述均无 skip。最终 native recovery
+1/1、phase/ring 回归 9/9，以及显式 legacy capacity-growth 均通过。文件流水线
+的纯调度测试还覆盖 1/2/8 线程与异常排空，实际 CUDA fixture 覆盖 pinned/pageable
+文件 staging。验证工具的两个 Python 套件分别为 3/3、8/8。
+
+最终 exact-build 再跑 `final-pp512`：同一冻结原版的 38.191 s prefill / 14.731 s
+decode 对比最终 34.200 s / 13.115 s，完整回复相同，边界的 154,880 个 float
+logits 全部有限且逐位相同（仍为上述 `497c9695…` SHA-256，max error 与 RMSE
+均为 0）。此轮无 projector、无前缀缓存，不能与上表混为同一配置。最终服务器在
+N=3 压力及续问检查后，五项语义任务（1..20 平方、天气 JSON、纯函数 AST、记录
+检索、图片 OCR）均自然结束、5/5 通过，并与较早部署的五个完整 message 相同。
+生成的代码未执行，JSON 检查不是实际外部工具 roundtrip；没有独立推理引擎 oracle，
+也没有完整 32k 上下文、长输出分布、多卡或其他设备/量化的通过结论。自适应宽度
+改变的数值限制仍按前文记录，不因固定宽度通过而取消。
+
+**2026-10-15 后续 RAM 层实验（尚未通过性能推广门）：** 增加默认关闭的
+`TS_HOST_MOE_RAM_CACHE_MB`，按源注册代次、原始 projection offset/extent 保留
+不可变专家字节。kind 6 使用独立的持久 RAM envelope；先预留再分配/commit，
+原生驱逐和上传 fence 完成后才归还额度。并发同源填充合并；源注销、同地址重新
+注册、拒绝/异常与仍在 DMA 中的租约都保留原始字节和生命周期合同。prefill
+只查询，decode 才准入；可选 `TS_HOST_MOE_RAM_CACHE_FREQUENCY=1` 使用有界
+频次草图，`TS_HOST_MOE_RAM_CACHE_PINNED=1` 使用 upstream host buffer 和
+直接上传租约，pinning 不可用时仍走明确的 pageable fallback。没有修改 ggml。
+
+该层不能把逻辑命中当成 SSD 收益：Windows 已利用空闲 RAM 缓存文件，显式 RAM
+副本还可能与 VRAM 内容重叠。相同 RTX 3080 Laptop 16 GiB / 31.71 GiB RAM、
+GLM-5.3-Flash UD-IQ1_S、PP512、greedy seed 17、关闭 prefix/projector 的两轮
+探索结果如下（秒；每轮包含 1872+32 和 33+128 两个请求）：
+
+| 配置 | 1872-token prefill 均值 | 32-token decode 均值 | 128-token decode 均值 |
+|---|---:|---:|---:|
+| RAM cache 关闭 | 35.546 | 13.448 | 42.606 |
+| pageable LRU，12 GiB ceiling | 33.062 | 16.120 | 53.645 |
+| pageable frequency，8 GiB ceiling | 35.200 | 13.600 | 43.700 |
+| pinned frequency，8 GiB ceiling | 33.392 | 14.711 | 45.682 |
+| pinned frequency，4 GiB ceiling | 34.049 | 14.172 | 44.745 |
+| RAM 关闭，buffered random-access hint | 34.187 | 12.820 | 43.388 |
+
+所有候选四个完整返回 message、计数及结束原因与对照一致；七份 prefill 边界的
+154,880 个 float logits 全部有限且逐位相同（SHA-256 `497c9695…`）。这不是
+独立语义 oracle。12 GiB LRU 的 128-token 请求机器磁盘读数为 131.59/126.26 GB，
+对照为 101.16/101.20 GB，明确拒绝其默认开启。其他候选也没有稳定 decode 收益，
+均保持实验关闭。磁盘计数包含整机其他进程以及请求的 prefill+decode，不能归属
+单一阶段；OS 页缓存、温度/频率未控制，部分探索与 CPU 编译重叠，不是安静 ABBA
+或冷盘资格。生成证据在忽略目录 `artifacts/perf/glm-memory-tier-20261015/` 的
+`exploratory-matrix-v5.json` 和各请求报告。
+
+另增加默认关闭的 `TS_HOST_MOE_LAYER_PREFETCH=1`：仅符合预算的宽 layer-major
+请求尝试下一层；两个专用 reader 只在完整 projection 之间暂停，需求读取优先，
+不占用共享 demand pool。新推测条目只能回收旧推测条目，不能驱逐 demand 热数据；
+`TS_HOST_MOE_RAM_CACHE_PREFETCH_ONLY=1` 可单独测试该路径。请求停止先 join，
+再清理未被 demand 晋升的字节。初次 3 GiB pageable 探索读取约 25.01 GB、
+实际使用 23.88 GB，但整请求更慢，尚无性能推广资格；后续控制、pinning 和故障
+验证须以各自报告为准。容量受共享账本约束，不能把仅一层的保留租约数量当成整个
+进程 RAM 峰值。
+
+已执行的组件门：RAM cache 原生 CUDA fixture 八项全部通过、零跳过，覆盖 Q8/IQ2、
+pageable/pinned/direct lease、源重注册、quota/commit 拒绝、排队上传后的故障与恢复；
+新增 prefetch scheduler/cache 和文件源 CPU CTest 四项通过，random-access hint 下
+文件源两项通过、零跳过。托管 RAM 所有权/容量等相关套件 102 项通过。各套件及
+不同版本存在重叠，不累加为独立整模型覆盖；prefetch 新版本不继承较早 CUDA fixture
+的资格。上述已执行验证使用干净的 `3612c0af93f2cfc8f048295300a61187723b12ae`。
+后续一次托管测试构建误用了无效的 native-skip 属性，触发仓库依赖更新脚本，
+将干净 checkout 切到 `a05c9922613c6a2230dbb1d0de679519ecafb4f0`；在候选 DLL
+链接前终止。未打补丁；随后恢复干净的原修订，完成 clean-first 的 268 个构建步骤，
+再增量编译 TensorSharp 自有的测试 oracle。`mtp-v8.dll` 的 SHA-256 为
+`7c347fe3939e1b0b5e79c3c3d23893a4c22fe18d69406af9a7128a33eec97e96`，
+该闭包的 CPU CTest 9/9、RAM CUDA CTest 8/8 通过且零跳过，记录在
+`mtp-v8-closure.txt`、`cpu-closure-v8.log`、`gpu-ram-closure-v8.log`。
+正确的托管构建隔离参数为 `TensorSharpSkipGgmlNative=true` 和
+`TensorSharpSkipMlxNative=true`；独立测试部署还需避免复制正在重建的 native 输出。
+当前 GPU 几何配额在已有 256-token trace 上已接近最优：按实际 269/648/90 槽重放，
+保持 payload 总量的离线重分配只降低约 0.081% 请求字节，不作为实现或吞吐收益。
+
+**Flash MTP 的有界实验路径（默认关闭，整模型资格尚未完成）。** 同一 checkpoint
+的第 45 层 NextN 是普通 MLA + MoE residual block，没有主干的 HC 张量。现在
+`TS_GLM_FLASH_MTP=1` 可显式加载其原始量化权重，要求单 GPU、单请求、关闭前缀缓存
+和 media，并将 context 限制在 `min(2048, indexer_top_k)`；在此范围 dense MLA 不会
+遗漏 sparse top-k 本应可见的位置。必须同时启用 `--spec --spec-type draft-head`，
+最多两个 draft token。独立对照使用同样的 `MAX_CONTEXT=2048` 和
+`TS_UNIFIED_MAX_RUNNING_REQUESTS=1`，避免把 context/并发预留差异当成 MTP 收益。
+尚不支持把此实验结论外推到长上下文、多请求或图片推理。
+
+draft 的专家源也接入原始文件读取和 pooled CUDA 缓存；kind 7 独立持有持久 draft
+图和 KDA snapshot，先准入、完成 native fence 后再归还。目标主干负责所有 token
+验证，拒绝后仍使用既有 snapshot restore + accepted-prefix replay。layer-major
+prefill 现在可返回全部 post-final-norm hidden rows，避免为了 catch-up 按 chunk
+重扫整模型。依据本地 vLLM/SGLang proposer 检查，Flash draft 的 `(token[p], h[p-1])`
+应写入 draft position `p-1`；仅跳过全局初始的 synthetic row，chunk 边界继续保留
+真实配对。非 Flash 路径不使用这个映射。
+
+托管 MTP/生命周期套件 289/289、后续 startup guard 套件 144/144 通过且零跳过，
+两个套件有重叠，不累加。8 项 snapshot 故障测试在 CPU/CUDA 实际执行通过；新
+tiny MTP 测试的早期运行因 fixture group/scope 初始化顺序及 CUDA SSM_CONV 的
+维度要求失败，不能计为模型数值通过。修正后两项 CUDA 测试实际通过、零跳过：
+public draft 与独立 raw-position 输入的完整 logits/hidden 在 chunk 1/4/5 下相同，
+2/3-row 强制拒绝、KDA restore/replay 与 scalar target 的完整 logits 相同。
+失败日志保留；最终记录在 `gpu-flash-mtp-v8-heads8.log` 和
+`native-v8-validation-summary.json`，没有更改 upstream 的维度限制。
+
+相同 bounded context/PP512 的真实模型 quick 对照中，两个完整返回 message、
+状态和计数 2/2 相同，但 MTP **未通过性能门**：1872-token prefill 为
+39.555 → 41.845 s，随后 32-token decode 为 13.986 → 21.469 s；短提示后的
+128-token decode 为 48.547 → 88.787 s。MTP 分别接受 19/26 和 71/112 个 draft，
+不是未启用 speculation 的假对照。128-token decode 中 target verify 占 76.652 s，
+rollback 占 8.146 s，不能据此优先把回放优化当成主要瓶颈。
+
+追加的 33+32 profile 中，两臂完整回复仍相同：普通 decode 15.608 s，MTP 18.979 s。
+普通 decode 的 expert read/upload pipeline 为 11.102 s、逻辑 payload 37.823 GB；
+MTP 的 13 次三行 verify 为 10.013 s、47.647 GB，verify 总耗时 16.169 s。
+stage 是有重叠的 host wall time，不能相加成 CUDA kernel 或 SSD 物理时间。
+同次诊断显示 steady target workspace 实际 live 约 9 MB，但 forecast 仍预留
+459 MB；kind 7 live 约 153 MB 含 snapshot，预留约 378 MB，存在重复 snapshot
+forecast。可归还的账本额度仍需通过实际物理余量检查才能供专家使用。
+证据见 `mtp2-smoke-v8/`、`plain2048-smoke-v8/`、`mtp-profile-summary-v8.json`。
+这些是同机探索，仍有 OS cache/温度及部分编译重叠限制；没有 MTP 吞吐提升或完整
+质量无回退的验收结论，自然 EOS 语义与进一步优化仍在验证中。MTP 和额外 RAM
+cache 均保持默认关闭。
+
+后续 v9 修正了 kind 7 的重复 snapshot forecast：原生 getter 返回实际专用 snapshot
+buffer 字节，托管侧只补足尚未分配的差额，不把 invalid snapshot 或异常路径的
+live allocation 当成已释放。122 项托管 admission/diagnostic 测试通过；v9/v10
+各自的 snapshot/MTP CUDA 集成测试为 10/10、零跳过，两个版本的相同用例不能
+累加为不同覆盖。`TS_GLM_FLASH_MTP_GRAPH_CACHE_ENTRIES` 允许实验保留 1..16 个图，
+默认仍为 3，所有 live children 和替换峰值继续独立计费。相同 33+32 请求保留
+3 个图时发生 31 次构图，其中 24 次重复；保留 8 个图后只剩 7 个首次构图。
+两次 decode 为 19.086/18.218 s；一 token draft 为 16.297 s，接受 15/16，仍未
+证明比普通 decode 更快。两配置完整 API 回复相同；v10 普通路径与 MTP 的
+154880 个 PP33 边界 logits 字节一致，SHA256 为
+`5D465D16F0703D7C071B0F2535617599F6C9DB086BA6C76023857DE1D681D0B6`。
+
+`TS_GLM_FLASH_MTP_FORWARD_TIMING=1` 显式诊断普通 GLM5Next 和 MTP 的原生构图、
+输入、执行、输出 host wall time，不增加同步；执行时间已包含 expert callback，
+不能再与其嵌套计时相加。v10 的相邻探索中普通 32-token decode 为 12.955 s，
+一 token MTP 为 16.130 s；target 执行扣除 expert callback 后分别约 2.865/5.52 s，
+构图和数据接口仅占毫秒级。Nsight 的有限窗口指出 owned `q8_f32_tiled<8>` 占
+采样 GPU kernel 时间约 74.5%，不是 CUDA graph 重建主导。该 profiler 请求未收集到
+完整 speculation stats，因此保留失败资格记录，仅作 kernel 定位，不计性能通过。
+同时真实 trace 发现 PP33 后三组 slots 为 269/353/304，后两组严重偏离 decode
+份额但旧半份额门未触发；正在独立验证阶段重平衡与保持 K 顺序的窄 Q8 kernel。
+证据位于 `mtp2-cap3-v9/`、`mtp2-cap8-v9/`、`mtp1-cap8-v9/`、
+`plain2048-stage-v10/`、`mtp1-stage-v10/` 和 `mtp1-nsys-v10.nsys-rep`。
+
+v11 在同一未修改 ggml revision 上独立验证两个默认关闭的实验：
+`TS_GGML_Q8_ORDERED_SMALL_BATCH=1` 让窄 Q8 乘法的列独立执行，保留解码操作数和
+递增 K 的 FMA 顺序；`TS_HOST_MOE_DECODE_REBALANCE=1` 在 wide→narrow 边界将
+严重不足的 decode 份额门从 50% 提高到 75%，仍要求另一组超过两倍份额。
+1577 项 phase 纯检查、5 项 CUDA CTest 和 10 项 snapshot/MTP 测试通过，零跳过。
+Q8 实际 gate shape 的 N2/N3 微基准约快 4 倍，但不等于完整模型吞吐提升。
+同一 v11 DLL 的 PP33+D32 探索中，普通路径为 12.298 s；仅重平衡为 12.516 s，
+logical expert payload 从 41.466 降至 37.979 GB，约减少 8.4%，尚无墙钟收益。
+重平衡实际使用 7424/7429 MB 的缓存 ceiling，而非只提高虚拟预算。
+一 token MTP 的旧 Q8 路径为 16.417 s，ordered 路径为 12.707 s，叠加重平衡
+为 12.624 s，接受率同为 15/16。所有 API 回复、token 数和终止状态完全相同，
+但这些是每组一次的短探索，没有请求全词表 dump，仍不能代替多次长请求和语义验收。
+证据为 `native-v11-validation-summary.json`、`v11-short-arms-summary.json` 及对应
+`plain-*-v11/`、`mtp1-*-v11/` 目录；不得将 logical payload 解释为物理 SSD 读取。
+
+v12 的 Flash catch-up 图只展开 draft KV 写入及其祖先，不再执行未被读取的
+query/attention output、expert FFN 和 head。缓存 key 采用实际 hidden 输出需求；
+没有 expert seam 的图也建立新的错误 epoch fence。更新后的同一组 10 项 CUDA
+snapshot/MTP 用例全部通过，包含完整 raw draft block 与 KV-only public catch-up
+的后续 logits/hidden 精确比较、零 expert seam、分块边界和历史错误恢复。
+短请求一 token MTP 为 12.085 s，两 token 为 13.470 s；但长请求仍未胜过普通路径：
+PP1872 为 36.460 vs 36.350 s，其后 D32 为 14.415 vs 14.033 s，另一 PP33 后 D128
+为 51.770 vs 47.840 s。两请求 API 回复完全一致，1872 边界完整 logits 仍为
+`497c969504743b703f98c84998a210663af9af4bb973481a873ef2da6576ad85`。
+这组单次结果只证明减少了被丢弃的计算和精确性，不能验收 MTP 全局性能收益。
+自适应 parking 仍保留 draft 权重/KV/snapshot/预算，plain step 也继续同步 draft KV；
+不能把它解释为恢复了 `--no-spec` 的容量。MTP 继续默认关闭。
+独立 wide Q8 实验在 M128/N336、N512 上变慢，后续候选收窄到已测有利的 shape；
+不能仅凭窄 decode 微基准把新 kernel 推广到全部 prefill。证据见
+`native-v12-validation-summary.json`、`q8-v12-validation-summary.json`、
+`mtp1-quick-v12/`、`plain-quick-v11/`。
+
+v13 将 ordered wide Q8 的适用范围收窄为 K4096、M64/N9..336 或 M128/N9..128；
+范围外保留原路径。6 项 CUDA Q8 suites 全部通过且零跳过，包括逐 bit、guard、
+stride 和独立 FP64 参考检查。独立强制 tile16 的 microbenchmark 在 8 个宽形状上
+快 1.10–1.25 倍，但这不是完整模型吞吐收益，也不改变默认 dispatch。
+完整 PP1872 logits 的 154880 个 F32 与既有基准完全相同。
+
+随后使用同一 v13 DLL、关闭 Q8 实验、独立新进程的安静 PP33+D256 比较，
+普通 decode 为 92.612 s，重平衡为 91.791 s；完整 API 回复、计数和结束状态相同。
+decode logical expert payload 从 321.633 GB 降至 281.267 GB（减少 12.55%），
+但 file pipeline host wall 仅从 61.647 s 降至 61.124 s。请求期间机器级磁盘读取反而
+从 188.683 GB 增至 200.876 GB；该计数包含 prefill 且不能归因到模型进程。
+因此不能宣称已减少物理 SSD 工作或取得显著吞吐改善。两臂跨越 256-token context
+padding 边界，实际 cache ceiling 也略有差异；该单次配对不是统计验收。
+重平衡继续默认关闭。证据：`q8-v13-validation-summary.json`、
+`v13-d256-rebalance-summary.json` 和对应原始报告。
+
+v14 增加默认关闭的 `TS_GLM_FLASH_MTP_SHAPE_PLAN=1`：独有 draft expert group
+只承诺实际使用的 row1 图；与 trunk 共用的 group 仍取两者最大宽度。KV-only
+catch-up 的 forecast 去掉不执行的 FFN/head 部分，原生能力与 handle 状态均须匹配。
+另有 `TS_GGML_Q8_GATE_PREFILL_TILE16=1` 的限定 gate 形状实验。
+218 项 managed CPU、11 项 model/snapshot（7 项 CUDA、4 项 CPU）、9 项 Q8 CUDA suites、1589 项
+phase 检查及两个 phase CUDA cases 均通过，零跳过。新的 model case 包含六个
+独立模型，覆盖 shared/distinct group、最小预算减一、写 KV 前拒绝超宽调用，及
+完整 draft oracle 对 KV-only 的有限值和逐 bit 比较。
+
+安静单次 PP1872+D32、PP33+D128 中，普通路径为 36.832/13.802/47.609 s，
+v14 MTP 为 36.263/14.356/50.656 s。两臂完整 API 结果及 PP1872 的 154880 个
+F32 logits 均与既有基准相同；后者 SHA256 为
+`497c969504743b703f98c84998a210663af9af4bb973481a873ef2da6576ad85`。
+MTP 另通过 math、extraction、squares、code、tool_json 五个固定答案任务，全部
+自然 EOS，完整 API 与普通路径相同。code 未执行生成代码，tool_json 不是实际
+工具往返。这些覆盖不能外推为所有模型/设备/长上下文的质量证明。
+限定形状的 tile16 microbenchmark 快 1.168–1.214 倍，但完整模型未显示显著收益；
+MTP 的 D128 仍慢于普通路径，继续默认关闭。证据保存在
+`native-v14-validation-summary.json`、`q8-v14-validation-summary.json`、
+`v14-model-summary.json` 及原始日志、TRX 和报告中。
+
+v15 增加默认关闭的 `TS_GLM_DECODE_GRAPH_RESERVE=1`。仅在已证明一次 acquire 的
+单主卡、小行数文本 decode 中，device graph reserve 使用全部存活子分配加一次
+保守 replacement forecast；host、真实物理余量和失败后的偿还约束保持生效。
+281 项 managed CPU 检查通过、零跳过。PP33+D32 单次测量为 8.056/12.270 s，
+API 结果相同；kind5 释放约 213 MiB 预留额度，但实际 expert ceiling 未增加，
+因此不能将账面释放等同于增加驻留容量或性能提升。
+
+v16 增加默认关闭的 `TS_GLM_FLASH_MTP_PREFIX_COMMIT=1`：N2 verify 使用未修改
+upstream 的 gated-delta 中间状态，单独保存第一行后的 KDA/conv 状态；拒绝唯一
+draft 时提交该前缀，省去一次 trunk replay。独立 kind7 arena、窗口/slot/代次校验、
+同步后发布和部分复制失败后的 poison 保证该优化不会误用旧状态。
+264128 项 native CPU 检查、11 项 CUDA cache cases、12 项 model/snapshot cases
+均通过，零跳过。模型 fixture 覆盖 K1/K2/scalar 的有限值与逐 bit 输出、完整接受、
+前缀提交及复制失败恢复；ctx256 fixture 本身不覆盖 256 到 512 的 padding 转换。
+
+同一 v16 frozen server 的 PP1872+D32、PP33+D128 为 35.217/13.641/49.006 s，
+完整 API 和 PP1872 的 154880 个 F32 logits 与既有基准相同。D128 有 70 次 verify、
+57 次接受、13 次拒绝，rollback host 时间仅 28 ms；trace 中唯一 row1 target 调用
+是最后一项普通 decode，未再执行拒绝前缀 replay。不过 D128 仍慢于 v14 普通路径
+的 47.609 s；这是不同进程的单次观察，不能作为统计性能验收。新策略继续默认关闭。
+v16 还包含默认关闭的选择性 GPU victim RAM cache。新进程 PP33+D256 对照中，
+普通 decode 为 95.395 s，4 GiB 初始 RAM ceiling 的 victim 路径为 204.334 s，
+完整 API 相同。测量请求实际完成 55.358 GB D2H、51.250 GB RAM promotion，
+零 transfer failure；logical file payload 从 321.743 GB 降至 270.418 GB，但 file
+host wall 仍为 64.507/65.472 s，整个 cache host wall 为 72.299/179.289 s。
+机器级 PhysicalDrive0 读取为 190.737/201.032 GB，不能归因到模型进程且包含
+prefill。它证明了真实 RAM 复用，却没有 SSD 或速度收益；源码检查发现 promotion
+后反复释放并重新分配 pinned buffer 的成本，后续须通过有界 buffer pool 单独验证。
+不能由 component tests、logical-byte 下降或离线 replay 推定性能通过。
+证据：`v15-reserve-validation-summary.json`、`native-v16-validation-summary.json`、
+`native-v16-model-validation-summary.json`、`v16-victim-control-summary.json` 和
+`mtp1-prefix-quick-v16/report.json`。
+
+v17 为 victim promotion 后的 pinned storage 增加有界复用池。完成 H2D 并检查
+错误状态后才回收；清除 source key，保留实际 storage 和 kind6 额度，按相同大小
+复用；shrink 优先释放无 payload 的 free extent，物理释放后归还额度。新 native
+CPU、11 项 CUDA cache cases、281 项 managed CPU、13 项 model/snapshot cases
+（9 项 CUDA、4 项 CPU）全部通过、零跳过；后者新增 ctx512 的 254/255/256 边界及 verify 后 trim 图再提交
+前缀的精确 oracle 检查。4 GiB victim 实测 D256 降至 101.477 s，22455 次 pool
+reuse、1769 次物理分配（1.578 s）、498 次释放（0.306 s），实际 promotion
+51.029 GB、零 transfer failure、完整 API 相同。虽然解决了大部分 v16 分配成本，
+仍比 95.395 s 普通对照慢约 6.4%，因此继续默认关闭。
+
+v17 prefix D256 为 95.074 s，143 次 verify、113 次接受、30 次拒绝，rollback
+仅 63 ms；完整 API 相同，跨越 context padding 边界。这与普通路径基本持平，
+不是显著加速证明。五项固定答案任务再次全部通过、自然 EOS，完整 API 与普通
+路径相同；生成 code 未执行，tool_json 未作真实工具调用。证据：
+`native-v17-validation-summary.json`、`native-v17-model-validation-summary.json`、
+`v17-model-summary.json` 和原始报告。未修改 upstream ggml。
+
+v18 增加默认关闭的 `TS_HOST_MOE_DECODE_STAGING_72MB=1`。仅对 pooled GLM 的
+单行、top8、完整 miss payload 大于 32 MiB 且不超过 72 MiB 的调用扩展 staging；
+单 token prefill 也属于这一宽度条件。多行 prefill 保留原路径。先准入新增 40 MiB
+kind3 额度，拒绝时保留原 32 MiB buffer；替换时先释放旧物理内存，成功后单份
+72 MiB buffer 由两张 ticket 共同计费。分配或 commit 开始后的失败停止执行。
+托管 host forecast 在后续所有形状保留新增 40 MiB，graph generation 只计一次，
+MTP kind7 不重复计入。能力探针及 process-static flag 检查防止后续 session 少报。
+
+2026-10-22 的本机 driver 已变为 621.01，原 CUDA12 runtime/dev 文件已缺失。
+旧 v18 DLL 首次模型测试因 DLL dependency 缺失全部失败，原始日志/TRX 保留；
+从 NVIDIA 官方包校验并恢复本地 CUDA12 runtime 后，13 项 model/snapshot
+（9 CUDA、4 CPU）重新通过，零跳过。此前 5 项 native CPU、18 项 CUDA cache
+及 303 项 managed CPU 检查通过；这些日期、runtime 和覆盖范围不混算。
+
+同一 frozen v18 binary、新 runtime/driver 下的 A-B-B-A PP33+D256 为：普通
+101.487/102.526 s，72 MiB 为 96.866/101.302 s，均完整 API 相同。平均时间下降
+2.87%，两次成对下降 4.55%/1.19%；每次实验实际观察到 3059 个大于 32 MiB 的
+单窗口 scalar transfer，不能仅凭 flag 认定执行。两个新进程样本不足以作广泛
+统计或跨设备验收；cache capacity 略有变化，机器级磁盘计数也不是模型进程的
+SSD 归因。该优化仍默认关闭，不能据此宣称大幅加速或统一内存目标已完成。
+证据：`native-v18-validation-summary.json`、`managed-v18-validation-summary.json`、
+`cuda12-runtime/runtime-receipt.json` 和 `v18-staging-abba-summary-20261022.json`。
+独立 quick correctness run 的两项完整 API 及 PP1872 的 154880 个 F32 logits
+再次与 canonical 完全相同（SHA256 仍为 `497c9695…76ad85`），实际观察到 2063
+个扩展 scalar transfer。该次运行与 SDK 恢复重叠，其耗时明确不计入性能结论。
+
+v19 增加默认关闭的 `TS_HOST_MOE_PHASE_COLD_GROWTH=1`，尝试在宽 prefill 转为
+窄 decode 后，将无法容纳旧表与新表同时存活的闲置额度转为真实专家容量。
+每次转换只提名一个不足额 group；先规划候选及同容量 fallback，排空读取和设备，
+释放旧物理表后才归还额度。仅分配前额度拒绝可重建 fallback；物理分配、commit、
+发布或 sticky error 失败停止执行，不以错误后的输出继续推理。
+
+本轮在 unchanged ggml `3612c0af93f2cfc8f048295300a61187723b12ae` 上重新构建
+CUDA13.4/SM86；新 CPU 自动检测与旧缓存配置不同，性能只使用新 binary 自身对照。
+10 项 native 检查（1 项 CPU、9 项 CUDA）通过、零跳过；新真实 CUDA fixture
+增加 182.75 MiB 专家容量并保持 surviving peers、精确输出及失败后的额度正确。
+316 项 managed CPU 和 13 项 model/snapshot（9 CUDA、4 CPU）通过、零跳过。
+这些 synthetic case 不替代完整 checkpoint 验收。
+
+完整 GLM quick 对照与 cold arm 都保持两项 API 完全相同，PP1872 的 154880 个
+logits 仍与 canonical 逐位相同。但 cold arm 没有实际增长事件，bench 因此明确
+不授予 feature qualification，不能宣称加速；该 flag 继续关闭。对照的
+PP1872/D32/D128 为 35.923/14.324/50.522 s；cold 的 36.492/14.081/52.168 s
+仅保留为无有效 feature 活动的原始观察。证据见 `native-v19-validation-summary.json`、
+`managed-v19-validation-summary.json`、`v19-fullmodel-summary-20261022.json`。
+
+`TS_GLM_GRAPH_MEMORY_DIAGNOSTICS=1` 为普通统一会话增加 kind5 reserve/commit/
+release 及调用边界观测。pending 是额度，不能当作物理分配；不包含未接线 backend/
+driver pools，admitted rows 是托管外层调用上限，不是每个 native layer 的实际形状。
+serial 和 batch 成功/异常退出后都清除调用归属，保留 child 的 origin call。
+独立 PP1872 diagnostic run 的完整 logits/API 相同，但耗时不计入性能结论。
+
+v20 增加默认关闭的 `TS_HOST_MOE_PREFILL_RING_72MB=1`，仅为 pooled、top8、
+真正宽 prefill 的 ring 路径使用两块 36 MiB slot。与 v18 scalar72 共用同一份
+72 MiB arena 和原 32 MiB + 新增 40 MiB tickets；两个 flag 同时启用也只计一次
+40 MiB Host forecast，MTP kind7 不重复计入。额度拒绝保留 32 MiB 路径；物理
+分配后、commit、worker read 或 queued upload 失败均排空后终止，不发布部分输出。
+新 timing 区分实际 ring plan 与仅保留的物理 arena，1 MiB fault override 不能
+冒充 72 MiB 活动。20 项 native（17 CUDA、3 CPU/6433 checks）、320 项 managed
+CPU、13 项 synthetic model/snapshot（9 CUDA、4 CPU）通过，零跳过。
+
+同一 frozen v20 binary 的 quiet A-B-B-A quick 对照两臂都启用 scalar72，固定
+PP512、RAM payload/victim cache 关闭。PP1872 时间普通为 35.986/38.516 s，
+ring72 为 35.831/35.923 s，平均下降 3.69%，但成对下降 0.43%/6.73%，方差较大。
+D128 为 48.501/50.474 对 47.471/49.389 s，平均下降 2.14%；这只是样本中的
+decode 观察，不能把后续 decode 的所有差异归因于 prefill ring，cache capacity
+略有变化。全部四次的两项 API 与 canonical 的 154880 个 PP1872 logits 完全相同。
+宽 prefill 的逻辑读取字节均为 81,434,968,064，window 从 4960 降至 2293；
+每个 enabled quick run 实际观察到 115 次 expanded ring fill。这是减少 staging
+transition 的温和改进，不是减少物理 SSD 字节或大幅加速的证明，仍默认关闭。
+完整证据见 `native-v20-validation-summary.json`、`managed-v20-validation-summary.json`、
+`v20-ring72-abba-summary-20261022.json`。
+
+本次 CMake 再生成曾引入默认 Windows/EHsc CUDA flags 导致不必要的宽重编译；
+保留原始日志后显式固定 `CMAKE_CUDA_FLAGS` 为空缓存值，由现有 CMake 追加
+compatibility flag，恢复 v19 的全部 157 条 CUDA compile command hash，零差异。
+未改 upstream 文件；新 flag-off/on 测量始终使用同一个 v20 binary。
+
+`eng/validation/cuda-readonly-register-probe.cpp` 为独立 Windows/CUDA 小型能力探针，
+生成只读映射 fixture，不改模型。4 KiB/16 MiB CPU mapping checks 及 24 次
+实际 H2D/D2H 全字节比较通过，支持 read-only host registration，fence、unregister、
+unmap 均完成。但 registered-source 的 16 MiB end-to-end median 3.357 ms，
+pageable source 为 1.426 ms；不能据能力通过宣称 RAM tier 加速。持久复用、锁页
+配额、mapped trim 排除及模型工作负载仍未实现/验收。receipt 同时记录 toolkit
+目录与实际 runtime/driver API 版本不同，不能仅凭目录推断实际 runtime。
+
+独立 CPU 工具 `eng/validation/windows-mapped-lock-probe.py` 验证只读 mapped
+page 的普通 Windows 锁页。默认 quota 下完整 16 MiB 返回 1453；仅提高子进程
+working-set min/max 至 32/48 MiB 后，4096 页成功锁定，释放后 Locked 为零，
+原设置恢复、父进程不变。两个不同只读 view 的补充测试中，trim-like
+`VirtualUnlock(B)` 返回 158 并使 B 的 Valid 页归零，A 仍保持 4096 Locked 页和
+完整字节；unmap B 也不影响 A。新 cache-owned view 与原 GGUF view 的地址范围
+隔离因而有本机能力证据，但物理 Cache Manager 页共享、SSD 避免量及推理收益
+尚未证明；能力探针本身不能据此启用新的 RAM tier。
+
+v21 的 `TS_HOST_MOE_PREFILL_RING_COALESCE16=1` 只合并来源与 arena 均连续的
+精确所选字节，单次 read 至多 16 MiB，不增加 staging payload。16 个 native
+case（14 CUDA、2 CPU）和 13 个合成模型 case（9 CUDA、4 CPU）通过、零跳过。
+同一冻结 binary 的 quiet A-B-B-A 全模型比较中，两个 enabled run 均实际执行
+106 次 coalesced fill；长 prompt 的相关 read tasks 从 35788 降到 8857。
+四次运行均与 canonical 154880 个 F32 prefill logits 完全逐字节相同，两个
+request 的 API 输出也完全相同。但 PP1872 平均 39.794→41.808 s，慢 5.06%，
+两组配对都回退，因此此实验仍默认关闭。D128 平均 54.090→49.662 s，快 8.19%，
+是整请求缓存状态的观测差异；coalescer 不在 decode 执行，不能据此宣称 decode
+kernel 加速。逻辑字节/read tasks 与整机磁盘计数分别记录，不将其等同于归属于
+模型的物理 SSD 字节；仅两组配对、一个模型和一个设备，不构成广泛质量验收。
+完整结果保存在忽略的 `v21-coalesce16-abba-summary-20261022.json`。
+
+v22 增加默认关闭的 `TS_HOST_MOE_RAM_CACHE_MAPPED=1`：从已注册的同一只读
+file handle 创建独立 cache-owned view，按 4 KiB envelope 锁页，命中只复制精确
+所选字节到已有 pinned staging，再沿用原有 H2D fence。它不创建私有的完整
+payload 副本，也不从 GPU 下载 victim。独立 immutable cache 禁止写入、rekey
+和 writable recycle；source generation、loading retirement 与最多 16 个并发
+lease record 受显式约束。每项计入完整锁页范围加 4096 B metadata，另有
+64 KiB control 额度；初版最多 4096 项，只允许普通单行 GLM demand 准入，
+wide prefill 可命中但不准入/更新 recency。边界重叠页保守重复计费，不宣称
+总进程物理 RAM 硬上限或 OS 页的唯一物理归属。
+
+Windows quota 扩展须额外显式设置
+`TS_HOST_MOE_RAM_CACHE_MAPPED_EXCLUSIVE_QUOTA=1` 和正数
+`TS_HOST_MOE_RAM_CACHE_MAPPED_QUOTA_MB`，后者是本进程 quota ceiling，
+不是 RAM reservation。此模式依赖进程内协作式独占 quota owner；遇到其他
+组件改变 min/max/flags 则停止改写并保留待清理 owner。没有扩展时只尝试
+原 quota，拒绝锁页则精确 buffered fallback。unlock/unmap/close/restore
+失败均不能提前返还 live view、lease、quarantine 的 Host 额度；零容量清理
+允许重试，也不会因为环境设置改变而失去清理入口。
+
+本次 immutable CPU fixture 11753 checks、Windows own-child backend 25 个
+assertion groups、最终 43 个受影响托管 case 均通过；此前宽范围 212 个托管
+case 的结果另存，不重复加总。新的 Q8、mixed IQ2/IQ4、pageable 三个 CUDA
+case 与独立 resident graph 精确相同，真实 locked pages、cold/warm reuse、
+wide hit-only/fallback、guarded copy、Host refusal、source replacement、
+完整清理通过；第一轮 fixture 把 arena ceiling 误当实分配导致失败，已改用
+观察到的 staging bytes，原失败结果保留。不能把这些小 fixture 当成
+GLM-5.3-Flash 加速或广泛质量通过。
+
+v22 的全模型试验随后被否决：相同 staging 设置、RAM 关闭的首个对照中，
+PP1872/D32 为 35.199/14.338 s；8 GiB mapped RAM 的首个完整 request 为
+36.214/76.839 s，decode 慢 5.36 倍。两者 API 输出和全部 154880 个 F32
+prefill logits 完全相同。enabled request 在排除启动阶段后仍新准入
+34.67 GiB、驱逐 14301 次，成功命中复制约 5.35 GiB；整机 read 次数增加
+约 2.86 倍，但不能将整机计数归属为模型的物理 SSD 流量。后续 request
+已中断，另外两臂未运行，不能称为完成 A-B-B-A。失败、部分日志与停止原因
+均保留在忽略的 `v22-fullmodel-summary-20261022.json`。频繁冷锁页、quota
+收缩造成额外 fault 是待验证的解释，不能仅凭这些计数认定具体因果。
+
+v23 在 TensorSharp 自有代码中修正这一路径，ggml 保持
+`3612c0af93f2cfc8f048295300a61187723b12ae` 原样。RAM ready hit 先按精确
+source generation/范围查询，不查询 OS geometry；冷 miss 先完成原有 buffered
+read 到同一 arena，再考虑额外保留只读 view，避免新准入再复制当前 demand。
+固定 4096 项的精确 LRU probation 仅记录普通 N1 完整 projection 的 GPU miss，
+最近第二次 demand 才允许准入；构造任务的线程以固定 expert/projection 次序
+更新历史，worker 不更新该历史。ready hit 独立于准入，wide 与 fragment 可
+命中但不准入、不改变 probation。历史实际对象 196744 B，保守额外计入
+1 MiB Host 额度；不会用 bloom/hash 碰撞充当第二次使用证据。
+
+在仍有 live claim 时，quota min 保持已验证的 high-water，较小 replacement
+不主动降低 min；最后一个 claim 退休才恢复原设置。原有独占 owner、ceiling、
+冲突与 quarantine 契约仍生效。新增 process-lifetime API 调用/耗时计数及
+probation first/repeat 计数，benchmark 只取 request 边界差值，拒绝缺失、重复、
+逆序或中途 reset 的 telemetry；各阶段耗时可重叠，不能相加当 wall time，
+也不代表物理磁盘归属。v23 最终 20 个 native case（14 CUDA、6 CPU）、13 个
+合成模型 case（9 CUDA、4 CPU）和当时 36 个 harness case 通过，零跳过；
+新增并发 cold admission、fragment hit 不更新历史、strict-prefix read 失败后
+join/no-output、实际 source generation 与完整清理验证。托管源码未改动，
+707 个 C# source hash 与 v22 冻结包一致，未重复计作新的托管测试通过。
+
+同一 v23 binary 的完整 quiet A-B-B-A（RAM0/8 GiB/8 GiB/0，PP512、context2048、
+N1、两种 staging72 开启）中，PP1872 均值 35.475→36.724 s，慢 3.52%，
+两组配对方向不一致；D128 为 47.555→55.268 s，慢 16.22%，两组都回退。
+8 个 request 的 API identity 和四组完整 canonical prefill logits 均完全相同。
+实际 probation/计时遥测完整、无 reset/cleanup/quarantine 错误；B1 排除启动后
+命中复制约 32.19 GiB，但两臂短 request 的整机 read bytes 均值只减少约 0.57%。
+逻辑 RAM 命中可能已经由 OS file cache 服务，不能当成 SSD 避免量；锁页/
+mapping 开销仍未被收益抵消，继续默认关闭，不能称为推理加速。结果详见
+忽略的 `v23-mapped-probation-abba-summary-20261022.json`。首轮本地 HTTP
+startup 错误发生在 candidate 测量之前，保留失败证据后在 client dynamic
+port range 外完整重跑四臂，没有将该部分运行算入均值。
+
+后续 v24 的研究方向是由 native 累计强制 graph payload 上限后，再按实际
+layer-major 调用缩小 reservation，把可用额度交给 GPU 专家缓存。该 cap 不包括
+上游 CUDA pool、cuBLAS workspace、CUDA Graph 等未包裹分配，必须保留独立
+headroom；不能从一次测得的 424 MiB 峰值直接下调估计。cap 拒绝须先于物理
+分配，无普通 full-trunk fallback；部分执行失败须 fence 并 poison 状态。
+v24 已在原样 upstream 上构建；382 项累计 cap/allocator 检查与 1571 项 profile
+检查通过，最终 native 8 CPU、14 CUDA case 和合成模型 13 case 均通过，零跳过。
+真实 checkpoint 的 512/768 MiB 两项故障测试都完成第一层后触发注入失败，
+确认 caller logits 保持 sentinel、token head 未发布、拒绝继续，checked reset
+后完整词表输出与原 baseline 完全相同，清理后原生分配账本归零。这证明部分
+失败的状态处理，不代表完整 strict prefill 的质量或性能已通过。
+
+首次完整 server 尝试在分配前被托管 profile 拒绝：Host 的 retained conversation
+默认值仍为 2，即使 CLI 关闭 prefix cache。该次没有有效 timing，证据保留。
+Host 已修正显式 strict profile 的单请求/零 retained/零 prefix 配置；关闭 cap
+保留原默认值，不兼容的显式选项在加载前拒绝。最终 292 项托管 CPU 检查通过，
+零跳过，其中 22 项新增 Host profile/CLI 回归，包含先前 212 项 cap/准入检查，
+不能将两轮重叠测试累加成独立覆盖。
+
+完整 768 MiB candidate 的实际 strict prefill 成功，peak wrapped payload
+222875648 B，180 次 graph acquisition（112 build、68 reuse）、零 cap refusal；
+释放约 1.37 GiB Device reservation，完整 canonical prefill 154880 个 F32 与
+PP1872+D32、PP33+D128 两个 API identity 均完全一致。
+同一最终 native/managed binary 的 512 MiB quiet A-B-B-A 中，四臂完整 canonical
+向量及 8 个 API identity 全部精确一致；PP1872 均值 36.7315→35.3785 s，
+观察到 3.68% 时间减少，但两组配对方向不一致（第一组 candidate 较慢），
+control 本身为 34.027/39.436 s。D128 为 46.4675→44.921 s，观察到 3.33%
+减少；D32 为 13.233→13.2055 s，几乎不变。这是有限、波动较大的本机观察，
+没有实现显著的双阶段加速，仍默认关闭。独立报告保留在忽略的
+`v24-strict-graph-cap-abba-summary-20261022.json`，不能把 logical file bytes
+或 whole-machine read counter 视为模型物理 SSD 归属。
+此外，strict cap 目前只在实际 layer-major prefill 时释放 Device credit；
+CompletePrefill 回到与 control 相同的 N1 目标，不能据此宣称 decode 的稳态
+专家容量增加。必须分别测量真实 table capacity/resident/physical bytes 和
+完整推理时延，不能把较小 reservation 或较大 expert ceiling 当作加速。
+
+**2026-10-23 v25：原始量化 embedding 行搬运（默认关闭）。**
+`TS_GLM_HOST_TOKEN_EMBEDDING=1` 为同一 bounded 单请求配置增加显式不可变策略：
+输入 `token_embd.weight` 的 Q4_K 表保留只读文件映射，仅把本次 token 的原始
+2304 B 行复制到已计账的 1.125 MiB Host pack，再上传到最多 512 行的 GPU
+输入，交给原来的 CUDA `GET_ROWS`。不在 CPU 解量化，不修改权重或算术；
+独立的 output 表仍驻留 GPU。实际输入表为 356843520 B（340.3125 MiB），
+planner 只扣除这份表并计入新增的 Host/GPU pack。文件写入保护、源身份、
+实际 buffer provenance、所有 token ID 和图拓扑均先验证；部分失败必须 drain、
+保留调用方 logits 并拒绝继续，Reset 后才可恢复。
+
+冻结 native `B9217742…` 在上述干净 ggml 修订上完成 24 项 native CTest
+（9 CPU、15 CUDA）、独立 13 项 synthetic 模型测试、2 项实际 checkpoint
+中途 pack 故障/恢复测试，均零跳过；340 项托管 CPU 和 55 项 harness 检查通过。
+新 CUDA fixture 对两种词表大小及 1/9/512 行执行原表与 packed 行的相同
+Q4_K `GET_ROWS`，4276224 个 F32 逐位相同。测试范围不外推到其他设备、
+量化、长上下文、并发、MTP、media 或前缀捕获。
+
+同一 binary 的 quiet A-B-B-A 中，PP1872 均值为 36.200→35.4815 s
+（观察到 1.98% 减少），配对方向混合且 control 漂移约 16.20%；
+D32 为 15.0005→13.440 s（10.40%），D128 为 50.1005→45.1805 s
+（9.82%），两组 decode 配对均更快。四份 canonical 154880-F32 向量
+仍为 `497c9695…`，8 个 API identity 精确相同；另一次 candidate 也通过。
+真实请求中的 raw-row upload 覆盖 prompt，启动 warmup 不计入该资格。
+启动 expert ceiling 增加 356838912 B，首批三个 table 的槽上限从
+331/379/308 变为 345/414/311；这不是额外热专家或唯一物理 VRAM 的证明。
+D128 的 logical file bytes 反而增加约 9.69%，因此不把较快时间解释成
+SSD 读取减少或完整 RAM 层验收。独立证据为忽略目录中的
+`v25-host-token-embedding-abba-summary-20261023.json`。
+
+Host embedding 与 512 MiB strict cap 的单次组合 candidate 也通过 canonical
+和两个 API 检查，但 PP1872/D32/PP33/D128 为 36.610/15.134/8.734/52.163 s，
+没有组合加速证据。实际 ceiling 7212105728 B 虽超过三组 wide floor 总和，
+仍发生 5 次 prefill table 创建；不能把分析上可容纳三组当成实际复用。
+此组合尚未做匹配 ABBA，两个实验均保持默认关闭；显著双阶段优化目标仍未完成。
+
+**2026-10-23 v26：prefill Gate/Up 计算与 Down 读取重叠（默认关闭）。**
+
+`TS_HOST_MOE_PREFILL_DOWN_OVERLAP=1` 在原有精确选中专家路径中，先完成 Gate/Up
+上传，再提交同一原始图的 SwiGLU 前半段；Down 的文件读取和上传使用独立的同设备
+backend，双方排空后继续原始后半图。节点、形状、量化权重和数学运算保持不变。
+两阶段共用已记账的 72 MiB 双缓冲，未减少图预测或增加专家 payload 配额。
+GLM 加载时要求显式不可变 `TS_GLM_HOST_TOKEN_EMBEDDING=1`，以保留整次调用的
+logits 发布、失败后拒绝续推和 Reset 恢复保护；不能在加载后通过环境变量绕过。
+每个阶段的源区间、目标容量及前半图依赖在提交前检查，失败时两个 stream 都必须排空。
+
+冻结原生库 SHA256 为
+`4B47611BA372E47BB4B87ACA814FE5255E7DC9CA6A9621178227ECBD3C6A9E4E`。
+不修改 ggml，依赖仍为干净的 `3612c0af93f2cfc8f048295300a61187723b12ae`。
+实际通过 28 个不同的 native CTest（10 CPU、18 CUDA）、13 个合成模型用例、
+2 个真实 checkpoint 故障用例及 63 个 harness CPU 用例，均无跳过。故障覆盖已提交
+prefix 后失败及真实 Down 部分读取后失败；检查输出哨兵、head、续推拒绝、Reset 后
+全词表逐位一致和释放后预算清零。v25 的 340 个托管 CPU 用例仅保留既有证据，
+未计作本次重新执行。最初 IQ2 fixture 的 180 秒超时保留为失败证据；仅将其准备规模
+缩小五倍并使用 8 MiB 多窗口 fixture 后通过，未提高超时。生产数学代码未因此改变。
+
+同一二进制、Host embedding 开启、graph cap 关闭、Down 重叠关/开/开/关的 ABBA 中，
+PP1872 均值 **36.037→34.249 s（用时减少 4.96%）**，两对分别改善约 3.94% 和 5.92%；
+D32 **13.4135→13.109 s（减少 2.27%）**，D128 **44.776→45.2945 s（增加 1.16%）**。
+PP33 均值只改善 1.09%，两对方向相反。四轮全部 154880 个 F32 canonical logits
+逐位一致，8 个完整 API 输出一致，两个 B 轮的两个请求均记录真实完成的两阶段执行。
+这证明固定 N1/context2048/PP512 配置的有界精度与活动，不是通用语义质量、长上下文、
+其他设备或并行推理验收。控制 PP 自身有约 6.90% 漂移，每个设置仅两次观测；
+没有一致的长 decode 收益，因此仍关闭默认值，整体大幅加速目标未完成。
+host 阶段计时不证明 CUDA kernel 实际重叠或物理 SSD 读取减少。
+生成证据位于忽略的 `artifacts/perf/glm-memory-tier-20261015/`，主要汇总为
+`v26-native-validation-summary.json` 和 `v26-prefill-down-overlap-abba-summary-20261023.json`。
+
+**2026-10-23：Host embedding 与现有 decode graph reserve 的组合诊断。**
+
+使用同一 v26 原生库、Host embedding 开启、cap/Down overlap/rebalance 关闭，单独开启
+既有 `TS_GLM_DECODE_GRAPH_RESERVE=1`。实际 PP1872/D32/PP33/D128 为
+**35.903/13.265/7.635/45.171 s**，canonical 154880 个 F32 和两个完整 API 输出一致。
+这只是一次未配对候选，未运行性能 ABBA，也没有速度收益结论。
+运行时 `ceiling_max=8,698,761,992 B` 确认启动的 `8,062,425,352 B` 不是硬上限；
+上限仍需服从每次真实 ledger 与设备可用量，不能将差额当作已获准容量。
+
+首个 N1 先释放 `223,075,584 B` 图预测 credit，专家上限实际从
+`7,950,303,232→8,172,601,344 B`。但创建第一个完整 N1 图后，下一次
+`PrepareGraph→AdmitGraph→RepayExpertCapacity` 又回收 `342,557,952 B`
+（当次 shortfall `208,340,224 B` 加 128 MiB margin）。日志没有记录第二次的
+physical/ledger/live 采样，不能把 shortfall 精确归因于图 payload、vendor workspace
+或 driver。最终表容量为 **299/722/90**，不是此前 Host 普通路径的 **300/753/87**；
+没有持续的 D32 容量增益。group3 还保留 `71,586,816 B` 的 336 行 wide scratch，
+增长复制了 `2,170,552,320 B` 旧 payload；这也说明“所有表都按新 narrow 配额创建”
+的冷计划不能描述继承状态。短请求首 N1 虽然增加上限 `280,869,376 B`，
+却触发默认重平衡，最终全新表为 290/726/85，仍不构成因果性能证明。
+
+可复用检查器 `eng/validation/glm_decode_graph_reserve.py` 把真实首 N1 的 credit、
+专家上限增长和驻留容量验收分开，最后一项始终要求独立证据。实际日志的
+reserve scope 和 recovery scope 不同；普通 dispatch 的原始 `output_rows=0`
+表示一个有效输出行。最初 checker 混淆这两个约定，候选在请求完成前主动中止，
+保留为未完成运行；修复后 19 个 helper CPU 用例、66 个主 harness 用例通过，
+真实记录已加入 fixture，再运行的新候选才计作有界质量/活动验收。
+主要证据为忽略的 `v26-decode-reserve-candidate2-materialization-audit-20261023.json`。
+该组合继续默认关闭；下一步必须解决实际持有者和替换峰值，不能仅降低预测数值。
+
+**2026-10-23：TensorSharp 自有 CUDA VMM 最小原型，尚未集成缓存。**
+
+`eng/validation/cuda-vmm-expert-table-probe.cpp` 为 Gate/Up/Down 分别预留独立 VA，
+使用标准 CUDA buft 和完全自有 buffer callbacks，按实际 `cuMemCreate` 粒度记账。
+不转发会解释私有 CUDA context 的原始 callbacks，也不使用可能分配整张 Host tensor
+的通用 tensor-copy fallback。三个投影的容量增长不会移动另一个投影的起点；
+每个物理 chunk 独立映射，回收完整 chunk 前先排空访问，成功解除映射及释放后才退款。
+几何变化后更新图 UID，原有小图保持相同节点和数学运算。
+
+首次实际 GPU 运行出现非法内存访问并中止，保留为失败。源码检查发现两个顺序缺口：
+device `cudaMemset` 在 Host 上异步，部分分配失败时可能直接 unmap 尚在初始化的页；
+成功分配的初始化也可能与另一个 stream 的上传竞态。同步 copy/memset callbacks
+同样不能只依靠函数名假设同步。修复在所有 reclaim 前和初始化发布前排空，并在
+失败排空时保留持有者及 ticket；几个修复同时提交，不能宣称已单独复现并隔离原始
+非法访问的唯一原因。原始二进制和失败日志未被覆盖。
+
+修复后的冻结源码 `C8EC9B669406EE5D28164F11C9E17D9954BE0BAE7BC026BEE4807E06895394FF`
+以既有 CUDA13 静态库链接，不重配、不重建、不修改 ggml。RTX3080 Laptop 上，
+完整普通 GGML Q8 Gate/Up→SwiGLU→Down→加权和在 N1/N9、容量 8→24→12 下
+**61,440 个 F32 比较逐位一致**。覆盖预先 ticket 拒绝（零物理分配）、两个实际
+物理 chunk 分配后的失败回滚、23→2 热 slot D2D 压缩、poison 后真实 owned-copy
+恢复、几何变化后重复提交及所有 live 原始量化 slot 的有界回读。实际 2 MiB 粒度下，
+VMM 物理权重 **12,582,912→25,165,824→12,582,912 B**，声明的 payload ledger
+峰值 `45,415,168 B`，结束 pending/committed/quarantine 均为零。
+
+这只是分配机制原型，**不是 GLM 质量或性能验收，也未用于生产推理**。实际 CUDA
+graph capture、清理 API 失败注入、context fatal error 的优雅恢复、其他量化、views、
+2D、TP 与跨 backend copy 均未通过验收；图日志仅观察到 warmup/reuse。ledger 不含
+driver/context/workspace、虚拟地址预留和独立原始 fixture 数据，不是总 VRAM/RAM
+硬上限。生产集成还必须解决真实 kind4 票据、缓存布局/UID 生命周期、已准入 credit
+的持续性以及实际 checkpoint 精度与性能。证据在忽略的
+`cuda-vmm-expert-table-probe-v27-retry1/execution-receipt.json`；可复用编译入口为
+`eng/validation/build-cuda-vmm-expert-table-probe.ps1`。
+
+**2026-10-23：实际 N1 专家边界计时，优先优化读取流水线。**
+
+v27 为 TensorSharp 自有 GLM executor 增加默认关闭的
+`TS_GLM_SELECTED_EXPERT_TIMING=1`。它只观察既有 callback、下载、helper 和 fence，
+不增加 GPU 同步，不改变图节点或数学运算。配合 `TS_DSV4_PERF=3` 记录 precision
+facade 的 process-global 增量；这些是嵌套 Host API wall time，不能当成 CPU 独占
+时间或 GPU kernel 时间。诊断 launcher 明确禁止将带观测开销的运行计作性能 ABBA。
+
+同一干净 ggml revision 上的新 native SHA-256 为
+`214793BC22307876A7EE78E4B1BFAD06A65B45B60EE841B2F7A9125CC6D621B5`，
+相对 v26 的 305 文件快照仅修改 GLM executor 计时。13 个合成模型用例重新通过，
+零跳过；v26 的 28 个 native 用例保留旧版本执行证据，未计作 v27 重新执行。
+检查器 `eng/validation/glm_selected_expert_timing.py` 的 21 个 CPU 用例通过，
+要求实际完成、valid、完整位置序列、每步 42 个 ask/ready/completed、零 errors、
+有限非负计时及 total/helper/outer 的一致性。仅有 availability 标志不足以授予
+facade 计时资格，必须每步实际观察到正值 calls 与 submission time。
+
+新进程的 Host embedding 开启、reserve/Down/cap 关闭试验中，PP1872 canonical
+154880 个 F32 逐位一致，两个完整 API 输出一致。实际 D32 和 D128 的全部
+160 个 N1 step 通过上述协议检查，两个启动 N1 记录没有计入请求。
+
+| 实际嵌套阶段 | D32 | D128 |
+|---|---:|---:|
+| 整体 graph compute | 12.953 s | 43.295 s |
+| producer ready wall | 2.648 s | 10.507 s |
+| selected-expert helper wall | 10.232 s | 32.506 s |
+| helper 内 file pipeline | 9.040 s | 28.756 s |
+| helper 后既有 drain | 0.00165 s | 0.00598 s |
+| 外层 facade Host API submission | 0.216 s | 0.679 s |
+
+D128 file pipeline 占整体 compute 约 **66.42%**，helper 占约 **75.08%**；
+外层 facade submission 仅约 **1.57%**，不能支持优先靠 UID 省去属性比较来获得
+大幅加速的判断。file pipeline 包含 worker join 和 H2D consumer，upload enqueue
+与其嵌套，不能相加或推断物理 SSD 服务时间。producer ready 也含 GPU 和 Host
+等待，未进一步获得 kernel 归因。这轮没有性能收益结论，当前重点转向实际专家
+保留及读取流水线，整体大幅加速目标仍未完成。原始日志和独立复核保存在忽略的
+`selected-expert-diagnostic-v27-cuda13-20261023-base1-candidate/`、
+`selected-expert-timing-tool-v27/` 和
+`selected-expert-diagnostic-v27-base1-independent-audit-20261023.json`。
+
+同日另一份 reserve+route trace 也保持 canonical 和两个 API 输出一致。实际 G4
+从新建 774 槽退为冷建 741 槽，预算为 `7,954,029,312 B`；三投影分别按 2 MiB
+计费的保留方案最多按 740 槽估算，尚未准入新元数据开销。严格按完成后的 N1
+timer 关联 32 步路由，先逐层核对冷 LRU 的真实读取字节，再重放保留 224 个低槽
+key 的在线策略：131 个恢复命中、2 个反向 miss，净少 `836,960,256 B`，只占
+整个 D32 逻辑读取的 **2.09%**。这是有限的机制机会，不是运行时候选、SSD 或
+速度收益。同一实际 trace 的 source-qualified LFU 更差：D128 三组全部增加读取，
+总逻辑字节增加 **2.59%**，因此没有实现该策略。D32 的继承 G3 缺少完整初始 key，
+明确排除，没有按冷表伪造其通过结果。
+
+**2026-10-23：有界文件读取并行度试验。**
+
+v28 增加 `TS_HOST_MOE_FILE_READ_WORKERS=0..16`。缺省或 `0` 保留原有 pool；
+显式正数设置 prepare 上限，并受已有可用并行度限制。原 pool 的 submitter
+负责消费完成项和提交上传，16 个 pool slots 对应 15 个后台 reader；ring 的
+两个 slot 不是两个 reader。显式 `1` 使用既有串行路径。原有 read chunk、
+72 MiB arena、upload window、源 extent、图节点和数学不变，不增加 ggml 修改。
+所有 prepare 和 consume 的异常仍经既有 join/fence；caller 只在 join 后统计完成
+任务及 source bytes，失败调用不认证部分完成。新字段追加到原 cache timing 行，
+不增加每次读取的日志或 worker atomic；配置上限不是实际并发峰值或 SSD 队列深度。
+
+新 native `22ABD926C250E9B68448C159322EB44F020124B2D1130919ABD164B5314E5415`
+实际通过 10 个 native 用例（6 CPU、4 CUDA）、13 个合成模型用例（4 CPU、9 CUDA），
+零跳过。新 CPU fixture 实际证明 8 个 prepare 同时进入、caller 消费、失败后 join
+及 pool 重用；Windows 文件用例没有执行 POSIX 专属情形。71 个主 harness 与
+14 个 helper CPU 用例通过；profile 禁止 server 参数覆盖固定 PP512/N1/context2048
+及其他相关实验，每个测量请求须有真实完成的 N1 source reads。忽略目录中的主要证据为
+`v28-file-workers-native10-synthetic13/validation-summary.json`、
+`harness-v28-file-workers-final/validation-summary.json` 和
+`route-retention-tool-v27/retention-and-lfu-conclusions.txt`。
+
+随后完成同一 v28 二进制的 auto/8/8/auto 四臂验收：四次 canonical 全 logits 和
+八次 API 输出均精确一致，每个请求的实际 reader activity 通过。PP1872 平均仅减少
+**0.083%**，D128 减少 **0.840%**，两者逐对结果均有反向变化；D32 平均减少
+**5.921%**，但 control 自身漂移 **8.447%**。没有得到 prefill 与 decode 的明确共同
+收益，默认继续 auto。完整归因和限制保存在
+`file-read-workers8-v28-abba1-independent-audit-20261023.json`；逻辑 source bytes
+和 host file pipeline 不等同于物理 SSD 读取和独立 DMA 时间。
+
+v29 将 Windows 文件句柄的实际 `FILE_FLAG_RANDOM_ACCESS` 选择追加到已完成读取
+的 timing 记录，并验证对象创建后环境变化不改变已打开句柄；它不证明 Windows 缓存
+策略的效果。native 10 项、合成 13 项、主 harness 76 项及 reader helper 18 项均通过，
+零跳过。hint=1 的单个候选和既有 75% decode rebalance 单个候选均通过 canonical 与
+两次 API 精确质量检查，但均未完成各自同二进制配对性能验收，不能宣布加速。
+对应 native 为 `D60F78076687732936904A5011CDC9DE85B48D2D3077420ED28465C551FE2CC7`。
+
+**2026-10-23：修正 VMM 容量估算与保留热表的实现准备。**
+
+实际 v28 D128 活跃预算为 **7,538,484,736 B**，现有占用 **7,273,053,952 B**，
+余量只有 **265,430,784 B**，并非约 2 GB 空闲。按三个独立 2 MiB 物理池取整后，
+保持其他组不变只能将 G4 从 363 扩至约 401 slots；还未扣新 owner 的额外开销，
+也未证明实时设备余量及共享账本准入。Q6 从 305 缩至 87 可释放约 1.917 GB，
+但这是重分配，且可能需要淘汰/搬移热项。另发现普通 D128 的继承宽表已被标记为当前
+growth generation，没有预算增加便不再尝试增长；delta allocator 本身不足以改变该行为。
+原始依据为 `v28-d128-vmm-delta-capacity-audit-20261023.txt`。
+
+新的默认关闭 `TS_HOST_MOE_DECODE_REBALANCE_RETAIN_PEER=1` 模式要求既有
+`TS_HOST_MOE_DECODE_REBALANCE=1`，仍先回收严重失衡的组，但只为缺失组的真实 mandatory
+floor 回收额外 peer，并在冷分配时保留其他缺失组的 floor。它旨在避免仅为 optional
+full share 清空已有热表；不能增加预算或放宽设备余量检查。实现、三种量化的实际 owner/
+source/LRU/graph UID 保留及失败回滚 fixture 已完成独立源码审查；新二进制
+`A597D8808859C356B3752708C5886AE9728D26205B7ECF001CAF08BCF27BDD46`
+实际通过 8 项 native（4 CPU、4 CUDA）及 13 项合成回归（4 CPU、9 CUDA），零跳过。
+三池 VMM planning/ownership helper 实际通过 417 个纯 CPU 检查，未接入生产 CUDA cache；
+首次编译暴露的 test 混合 auto 类型声明错误已修复，失败日志保留。主 harness 86 项及
+retention helper 12 项 CPU 检查通过；每个请求分别记录 actual activity，零事件请求
+保持 `passed=false/not_observed` 与零 retention credit，整个条件试验要求至少一个真实
+事件且所有请求记录有效。真实模型候选随后通过两次 API 与 canonical 全 logits；
+D128 实际保留 300 个热 slots、`2,276,414,720 B` 的既有 owner，D32 无该事件，
+不计 retention 通过。
+
+同二进制 off/on/on/off 的四次 canonical、八次 API、Host activity 全部精确通过，
+但 **D128 平均从 44.1665 s 变为 46.36 s，慢 4.966%**，两对均变慢。PP1872 平均
+少 1.882%，逐对方向不一致。B 的容量为 G3/G4/Q6 = **300/713/70**，A 为
+**284 或 285 / 712 或 713 / 83**：G3 的平均逻辑读取少约 1.017 GB，Q6 多约
+0.948 GB，总计仅少 **98,205,696 B（0.06939%）**。保留热表同时改变了其他组可得
+容量，不能由单个保留事件推定整体收益；timer 差异也没有唯一的因果归因。该模式继续
+默认关闭，没有作为性能改进交付。证据为
+`v31-retained-peer-abba-independent-summary-20261023.txt` 和对应 detailed JSON。
+以上更改均位于 TensorSharp 自有代码；ggml 仍为未修改的
+`3612c0af93f2cfc8f048295300a61187723b12ae`。
+
+另完成一次 v29 冻结二进制的可选只读 GPU 时钟诊断：633 个有效 sample，两个请求
+窗口分别有 260、299 个 sample，均为 P0，memory clock 均为 6001 MHz，无 sample
+报告 thermal slowdown；power limit 全部为 N/A，原样保留。两次 API 与 canonical
+全 logits 精确通过，sampler 子进程已确认清理。200 ms whole-board sample 不能分离
+prefill/decode 的精确边界、短 kernel/传输，不能证明低功耗或任何 stall 的因果；轮询
+本身可干扰执行，该运行 `timing_eligible=false`。证据为
+`v30-actual-gpu-clock-qualification.json`，没有改变时钟、电源或 OS 策略。
+
+**2026-10-23：VMM 所需的可确认预算回收桥。**
+
+既有共享预算 release callback 返回 void；managed 侧若在实际 ledger refund 后的
+notification 失败，仍保留 token，native 无法由 shared_ptr reset 证明 managed 已移除
+它。新的可选 checked-release callback 只在 reservation dispose 及 token 移除完成后
+返回 1；返回 0 时 native 保留原 ticket、registry 与 managed callback owner，允许同
+token 重试。managed 健康错误保持 sticky，清理成功不重新允许模型工作。旧构造器及
+旧 void ABI 保留原路径，新的五参数 scope 显式 opt in；还有 rank/kind/reserved bytes/
+commit 的原始 charge certificate，不能将它当作物理设备余量。
+
+该桥实际通过 1 项 native accounting suite、16 项 managed ownership、3 项实际
+native/managed ABI 用例，以及 13 项合成回归（4 CPU、9 CUDA），零跳过。ABI 测试
+没有分配 CUDA/VMM storage；VMM adapter 仍在独立源码审查和设备 fixture 准备阶段。
+因此这些结果不代表生产 cache 已接入 VMM，也不代表 GLM checkpoint 或速度验收。
+桥接二进制为 `4FA1E27CD11317AA2291F734A5B30F922035F152D69CCCE2E6AA00D962CAF1EA`，
+证据为 `native-v32-checked-budget-build-freeze.json`。实际 CUDA VMM、图重建、源身份/
+slot compaction、错误保留和完整 checkpoint 验收必须另行通过。
+
+v33 随后完成独立生产 VMM weight adapter 的实际 CUDA component 验收：Q8_0、IQ1_M、
+IQ2_XXS 三项均通过、零跳过，每种类型与普通 CUDA full-resident oracle 比较
+61,440 个 F32 值，逐位一致。覆盖 N1/N9、8→24→12 容量、三个独立稳定 VA、
+原生 async 1D/2D 传输、slot23→empty2 的 D2D、真实成功分配后的部分回滚、
+真实 padding 写入后的故障，以及已退款但回执失败时保留 Device/Host token 后重试。
+初次三项失败来自 fixture 每 token 的重复 top-k ID；失败日志保留，修复后重新完整执行。
+编译另补 TensorSharp 自有文件的 `ggml-impl.h` include，ggml 上游仍为干净的
+`3612c0af93f2cfc8f048295300a61187723b12ae`。
+二进制为 `70EDA4F7BDCBB27B182A4BAF591DF726EA2DFE843BCBC6CFCED5A5EC3AFC95B9`，
+证据为 `v33-vmm-weights-validated3/validation-summary.json` 与
+`vmm-phase-b-v33-runtime-retry1/execution-receipt.json`。这些 component 测试没有覆盖
+混合量化三元组、实际 CUDA capture、保留 scratch 的 resize、完整 GLM checkpoint
+或性能。后续独立执行真实格式的 G3=`IQ2_XXS/IQ2_XXS/IQ3_XXS`、
+G4=`IQ1_S/IQ1_S/IQ3_XXS`、G11=`IQ2_XXS/IQ2_XXS/IQ4_XS` 三项 component，
+仍在 H512/FF1024 和 tiny padding 几何下，每项 61,440 个 F32 逐位一致、零跳过。
+此前把 G11 简称为 Q6 不准确，实际 Down 为 IQ4_XS；不能由这些记录宣称 Q6_K 验收。
+证据为 `v33-vmm-glm-weights-validated3/validation-summary.json`。
+托管启动/最终 checked close、拒绝释放时保留 model handle 的接线已编译，并通过
+38 项 CPU 用例、零跳过；见 `v34-vmm-managed-build-freeze.json`。这还不代表
+新 native scope ABI 或完整 checkpoint 验收。生产 cache 接线正在进行，默认保持关闭，
+不能据此宣称提速。
+
+v35 已构建完整 cache 接线，并另行实际执行 6 项 CPU native ABI 用例，零跳过；
+覆盖纯 HostPlan、checked free 的空句柄握手、OFF scope 零 VMM owner、
+不支持的 loader 配置在 backend/文件操作前拒绝，以及 checked budget 回执。
+GPU 集成首次运行 5/6 通过，安装 phase plan 时发现 pool identity 的错误假设：
+实际 loader 对每个量化组都使用共同的 `45×288` 专家索引范围，
+`11/28/3` 仅为各组流量权重。已修复并保留原有统一 trunk/pool 检查；
+第二次运行安装成功，但首次 N16 输出比较失败，仍为 5/6 通过，不能计作验收。
+随后独立控制发现普通 CUDA 的 C48→C62 也产生同样 1,396 个 F32 差异，
+最大 absolute 为 `2.002716064453125e-5`；实际 VMM 与普通 CUDA C62 **逐位一致**，
+全部已占用 slot 的三投影原字节亦相同。该结果仅覆盖首次 G3/N16，
+不能把原失败改计通过，也不能由小几何下不同 CUDA reduction 的差异宣称模型质量下降或不下降。
+cache fixture 后续使用独立文件数据、完整 source/slot 身份和相同几何的普通 CUDA oracle；
+完整 checkpoint 的 canonical logits 门槛不变。
+这些失败日志与修复前后源码身份均保留；完整 checkpoint、真实 resize 的数值正确性
+和性能尚未通过。另有既有模型 synthetic 回归 13 项通过、零跳过（4 CPU、9 CUDA），
+只覆盖原有模型路径。证据为 `v35-vmm-interop6/execution-receipt.json`、
+`v35-vmm-cache6/validation-summary.json`、
+`v35-vmm-cache6-pool-fixed/validation-summary.json`、
+`v35-vmm-mismatch-diagnostic-native/diagnostic.log`、
+`v35-vmm-synthetic13/validation-summary.json`。
+
+v35 完整 checkpoint candidate 与同二进制 ABBA 随后均通过 canonical154880 logits
+及所测 API 输出比较，四臂共 8 个 API 请求；B 臂每个所测 routed call 均使用实际 VMM，
+D128 有真实的 donor shrink→G4 growth，D32 因压力下整组驱逐未形成完整三组 reshape。
+这些记录不代表通用语言质量或 graceful checked teardown 验收：benchmark 最后终止 server 子进程。
+配对结果为长 prefill 平均 **33.9415→38.822 s（增加14.38%）**，
+D128 **45.373→49.4195 s（增加8.92%）**，均在两对中变慢，故默认继续关闭。
+后续实验分别检查较大物理 chunk 的资源数量，以及压力下的 shrink-only compaction；
+前者尚未证明 WDDM 开销归因，后者须同时覆盖 Update/Trim 和内部 wide admission 的回收，
+仅修改一个回收入口不足以修复实测 D32 的整组丢失。
+独立结果在 `v35-vmm-weights-abba-independent-summary-20261023.json`；
+2 MiB v35 的失败和吞吐结果不改计为后续实现的通过记录。
+
+v36 将生产 profile 的物理 chunk 改为 16 MiB，并保留 tiny fixture 的 driver-minimum
+chunk；规划、实际分配、map/unmap 和退款均使用同一完整 chunk，未修改 ggml。
+最终二进制 `3369B40E19CC93D66450532BED589D68931703B1513E372A833A535AE642FCF0`
+通过 23 项 native/合成验证（8 CPU、15 CUDA），另有 6 项实际 ABI CPU 用例，零跳过。
+cache fixture 在相同容量、相同执行几何的独立普通 CUDA oracle 下比较 210,944 个
+F32，逐位一致，并覆盖三组 compaction、保留 narrow scratch、fresh UID、故障后
+禁止继续提交，以及 Device/Host 回执失败后保留 token 并重试。
+独立 coarse component 的实际三投影容量 8→24→12 对应 48→96→48 MiB，
+比较 122,880 个 F32，逐位一致；不把该对齐几何当成 padding 故障验收。
+证据为 `v36-vmm-coarse-native-validation/validation-summary.json`、
+`v36-vmm-coarse-native-validation/independent-runtime-audit.json` 和
+`v36-vmm-interop6/execution-receipt.json`。
+
+v36 完整 GLM candidate 亦通过 canonical154880 logits、两个 API 请求和所测全部
+42 个 routed layer 的实际 VMM 活动检查。单次长 prefill/D32/短 prefill/D128 分别为
+32.571/14.444/6.691/44.827 s；这是未配对结果，不能据此宣称提速。
+当前下一步是在非零 Update/Trim 与内部准入回收时保留三组中的有效权重，
+并在实际当前预算内重新分配 decode 容量；新压力路径尚未完成 runtime/model 验收。
+实际 CUDA capture、通用语言质量、server graceful checked teardown 和联合性能收益
+仍未由这些记录覆盖，默认继续关闭。
+
+v37 压力路径的首轮 CUDA fixture 揭示了实际清理缺陷：同一次调用已经压缩后，
+新候选在物理准入前拒绝，保留的零字节 unpublished registry node 使旧 Trim(0)
+在字节账归零时提前停止，Host staging 因 registry 非空未释放。
+已将显式零目标清理改为逐一 checked retire 所有 registry node；非零压力策略不变，
+原失败记录和原 fixture 断言保留。修复后二进制
+`18F86549A7BD91821C92053CF53212D410D782D7E9D78C68652B18EA34ADCEE2`
+实际重跑通过一个 CUDA pressure case，零跳过，75 个相同几何的独立 CUDA reference
+frame 合计 305,152 个 F32 逐位一致。
+覆盖非零 Update/Trim 的三组保留、stable VA/narrow scratch、source/LRU/raw bytes、
+实际当前预算下的未来 N16/N9 重建和 N1，以及 wide ACK 失败保留原 token、
+真实释放后故障34、同调用压缩后 prephysical 拒绝35的禁止重试/禁止提交/输出 sentinel。
+清理仍通过 checked free→ACK，失败则保留 owner 重试，最终声明 payload token 归零。
+证据为 `v37-vmm-pressure-runtime1/`、`v37-pressure-runtime1-causal-review-20261023.json`
+和 `v37-vmm-pressure-runtime2/validation-summary.json`。这是 tiny cache 生命周期验收，
+尚不代表完整 checkpoint、实际 CUDA capture、通用语言质量或性能。
+
+v37 随后在同一最终二进制通过既有 23 项 native/合成回归与 6 项 CPU ABI；
+这些通过记录零跳过。ABI 首次调用遗漏 hooks opt-in，发现的 5 项被跳过，
+记录保留但不计通过；启用明确 opt-in 后实际执行 6 项全部通过。
+完整 GLM candidate 通过 canonical154880 logits 和两个 API 输出比较，
+实测 6,930 个 completed selected frame 覆盖每个所需 PP/N1 token 的全部 42 层，
+有 15 个真实 pressure event 和两个 decode reshape，pending/quarantine 均为零。
+长请求保留三组并从 108/256/257 改为 297/741/79，实际 owned
+4,878,268,416→7,914,944,512 B，没有超过当时 7,953,448,960 B 预算。
+D32 逻辑读取相对 v36 candidate 减少 8.414%，但长 PP 增加 2.079%，
+D128 仅减少 0.064%；这些跨 candidate 的字节比较不等于 SSD 或速度收益。
+单次 PP1872/D32/PP33/D128 为 36.314/15.654/8.289/52.380 s，仍未配对。
+证据为 `v37-vmm-pressure-regressions/validation-summary.json`、
+`v37-vmm-interop6-retry1/execution-receipt.json` 和
+`v37-pressure16-candidate-independent-audit-20261023.json`；同二进制 ABBA 正在执行。
+
+v37 ABBA 已完成，四臂 canonical/API 均一致。均值 PP1872/D32/PP33/D128 分别减少
+6.830%/10.220%/6.863%/5.877%，但第二对 PP1872 增加 3.550%、D128 增加 5.575%，
+两次 OFF control 本身存在约 9%–17% 漂移。因此不能宣称稳定联合提速，VMM 继续默认关闭。
+ON 臂每个实际测量窗口均有压力事件；两臂各 13 个 measured event，startup 事件不计入。
+见 `v37-vmm-pressure-abba-independent-audit-20261023.json`。
+
+v38 的独立实验 `TS_HOST_MOE_FILE_READ_SORT=1` 只排列已选定 miss pair 的读取副本，
+不改变原 slot/source、route/LRU/publication 顺序、payload、task/window 大小或 H2D 次数。
+它保持 expert-major 三投影 packing，不重复 v21 已使 PP 变慢的 projection-major coalesce16。
+最终二进制 `D1CC63E302A4D0A6E4F24274B431B03F8223BDDD41B3E10908ADE92C21165244`
+通过 26 项 focused/native/合成验证（5 CPU、21 CUDA）及另行 6 项 CPU ABI，零跳过；
+主 harness 101 项与 helper 修复后的 20 项 CPU 用例均通过。
+sort 专属 GPU 四臂实际覆盖正常、真实 prefix read 失败、queued upload 与 epoch 失败；
+不把复用的 generic PASS 文字中未在该 case 执行的 allocation/commit 故障计入覆盖。
+完整 GLM candidate 在 VMM0/Host1/75%/ring72 下通过 exact canonical/API2 和两个请求中
+PP/N1 的实际 changed-order 活动，单次 PP1872/D32/PP33/D128 为
+34.771/14.232/7.370/43.110 s；未配对，不能据此宣称提速。
+同二进制 ABBA 已完成，四臂 canonical/API8 与实际排序活动均通过。
+PP1872 均值增加 3.373%（两对均变慢）、PP33 增加 7.523%、D128 增加 1.104%；
+D32 减少 4.398%，但 D128 两对为增加 4.402% / 减少 1.968%，OFF control 漂移 7.388%。
+因此 file-read sort 保持默认关闭，见 `v38-file-sort-abba-independent-audit-20261023.json`；
+严格保留原始结果，不把排序成功、逻辑字节相同或机器级磁盘读量当作 SSD 提速证明。
+
+RAM 固定 cohort 的 source-qualified chronological replay 已通过 25 项 CPU 用例并逐层
+复核保存的 GPU miss 字节。训练 32 token 后冻结 cohort，再验证 96 token；按相同总量
+16/20 GiB 比较普通 whole-triple RAM LRU 与 cohort+剩余 LRU，并计入实际模型中的
+新增 admission 成本，全部八种 cohort 方案净逻辑 source 读取均增加。
+因此拒绝该固定 cohort 策略在此 trace 上的实现建议；这不是实际 OS cache、SSD、
+物理共享、RAM 准入或速度结论。见 `ram-miss-cohort-replay-v2/independent-audit-20261023.json`。
+
+实际 checkpoint 的 checked teardown 另行通过 1 项显式 CUDA/Models 用例，零跳过。
+它使用真正的 scheduler admission 与 BatchExecutor 执行 PP9/N1/N1，证明仍持有
+8,151,100,672 字节 VMM payload 时真实非空 model handle 的 checked free 被拒绝，
+同一 handle 可继续前进至 head11；归还请求后先关闭专家 scope，再正常删除模型，
+最终 executor handle、native declared owners 与预算 Reserved/Committed 全部归零。
+这不是 legacy destructor 故障 ACK、完整 OS 内存、capture 或性能证明。
+见 `v38-vmm-checkpoint-teardown-runtime1/independent-audit-20261023.json`。
+
+新增 `eng/validation/expert-file-source-view-probe.cpp` 对完全相同的注册只读句柄
+建立独立 unlocked view，逐字节对照原 ReadFile；不 pin、不新建私有权重副本。
+真实 layer3 Gate 的已保存 top8 span，在 72/32 MiB arena 下 joined preparation
+均值分别为 ReadFile 1.540/1.483 ms、view copy 1.059/1.012 ms；整个 622,854,144
+字节 tensor 为 57.973/36.307 ms。五种实际 probe 均完整清理，两种合成 partial/inpage
+故障均通过 full-task buffered overwrite，且故障运行不计作 timing 通过。
+这些是 warm CPU source-service 结果，validation 本身会暖 OS cache，不能外推为
+SSD 读取量、常驻 RAM、H2D 或完整模型速度；生产 scope/metadata 计账与 checked close
+仍需完整模型验收，实验保持默认关闭。
+
+v39 已将该方案实现为默认关闭的 `TS_HOST_MOE_FILE_SOURCE_VIEW=1` 实验：
+在模型创建前预留持久 Host promise（实际 control slab 与单独的 OS mapping/PTE forecast），
+在全部 126 个 selected-expert Source 注册后、首次计算前，绑定其原只读句柄的独立 view。
+它保留原 route、LRU、任务与 window、CPU copy、H2D 及计算路径；Host embedding source 不入选。
+原子 shared alias 与 last-strong-owner 通知保护 lookup/reader-acquire/close 之间的生命周期；
+close 先撤销新 lease，busy 时不等待持锁清理，所有物理资源释放后才请求 checked ACK。
+失败的 mapping/control/ticket owner 保留到 retry，model checked free 在最终 close 前拒绝删除。
+PTE allowance 只是预算预测，不是实际 Windows 内核或常驻权重 payload 计量。
+profile 限于 Host1/VMM0、context2048/chunk512、N1、LFU 显式关闭且无其他 RAM/read/cache 实验。
+当前 managed startup/lifecycle/profile 回归已通过 63 项 CPU、零跳过；harness 主 106 项与
+source-view helper 16 项 CPU 及 PowerShell 解析通过。独立 Windows CPU fixture 已实际通过
+304 个断言、14 个生命周期 scope，零跳过，覆盖精确 offset/handle/bounds、8 个并发 reader、
+partial/SEH fallback、失败 buffered prefix 的 joined pipeline、三种建图/三种关闭故障及 ACK retry。
+它与 CUDA 编译重叠执行，不是 CUDA/model/性能验证；也未执行 reserve/commit refusal。
+v39 native DLL `123294E8…EB0B2D9E` 已构建；320 份 native source 无漂移，
+ggml 保持原版 `3612c0af93f2cfc8f048295300a61187723b12ae` 且工作树干净，
+157 条 GgmlOps CUDA 编译命令与既有配置一致。当前 cuDNN 为 `9.25.0.15-cuda13`，
+其输入与旧 D1CC 构建不完全相同，只能用相同新 binary 的 OFF/ON 对照作性能结论。
+严格 driver 实际通过 40 次回归执行（38 个不同 case；24 CUDA、16 CPU），零跳过，
+其中独立 CMake 构建的 source-view fixture 也通过全部 304 个断言；另有 6 个真实 CPU ABI
+case 通过。首次 ABI runner 误开 teacher-export shortcut 的 3 个失败保留，不计作通过。
+
+首次真实 source-view checkpoint 在 compute 前拒绝配置：managed 误把每个 tensor 的
+64 KiB placement allowance 加入精确 source 总量，126 个 projection 多出 8,257,536 字节。
+v39b 增加独立的 trunk raw-range 总量，保留原 placement/graph/credit 预测，
+合成 GGUF 回归核对真实六段范围、排除 draft/tail/allowance 并验证溢出；相关 37 个 CPU
+case 全通过。使用同一 native DLL 的真实 checkpoint 实际通过 PP9/N1/N1、126 个 view、
+nonnull checked-free 拒绝、原 handle/head/ledger 保持、继续到 head11、Trim0 保留 view，
+最终正常 checked close 后 model 删除且已声明 native owner/budget 为零。新的 native DLL
+也通过原 VMM checkpoint teardown。以上不证明完整 canonical logits、物理 SSD、全部 OS
+内存或性能，也不覆盖 legacy destructor 故障 ACK。
+
+首个完整 quick candidate 尚未执行 PP1872 就被物理 RAM admission 拒绝：startup warmup 后
+观测 Host available 1,758,666,752 字节，低于保留 headroom 2,127,921,152 字节；
+进程 peak working set 为 16.252 GiB。原 mapped-residency hint 仅处理模型原始 mmap，
+没有处理新增的 source view。该失败完整保留，不计作任何质量或速度通过。
+相同 v39b binary 的独立 OFF control 实际通过 canonical 619,520 字节 logits 与两个 API
+响应完全一致，peak working set 仅 1.104 GiB（private 为 15.197 GiB，ON 为 15.356 GiB）。
+单臂时间 34.922/14.414/7.894/46.004 秒不是 paired 提速结果。
+v39c 已实现在现有 Host-shortfall fallback 中调用的 checked quiescent residency hint：
+沿用原 mmap 的 Windows `VirtualUnlock` unlocked-page 行为，处理新增的独立 view 范围，
+VA、alias、原始句柄/section/source generation、slab/ticket/Host promise 全部保持，
+只由调用完成后的真实物理容量采样决定能否 admission；不放宽 headroom、不虚增 RAM credit。
+先前 unmap/remap 草案未编译执行，保留为生成证据，当前选择无需重建 view 的 hint。
+native DLL `B6F7BC10…2F53B508` 在原版 ggml `3612c0af…` 上构建，320 份 source 无漂移，
+157 条 CUDA 编译命令保持一致。独立 CPU fixture 实际通过 3,342 个断言、20 个 stage，
+四次 `QueryWorkingSetEx` 观测分别将 99/4,165 个 active page 降为零；未来精确读取、
+全部 16 项 view stats、VA、alias、句柄、source 身份与已声明收费保持不变。
+这只证明被查询页退出进程 working set，不证明释放等量物理 RAM、SSD 降载或未来常驻。
+busy reader 不调用 OS；unexpected OS 结果仅返回 advisory，owner 错误阻止执行且保留可重试清理。
+相关 managed fake 回归 65 项、native CPU/focused CUDA 回归 17 项、synthetic 回归 13 项、
+真实 CPU ABI 6 项均通过且零跳过。synthetic 首次因复制耗尽磁盘而未执行，原失败保留；
+driver 改用不可变 managed hardlink、单独复制 native DLL 后，13 项才实际执行通过。
+真实 CUDA checkpoint 又实际通过 1 项：PP9/N1/N1，head10 和真实请求释放边界各接受
+126 个 checked hint，全部 view stats/ledger/allocation/head/handle 不变，nonnull free 拒绝，
+继续到 head11，最终 checked close 与 model 删除后已声明 native/budget 为零。
+
+首个 v39c quick candidate 不再立即拒绝长请求，但 scheduler 将 PP1872 的宽度由 512
+降为 12，root 因固定 shape 验收已失败而停止该运行；连接重置和中止记录完整保留，
+没有 canonical logits 或性能通过。原因是 adaptive admission 只有所有宽度均不满足时
+才调用 hint，12 行满足就直接接受。v39d 已补充 source-view 专属、每次 adaptive admission
+至多一次的 retry：
+只有最大宽度确有 Host 缺口且 Device 缺口不超过实际可回收 expert 额度时，checked hint 后
+重新采样并运行原完整候选选择；不改变任何预算、floor、headroom 或物理信用规则。
+managed 源码三文件通过独立审查，117 项相关 CPU case（含 13 项新增物理容量注入测试）
+实际全部通过，零跳过；真实 CUDA checkpoint 的 1 项生命周期测试再次通过。
+使用同一 `B6F7BC10…` native 的完整 candidate 已通过 619,520 字节 canonical logits
+逐字节一致、两个 API 响应一致，以及全部 42 层在两请求 prefill/decode 中的 mapped-byte
+闭合、零 fallback 与固定 512 chunk 验证。单臂 PP1872/D32/PP33/D128 为
+61.928/32.708/16.393/107.310 秒。同 binary 的单次 OFF control 也完整通过同等质量、
+shape 和 activity 验证，时间为 33.087/13.170/6.597/40.721 秒；该单对照不是 ABBA，
+但本轮没有性能收益，source view 继续关闭。
+两臂长 prefill 的逻辑 source 字节完全相同（81,374,674,944 字节）；D32 的 ON expert
+capacity 为 189/468/57、OFF 为 291/753/87，缓存容量不同造成额外逻辑读取，需单独解释。
+D128 的 ON 逻辑读取反而略少，仍明显较慢。两个请求合计的整机物理盘读计数分别为
+3,222,019/199,093，平均每次 62,562/977,392 字节，显示小 I/O 与本轮慢速相关；
+计数属于整机，未证明每次请求均来自模型、mapped fault 或指定 SSD。
+下一候选只对当前已确定的 miss window 提交有界 `PrefetchVirtualMemory` 地址范围，
+尝试恢复较大的并行 I/O；不是预测未来路由、增加 payload cache 或授予 RAM credit。
+完整 checkpoint 质量验收不等于泛化质量结论，也不证明进程 working set 对应等量唯一 RAM。
+实验仍默认关闭，性能目标尚未达成。
+
+v40 为当前已确定的 miss window 增加默认关闭的
+`TS_HOST_MOE_FILE_SOURCE_VIEW_PREFETCH=1`。只提交原 source owner/generation 下的
+精确范围，固定 64 个 range 的栈上 batch 与原 72 MiB ring 上限不变；API 调用期间持有
+reader/owner 租约，原有 mapped copy 和完整 buffered fallback 仍决定读取结果。
+该 advisory 不代表 I/O 完成、页面常驻或可计入的 RAM credit。新增 joined counters
+区分实际 API call/range/logical bytes/failure，不把它们解释为物理 SSD 读取。
+native `4CB7B78E…F6ACA6C` 仍使用原版 ggml
+`3612c0af93f2cfc8f048295300a61187723b12ae`；321 份 TensorSharp native source
+无漂移，157 条 production CUDA 编译命令保持一致。
+
+同时修复 source-view 下 expert cache 恢复可能被 Host 物理限制阻挡的问题：
+Device-only 增长仍由完整多 pool admission 检查，已有 Host 承诺超过当时物理限制时，
+原 Resize 会失败。仅在真实增长失败且 Host 有缺口、Device 增量可满足时，执行 checked
+hint、重新采样、按原 margin/minimum-growth 重算目标，再重试一次完整 admission。
+不改变 floor/headroom，也不把 hint range 数换算为回收字节。相关 managed CPU 回归
+146 项实际通过且零跳过，包含 13 项新增增长策略/真实账本 case；harness 的 29+113 项
+最终通过。首次 harness 测试断言错误保留，修复只涉及失败路径的测试断言。
+
+本轮 native/synthetic 回归最终有 31 个不同 case 实际通过（11 CPU、20 CUDA，零跳过），
+另有 6 个真实 CPU ABI case。新增 source-view fixture 通过 3,996 个断言、24 个 stage，
+包含真实 advisory API、精确字节、租约与 busy close、两 slot pipeline。
+四个 ring case 首次因 C: 临时目录空间不足失败，改用 D: 临时目录后实际重跑通过；
+中间一次 driver 误报全局通过但未派发这四项的记录保留且不计覆盖，driver 已补全派发和
+所有请求 batch 必须通过的检查。新生成的大文件经 ignored workspace junction 存放于
+D:，模型及历史证据不移动。一次误启动的默认 ALL build 已停止，production DLL 和显式
+15-target build 有独立记录，不给未执行的 precision test 任何验证信用。
+
+真实 GLM checkpoint 实际通过 PP9/N1/N1、nonnull checked-free 拒绝、继续至 head11、
+两次各 126 个 range 的 checked hint、正常关闭后已声明 owner/ledger 清零；126 个完成的
+cache frame 共提交 384 次 API、6,330 个 range、13,986,299,904 个逻辑字节，零失败。
+完整 quick candidate 又通过 619,520 字节 canonical logits 逐字节一致、两个 API 响应一致、
+固定 512 chunk、42 层所有 prefill/decode frame 的 mapped/prefetch/source 字节闭合和零 fallback。
+单臂 PP1872/D32/PP33/D128 为 64.448/19.711/15.422/83.317 秒，尚无提速结论。
+本次真实增长诊断确认第一次 hint 后 Host shortfall 从 527,083,840 字节变为零，expert
+ceiling 从 4,998,199,296 增至 7,952,400,384 字节；第二次从 7,532,926,464 增至
+8,149,532,672 字节。它证明该恢复分支在真实模型中执行，不证明性能收益。
+同 binary 的全关闭 control 已完成同等 canonical/API/shape/activity 检查，四项时间为
+33.337/12.898/6.760/41.054 秒。本轮单对照不是 ABBA，但没有性能收益，当前两项实验
+保持默认关闭。下一 source-only 假设是将精确 advisory 移至原 reader worker 的逐 task
+prepare 前，避免 producer 在释放本 window 的 copy jobs 前先执行整个 window 的 API；
+该并行度假设由后续 v41 单独测试，不把整机 I/O 关联当作已证明的因果解释。
+
+v41 已将该逐 task worker 策略接入同一默认关闭开关：原 slot fence/readiness 后，由
+原 reader 执行精确 API、合并四个局部计数，再执行原 copy；mutex 只保护计数，不覆盖
+OS 调用或 copy，原 full join 成功后才发布 TLS activity。每个活动 worker 使用原固定
+64-entry helper 栈（约 2 KiB），没有新增 thread、heap、task member、payload 或 ticket。
+native `FE865845…21B5233` 只重新编译两份 C++ 源并链接，321 份源无漂移，157 条 CUDA
+命令和八份 cuDNN header 与父构建一致，ggml 仍为同一原版 clean revision。
+31 项 native/synthetic 回归（11 CPU、20 CUDA）、6 项真实 CPU ABI 均实际通过且零跳过。
+新 fixture 实际通过 4,012 个断言、25 个 stage：四个 window 的 12 task 各发一次真实 API，
+共 98,292 逻辑字节；注入 mapped prefix 后 buffered prefix 失败，全部 worker/reader
+结束，无 window consumer 和 completed activity。真实 GLM 生命周期 checkpoint 也已通过
+1 项；126 个真实完成 frame 共发出 6,363 次 API/range，提交 14,067,499,008 个逻辑字节，
+全部 task/view/prefetch 字节闭合且零失败。此数值不等于物理 SSD 读取或常驻 RAM。
+完整 quick candidate 和相同 binary 的 OFF control 均通过 canonical logits、两个 API
+message、固定 chunk、全部 42 层的两阶段验证。ON 的四项时间为
+50.550/17.382/12.985/58.395 秒，OFF 为 38.999/14.543/8.585/48.970 秒。
+两臂四个阶段逻辑 source 字节完全相同，D32/D128 capacities 分别都为 291/753/87 和
+284/713/83；本轮单对照仍没有收益，实验保持关闭。它不是 ABBA，不将跨 v40/v41 的
+时间变化解释为因果提速，也没有用较大的 active working set 代表额外唯一 RAM 容量。
+
+下一项仅做 lossless RAM 表示的拒绝样本：新增独立 Windows Cabinet
+`eng/validation/expert-lossless-compression-probe.cpp`，对显式只读 offset/length 的 packed
+字节运行 XPRESS/XPRESS_HUFF、逐次完整 memcmp、记录真实 codec 请求 workspace 和
+checked cleanup。不接入推理缓存、不改模型或 ggml、不做有损重排。两个生成输入的
+20 对完整 codec roundtrip 及七种非法 CLI/bounds 拒绝已实际通过；真实三类量化组的
+36 个完整 expert projection 样本（87 MiB）也已完成，720 对完整 roundtrip 全部通过，
+文件身份/大小/mtime 保持不变。91,226,112 个原始字节经 XPRESS 反而多出 1,008 字节；
+XPRESS_HUFF 得到 90,969,820 字节，仅节省 256,292 字节（0.28094%），两种 codec 的
+预分配 encoded capacity 均为 91,227,552 字节，尚有 workspace 与 cache metadata。
+HUFF 在该固定顺序暖 CPU 样本上的解码/完整比较/原始 memcpy 合计分别为
+113.705/5.777/3.593 ms；不是冷盘、并发 worker、H2D 或推理吞吐。
+据此拒绝这两种 codec 的完整 projection 压缩 RAM tier，不进行 production 接线。
+该样本只覆盖三个量化组各一层，不推断所有 lossless 表示；压缩率也不能抵扣 OS
+file-cache 重复、解码/准入成本或证明 cold prefill 获益。
+
+v43 增加只消费已保存 route/metadata 的 GPU cache policy replay 工具
+`eng/validation/glm_gpu_adaptive_replay.py`，没有接入新的 native policy。
+25 项 CPU case 实际通过且零跳过；独立审查核对 5,376 个历史完成 layer frame。
+固定历史 v27 的冷缓存、三类容量 299/750/87 下，原 LRU 有 20,018 次 expert miss，
+对应 139,102,257,152 个逻辑 source 字节。严格只用过去和当前信息的 ARC-style 策略
+减少 256 次 miss、1,838,481,408 字节（1.3217%），但第二、第三个 32-token 区间反而
+增加读取，最后区间贡献全部净收益。仅反转原路由的最终 recency touch 顺序只减少
+6 次 miss、53,739,520 字节（0.0386%）。据此拒绝这两项 native policy 实现。
+这些是固定容量下的逻辑反事实，不包含 metadata、准入、CPU 或物理 SSD 成本，
+没有推理提速或质量通过信用。使用未来信息的 Belady 诊断显示 39.17% 逻辑空间，
+只用于理解该历史 trace 的上界，不是可以部署的策略。
+
+另外复核 legacy layer-prefetch 的请求生命周期：原 RAII 在 layer-major forward 返回前
+已经 stop/join worker，再丢弃 speculative payload；不存在该 payload 泄漏到 decode 的
+证据。保留的空 RAM capacity/promise 不等于仍占用同量物理 payload。
+更早退休已完成完整 projection copy 的 speculative RAM 条目只是一项有条件的 prefill
+假设：实际 GPU capacity 必须覆盖整层、所有 chunk 均走 wide 路径，且 owner、generation、
+预算稳定。ring 分片、窄尾块和准入缩容都可能使提前退休增加重读；提前 unlink 也不能
+在最后 lease 释放前返还额度，并可能失去现有同尺寸 buffer/ticket 复用。
+当前没有为此接入 production 代码，也不额外添加重复的 decode 边界 discard。
+
+v44 又在当前同一 binary 上完成两个不同主题、各 384-token 的串行 decode diagnostic。
+两个窗口都从实际新建的三组冷缓存开始，capacity 分别为 291/729/85 与 283/708/83；
+32,256 个 layer frame 的原 LRU miss 顺序和逻辑字节全部重建一致。ARC-style 策略分别
+只减少约 0.45%/1.20% 的逻辑读取，延长窗口仍没有大收益。该次带 route 与 GPU telemetry，
+时间不计性能资格；没有相同请求的独立响应或完整 logits oracle，不给予新质量资格。
+
+v45 又实际执行了固定 32-row rolling-frequency GPU replay：25 项 CPU case 通过、零跳过，
+先核对原 LRU 的逐层 miss/逻辑字节，再按 source/layer 独立窗口计数，包含当前路由且不看未来。
+三个预先指定窗口相对原 LRU 分别增加 3,447,193,600 / 9,935,716,352 / 8,769,765,376
+个逻辑 source 字节（2.478%/2.430%/1.878%）；16/64-row 仅作诊断，不据其结果重选策略。
+据此拒绝该 native policy 实现；这些仍是固定容量逻辑反事实，不是 SSD、实际 RAM 常驻或
+推理速度结果。证据见 [rolling-frequency verdict](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v45-rolling-frequency-runtime1/root-verdict.json)。
+
+v49 的 causal route-neighbor replay 则在运行前固定唯一策略：每个 source/layer 保留最近
+64 个已完成 route，只比较其后续 8 个访次也已全部完成的历史 anchor（最多 56 个），
+intersection 至少为 2，再按精确 Jaccard 与最近 anchor 决胜。历史 suffix 只生成本层的
+预测，其 due ordinal 按完整层循环绝对定位；过期后不顺延，各层独立更新。三个冷窗口均
+重新开始，没有跨主题状态、参数选择或真实未来路由输入；当前路由仍全部保护并强制准入，
+原 LRU 的逐层 miss/逻辑字节先核对一致。
+
+26 项 CPU case 实际通过、零跳过；历史 128-token 窗口与两个不同主题的 384-token 窗口
+分别减少 4,086,235,136 / 14,537,850,880 / 19,099,418,624 个逻辑 source 字节，
+即 2.937576% / 3.555337% / 4.090909%，且每个窗口的三种 quant group 都为正。
+这只支持继续做有界 native 设计与实验实现；该 replay 本身不构成原生执行证据。保存的
+descriptor namespace 不能代替实际 native source-generation 验证，metadata 准入和
+scoring CPU 成本也未测量；没有物理 SSD、H2D 服务、推理速度或模型质量资格。
+证据见 [v49 independent cross-window audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-causal-route-neighbor-replay-runtime1/independent-cross-window-audit.json)。
+
+随后固定了 model-owned metadata 契约：一个实际 `sizeof(State)` 的 Host slab 在模型创建前
+预留持久额度，由原生 checked ticket 先 reserve、后分配及 commit；不增加 Device payload。
+12960 项 slot scratch 覆盖既有 `45*288` pooled table 容量，不能把 42 层的唯一 key 数误作
+物理 slot 上限。当前 visit 只在 helper、最终 drain 和错误检查成功后进入历史；cache/source
+变化、prefill 和失败调用会重置历史。Close 在专家和模型删除前完成物理释放及 checked ACK；
+失败时保留原 ticket、模型和 Host envelope。既有 controller、shared_ptr 和 allocator metadata
+仍遵循原有开销约定，不宣称所有进程分配都已精确计账。
+
+managed 10 文件经独立源码审查后集成，实际构建通过（2345 个源码输入无漂移、45 warnings、
+0 errors）；47 个新增 planning/lifecycle case 加原有 382 个受影响 CPU case，共 **429 PASS、
+0 skip**。这批 CPU 检查使用旧的 frozen v46 native `D675BEC3…`，只证明托管规划、真实账本和
+fake interop 契约；不计作 v49 native、CUDA、模型输出或性能通过。实验默认关闭。证据见
+[v49 managed CPU receipt](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-managed-cpu-runtime1/execution-receipt.json)。
+
+原生实现随后集成并构建为 `9B9C0CBD…600B63C8`：329 个源码输入无漂移，157 条生产 CUDA
+编译命令与既有 v26 完全相同，未重新编译或更改 ggml CUDA kernel；上游仍为干净的
+`3612c0af93f2cfc8f048295300a61187723b12ae`。实际 Host slab 为 293,256 字节，Device
+payload 增量为零。新增 policy/owner CPU fixture 分别通过 99,518/1,483 个检查；实际
+CUDA fixture 用 12 个真实文件源、四代 source、三种混合 quant group 验证 67,584 个
+精确 F32 元素、63 次独立 victim oracle 和 384 个替换 slot，包含两处真实 helper 故障及
+checked Host ACK 重试。既有 31 个 native/synthetic 回归（11 CPU、20 CUDA）和独立
+baton CUDA fixture（302 检查、9,344 个精确元素）均通过、零跳过。这些小型 fixture
+不是全模型质量、capture 或性能验收。见
+[new native fixtures](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-native-new-fixtures-runtime1/execution-receipt.json)
+与 [existing regressions](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-native-regressions1/validation-summary.json)。
+
+同一 native 的真实 GLM checkpoint 四个用例也实际通过、零跳过：经生产 scheduler/admission
+执行 521-row prefill（512+9，不学习）及 32 次 N1，确认 1,344 个已完成 route row 和真实
+历史匹配；公共 reset 清空 head/历史但保留同一 slab/ticket 及累计计数。另三项分别在真实
+query 后、实际 miss upload 后及最终 callback 注入故障，检查 caller sentinel、既有
+LastLogits 和 head 未发布，拒绝普通续跑，再经 checked reset 恢复。四项均验证 slab 在
+专家/model 之前 checked close，最后实际 executor handle、native allocations 和所有
+ledger reserved/committed 为零。输入为合法合成 token，有限 logits 不是 canonical
+质量证明；quiet ABBA 的 exact logits/API、活动和双阶段计时仍须单独验收。见
+[real checkpoint receipt](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-causal-route-neighbor-model-runtime1/execution-receipt.json)。
+
+随后同一 frozen native/managed binary 完成 quiet A-B-B-A，仅切换该策略。四臂 canonical
+logits 均为原 `497C9695…6576AD85`，八个完整 API 响应精确相同，42 层 source/phase 与
+实际 metadata 活动检查均通过。OFF/ON 平均 PP1872 为 34.9375/36.808 秒（ON 慢 5.35%），
+D32 为 14.564/13.9635 秒（平均快 4.12%，但两对分别快 8.93%/慢 0.41%），PP33 为
+7.495/7.881 秒（慢 5.15%），D128 为 45.0335/45.8055 秒（慢 1.71%，两对快 3.72%/
+慢 7.41%）。D128 control 自身漂移 4.49%，不能以一对或均值取得稳定的大幅双阶段收益。
+
+D128 的实际逻辑 source 字节平均从 141,560,152,064 降为 137,688,645,632，少
+3,871,506,432 字节（2.734884%）；PP1872 字节不变，D32 略增 8,912,896 字节。两组
+D128 对应实际 slot capacity 分别一致为 284/712/83 与 284/713/83。两次 ON D128 的
+matcher prepare+commit 嵌套 host wall 约 167.19/174.02 ms，未覆盖其他 scorer/victim-loop
+成本，不能当完整策略 CPU 成本或解释整体速度变化。逻辑读取减少不是物理 SSD 减少，
+强制 server exit1 也不证明正常 teardown；该覆盖来自独立真实 checkpoint。策略继续
+默认关闭，没有满足用户要求的大幅 prefill/decode 同时提速。见
+[v49 independent ABBA audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-causal-route-neighbor-abba1/cuda-runtime-restore-independent-abba-audit-v2.json)
+与 [aggregation/source closure](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v49-independent-abba-analyzer-source/completed-aggregation-closure.json)。
+
+v45 对四项既有设置做同 binary 的 quiet A-B-B-A：A 将 Host embedding、scalar72、
+prefill ring72、decode rebalance 全部设为 0；B 全部设为 1，其余配置均相同。
+四次运行均通过 canonical 619,520 字节逐字节一致、共八个完整 API 响应一致、
+42 层固定 512/336/33/1 行与完成次数检查；当前 private binaries 的完整 pin 在结束后
+再次核对。A 的平均 PP1872/D32/PP33/D128 为 35.4725/13.649/7.415/45.043 秒，
+B 为 33.359/13.3965/7.3325/43.116 秒，平均减少 5.96%/1.85%/1.11%/4.28%。
+长 prefill 的两对均改善（6.43%/5.48%），但 D128 两对为 -0.12%/+8.39%，A 自身漂移
+6.89%；没有取得可靠的大幅双阶段收益，不提升默认设置。这是四项设置的组合结果，
+不能相加或拆成四项各自收益；requested rebalance=1 也不代表每次都发生了具体重平衡。
+强制停止 server 的 exit=1 不证明模型正常释放，整机盘计数仍不能归因到模型 SSD 工作。
+完整证据在 ignored `v45-best-profile-abba1/`。
+
+v46 已实现默认关闭的独立 GPU residual bank，代替 layer-major prefill 的层间 CPU 中转，仍保持原图、
+kernel shape、顺序和权重不变。PP1872 需要额外 117 MiB（2048 tokens 为 128 MiB），
+必须作为独立实际 owner 在 kind5 联合承诺中加一次，并在执行前经过真实多 pool/物理准入，
+不能假定现有 graph forecast 免费覆盖。现有测得的层间搬运 host 时间约 1.572 秒，只是
+该优化的宽松上界，不是预测提速。13 份源码/CMake 变更已集成，显式 native 构建实际通过
+（两份 C++ 重编译、两次链接）；323 份 native source 无漂移，157 条 production CUDA
+命令与 v26 相同，upstream ggml 保持原版 clean `3612c0af…`。bank checked close 在 expert
+清理及 model 删除前执行，失败保留原 owner/ticket；stock CUDA free 的进程级错误不属于
+可恢复故障保证。构建记录本身不提供运行资格，后续运行验收分别记录如下。
+证据见 [v46 build receipt](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v46-targeted-native-build1/execution-receipt.json)。
+
+随后独立 CUDA component fixture 在冻结 native `D675BEC3…CA91A927` 上实际通过、零跳过：
+302 个检查、9,344 个 F32 元素逐 bit 一致，6 层、8/8/3 三个 chunk、重复三次；实际 bank
+仅 9,728 字节，层间 Host hidden payload 为零。包含 direct-copy 拒绝无 Host fallback、
+失败 drain 保留 owner、pending commit 和前后 ledger ACK retry，最终已声明 pending/committed
+为零。它不验证 117 MiB 实际分配、真实模型数学/质量、capture、性能或 vendor-free 故障恢复。
+证据见 [v46 component receipt](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v46-device-baton-native-runtime1/execution-receipt.json)。
+同一 native 另实际通过 31 个不同 native/synthetic 回归 case（11 CPU、20 CUDA）；与新增
+component 合计 32 个不同 case、零跳过。当前 source-view fixture 为 4,014 个检查、25 个
+stage；Windows 运行不覆盖 POSIX truncate/CLOEXEC。独立复核 323 份源无漂移、冻结 binary
+pins、原版 clean ggml、八份 cuDNN header 与 v41 一致，以及全部 157 条 CUDA 命令与 v26
+一致；synthetic 使用其独立冻结的旧 managed 测试程序集，不计作新 checkpoint 的运行覆盖。
+证据见 [v46 native32 audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v46-independent-native32-evidence-audit.json)。
+
+相关 managed CPU 规划/账本/fake-interop 回归最终实际通过 265 项、零跳过，其中 bank 新增
+21 项；harness helper/main 的 19/120 项也实际全部通过。首轮 CPU 的一个账本 clamp 断言
+错误保留，修正只涉及测试 oracle。三个 private freeze 的八份 production binary pin 相同，
+仅测试程序集改变；六份小源码 pin 核对一致，未在性能运行期间重新扫描大 binary 或源清单。
+
+真实 checkpoint 首次执行两项均因测试 oracle 错误失败（零通过）：kind5 是多 owner
+聚合值，不能等同单个 bank；普通 profile 的 expert cache 也不在 preliminary bridge 中
+退休。修正后第二次两项实际通过、零跳过，旧失败未重分类。happy 路径通过真实 scheduler/
+BatchExecutor 提交 PP1872，117 MiB bank 的 input/output 各 176 次，关闭 bank 后继续 N1
+至 head1873，再经 public Reset 回到零且保留原账本。fault 路径在已准入的 521-token 请求
+中触发第二个 raw pack：首个 512-row 图和 32 MiB output D2D 已完成，9-row tail 失败；
+logits sentinel/head 保持不变，34,144,256 字节 bank/ticket 保留，continuation/Reset 拒绝。
+checked bridge 恰好减少一个 kind5 owner 和同量 committed bytes，其他分组与普通 expert
+owner 不变；最终正常 Session.Dispose 后，两项都核对实际 executor handle、已声明 native
+allocation 与 budget reserved/committed 为零。输入是有效的固定 token ID，只验证有限 logits
+和生命周期；尚非 canonical/API、capture、性能、vendor-free/ACK 故障或总 OS 内存验收。
+证据见 [v46 managed/harness/checkpoint audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v46-independent-managed-harness-checkpoint-evidence-audit.json)。
+
+首次 v46 ABBA 的 A1 control 通过既有质量/shape 检查，但 B1 在加载模型前因 Host 提供
+`ContextTokens=0` 而被过早的 baton profile guard 拒绝；原 `MAX_CONTEXT=2048` 解析位于
+后方。该 study 已停止并保留失败，未形成配对速度结果。修复仅在 baton ON 时提前按既有
+显式 option 优先、其次 `MAX_CONTEXT` 的规则生成不可变 options 副本，仍要求有效 context
+恰为 2048；其他 guard、OFF、native、默认设置和预算/headroom 均不改变。
+managed build4 实际通过，其记录的 2,341 份 source 无漂移；扩展后的 CPU 382 项全部通过、
+零跳过，包含 42 项 baton 与 96 项 Host options。真实 checkpoint 改以 option context0 /
+`MAX_CONTEXT=2048` 运行，两项再次实际通过、零跳过，保留同样的有效 context、bank、
+故障隔离和最终 declared-owner 清零断言。native 仍为 `D675BEC3…`，新 Models pin 为
+`395A7353…A653BF0`；这不是 ON canonical/API 或性能资格，须由新的完整同 binary 对照另验。
+证据见 [v46 auto-context closure audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v46-independent-auto-context-closure-audit.json)。
+
+修复后全新的 v46 ABBA2 四臂实际完成，使用相同 private4 binary，Host embedding、ring72、
+scalar72、decode rebalance1 保持开启，仅切换 bank 0/1。四份 619,520 字节 canonical dump
+均为 `497C9695…6576AD85`；八个 API response identity 比较全部相同，其中六个非自身比较
+以本次 A1 为参照，另两个是新 A1 与已停止的旧 study A1 对照，不把旧 study 算作性能配对。
+独立核对四臂共 27,720 条 source frame 的 raw/decoded bytes、42 层 PP/N1 顺序与 0/0
+view/prefetch 关闭状态。两次 ON 各有且仅有一次长 PP bank completion，input/output 各
+176 次，bank 和 ticket 已关闭；短 PP 与 decode 没有 bank event。
+
+| elapsed 秒，两臂均值 | OFF | ON | ON 增加 |
+| --- | ---: | ---: | ---: |
+| PP1872 | 34.588 | 35.4835 | 2.589% |
+| D32 | 12.8595 | 13.594 | 5.712% |
+| PP33 | 7.341 | 8.561 | 16.619% |
+| D128 | 44.110 | 44.457 | 0.787% |
+
+长 PP 与 D128 的两个配对方向均不一致，control 长 PP 自身有 −4.516% 漂移；两对样本没有
+共同提速，bank 保持默认关闭。117 MiB 是 PP 阶段实际占用的临时借款：A1/B1 的 expert
+ceiling 恰好相差该值，G4 wide capacity 从 451 变为 439；退休后虽记录同量 checked owned
+credit，ON 的 D32 expert ceiling 相比相邻 OFF 净多仅 1–3 MiB，不能再当作新增 117 MiB
+物理容量。D32 的实际 G3/G4/G11 capacity 为 OFF `291/753/87`、ON `300/753/87`；OFF
+G3 hotgrow 搬迁 277 个热 slot 并保留 71,586,816 字节 wide scratch，ON 冷建 G3 没有该
+scratch。因此 ON 虽多九个 G3 slot，实际 aggregate owned 反而少 3,757,056 字节。D128
+四臂均为 `284/712/83`、owned 7,513,973,760 字节，逻辑 source bytes 均为
+141,589,348,352；其 cache compute 约 1.49–1.51 秒，pipeline/upload-wait 的变化属于既有
+嵌套 host wall 计时，不能相加后归因为 SSD 或 kernel 服务时间，也不能从上述容量差推断
+速度因果。
+
+这是固定 prompt、单机两对样本的负结果；没有 capture、频率、物理 SSD/NAND 或总 OS RAM
+归因信用。benchmark 由 harness 强制结束 server，不构成正常退出证明；checked teardown
+覆盖仍来自前述真实 checkpoint。证据、逐臂 capacity/成本与内存借款核对见
+[v46 ABBA2 independent audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v46-device-baton-abba2/cuda-runtime-restore-independent-abba-audit.json)。
+
+v47 的独立 Windows ETW block-read attribution prototype 已完成 build2；首次缺少 User32
+链接依赖的失败保留，补齐链接库后源码未变。九种非法 CLI 拒绝实际通过、零跳过；但生成文件
+的实际 capture 尝试因进程缺少 `SeSystemProfilePrivilege` 返回 unavailable exit3，在读取
+shard metadata 或启动任何 ETW session 前退出，没有 ETL。该不可用场景不计通过覆盖；尚无
+FileObject/IRP 关联 decoder 或模型 shard block-read 验证，更没有物理 I/O、NAND、SSD 或
+性能归因信用。证据见 [ETW runtime closure](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v47-block-read-trace-runtime1/source-build-runtime-closure.json)。
+
+v51 只探查既有 Host0 adaptive 路径，未改代码：使用 v46 private4 的 native `D675BEC3…`、
+Models `395A7353…`，不设置显式 chunk，requested maximum 为 1024；实际 42 个 routed layer
+均执行 `898/898/76`，共 126 条 source frame、81,436,213,248 个逻辑读取字节。warmup 的
+13-row frame 不混入这组计数。单次观察 PP1872/D32 为 30.565/12.822 秒，没有配对 control，
+不能据此取得提速资格或提升默认配置。
+
+该候选明确未通过质量门槛：619,520 字节 logits 的 SHA 为 `6C6EA516…1BA6209`，不同于
+canonical `497C9695…6576AD85`；154,880 个有限 F32 全部改变，最大/平均绝对差为
+2.403479/0.342285，RMS 为 0.434717，top1 从 9187 变为 154842；完整 API message
+精确比较也失败。API 参照只提取旧 v46 A1 的首个原样 record，不把它当本次计时 control。
+Host0 placement 与 chunk shape 同时不同于旧 Host1 参照，尚未隔离数值变化原因；文本看似
+合理或 logits 有限均不能代替独立语义质量验证。保留 benchmark exit1、强制 server exit1
+及失败证据，不重分类为成功，也没有新 v49 native、物理 SSD、正常 teardown 或性能信用。
+见 [v51 independent quality audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v51-host0-adaptive1024-prospect1/cuda-runtime-restore-independent-quality-audit.json)
+与 [root verdict](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v51-host0-adaptive1024-prospect1/root-qualified-verdict.json)。
+
+v53 随后用同一 v51 immutable `D675BEC3…`/Models `395A7353…` 做单次隔离：Host0 和其余
+实际 environment 相同，只增加显式 `TS_SCHED_PREFILL_CHUNK=512`（另变更 dump 输出路径）。
+42 层全部实际执行 `512/512/512/336`，168 条 source frame、81,374,674,944 逻辑字节；
+canonical 619,520 字节逐字节恢复为原 SHA，完整 API 响应也一致。因此 Host0 本身不足以
+解释 v51 差异；变化已收窄到 wider width/admission 所影响的 n_ubatch、kernel dispatch
+及状态分段，而非已定位到某个 kernel。源码复核未发现 898 的 position、padding、conv
+tail 或 KDA handoff 错误；实际 context2048/topK2048 未启用 sparse pooled selection，
+上游 KDA 也没有 64-row 对齐要求。该隔离仍没有配对计时或广泛语义质量资格，不抹去原
+strict quality gate 失败。见
+[v53 isolation verdict](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v53-host0-pp512-isolation1/root-qualified-verdict.json)
+与 [variable-prefill source audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v51-variable-prefill-correctness-source-audit/audit.json)。
+
+v54 新增可复用的 [production teacher diagnostic fixture](../../InferenceWeb.Tests/GlmUnifiedTeacherDiagnosticTests.cs)、
+[F64 score helper](../../InferenceWeb.Tests/GlmTeacherForcingNumerics.cs) 与
+[actual-chunk validator](../../eng/validation/glm_unified_teacher_diagnostic.py)，没有生产代码或
+native 改动。新的 managed build 验证 2,349 个输入无漂移；原有 2,346 个源码均未变，
+只增加三个 C# test/support 文件，八个生产 binary pin 与 v49 一致。30 个 numerical CPU
+case 和 25 个 validator CPU case 实际通过、零跳过；后者包括缺失/重复 source、未 join
+读取、错误 teacher/head、requested/actual 混淆和不完整 cleanup 的拒绝，不算 native 通过。
+
+两个 fresh process 使用同一 frozen native `9B9C0CBD…`/managed binary、Host0 和四组相同
+输入，先在任何 Forward 前冻结全部自然 chat-template prompt 与 teacher token ID。每个
+prompt 精确为 1,872 tokens，teacher 分别为 math 1、extraction 4、squares 32、code 8
+tokens，共 45 个位置；squares 原答案为 42 tokens，仅取固定 32-token prefix 并明确标注。
+通过未改动的 Session/Scheduler/BatchExecutor，在注入 teacher 前对原始完整 LastLogits
+计算稳定 F64 target loss、argmax、margin 和 native-endian F32 checksum，再检查实际
+forwarded token、history 与 head。三次进程执行均明确报告 ordinary attachment 的 unchecked budget
+callback；checked model free 与正常 native allocations/所有 ledger 归零分别验证，
+不冒称 checked budget ACK 故障覆盖。
+
+两次模型 fixture 各实际执行一个 Fact、均通过且零跳过，每次包含四个 case；原生记录
+独立核对所有 45 层 timer/42 层 source。fixed 为 `512/512/512/336`，adaptive 四组实际
+分别为 `924/924/24`、`916/916/40`、`907/907/58`、`905/905/62`，不能把 requested1024
+写成实际宽度。每个 profile 的 45 次 N1 均有 1,890 个 source frame、精确输入/head 与
+整数 read/task join 核对，最终 checked model free、ordinary scope 和 ledger 均归零。
+
+45 个相同 teacher-history 位置的 argmax 全部一致，但 45 个完整 vector checksum 全部
+不同；没有保留完整数组来判断逐个 float 是否改变。token-weighted mean NLL 从
+1.4374189923 降为 1.3515723816（delta -0.0858466107），但 math 从 7.987999 升为
+8.231736，24 个位置 loss 变坏、21 个变好。squares 占 32/45 的权重，且八个 teacher
+input 并非其位置的 argmax，所以这既不是独立广泛质量评估，也不能证明自由生成轨迹相同。
+源自少量固定 prefix 的均值改善不抹去 v51 strict canonical/API 失败，不提升默认配置，
+不算性能或物理 SSD 验收。见 [paired model audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v54-unified-teacher-runtime1/native-v18-paired-independent-audit.json)
+与 [numerical interpretation](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v54-numerical-interpretation-independent/interpretation-receipt.json)。
+
+另一个相同 frozen binary/input 的 fixed512 fresh process 重复控制实际通过，native
+chunk/source certificate 也通过；45 个 vector checksum、argmax 和 NLL 全部逐位/逐值
+重复，mean NLL 仍为 1.4374189923。这只证明本轮已观测 fixed profile 的可重复性，不能
+推广为所有 kernel/输入的确定性或定位单一数值原因。见
+[repeatability record](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v54-unified-teacher-repeat512-runtime1/repeatability.json)
+和 [independent repeat audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v54-unified-teacher-repeat512-runtime1/cuda-runtime-restore-independent-repeat-audit/independent-repeat-audit.json)。
+
+v55 复核既有 machine disk counters：harness 即使关闭 GPU telemetry，也在同步 HTTP
+请求前后读取 `psutil.disk_io_counters(perdisk=True, nowrap=False)` 的累计值，再作差；
+不是把瞬时速率积分。v49 D128 的逻辑 source 平均少 2.734884%，而覆盖整个 PP33+D128
+HTTP 请求的 global OS read-byte counter 平均从 109,161,985,792 降为 107,275,094,272
+（少 1.728524%）。两者范围不同，不能直接归因为模型 SSD、decode 或延迟改善。未保留
+原始绝对 counter、设备身份/实现版本和 disk-query 时间戳；只有在计数完整、稳定且
+同一 counter domain 的前提下，才可把全局增量当该窗口内某子集的条件上界。不能从
+logical 减 global 推出 RAM-hit 比例、介质读取或独立 phase 工作量。该复核没有新 capture，
+也没有弥补 ETW 不可用或得到新的性能资格。见
+[completed disk-bound audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v55-completed-disk-bound-source-audit/audit.json)。
+
+v56 源码及既有 v49 日志复核确认，外层 N1 graph 已有复用：各 arm 的 D32 为 31/32、
+D128 为 127/128 次 cache hit，不能把每步重建作为已证明的瓶颈。scheduler callback
+和 DSV4 ordinary subrun 的 graph view 使用 UID0，仍可经原始 CUDA backend 的属性
+比较、warmup 后捕获复用；现有日志没有证明实际 capture 命中数。直接赋予稳定非零 UID
+会跳过 tensor/source 地址、形状和 stride 的比较，而 KV view offset、slot/weight
+binding 仍可能改变，缺少安全契约，因此不实施此快捷方式。
+
+现有 `TS_GLM_SELECTED_EXPERT_TIMING=1` 与 `TS_DSV4_PERF=3` 仅在原有执行边界记录
+嵌套 host wall 和 submission counters，不新增 graph cut、UID、GPU event 或 wait。
+`submit_ms` 包含原始 CUDA backend 的异步提交、属性处理与 API 内部阻塞，不能当作
+CPU 独占时间、GPU kernel 时间或总 host 成本。接下来用同一 frozen binary 的独立
+diagnostic 请求核对完整 canonical/API、42 层 source 与逐位置 forward join，再解释
+此分量；诊断开销下的 wall time 不作性能验收。见
+[graph reuse audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v56-glm-graph-reuse-source-audit/audit.json)
+和 [diagnostic contract](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v56-glm-graph-reuse-source-audit/diagnostic-contract.json)。
+
+v57 随后以原有两个 diagnostic flag 实际完成一次 generic quick；同一 v49 frozen
+binary、Host1/PP512/N1，其余实验关闭。619,520-byte canonical checksum `497C9695…`
+与两个 API response 均精确一致；独立解析实际通过 6,930 个联合三投影 source frame、
+341 个 forward posttimer、160 个 scalar diagnostic 的顺序/形状/整数字节与 task join。
+42 个 frame 表示 42 个 routed layer call，不能写成 126 次独立 file identity 证明。
+
+D128 的 diagnostic compute 为 45,621.427ms，其中 ready 区间合计 10,557.0979ms、
+helper 34,769.7657ms、callback 34,906.6789ms；DSV4 outer submit 为 693.2577ms，
+仅占 compute 的 1.519588%。D32 outer submit 为 219.916ms / 13,671.8597ms
+（1.608530%）。helper 内走 stock backend，DSV4 helper counters 为零是合法结果。
+这些嵌套量不能相加，ready 减 submit 也不能直接称 GPU kernel 时间。D128 既有 source
+timer 的 file pipeline 为 29,258.553ms、expert compute 为 1,486.9522ms；仍缺少可把
+剩余 producer wait 精确归属到 shared FFN、attention 或其他 kernel 的独立 GPU 记录。
+本轮 diagnostic 不作速度比较或物理 SSD 验收；完整记录见
+[source/forward joins](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v57-existing-enqueue-diagnostic1/full-source-forward-joins.json)。
+
+v58 源码复核未发现 RAM0 路径中可删除的额外 private payload copy 或长期 dense/shared
+Host 镜像。原始 GGUF mapping/OS file cache 页可被回收，不能算未使用 RAM；当前
+read/upload 共用已计费的 staging destination。scalar top8 最大 67MiB 已放进 72MiB
+window；42 层原始三投影 payload 为 83,783,319,552 bytes，而 PP1872 logical read
+为 81,374,674,944 bytes（约 97.1%，这只是规模比较，未证明唯一 extent 集合下界）。见
+[pipeline source audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v58-pipeline-source-opportunity-audit/audit.json)。
+
+v59 用已安装 Nsight Systems 2026.3.2 实际完成 CUDA-only quick capture，关闭无权限的
+CPU sampling/context-switch tracing；profiled 请求仍有 exact canonical/API 与原冻结
+binary/upstream 核对。导出的 SQLite 有 655,463 个 captured kernel row，但 profiler
+明确报告可能丢失 CUDA event、driver13.5 使用13.4 tracing library 和 GetGraphId 的
+CUPTI error；619,520-byte D2H 仅 165 次，native 完成日志有 166 次 logits-bearing
+forward。因此不能把此 trace 写成完整 phase/kernel 覆盖，也不按它比较正常速度或给
+shared FFN 单独计时。记录中 small-grid `q8_f32_vector` 时间较多，只作为源码调查线索，
+grid 本身不足以证明 HC role。
+
+随后 v60 对实际 Q8/K16384/M24 的 HC shape，实现 N1 的 coalesced
+warp-row loads 和 PP 的 32-row compact tile；保留每个输出原有递增 K 的 F32 `fmaf`
+链，禁止 parallel-K reduction。`TS_GGML_Q8_HC_COMPACT` 默认关闭，N2..8/其他 shape
+保持原路径，不增加自有全局 RAM/VRAM payload。已完成显式目标编译，157 条生产 CUDA
+命令与基线一致；冻结 native 为 `C53A8BC5…`。18 个独立 CTest 实际通过、零跳过
+（2 CPU、16 CUDA）；补充完整日志分别核对 OFF/ON 的 44 个 case、两轮输入/权重、
+全量 F32 位模式，以及每种模式的 2 个 graph/4 次 replay。owned Q5 未做本轮运行验收。
+隔离 CUDA event 微基准的生产自动路径，在 N1/N33/N336/N512 上分别减少约
+49.94%/36.15%/29.64%/30.96% 时间；这些数字不代表模型速度、SSD 减负或默认启用依据。
+随后一次 ON 全模型 prospect 实际通过：619,520-byte canonical logits、两次 API
+响应均精确相同，6,930 个 routed-layer source frame 与 341 个 forward timer 完整核对。
+随后同 `C53A8BC5…` binary 的 quiet ABBA 四臂全部通过相同 canonical、8 次 API
+响应和 source/forward 门槛，但未建立联合加速。描述性 ON 均值相对 OFF：PP1872
+慢 3.26%，D32 快 0.90%，PP33 快 3.78%，D128 快 3.86%；每项首对变慢、次对变快。
+A1 的 D128 cache grant 比其他三臂少 6,909,952 字节，G4 slot 为 711 对 712，额外
+产生 84,344,832 logical source bytes/39 tasks。严格的相同逻辑工作门槛实际拒绝了
+速度归因；保留原失败，不能用描述性均值给 kernel 加速或 SSD 减负资格，继续默认关闭。
+见 [quiet ABBA 独立审计](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v60-hc-abba1/native-v18-independent-descriptive-audit/audit.json)。
+证据见 [v60 独立审计](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v60-new-fixtures-independent-completed-audit/audit.json)。
+shared FFN 提前执行另有 scratch liveness、同步下载与
+skip API 障碍，不实施未经证明的 enqueue-and-skip 快捷方式。原生 ggml 仍未改动。
+
+v61 实际读取本地三份 GGUF 的有界 header，确认 34 个 `ssm_beta` 为 Q8_0/K4096/M64，
+68 个 `ssm_f_a`/`ssm_g_a` 为 Q8_0/K4096/M128。复用已编译的 forced row-warp/Rows32
+内核扩展独立 fixture，仅重编译 test C++，生产 native 仍为 `C53A8BC5…`。
+66 个 case、两轮输入/权重、10,577,280 个 F32 位模式比较实际通过；原 44-case
+OFF/ON 与各自 2 graph/4 replay 也重新通过，不增加注册 CTest 数量。26 组隔离 ABBA
+的 N1 row-warp 减时 58.63%/50.24%，PP33/336/512 的 Rows32/Columns16 减时
+52.19%–56.24%；六组 Columns128 反而退化。这里没有 KDA 生产 dispatch、capture
+或模型速度资格。
+见 [v61 实测审计](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v61-kda-probe-independent-completed-audit/audit.json)。
+
+v62 随后加入默认关闭的 `TS_GGML_Q8_KDA_COMPACT`，仅覆盖 Q8/K4096/M64 或 M128，
+N1 用原 row-warp，N9..512 用 Rows32/Columns16；保留其他 shape 与已有显式实验优先级。
+HC 的 automatic fallback 改为 Columns16，仍默认关闭。没有改动 kernel 的数学体、
+驻留 payload、ggml 源码或 CUDA 编译选项。冻结 native `D8AF0E17…` 实际完成 21 个
+独立 CTest、零跳过（3 CPU、18 CUDA）。KDA OFF/ON 各 86 个 case、两轮输入/权重、
+12,829,200 个 F32 比较、4 个生产 producer graph/8 次 replay 均通过，mask 为 0/15；
+HC 与原有 15 个 Q8 回归也通过，保留完整 JUnit stdout。
+同 8 份 managed binary 的一次 combined ON 全模型 prospect 又通过 canonical/API2、
+6,930 source frame/341 timer 和全部四个 KDA process-enqueue marker。该 run 不计加速；
+同 binary quiet ABBA 四臂随后全部完成，canonical 四份、API 八次响应与每臂全部
+6,930 source frame/341 timer 均精确通过。描述性 ON 均值的 elapsed 减少为 PP1872
+4.121987%、D32 6.968481%、PP33 17.094832%、D128 8.300836%；每项在两对比较中
+均更快。OFF 的 A2/A1 漂移分别为 +0.838478%、−0.586622%、−9.763012%、+0.551666%。
+但严格的同逻辑 source work 检查实际拒绝，原分析脚本和失败记录均保留。独立复核确认
+差异仅在 D128：A1/B2 的 G4 为 711 slot，B1/A2 为 712 slot，对应 cache budget
+相差 6,909,952 B；首对 ON 少读 84,344,832 logical bytes/39 tasks，次对则恰好多读
+相同数量。ON/OFF 均值的 source bytes/tasks 相等，其他三项每臂逐项相等；均值平衡
+仍不能把原有逐臂相同工作门槛改判为通过。启动 RAM ceiling 也随物理可用量变化，
+未对 OS cache 常驻量作相等控制。这些均值不授予 kernel 因果加速、物理 SSD 减负
+或默认启用资格；两个 compact flag 仍默认关闭。尚未建立目标要求的大幅双阶段改善。
+见 [v62 原生实测审计](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v62-independent-build-fixtures-audit/audit.json)。
+全模型观察见 [v62 quiet ABBA 独立描述性审计](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v62-independent-descriptive-audit/audit.json)。
+
+v63 继续离线筛选不同的专家驻留策略：每层保留最近 64 个已完成的相邻 route 转移，
+用当前已知 expert 的条件成员概率选择 victim；当前转移在决策后才学习，预测到下一次
+本层的绝对 42-layer rank 到期。始终保护完整当前集合、强制准入全部 miss、保留原始
+重复 occurrence 的 LRU touch 顺序，未知/过期概率回退 LRU。新增可复用工具
+`eng/validation/glm_gpu_conditional_transition_replay.py` 和独立 full-past/Fraction、
+list-LRU 参考测试；25 项实际通过、零跳过。
+
+固定参数的三份 cold window 均完成原始 LRU 每行 miss-ID、timer 字节与整数字段核对。
+v27 D128、v44 两份 D384 的 logical source 分别只少约 0.10%、0.49%、2.43%，全部
+未达到预先固定、每份均须至少 10% 的筛选门槛，因此不增加 native flag 或运行时实现。
+42 个 288×288 uint16 矩阵仅裸计数 payload 就是 6,967,296 B，尚不含其他 metadata、
+allocator/OS 成本；该方案没有 native CPU 成本、prefill/warm-cache、实际 SSD 或模型
+速度资格。全部输出保留在忽略的
+[v63 replay evidence](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v63-conditional-transition-runtime1/execution-summary.json)。
+独立核对见 [v63 completed audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v63-conditional-transition-runtime1/capacity-independent-completed-audit.json)。
+
+v64 对剩余 68 个 Q8/K128/M8192 的 `ssm_f_b`/`ssm_g_b` 只扩展独立 fixture，
+仅重编译一个 C++ test target（两步），生产 native 仍为 `D8AF0E17…`，157 条生产
+CUDA 命令与原样 upstream 均不变。原 HC44/KDA86 的 OFF/ON 四个 fresh-process
+correctness/capture mode 实际重新通过；新 rejection screen 在 N1/33/336/512 的两轮
+输入/权重上完成 28,901,376 个 F32 比较、完整 guards 和 checked CUDA close。
+四组固定 ABBA 的 row-warp/Rows32×16 均比实际生产路径慢，两对方向全部一致：
+elapsed 分别增加约 413.87%、25.03%、141.35%、169.65%。该 shape 已有较大 grid，
+不能沿用 v62 的小 grid 收益，因此不扩展生产 dispatch，也不追加全模型运行。
+这是生成数据的 kernel rejection screen，未增加注册 CTest、B-shape graph capture、
+模型速度或物理 I/O 资格。见
+[v64 runtime receipt](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v64-b-probe-runtime1/execution-summary.json)。
+独立 completed-log 分析也已实际通过并确认四组两对全部回退，见
+[v64 completed analysis](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v64-b-probe-runtime1/independent-completed-analysis.json)。
+
+v65 在源码门槛拒绝进一步套用此 forced hook：header 的 12 个 K4096/M512
+`attn_kv_a_mqa` 实为 11 个 trunk 加 1 个 draft，走普通 `decode_mul_mat`/stock CUDA，
+不走 owned Q8 role；stock MMVQ 的 Q8_1 activation 算法也不同于现有 F32 forced
+hook。`attn_k_b`/`attn_v_b` 的 64 heads 保持 batch 轴，不能推成 64 次独立 launch
+或沿用自有 vector 的 grid 数量。类似地，header 中 92 个 K4096/M128 满足 shape
+predicate，不等于全部实际进入自有 dispatch：68 个 SSM role 与另 24 个普通 indexer
+projection 必须区分。因此不新增 fixture、生产策略或全模型运行。见
+[v65 source-gate audit](../../artifacts/perf/glm-memory-tier-20261015/v40-generated-on-d/v65-q8-attention-source-gate-audit/audit.json)。
 
 ### 15.2 手工 API、独立 KV 快照配置与硬件探针
 

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -19,15 +20,18 @@ struct Ledger {
     std::uint64_t next = 0;
     std::map<std::uint64_t, Allocation> allocations;
     bool fail_commit = false;
+    bool fail_checked_release = false, fail_release_ack = false;
+    int checked_release_calls = 0;
+    std::set<std::uint64_t> released_waiting_ack;
     int last_kind = -1;
     static std::vector<int> pools(int rank) { return rank < 0 ? std::vector<int>{0} : std::vector<int>{0, rank + 1}; }
     static std::uint64_t reserve(void* context, int rank, int kind, std::int64_t bytes)
     {
         auto& l = *static_cast<Ledger*>(context);
-        require(kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5, "unknown cache allocation kind");
+        require(kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5 || kind == 6 || kind == 7, "unknown cache allocation kind");
         l.last_kind = kind;
         if (rank < 0 || rank > 1) return 0;
-        if (kind == 3) rank = -1; // Host staging consumes shared RAM, no GPU credit.
+        if (kind == 3 || kind == 6) rank = -1; // Host payload consumes RAM, no GPU credit.
         for (int pool : pools(rank))
             if (bytes > l.capacity[pool] - l.reserved[pool] - l.committed[pool]) return 0;
         const auto token = ++l.next;
@@ -52,6 +56,18 @@ struct Ledger {
         require(!a.physical, "shared credits released before physical memory");
         for (int pool : pools(a.rank)) (a.committed ? l.committed[pool] : l.reserved[pool]) -= a.bytes;
         l.allocations.erase(token);
+    }
+    static int release_checked(void* context, std::uint64_t token) {
+        auto& l = *static_cast<Ledger*>(context);
+        ++l.checked_release_calls;
+        if (l.fail_checked_release) return 0;
+        if (l.released_waiting_ack.erase(token)) return 1;
+        release(context, token);
+        if (l.fail_release_ack) {
+            l.released_waiting_ack.insert(token);
+            return 0;
+        }
+        return 1;
     }
 };
 static bool attach(Ledger& ledger)
@@ -100,7 +116,7 @@ int main()
     require(!SharedCacheCharge::detach(&ledger), "detached resident selected-expert ownership");
     expert.reset();
     const auto calls_before_invalid = ledger.next;
-    require(!SharedCacheCharge::reserve(0, -1, 1) && !SharedCacheCharge::reserve(0, 6, 1)
+    require(!SharedCacheCharge::reserve(0, -1, 1) && !SharedCacheCharge::reserve(0, 8, 1)
         && ledger.next == calls_before_invalid, "invalid kind reached the callback");
 
     // A native allocation/upload failure unwinds physical storage before its
@@ -162,6 +178,21 @@ int main()
     require(!SharedCacheCharge::detach(&ledger), "host arena did not retain callback ownership");
     host.reset();
     require(ledger.allocations.empty() && SharedCacheCharge::detach(&ledger), "host release leaked shared credit");
+    auto old_ram_cache = SharedCacheCharge::reserve(0, 6, 32);
+    require(old_ram_cache && !host_attach(), "host scope adopted pending RAM cache");
+    require(old_ram_cache->commit(32) && !host_attach(), "host scope adopted resident RAM cache");
+    require(attach(ledger) && SharedCacheCharge::detach(&ledger), "legacy scope unexpectedly covers RAM cache");
+    old_ram_cache.reset();
+    require(host_attach(), "cannot attach after RAM cache release");
+    auto ram_cache = SharedCacheCharge::reserve(0, 6, 96);
+    require(ram_cache && ledger.last_kind == 6 && ram_cache->is_accounted(), "RAM cache dedicated charge missing");
+    require(!SharedCacheCharge::reserve(0, 3, 33), "RAM cache and staging escaped shared host quota");
+    require(!SharedCacheCharge::detach(&ledger), "detached pending RAM cache");
+    require(ram_cache->commit(96) && ledger.committed[0] == 96 && ledger.committed[1] == 0,
+        "RAM cache charged GPU instead of host");
+    require(!SharedCacheCharge::detach(&ledger), "detached resident RAM cache");
+    ram_cache.reset();
+    require(SharedCacheCharge::detach(&ledger) && ledger.allocations.empty(), "RAM cache leaked charge");
     auto graph_attach = [&] { return SharedCacheCharge::attach(&ledger, Ledger::reserve,
         Ledger::commit, Ledger::release, true); };
     auto old_joint = SharedCacheCharge::reserve(0, 5, 32);
@@ -175,5 +206,58 @@ int main()
     require(!SharedCacheCharge::detach(&ledger), "live joint graph did not protect callback lifetime");
     joint.reset();
     require(SharedCacheCharge::detach(&ledger) && ledger.allocations.empty(), "joint graph credit leaked");
-    std::puts("PASS shared cache bridge: expert kind4, joint graph kind5, atomic attach/detach, multi-pool/rank quota, physical-free order, rollback and concurrency");
+    require(!SharedCacheCharge::reserve(0, 7, 32), "unconfigured speculation received an unaccounted owner");
+    require(attach(ledger), "legacy scope attach for speculation test failed");
+    require(!SharedCacheCharge::reserve(0, 7, 32), "legacy graph-excluded scope admitted speculation");
+    require(SharedCacheCharge::detach(&ledger), "legacy speculation refusal leaked owner");
+    require(graph_attach(), "speculation scope attach failed");
+    auto speculation = SharedCacheCharge::reserve(0, 7, 64);
+    require(speculation && speculation->is_accounted() && ledger.last_kind == 7,
+        "speculation callback missed dedicated accounted owner");
+    require(!SharedCacheCharge::reserve(0, 7, 1), "speculation exceeded device envelope");
+    require(!SharedCacheCharge::detach(&ledger), "pending speculation lost callback ownership");
+    require(speculation->commit(64) && !SharedCacheCharge::detach(&ledger), "committed speculation lost callback ownership");
+    speculation.reset();
+    require(SharedCacheCharge::detach(&ledger) && ledger.allocations.empty(), "speculation owner leaked credit");
+    require(!SharedCacheCharge::checked_release_attached(), "detached registry advertises checked release");
+    require(host_attach(), "legacy host attach for checked refusal failed");
+    auto legacy = SharedCacheCharge::reserve(0, 3, 16);
+    require(legacy && !legacy->release_checked() && !SharedCacheCharge::checked_release_attached()
+        && !SharedCacheCharge::detach(&ledger), "void callback certified checked release or lost ownership");
+    legacy.reset();
+    require(SharedCacheCharge::detach(&ledger), "legacy checked refusal leaked registry");
+    require(SharedCacheCharge::attach(&ledger, Ledger::reserve, Ledger::commit, Ledger::release,
+        true, true, Ledger::release_checked) && SharedCacheCharge::checked_release_attached(),
+        "cannot install explicit checked-release acknowledgment");
+    for (bool committed : {false, true}) {
+        auto checked = SharedCacheCharge::reserve(1, 4, 32);
+        require(checked && checked->is_accounted() && checked->rank() == 1 && checked->kind() == 4
+            && checked->reserved_bytes() == 32 && !checked->is_committed(), "immutable pending certificate changed");
+        if (committed) require(checked->commit(32), "checked owner commit failed");
+        require(checked->is_committed() == committed, "certificate did not reflect actual commit");
+        ledger.fail_checked_release = true;
+        require(!checked->release_checked() && ledger.allocations.size() == 1
+            && !SharedCacheCharge::detach(&ledger), "failed checked release lost token or detach protection");
+        ledger.fail_checked_release = false;
+        require(checked->release_checked() && ledger.allocations.empty() && !checked->is_committed()
+            && !checked->commit(32), "checked release did not end exactly this ownership");
+        const auto calls = ledger.checked_release_calls;
+        require(checked->release_checked() && ledger.checked_release_calls == calls,
+            "idempotent checked release called accounting again");
+        checked.reset();
+        require(ledger.checked_release_calls == calls, "destructor duplicated an acknowledged refund");
+    }
+    auto delayed_ack = SharedCacheCharge::reserve(0, 3, 48);
+    require(delayed_ack && delayed_ack->commit(48), "cannot create checked Host owner");
+    ledger.fail_release_ack = true;
+    require(!delayed_ack->release_checked() && ledger.allocations.empty()
+        && ledger.released_waiting_ack.size() == 1 && !SharedCacheCharge::detach(&ledger),
+        "post-ledger failure forgot exact ticket or prematurely detached");
+    ledger.fail_release_ack = false;
+    require(delayed_ack->release_checked() && ledger.released_waiting_ack.empty()
+        && ledger.reserved[0] == 0 && ledger.committed[0] == 0, "ack retry duplicated physical credit");
+    delayed_ack.reset();
+    require(SharedCacheCharge::detach(&ledger) && !SharedCacheCharge::checked_release_attached(),
+        "acknowledged cleanup retained callback registration");
+    std::puts("PASS shared cache bridge: expert kind4, joint graph kind5, RAM kind6, admitted speculation kind7, atomic attach/detach, multi-pool/rank quota, physical-free order, rollback and concurrency");
 }

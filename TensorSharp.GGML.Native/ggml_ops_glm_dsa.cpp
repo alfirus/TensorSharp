@@ -50,13 +50,29 @@
 #include "ggml_ops_precision_policy.h"
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_host_moe_cache_policy.h"
+#include "ggml_ops_host_moe_layer_prefetch.h"
+#include "ggml_ops_host_moe_file_batch.h"
 #include "glm_file_strip.h"
 #include "glm_joined_workers.h"
 #include "glm_metadata_owner.h"
 #include "glm_upload_buffer.h"
 #include "glm_graph_budget.h"
+#include "glm_layer_major_graph_cap.h"
+#include "glm_layer_major_device_baton.h"
+#include "glm_causal_route_neighbor_cache.h"
+#include "glm_host_token_embedding.h"
+#include "glm_flash_mtp_policy.h"
+#include "glm_verified_prefix_policy.h"
 #include "glm_batched_execution.h"
 #include "ggml_ops_graph_budget.h"
+
+// The shared cache freezes this opt-in when queried. GLM admits it only with
+// the immutable Host embedding profile, which owns whole-call failure guards.
+extern "C" int TSGgml_HostMoePrefillDownOverlapEnabled();
+extern "C" int TSGgml_HostMoeFileSourceViewEnabled();
+// Narrow private seam: do not invalidate unrelated CUDA translation units by
+// adding this model-only maintenance declaration to ggml_ops_internal.h.
+namespace tsg { int host_moe_file_source_view_trim_quiescent() noexcept; }
 
 #include "gguf.h"
 #include "ggml-impl.h" // ggml_graph_view for segmented TP execution
@@ -83,12 +99,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <utility>
 #include <mutex>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -344,6 +362,7 @@ struct shard_files
 
 struct graph_inputs
 {
+    ggml_tensor * packed_token_embedding = nullptr; // Original raw dtype; GPU input, never the full mapped table.
     ggml_tensor * tokens[MAX_GPUS + 1] = {};   // I32 [nt]
     ggml_tensor * pos[MAX_GPUS + 1] = {};      // I32 [nt]
     ggml_tensor * kq_mask[MAX_GPUS + 1] = {};  // F16/F32 [n_kv, nt]
@@ -515,8 +534,10 @@ struct bd_token
     ggml_tensor * trail_vals[MAX_GPUS + 1] = {};  // F32 [1, kpool, 1]
 };
 
+struct glm_selected_expert_timing;
 struct graph_build_result
 {
+    tsg_glm_neighbor::Owner* causal_neighbor = nullptr; // Model-owned, immutable graph borrow.
     struct selected_expert_seam {
         tsg::HostMoeSegment segment;
         ggml_tensor* boundary = nullptr;
@@ -529,6 +550,8 @@ struct graph_build_result
     size_t selected_expert_completed = 0;
     bool selected_expert_failed = false;
     std::uint64_t selected_expert_error_epoch = 0;
+    const tsg::HostMoePrefetchHooks* selected_expert_prefetch = nullptr; // one live forward only
+    glm_selected_expert_timing* selected_expert_timing = nullptr; // stack borrow during one scalar compute only
     int64_t n_ovr = 0;   // glm5next vision-override rows this graph expects
 
     ggml_context * ctx = nullptr;
@@ -548,6 +571,10 @@ struct graph_build_result
     bool sparse = false;
     bool want_logits = true;
     bool want_h = false;
+    bool capture_prefix = false; // N2 target graph writes the stable first-row KDA mirror
+    std::size_t layer_major_graph_cap_bytes = 0; // Immutable provenance; zero is ordinary broad graph.
+    bool layer_major_graph_cap_verified = false;
+    bool host_token_embedding = false; // Immutable input-path provenance, including broad graphs.
     /// 0 = trunk, 1 = the NextN/MTP draft block. Part of the cache key: the two
     /// graphs have different shapes at the same (nt, n_kv).
     int kind = 0;
@@ -575,6 +602,11 @@ struct graph_build_result
 
     ~graph_build_result()
     {
+        if ((layer_major_graph_cap_bytes || host_token_embedding) && sched) {
+            // Strict failures can unwind before the caller obtains this entry.
+            // Fence its buffers before scheduler free and budget-token refund.
+            try { ggml_backend_sched_synchronize(sched); } catch (...) {}
+        }
         tp_peers.clear();
         if (galloc) tsg::graph_budget_gallocr_free(galloc);
         if (sched) ggml_backend_sched_free(sched);
@@ -589,6 +621,23 @@ struct glm_model
     // Additive, quiescent opt-in. No global backend is replaced. Each stream
     // and registered file range remains alive until its compact entries retire.
     bool selected_expert_seams = false;
+    tsg_glm_neighbor::Owner causal_neighbor;
+    bool device_baton_requested = false, device_baton_failed = false;
+    tsg_glm::device_baton device_baton; // Closed before any model/backend deletion.
+    std::uint64_t baton_completed_calls = 0, baton_last_bytes = 0;
+    std::uint64_t baton_last_input_bytes = 0, baton_last_output_bytes = 0;
+    std::uint64_t baton_last_input_calls = 0, baton_last_output_calls = 0;
+    bool source_view_pressure_failed = false; // Terminal owner error; cleanup remains checked/retryable.
+    std::size_t layer_major_graph_cap_bytes = 0; // Configure-once explicit profile1 policy.
+    struct strict_call_observation {
+        uint64_t builds = 0, reuses = 0, peak = 0, refusals = 0;
+    } strict_call;
+#if defined(TSG_GGML_TEST_HOOKS)
+    int strict_fail_after_layer = -1;
+    int64_t strict_failure_count = 0;
+    int host_embedding_fail_after_packs = -1;
+    int64_t host_embedding_pack_failure_count = 0;
+#endif
     int selected_expert_groups = 0;
     size_t selected_expert_minimum_bytes = 0;
     std::vector<tsg::HostMoePhaseGroupMinimum> selected_expert_group_minima;
@@ -627,6 +676,15 @@ struct glm_model
     size_t mmap_weight_bytes = 0;
 
     ggml_tensor * tok_embd = nullptr;
+    bool host_token_embedding = false; // Immutable, explicitly requested before weight allocation.
+    bool vmm_expert_weights = false; // Immutable load-time request; scope activation must match.
+    host_token_embedding_layout host_embedding_layout{};
+    std::shared_ptr<tsg::ExpertFileSource> host_embedding_file; // Opens BEFORE mapping; denies write/delete/rebind.
+    std::shared_ptr<tsg::SharedCacheCharge> host_embedding_pack_charge;
+    std::unique_ptr<std::uint8_t[]> host_embedding_pack; // Physical free precedes its charge's member destruction.
+    std::size_t host_embedding_pack_bytes = 0, host_embedding_device_pack_max = 0;
+    int host_embedding_shard = -1;
+    std::uint64_t host_embedding_calls = 0, host_embedding_rows = 0, host_embedding_bytes = 0;
     // Rank-local copies used by the segmented TP path. tok_embd_rank[0] aliases
     // tok_embd; the remaining entries are separately loaded onto their rank's
     // GPU so every graph starts from a wholly local residual stream.
@@ -641,6 +699,9 @@ struct glm_model
     /// trunk graph still runs exactly hp.n_layer blocks, so every loop that
     /// walks the trunk is unaffected by its presence.
     bool has_mtp = false;
+    bool flash_mtp = false; // bounded, explicitly enabled GLM5Next draft adapter
+    bool flash_mtp_shape_plan = false; // immutable opt-in: draft FFN executes only N1
+    bool flash_mtp_prefix_commit = false; // immutable, bounded N2 verification experiment
     int  mtp_layer = -1;
     /// Tokens the draft block has written into its own MLA cache, per slot, is
     /// tracked by the caller through the positions it passes; this is only the
@@ -712,7 +773,11 @@ struct glm_model
             valid = false;
             slot_id = -1;
         }
-    } kda_snap;
+    } kda_snap, kda_prefix;
+    tsg::GlmVerifiedPrefixWindow prefix_window;
+    // Never rebind a live prefix arena: retained graphs contain its tensor pointers.
+    // Binding 1 is published only after the first complete allocation.
+    std::uint64_t prefix_binding = 0;
 
     bool flash_attn = false;
     bool fused_lid = false;      // ggml_lightning_indexer has a kernel here
@@ -781,6 +846,9 @@ struct glm_model
 
     ~glm_model()
     {
+        if (host_token_embedding)
+            for (int d = 0; d < n_backends; ++d)
+                try { ggml_backend_synchronize(backends[d]); } catch (...) {}
         graph_cache.clear();
         for (int i = 0; i < n_backends; ++i)
             tsg::host_moe_expert_cache_release_backend(backends[i]);
@@ -795,6 +863,7 @@ struct glm_model
         }
         slot_ctxs.clear();
         kda_snap.release();
+        kda_prefix.release();
         for (int i = 0; i <= MAX_GPUS; i++)
         {
             if (c_buf[i]) tsg::graph_budget_free_buffer(c_buf[i]);
@@ -817,6 +886,346 @@ struct glm_model
         for (int i = 0; i < n_backends; i++)
             if (backends[i]) ggml_backend_free(backends[i]);
         if (cpu_threadpool) ggml_threadpool_free(cpu_threadpool);
+    }
+};
+
+static int glm_device_baton_option() noexcept
+{
+    static const int requested = []() {
+        const char* value = std::getenv("TS_GLM_LAYER_MAJOR_DEVICE_BATON");
+        if (!value || std::strcmp(value,"0") == 0) return 0;
+        return std::strcmp(value,"1") == 0 ? 1 : -1;
+    }();
+    return requested;
+}
+static bool glm_device_baton_close(glm_model& model) noexcept
+{
+    return model.device_baton.close([&]() {
+        const auto before = tsg::g_ggml_error_count.load(std::memory_order_acquire);
+        ggml_backend_synchronize(model.backends[0]);
+        return before == tsg::g_ggml_error_count.load(std::memory_order_acquire);
+    });
+}
+TSG_EXPORT int TSGgml_GlmLayerMajorDeviceBatonVersion() { return 1; }
+TSG_EXPORT int TSGgml_GlmLayerMajorDeviceBatonEnabled() { return glm_device_baton_option(); }
+TSG_EXPORT int TSGgml_GlmLayerMajorDeviceBatonClose(void* handle)
+{
+    if (!handle) return 1;
+    auto& m = *static_cast<glm_model*>(handle);
+    if (glm_device_baton_close(m)) return 1;
+    m.device_baton_failed = true; return 0;
+}
+TSG_EXPORT int TSGgml_GlmLayerMajorDeviceBatonInfo(void* handle, int64_t* values, int length)
+{
+    if (!handle || !values || length < 12) return 0;
+    const auto& m = *static_cast<glm_model*>(handle);
+    const int64_t result[] = {1,m.device_baton_requested ? 1 : 0,m.device_baton_failed ? 1 : 0,
+        static_cast<int64_t>(m.device_baton.physical_bytes()),static_cast<int64_t>(m.device_baton.held_ticket_bytes()),
+        static_cast<int64_t>(m.baton_completed_calls),static_cast<int64_t>(m.baton_last_bytes),
+        static_cast<int64_t>(m.baton_last_input_bytes),static_cast<int64_t>(m.baton_last_output_bytes),
+        static_cast<int64_t>(m.baton_last_input_calls),static_cast<int64_t>(m.baton_last_output_calls),1};
+    std::copy(std::begin(result),std::end(result),values); return 1;
+}
+
+static int glm_host_token_embedding_option() noexcept
+{
+    const char* value = getenv("TS_GLM_HOST_TOKEN_EMBEDDING");
+    if (!value || std::strcmp(value,"0") == 0) return 0;
+    return std::strcmp(value,"1") == 0 ? 1 : -1;
+}
+
+static int glm_vmm_expert_weights_option() noexcept
+{
+    const char* value = getenv("TS_HOST_MOE_VMM_WEIGHTS");
+    if (!value || std::strcmp(value, "0") == 0) return 0;
+    return std::strcmp(value, "1") == 0 ? 1 : -1;
+}
+
+// Check before a forward can change graph, KV or recurrent state. A scope
+// enabled after loading a legacy handle cannot borrow Host1's failure guard.
+static bool glm_vmm_expert_weights_call(const glm_model& m) noexcept
+{
+    if (m.device_baton_failed || m.device_baton.owned()
+        || m.device_baton_requested != (glm_device_baton_option() == 1)) return false;
+    if (m.source_view_pressure_failed || (tsg::host_moe_file_source_view_requested()
+        && !tsg::host_moe_file_source_view_execution_ready())) return false;
+    if (m.vmm_expert_weights != tsg::host_moe_vmm_requested()) return false;
+    return !m.vmm_expert_weights || (m.host_token_embedding && m.shared_graph_owner
+        && m.selected_expert_seams && !m.layer_major_graph_cap_bytes && !m.has_mtp
+        && m.tp == 1 && m.n_gpu == 1 && m.n_ctx == 2048 && m.n_ubatch == 512);
+}
+
+// Keep structured exception handling in a leaf with no C++ unwind objects.
+// A failed mapped read may have copied a prefix; it must never be uploaded.
+static bool glm_host_token_embedding_copy(void* destination, const void* source, std::size_t bytes) noexcept
+{
+#if defined(_WIN32) && defined(_MSC_VER)
+    __try {
+        if (bytes) std::memcpy(destination,source,bytes);
+        return true;
+    } __except ((GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR || GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION)
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
+#else
+    (void)destination; (void)source; (void)bytes; return false;
+#endif
+}
+
+static bool glm_host_token_embedding_ready(const glm_model& m) noexcept
+{
+    if (!m.host_token_embedding) return false;
+    const auto& l = m.host_embedding_layout;
+    if (l.hidden != 4096 || l.vocabulary != 154880 || l.type != (int)GGML_TYPE_Q4_K
+        || l.row_bytes != 2304 || l.table_bytes != 356843520 || !m.host_embedding_file
+        || m.host_embedding_file->bytes() != l.table_bytes || !m.host_embedding_pack
+        || !m.host_embedding_pack_charge || !m.host_embedding_pack_charge->is_accounted()
+        || m.host_embedding_pack_bytes != 1179648 || m.host_embedding_device_pack_max != 1179648
+        || m.host_embedding_shard < 0 || (size_t)m.host_embedding_shard >= m.mmap_owners.size()
+        || (size_t)m.host_embedding_shard >= m.mmap_bufs.size()
+        || !m.tok_embd || m.tok_embd->view_src || !m.tok_embd->data || !m.tok_embd->buffer
+        || m.tok_embd->type != GGML_TYPE_Q4_K || m.tok_embd->ne[0] != 4096 || m.tok_embd->ne[1] != 154880
+        || m.tok_embd->ne[2] != 1 || m.tok_embd->ne[3] != 1 || !ggml_is_contiguous(m.tok_embd)
+        || !m.output || !m.output->buffer || m.output == m.tok_embd || m.has_mtp
+        || m.n_gpu != 1 || m.tp != 1) return false;
+    const size_t shard = (size_t)m.host_embedding_shard;
+    const auto& mapping = m.mmap_owners[shard];
+    if (!mapping || !mapping->data() || m.tok_embd->buffer != m.mmap_bufs[shard]
+        || !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(m.tok_embd->buffer))
+        || ggml_backend_buffer_get_type(m.output->buffer) != ggml_backend_get_default_buffer_type(m.backends[0])) return false;
+    const auto offset = m.host_embedding_file->offset();
+    if (offset > mapping->size() || l.table_bytes > mapping->size() - offset) return false;
+    const auto base = reinterpret_cast<std::uintptr_t>(mapping->data());
+    return base <= UINTPTR_MAX - offset
+        && reinterpret_cast<std::uintptr_t>(m.tok_embd->data) == base + offset;
+}
+
+static bool glm_host_token_embedding_call(const glm_model& m, const int32_t* tokens, int count,
+    bool hidden_export = false) noexcept
+{
+    if (!m.host_token_embedding) return true;
+    if (!glm_host_token_embedding_ready(m) || hidden_export || count <= 0 || !m.shared_graph_owner
+        || m.slots.size() != 1 || !m.active_slot || m.slots.begin()->second.get() != m.active_slot
+        || m.active_slot->kda_restore_failed || !m.embd_ovr.empty() || m.trace_dump || m.tp_fused
+        || m.kda_snap.valid || m.kda_prefix.valid) return false;
+    if (m.active_slot->n_past < 0 || m.active_slot->n_past > m.n_ctx
+        || (int64_t)count > m.n_ctx - m.active_slot->n_past
+        || tsg::g_backend_compute_failed.load(std::memory_order_acquire)) return false;
+    return validate_host_token_embedding_tokens(tokens,(size_t)count,m.host_embedding_layout.vocabulary);
+}
+
+struct glm_host_embedding_failure_guard {
+    glm_model& model; glm_slot& slot; bool armed; int64_t head; bool complete = false;
+    ~glm_host_embedding_failure_guard() noexcept {
+        if (!armed || complete) return;
+        for (int d = 0; d < model.n_backends; ++d)
+            try { ggml_backend_synchronize(model.backends[d]); } catch (...) {}
+        slot.n_past = head; slot.kda_restore_failed = true;
+        model.kda_snap.valid = model.kda_prefix.valid = false; model.prefix_window.invalidate();
+    }
+};
+
+static void glm_mtp_graph_diagnostic(const glm_model & m, const char * event,
+                                     const char * reason, const graph_build_result * graph)
+{
+    if (!m.flash_mtp) return;
+    static const bool enabled = [] {
+        const char * value = getenv("TS_GLM_FLASH_MTP_GRAPH_DIAGNOSTICS");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (!enabled) return;
+    fprintf(stderr, "[GLM-MTP-GRAPH] event=%s reason=%s kind=%d nt=%" PRId64
+        " nout=%" PRId64 " wanth=%d logits=%d nkv=%" PRId64 " slot=%d layers=%d:%d"
+        " cache_size=%zu capacity=%d\n", event, reason,
+        graph ? graph->kind : -1, graph ? graph->nt : 0, graph ? graph->n_out : 0,
+        graph ? int(graph->want_h) : 0, graph ? int(graph->want_logits) : 0,
+        graph ? graph->n_kv : 0, graph ? graph->slot_id : -1,
+        graph ? graph->layer_begin : 0, graph ? graph->layer_end : 0,
+        m.graph_cache.size(), m.graph_cache_cap);
+}
+
+static void glm_enforce_graph_cache_capacity(glm_model & m)
+{
+    while ((int) m.graph_cache.size() > m.graph_cache_cap) {
+        glm_mtp_graph_diagnostic(m, "evict", "capacity", m.graph_cache.back().get());
+        m.graph_cache.pop_back();
+    }
+}
+
+// Optional host-wall attribution for Flash MTP and its plain GLM5Next control.
+// The existing compute synchronizations remain the stage boundaries;
+// diagnostics never add a device synchronization.
+struct glm_flash_forward_timing {
+    using clock = std::chrono::steady_clock;
+    enum stage { acquire, input, compute, output };
+    bool enabled = false, completed = false;
+    int kind, reused = -1;
+    int64_t rows, position, n_out;
+    bool want_h, want_logits;
+    stage active = acquire;
+    clock::time_point started{}, previous{};
+    double milliseconds[4]{};
+
+    glm_flash_forward_timing(const glm_model& model, int graph_kind, int64_t nt,
+                            int64_t p0, int64_t outputs, bool hidden, bool logits) noexcept
+        : kind(graph_kind), rows(nt), position(p0), n_out(outputs), want_h(hidden), want_logits(logits)
+    {
+        if (!model.hp.g5n) return;
+        static const bool requested = [] {
+            const char* value = getenv("TS_GLM_FLASH_MTP_FORWARD_TIMING");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        enabled = requested;
+        if (enabled) started = previous = clock::now();
+    }
+
+    void next(stage following) noexcept
+    {
+        if (!enabled) return;
+        const auto now = clock::now();
+        milliseconds[active] += std::chrono::duration<double, std::milli>(now - previous).count();
+        previous = now;
+        active = following;
+    }
+
+    ~glm_flash_forward_timing() noexcept
+    {
+        if (!enabled) return;
+        const auto now = clock::now();
+        milliseconds[active] += std::chrono::duration<double, std::milli>(now - previous).count();
+        const double total = std::chrono::duration<double, std::milli>(now - started).count();
+        fprintf(stderr, "[GLM-MTP-FORWARD-TIMING] kind=%d rows=%" PRId64 " p0=%" PRId64
+            " nout=%" PRId64 " wanth=%d logits=%d reused=%d outcome=%s"
+            " acquire_ms=%.6f input_ms=%.6f compute_ms=%.6f output_ms=%.6f total_ms=%.6f"
+            " scope=host_wall_including_existing_sync_and_expert_callbacks\n",
+            kind, rows, position, n_out, int(want_h), int(want_logits), reused,
+            completed ? "completed" : "failed", milliseconds[acquire], milliseconds[input],
+            milliseconds[compute], milliseconds[output], total);
+    }
+};
+
+// Optional scalar-call attribution. These clocks wrap existing operations only;
+// process-global relaxed DSV4 deltas are nested host API wall, not kernel time
+// or CPU-exclusive work. Never reset shared counters or add a device fence.
+struct glm_selected_expert_timing {
+    using clock = std::chrono::steady_clock;
+    enum stage { ids, helper, drain };
+    struct counters { uint64_t calls = 0, views = 0, fused = 0, nodes = 0; double submit_ms = 0; };
+    graph_build_result& graph;
+    bool enabled = false, bound = false, valid = true, completed = false, finished = false, dsv4 = false;
+    int64_t position;
+    size_t asks = 0, ready = 0, callbacks_completed = 0;
+    const ggml_tensor* pending = nullptr;
+    clock::time_point started{}, asked{}, last_callback{};
+    double ready_ms = 0, stage_ms[3]{}, callback_ms = 0, tail_ms = 0, compute_ms = 0;
+    counters first{}, total{}, helpers{};
+
+    static double elapsed(clock::time_point a, clock::time_point b) noexcept {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    }
+    counters read() noexcept {
+        counters out;
+#if defined(TSG_GGML_USE_CUDA)
+        if (dsv4) try {
+            const auto value = tsg_dsv4_fused_counters_read();
+            out = {value.calls, value.views, value.fused, value.nodes, value.submit_ms};
+        } catch (...) { valid = false; }
+#endif
+        return out;
+    }
+    counters delta(const counters& before, const counters& after) noexcept {
+        if (after.calls < before.calls || after.views < before.views || after.fused < before.fused
+            || after.nodes < before.nodes || !std::isfinite(before.submit_ms) || !std::isfinite(after.submit_ms)
+            || after.submit_ms < before.submit_ms) { valid = false; return {}; }
+        return {after.calls - before.calls, after.views - before.views, after.fused - before.fused,
+            after.nodes - before.nodes, after.submit_ms - before.submit_ms};
+    }
+    glm_selected_expert_timing(const glm_model& model, graph_build_result& value, int64_t nt,
+                              int64_t p0, bool whole_trunk) noexcept : graph(value), position(p0) {
+        if (!model.hp.g5n || nt != 1 || model.tp != 1 || model.n_gpu != 1 || !whole_trunk
+            || graph.tp_fused || graph.kind != 0 || !graph.bd.empty() || graph.selected_expert_seams.empty()) return;
+        static const bool requested = [] {
+            const char* value = getenv("TS_GLM_SELECTED_EXPERT_TIMING");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (!requested) return;
+        enabled = true;
+#if defined(TSG_GGML_USE_CUDA)
+        static const bool counters_requested = [] {
+            const char* value = getenv("TS_DSV4_PERF"); return value && atoi(value) >= 3;
+        }();
+        dsv4 = counters_requested;
+#endif
+        if (graph.selected_expert_timing) valid = false;
+        else { graph.selected_expert_timing = this; bound = true; }
+        started = last_callback = clock::now(); first = read();
+    }
+    void ask(const ggml_tensor* tensor) noexcept {
+        if (pending) valid = false;
+        pending = tensor; asked = clock::now(); ++asks;
+    }
+    struct callback {
+        glm_selected_expert_timing* timing;
+        clock::time_point start{};
+        bool completed = false;
+        callback(glm_selected_expert_timing* value, const ggml_tensor* tensor) noexcept : timing(value) {
+            if (!timing) return;
+            start = clock::now();
+            if (timing->pending != tensor) timing->valid = false;
+            else timing->ready_ms += elapsed(timing->asked, start);
+            timing->pending = nullptr; ++timing->ready;
+        }
+        ~callback() noexcept {
+            if (!timing) return;
+            const auto end = clock::now();
+            timing->callback_ms += elapsed(start, end); timing->last_callback = end;
+            if (completed) ++timing->callbacks_completed;
+        }
+    };
+    struct span {
+        glm_selected_expert_timing* timing;
+        stage active;
+        clock::time_point start{};
+        counters before{};
+        span(glm_selected_expert_timing* value, stage kind) noexcept : timing(value), active(kind) {
+            if (timing) { start = clock::now(); if (active == helper) before = timing->read(); }
+        }
+        ~span() noexcept {
+            if (!timing) return;
+            timing->stage_ms[active] += elapsed(start, clock::now());
+            if (active == helper && timing->dsv4) {
+                const auto value = timing->delta(before, timing->read());
+                timing->helpers.calls += value.calls; timing->helpers.views += value.views;
+                timing->helpers.fused += value.fused; timing->helpers.nodes += value.nodes;
+                timing->helpers.submit_ms += value.submit_ms;
+            }
+        }
+    };
+    void finish() noexcept {
+        if (!enabled || finished) return;
+        const auto end = clock::now(); compute_ms = elapsed(started, end);
+        tail_ms = elapsed(last_callback, end); total = delta(first, read()); finished = true;
+        if (pending || asks != ready || ready != callbacks_completed || ready != graph.selected_expert_seams.size()) valid = false;
+        if (bound) {
+            if (graph.selected_expert_timing == this) graph.selected_expert_timing = nullptr;
+            else valid = false;
+            bound = false;
+        }
+    }
+    ~glm_selected_expert_timing() noexcept {
+        if (!enabled) return;
+        finish();
+        const auto outer = delta(helpers, total);
+        fprintf(stderr, "[GLM-SELECTED-EXPERT-TIMING] profile=1 rows=1 p0=%" PRId64
+            " outcome=%s valid=%d boundaries=%zu asks=%zu ready=%zu completed=%zu errors=%zu"
+            " ready_ms=%.6f ids_ms=%.6f helper_ms=%.6f drain_ms=%.6f callback_ms=%.6f tail_ms=%.6f compute_ms=%.6f"
+            " dsv4_available=%d dsv4_total_calls=%" PRIu64 " dsv4_total_views=%" PRIu64 " dsv4_total_fused=%" PRIu64 " dsv4_total_nodes=%" PRIu64 " dsv4_total_submit_ms=%.6f"
+            " dsv4_helper_calls=%" PRIu64 " dsv4_helper_views=%" PRIu64 " dsv4_helper_fused=%" PRIu64 " dsv4_helper_nodes=%" PRIu64 " dsv4_helper_submit_ms=%.6f"
+            " dsv4_outer_calls=%" PRIu64 " dsv4_outer_views=%" PRIu64 " dsv4_outer_fused=%" PRIu64 " dsv4_outer_nodes=%" PRIu64 " dsv4_outer_submit_ms=%.6f"
+            " scope=host_wall_and_nested_process_global_host_api_submission_not_kernel_or_cpu_exclusive\n",
+            position, completed ? "completed" : "failed", int(valid), graph.selected_expert_seams.size(), asks, ready,
+            callbacks_completed, ready - callbacks_completed, ready_ms, stage_ms[ids], stage_ms[helper], stage_ms[drain],
+            callback_ms, tail_ms, compute_ms, int(dsv4), total.calls, total.views, total.fused, total.nodes, total.submit_ms,
+            helpers.calls, helpers.views, helpers.fused, helpers.nodes, helpers.submit_ms,
+            outer.calls, outer.views, outer.fused, outer.nodes, outer.submit_ms);
     }
 };
 
@@ -1619,7 +2028,10 @@ static void slot_free(glm_model & m, int slot_id)
         bool refs = (*it)->slot_id == slot_id;
         for (const bd_token & B : (*it)->bd)
             if (B.slot_id == slot_id) refs = true;
-        it = refs ? m.graph_cache.erase(it) : std::next(it);
+        if (refs) {
+            glm_mtp_graph_diagnostic(m, "trim", "slot-free", it->get());
+            it = m.graph_cache.erase(it);
+        } else ++it;
     }
 
     m.slots.erase(slot_id);
@@ -1627,6 +2039,7 @@ static void slot_free(glm_model & m, int slot_id)
     // A snapshot of this slot's KDA state describes caches that no longer
     // exist; slot ids are reused, so it must not survive to match a new one.
     if (m.kda_snap.slot_id == slot_id) m.kda_snap.valid = false;
+    m.prefix_window.invalidate();
     for (auto it = m.slot_ctxs.begin(); it != m.slot_ctxs.end(); )
     {
         if (it->slot_id != slot_id) { ++it; continue; }
@@ -1733,12 +2146,97 @@ static std::string akey(const char * arch, const char * suffix)
     return k;
 }
 
+static bool glm_causal_environment() noexcept {
+    const char* disabled[] = {
+        "TS_HOST_MOE_DECODE_REBALANCE_RETAIN_PEER", "TS_HOST_MOE_PHASE_COLD_GROWTH",
+        "TS_HOST_MOE_PREFILL_DOWN_OVERLAP", "TS_HOST_MOE_PREFILL_RING_COALESCE16",
+        "TS_HOST_MOE_EXPERT_CACHE_PREFETCH", "TS_HOST_MOE_DECODE_PREFETCH", "TS_HOST_MOE_LAYER_PREFETCH",
+        "TS_HOST_MOE_EXPERT_CACHE_DIRECT_READS", "TS_HOST_MOE_EXPERT_CACHE_ORDERED_READS",
+        "TS_HOST_MOE_RAM_CACHE_MB", "TS_HOST_MOE_RAM_CACHE_MAPPED", "TS_HOST_MOE_RAM_CACHE_VICTIM",
+        "TS_HOST_MOE_RAM_CACHE_PINNED", "TS_HOST_MOE_RAM_CACHE_DIRECT_UPLOAD", "TS_HOST_MOE_RAM_CACHE_FREQUENCY",
+        "TS_HOST_MOE_RAM_CACHE_PREFETCH_ONLY", "TS_GLM_DECODE_GRAPH_RESERVE",
+        "TS_HOST_MOE_FILE_READ_WORKERS", "TS_HOST_MOE_FILE_RANDOM_ACCESS", "TS_HOST_MOE_FILE_SOURCE_VIEW",
+        "TS_HOST_MOE_VMM_WEIGHTS", "TS_GLM_LAYER_MAJOR_DEVICE_BATON", "TS_HOST_MOE_FILE_READ_SORT",
+        "TS_HOST_MOE_FILE_SOURCE_VIEW_PREFETCH", "TS_GLM_GRAPH_MEMORY_DIAGNOSTICS",
+        "TS_HOST_MOE_ROUTE_TRACE", "TS_DSV4_PERF" };
+    for (const char* name : disabled) {
+        const char* value = std::getenv(name);
+        if (value && std::strcmp(value, "0") != 0) return false;
+    }
+    const char* lfu = std::getenv("TS_HOST_MOE_EXPERT_CACHE_LFU");
+    const char* trace = std::getenv("TS_GLM_TRACE");
+    const char* dump = std::getenv("TS_GLM_TRACE_DUMP_DIR");
+    return lfu && std::strcmp(lfu, "0") == 0 && (!trace || !*trace) && (!dump || !*dump);
+}
+
 static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch,
                             int n_threads, int n_cpu_moe_req, const char * backend_name, int tp_req,
-                            bool ctx_is_hard_limit, bool load_mtp)
+                            bool ctx_is_hard_limit, bool load_mtp, bool host_token_embedding = false)
 {
+    if (!tsg::host_moe_causal_model_release_ready()) {
+        tsg::report_load_refusal("[glm] the exclusive causal-route owner requires checked final cleanup before another load\n");
+        return nullptr;
+    }
+    if (!tsg::host_moe_vmm_model_release_ready()) {
+        tsg::report_load_refusal("[glm] the exclusive VMM model owner requires checked final cleanup before another load\n");
+        return nullptr;
+    }
+    if (!tsg::host_moe_file_source_view_model_release_ready()) {
+        tsg::report_load_refusal("[glm] the exclusive source-view owner requires checked final cleanup before another load\n");
+        return nullptr;
+    }
+    const int baton = glm_device_baton_option();
+    if (baton < 0 || (baton == 1 && (!host_token_embedding || load_mtp || n_gpu_req != 1 || tp_req > 1
+        || n_ctx != 2048 || n_ubatch != 512 || !ctx_is_hard_limit || !backend_name
+        || std::strcmp(backend_name,"CUDA") != 0 || glm_vmm_expert_weights_option() != 0
+        || TSGgml_HostMoeFileSourceViewEnabled() != 0
+        || !tsg::SharedCacheCharge::graph_accounting_attached()
+        || !tsg::SharedCacheCharge::checked_release_attached()))) {
+        tsg::report_load_refusal("[glm] device baton requires checked shared graph accounting, Host1, CUDA1/context2048/chunk512, no VMM/source views/MTP\n");
+        return nullptr;
+    }
+    const int vmm_weights = glm_vmm_expert_weights_option();
+    const char* graph_cap = getenv("TS_GLM_LAYER_MAJOR_GRAPH_CAP_MB");
+    const int source_views = TSGgml_HostMoeFileSourceViewEnabled();
+    const int causal_neighbor = tsg_glm_neighbor::option();
+    if (causal_neighbor < 0 || (causal_neighbor == 1 && (!host_token_embedding || load_mtp
+        || n_gpu_req != 1 || tp_req > 1 || n_ctx != 2048 || n_ubatch != 512 || !ctx_is_hard_limit
+        || !backend_name || std::strcmp(backend_name, "CUDA") != 0 || vmm_weights != 0
+        || source_views != 0 || baton != 0 || (graph_cap && std::strcmp(graph_cap, "0") != 0)
+        || !tsg::SharedCacheCharge::host_accounting_attached()
+        || !tsg::SharedCacheCharge::checked_release_attached() || !glm_causal_environment()))) {
+        tsg::report_load_refusal("[glm] causal-route requires guarded Host1/CUDA1/context2048/chunk512/checked Host accounting and no competing profile\n");
+        return nullptr;
+    }
+    if (source_views < 0 || (source_views == 1 && (!host_token_embedding || load_mtp || vmm_weights != 0
+        || n_gpu_req != 1 || tp_req > 1 || n_ctx != 2048 || n_ubatch != 512 || !ctx_is_hard_limit
+        || !backend_name || std::strcmp(backend_name, "CUDA") != 0
+        || (graph_cap && std::strcmp(graph_cap, "0") != 0)))) {
+        tsg::report_load_refusal("[glm] source views require flag1, guarded Host1, one CUDA rank, context2048/chunk512, no VMM/MTP/graph cap\n");
+        return nullptr;
+    }
+    if (vmm_weights < 0 || (vmm_weights == 1 && (!host_token_embedding || load_mtp
+        || n_gpu_req != 1 || tp_req > 1 || n_ctx != 2048 || n_ubatch != 512 || !ctx_is_hard_limit
+        || !backend_name || std::strcmp(backend_name, "CUDA") != 0
+        || (graph_cap && std::strcmp(graph_cap, "0") != 0)))) {
+        tsg::report_load_refusal("[glm] VMM expert weights require flag1, guarded Host1, one CUDA rank, context2048/chunk512, no MTP or graph cap\n");
+        return nullptr;
+    }
+    if (TSGgml_HostMoePrefillDownOverlapEnabled() == 1 && !host_token_embedding) {
+        tsg::report_load_refusal("[glm] prefill Down overlap requires the explicit guarded Host token embedding profile\n");
+        return nullptr;
+    }
     auto t_start = std::chrono::steady_clock::now();
     std::unique_ptr<glm_model> m(new glm_model());
+    m->host_token_embedding = host_token_embedding;
+    m->device_baton_requested = baton == 1;
+    m->vmm_expert_weights = vmm_weights == 1;
+    m->causal_neighbor.request(causal_neighbor == 1);
+#if !defined(_WIN32) || !defined(_MSC_VER) || !defined(TSG_GGML_USE_CUDA)
+    if (host_token_embedding) {
+        tsg::report_load_refusal("[glm] Host token embedding requires the qualified Windows CUDA/SEH path\n"); return nullptr;
+    }
+#endif
     const char * strict_recurrent = getenv("TS_GGML_STRICT_RECURRENT_PROJECTIONS");
     m->strict_recurrent_requested = strict_recurrent && strcmp(strict_recurrent, "1") == 0;
     m->trace_dump = trace_dump_state::configured();
@@ -2068,6 +2566,62 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         embd_bytes = it->second.size;
     }
     size_t head_bytes = root_bytes > embd_bytes ? root_bytes - embd_bytes : 0;
+    if (host_token_embedding) {
+#if defined(_WIN32) && defined(_MSC_VER) && defined(TSG_GGML_USE_CUDA)
+        const auto& source = sources.at("token_embd.weight");
+        const auto output = sources.find("output.weight");
+        const int width = n_ubatch > 0 ? n_ubatch : 512;
+        const char* mapping = getenv("TS_GLM_MOE_MMAP");
+        if (!hp.g5n || n_gpu != 1 || m->tp != 1 || !ggml_backend_is_cuda(m->backends[0])
+            || !m->projection_backends[0] || load_mtp || width < 1 || width > 512
+            || m->trace_dump || (getenv("TS_GLM_TRACE") && *getenv("TS_GLM_TRACE"))
+            || (mapping && atoi(mapping) == 0) || source.type != GGML_TYPE_Q4_K
+            || source.ne[0] != 4096 || source.ne[1] != 154880 || source.ne[2] != 1 || source.ne[3] != 1
+            || hp.n_embd != 4096 || hp.n_vocab != 154880 || source.size != host_token_embedding_profile_table_bytes
+            || output == sources.end() || output->second.ne[0] != 4096 || output->second.ne[1] != 154880
+            || output->second.ne[2] != 1 || output->second.ne[3] != 1) {
+            tsg::report_load_refusal("[glm] Host token embedding requires exact Q4_K text trunk, one CUDA/rank, rows<=512, mapping, no MTP/trace and a distinct GPU output\n");
+            return nullptr;
+        }
+        if (source.offset > UINT64_MAX - source.size || output->second.offset > UINT64_MAX - output->second.size) {
+            tsg::report_load_refusal("[glm] Host token embedding source extent overflows\n"); return nullptr;
+        }
+        if (source.shard == output->second.shard
+            && source.offset < output->second.offset + output->second.size
+            && output->second.offset < source.offset + source.size) {
+            tsg::report_load_refusal("[glm] Host token embedding cannot alias/tie the GPU output extent\n"); return nullptr;
+        }
+        m->host_embedding_layout = checked_host_token_embedding_layout(source.size,
+            ggml_row_size(source.type, source.ne[0]), source.ne[0], source.ne[1], (int)source.type);
+        // Hold the exact shard read-only BEFORE creating any mapped view. This
+        // stronger share policy also prevents path replacement during its life.
+        m->host_embedding_file = std::make_shared<tsg::ExpertFileSource>(shards.paths.at(source.shard).c_str(),
+            source.offset, source.size);
+        m->host_embedding_shard = source.shard;
+        const auto pack_bytes = host_token_embedding_profile_row_bytes * host_token_embedding_max_rows;
+        auto charge = tsg::SharedCacheCharge::reserve(0, 3, pack_bytes);
+        if (!charge || !charge->is_accounted()) {
+            tsg::report_load_refusal("[glm] Host token embedding pack requires an accounted load-time Host owner\n"); return nullptr;
+        }
+        std::unique_ptr<std::uint8_t[]> pack(new std::uint8_t[pack_bytes]);
+        if (!charge->commit(pack_bytes)) {
+            tsg::report_load_refusal("[glm] Host token embedding pack commit refused\n"); return nullptr;
+        }
+        m->host_embedding_pack_charge = std::move(charge);
+        m->host_embedding_pack = std::move(pack); m->host_embedding_pack_bytes = pack_bytes;
+        ggml_init_params metadata{ggml_tensor_overhead() * 2, nullptr, true};
+        auto* context = ggml_init(metadata);
+        if (!context) return nullptr;
+        auto* packed = ggml_new_tensor_2d(context, GGML_TYPE_Q4_K, 4096, 512);
+        m->host_embedding_device_pack_max = ggml_backend_buft_get_alloc_size(
+            ggml_backend_get_default_buffer_type(m->backends[0]), packed);
+        ggml_free(context);
+        if (m->host_embedding_device_pack_max != pack_bytes) {
+            tsg::report_load_refusal("[glm] Host token embedding requires the qualified exact CUDA packed-row allocation shape\n"); return nullptr;
+        }
+        root_bytes -= embd_bytes; embd_bytes = 0; // Actual GPU placement excludes ONLY the input table.
+#endif
+    }
 
     // --- NextN/MTP draft block -------------------------------------------
     // Loading it costs a whole extra decoder layer (~3 GiB of GLM-5.2 at
@@ -2076,14 +2630,13 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // before the model loads, and the managed side forwards that as
     // `load_mtp`. A checkpoint that declares nextn_predict_layers but ships no
     // MTP tensors (a trunk-only re-quantization) loads normally without one.
-    if (load_mtp && hp.g5n)
-    {
-        // The glm5next NextN block is a full DSA decoder layer wrapped in its
-        // own hyper-connections; llama.cpp asserts its graph unimplemented and
-        // this executor does not build it yet either.
-        fprintf(stderr, "[glm] glm5next NextN/MTP draft heads are not implemented; ngram speculation remains available\n");
-    }
-    if (load_mtp && !hp.g5n)
+    const char* flash_mtp_option = std::getenv("TS_GLM_FLASH_MTP");
+    const bool flash_mtp_enabled = flash_mtp_option && flash_mtp_option[0] == '1' && flash_mtp_option[1] == '\0';
+    const bool flash_mtp_allowed = hp.g5n && flash_mtp_eligible(flash_mtp_enabled, n_gpu, m->tp,
+        n_ctx > 0 ? n_ctx : 8192, hp.indexer_top_k);
+    if (load_mtp && hp.g5n && !flash_mtp_allowed)
+        fprintf(stderr, "[glm] Flash MTP requires TS_GLM_FLASH_MTP=1, one GPU/rank, and context <= indexer top-k; draft disabled\n");
+    if (load_mtp && (!hp.g5n || flash_mtp_allowed))
     {
         auto has_src = [&](const char * suffix) {
             char nm[256];
@@ -2093,7 +2646,20 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         // Everything is decided BEFORE a byte is placed: a decision made later
         // would already have priced (and, worse, uploaded) 3 GiB of a block
         // that then turns out to be unusable.
-        const bool wiring = mtp_present && has_src("nextn.enorm.weight") && has_src("nextn.hnorm.weight");
+        bool wiring = mtp_present && has_src("nextn.enorm.weight") && has_src("nextn.hnorm.weight");
+        if (flash_mtp_allowed) {
+            // The actual Flash NextN block is a plain-residual MLA decoder,
+            // with no hyper-connection tensors. Validate its full executable
+            // path before placement; indexer weights are unused in this bound.
+            for (const char* suffix : {"attn_norm.weight", "ffn_norm.weight", "attn_q_a.weight",
+                "attn_q_a_norm.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
+                "attn_k_b.weight", "attn_v_b.weight", "attn_output.weight", "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight", "nextn.shared_head_norm.weight"})
+                wiring = wiring && has_src(suffix);
+            if (hp.n_expert_shared > 0)
+                wiring = wiring && has_src("ffn_gate_shexp.weight") && has_src("ffn_up_shexp.weight")
+                    && has_src("ffn_down_shexp.weight");
+        }
         // A draft block with no head of its own borrows the trunk's, which is
         // column-parallel under tensor parallelism — the draft would read one
         // rank's strip of the vocabulary and produce nonsense.
@@ -2114,6 +2680,13 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         else
         {
             m->has_mtp = true;
+            m->flash_mtp = flash_mtp_allowed;
+            const char* shape_plan = std::getenv("TS_GLM_FLASH_MTP_SHAPE_PLAN");
+            m->flash_mtp_shape_plan = flash_mtp_allowed && shape_plan
+                && shape_plan[0] == '1' && shape_plan[1] == '\0';
+            const char* prefix_commit = std::getenv("TS_GLM_FLASH_MTP_PREFIX_COMMIT");
+            m->flash_mtp_prefix_commit = flash_mtp_allowed && m->n_gpu == 1 && m->tp == 1
+                && prefix_commit && prefix_commit[0] == '1' && prefix_commit[1] == '\0';
             m->mtp_layer = hp.n_layer;
         }
     }
@@ -2133,7 +2706,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     }
     // The draft block lands beside the LM head (it reads the trunk's post-norm
     // hidden state and writes through the same head), so it is priced with it.
-    head_bytes += mtp_bytes;
+    head_bytes += mtp_bytes - (m->flash_mtp ? mtp_exps_bytes : 0);
 
     m->n_ctx = n_ctx > 0 ? n_ctx : 8192;
     // What the caller asked for, kept so a later measurement can hand slack back
@@ -2541,7 +3114,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     {
         glm_layer & M = m->layers[(size_t) m->mtp_layer];
         M.device = n_gpu > 0 ? m->layers[(size_t) hp.n_layer - 1].device : 0;
-        M.cpu_moe = n_gpu == 0 || m->mtp_layer < n_cpu_moe;
+        M.cpu_moe = m->flash_mtp || n_gpu == 0 || m->mtp_layer < n_cpu_moe;
     }
 
     // --- weight tensors ---------------------------------------------------
@@ -2566,7 +3139,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
     weight_loader WL(*m, sources);
 
-    m->tok_embd = WL.full(dev_first, true, "token_embd.weight");
+    m->tok_embd = WL.full(host_token_embedding ? n_gpu : dev_first, true, "token_embd.weight");
     m->tok_embd_rank[0] = m->tok_embd;
     const bool load_rank_embeddings = hp.g5n && m->tp > 1 && m->tp <= n_gpu && m->tp_shard == 3 &&
         n_cpu_moe == 0 && !(getenv("TS_GLM_TRACE") && *getenv("TS_GLM_TRACE"));
@@ -2645,7 +3218,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             W.attn_norm = WL.full(d, true, "blk.%d.attn_norm.weight", il);
             W.ffn_norm  = WL.full(d, true, "blk.%d.ffn_norm.weight", il);
 
-            if (hp.g5n)
+            if (hp.g5n && il < hp.n_layer)
             {
                 // Every glm5next layer crosses the residual through Sinkhorn
                 // hyper-connections, twice.
@@ -2890,6 +3463,10 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         }
     }
 
+    if (host_token_embedding && (!m->tok_embd->buffer || std::find(m->mmap_bufs.begin(),m->mmap_bufs.end(),
+            m->tok_embd->buffer) == m->mmap_bufs.end())) {
+        tsg::report_load_refusal("[glm] Host token embedding refuses an anonymous whole-table allocation\n"); return nullptr;
+    }
     for (int d = 0; d <= n_gpu; d++)
     {
         if (ggml_get_first_tensor(m->w_ctx[d]) != nullptr)
@@ -3160,10 +3737,10 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
     // Preserve exact loader ranges without opening any additional file handles
     // on the default path. Only the opt-in adapter registers these sources.
-    if (hp.g5n && m->tp == 1 && n_gpu == 1 && !m->has_mtp) {
+    if (hp.g5n && m->tp == 1 && n_gpu == 1 && (!m->has_mtp || m->flash_mtp)) {
         std::vector<std::array<int, 3>> groups;
         bool complete = true;
-        for (int il = 0; il < hp.n_layer; ++il) {
+        for (int il = 0; il < hp.n_layer + (m->flash_mtp ? 1 : 0); ++il) {
             const auto& layer = m->layers[il];
             const auto& weights = layer.w[0];
             if (!layer.cpu_moe || !weights.ffn_gate_exps) continue;
@@ -3321,7 +3898,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         // requested, and "(+1 MTP)" on a run with no draft head is exactly the
         // kind of log line that costs an hour.
         const char * mtp_state = m->has_mtp ? " +1 NextN/MTP draft block"
-                               : (hp.n_layer_nextn > 0 ? (hp.g5n ? " (NextN block present; glm5next draft heads are not implemented)"
+                               : (hp.n_layer_nextn > 0 ? (hp.g5n ? " (NextN block present; bounded Flash draft adapter not enabled)"
                                                                : " (NextN block present but not loaded; --spec loads it)")
                                                        : "");
         fprintf(stderr, "[glm] %s: %d trunk layers%s, n_embd=%d, %d heads, MLA(q_lora=%d, kv_lora=%d, "
@@ -3371,6 +3948,10 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         }
     }
 
+    if (host_token_embedding && !glm_host_token_embedding_ready(*m)) {
+        tsg::report_load_refusal("[glm] Host token embedding did not obtain its exact immutable mapped source and bounded owned pack\n");
+        return nullptr;
+    }
     return m.release();
 }
 
@@ -3387,8 +3968,9 @@ static tsg::HostMoeSegment selected_expert_segment(const glm_model& m, int layer
     segment.num_experts = hp.n_expert; segment.n_used = hp.n_expert_used;
     segment.seq_len = rows; segment.independent_decode_rows = joint;
     segment.swiglu_clamp = hp.swiglu_clamp;
-    segment.pooled_model_experts = hp.n_expert > 0 && hp.n_layer <= 65536 / hp.n_expert
-        ? hp.n_layer * hp.n_expert : 0;
+    const int loaded_layers = hp.n_layer + (m.flash_mtp ? 1 : 0);
+    segment.pooled_model_experts = hp.n_expert > 0 && loaded_layers <= 65536 / hp.n_expert
+        ? loaded_layers * hp.n_expert : 0;
     segment.gate_data = w.ffn_gate_exps->data; segment.gate_type = w.ffn_gate_exps->type;
     segment.gate_ne0 = w.ffn_gate_exps->ne[0]; segment.gate_ne1 = w.ffn_gate_exps->ne[1];
     segment.gate_bytes = ggml_nbytes(w.ffn_gate_exps);
@@ -3417,7 +3999,9 @@ struct graph_builder
     graph_builder(glm_model & model, graph_build_result & r, glm_slot & s,
                   int64_t nt_, int64_t p0_, int64_t n_kv_, bool sparse_)
         : m(model), hp(model.hp), ctx(r.ctx), gf(r.gf), res(r), slot(s),
-          nt(nt_), p0(p0_), n_kv(n_kv_), sparse(sparse_) {}
+          nt(nt_), p0(p0_), n_kv(n_kv_), sparse(sparse_) {
+        res.causal_neighbor = model.causal_neighbor.requested() ? &model.causal_neighbor : nullptr;
+    }
 
     /// Device that runs layer `il` for rank `r`: the rank's device under tensor
     /// parallelism, the layer's home device under a layer split.
@@ -4496,6 +5080,8 @@ struct graph_builder
             ggml_tensor * qf = ggml_permute(ctx, Qcur, 0, 2, 1, 3);             // [n_kv_row, nt, n_head]
             ggml_tensor * fa = tsg_flash_attn_ext_guarded(ctx, m.backends[device_of(il, rank)], "GLM-DSA forward", qf, K, V, mask, hp.kq_scale(), 0.0f, 0.0f,
                 nullptr, GGML_PREC_F32);
+            if (res.layer_major_graph_cap_bytes && fa->op != GGML_OP_FLASH_ATTN_EXT)
+                throw std::runtime_error("Strict layer-major graph requires actual FlashAttention without explicit fallback");
             // [kv_lora, n_head, nt] -> [kv_lora, nt, n_head] so wv_b's per-head
             // matmul runs as a matrix-matrix product with nt in dimension 1.
             fa = ggml_permute(ctx, fa, 0, 2, 1, 3);
@@ -4618,7 +5204,7 @@ struct graph_builder
         trace("moe_w", il, rank, weights);
         ggml_build_forward_expand(gf, weights);
 
-        if (m.selected_expert_seams && L.cpu_moe && rank == 0 && res.kind == 0) {
+        if (m.selected_expert_seams && L.cpu_moe && rank == 0 && (res.kind == 0 || (res.kind == 1 && m.flash_mtp))) {
             // The scheduler callback must observe materialized routing, never a
             // fused router's unmaterialized intermediate. Retain all producers,
             // then create a distinct terminal boundary node before the external
@@ -4837,6 +5423,11 @@ struct graph_builder
         ggml_tensor * tail = ggml_view_3d(ctx, conv_in, dc - 1, 3 * d_inner, 1,
                 conv_in->nb[1], conv_in->nb[2], (size_t) nt * conv_in->nb[0]);
         ggml_build_forward_expand(gf, ggml_cpy(ctx, tail, conv_state));
+        if (res.capture_prefix) {
+            ggml_tensor * prefix_tail = ggml_view_3d(ctx, conv_in, dc - 1, 3 * d_inner, 1,
+                conv_in->nb[1], conv_in->nb[2], conv_in->nb[0]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, prefix_tail, m.kda_prefix.conv[rank][(size_t) il]));
+        }
 
         const size_t rs_hd = ggml_row_size(conv_out->type, hd);
         ggml_tensor * qc = ggml_view_3d(ctx, conv_out, hd, H, nt, rs_hd, conv_out->nb[1], 0);
@@ -4871,7 +5462,7 @@ struct graph_builder
         ggml_tensor * state = slot.kda_ssm[rank][(size_t) il];                       // [hd, hd, H]
         ggml_tensor * s4 = ggml_reshape_4d(ctx, state, hd, hd, H, 1);
 
-        ggml_tensor * gdn = ggml_gated_delta_net(ctx, qc, kc, vc, g4, b4, s4, 1);
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, qc, kc, vc, g4, b4, s4, res.capture_prefix ? 2 : 1);
 
         const int64_t attn_elems = hd * H * nt;
         ggml_tensor * core = ggml_view_3d(ctx, gdn, hd, H, nt,
@@ -4880,6 +5471,14 @@ struct graph_builder
                 ggml_row_size(gdn->type, hd), ggml_row_size(gdn->type, hd * hd),
                 ggml_row_size(gdn->type, attn_elems));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, state));
+        if (res.capture_prefix) {
+            // Upstream K=2 retains the same recurrence and emits newest first.
+            // Slot 1 of an N2 pass is exactly the state after its first row.
+            ggml_tensor * prefix_state = ggml_view_3d(ctx, gdn, hd, hd, H,
+                ggml_row_size(gdn->type, hd), ggml_row_size(gdn->type, hd * hd),
+                ggml_row_size(gdn->type, attn_elems + hd * hd * H));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, prefix_state, m.kda_prefix.ssm[rank][(size_t) il]));
+        }
         trace("kda_scan_out", il, rank, core);
 
         // low-rank output gate; RMS over hd with one weight shared by every
@@ -5273,7 +5872,14 @@ struct graph_builder
             snprintf(nb, sizeof(nb), "inp_tokens.%d", dev_embd);
             inp.tokens[dev_embd] = new_input(GGML_TYPE_I32, nt, 0, nb, dev_embd);
             // hc_mult exact copies of the embedding: no scaling, no one-hot.
-            ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, inp.tokens[dev_embd]);
+            ggml_tensor * embedding_source = m.tok_embd;
+            if (m.host_token_embedding) {
+                if (nt < 1 || nt > 512 || res.kind != 0 || res.want_h || res.n_ovr)
+                    throw std::runtime_error("Host token embedding graph is outside its packed raw-row profile");
+                inp.packed_token_embedding = new_input(GGML_TYPE_Q4_K,hp.n_embd,nt,"inp_raw_token_rows",dev_embd);
+                embedding_source = inp.packed_token_embedding;
+            }
+            ggml_tensor * emb = ggml_get_rows(ctx, embedding_source, inp.tokens[dev_embd]);
             if (res.n_ovr > 0)
             {
                 // Vision rows: the projected image embeddings replace the token
@@ -5651,12 +6257,10 @@ struct graph_builder
     //
     //   h_mtp = shared_head_norm( block( eh_proj([enorm(embed(t)) ; hnorm(h)]) ) )
     //
-    // `block` is an ordinary glm-dsa decoder block reusing the trunk builders,
-    // with one deliberate difference: the attention is DENSE. The block ships
-    // lightning-indexer weights, but llama.cpp's graph_mtp builds the plain MLA
-    // attention input and never reads them, and it has no indexer key cache to
-    // score against — so running the indexer here would be a different model,
-    // not a faster one.
+    // `block` has plain residual additions, including Flash's NextN block
+    // (vLLM Glm5NextDecoderLayer(is_mtp_layer=True)); Flash trunk HC does not
+    // apply here. Flash dense attention is deliberately limited to contexts
+    // no larger than indexer_top_k. Sparse Flash drafting is not implemented.
     void build_mtp()
     {
         graph_inputs & inp = res.inp;
@@ -5691,6 +6295,13 @@ struct graph_builder
         // the result and the block's input is computed once (like inpL).
         ggml_tensor * embd_w = W0.nextn_embd ? W0.nextn_embd : m.tok_embd;
         ggml_tensor * tok = ggml_get_rows(ctx, embd_w, inp.tokens[dev0]);
+        if (m.flash_mtp) {
+            // vLLM's Flash fused_eh_norm zeros the embedding at position zero.
+            // Use runtime positions because cached graphs also serve later
+            // windows with the same shape and padded attention extent.
+            auto* nonzero = ggml_step(ctx, ggml_cast(ctx, inp.pos[dev0], GGML_TYPE_F32));
+            tok = ggml_mul(ctx, tok, ggml_reshape_2d(ctx, nonzero, 1, nt));
+        }
         ggml_tensor * e_norm = rms(tok, W0.nextn_enorm);
         ggml_tensor * h_norm = rms(inp.h_in[dev0], W0.nextn_hnorm);
         ggml_tensor * cat = ggml_concat(ctx, e_norm, h_norm, 0);        // [2*n_embd, nt]
@@ -5706,6 +6317,11 @@ struct graph_builder
             ggml_tensor * qr = rms(decode_mul_mat(ctx, L.w[r].wq_a, cur), L.w[r].q_a_norm);
             part[r] = build_attention(il, r, cur, qr, inp.pos[dev], inp.kq_mask[dev], inp.kv_idxs[dev]);
         }
+        // Catch-up only repairs the draft KV rows. build_attention has already
+        // expanded those writes and their dependencies into the graph. Flash's
+        // query, attention output, expert FFN and head are not their ancestors;
+        // computing them would read expert payloads whose outputs are discarded.
+        if (m.flash_mtp && !res.want_logits && !res.want_h) return;
         ggml_tensor * ffn_inp = ggml_add(ctx, inpSA, reduce_ranks(part, n_attn));
 
         // ---- FFN ----------------------------------------------------------
@@ -5760,8 +6376,13 @@ static bool glm_selected_expert_callback(ggml_tensor* tensor, bool ask, void* da
 {
     auto& graph = *static_cast<graph_build_result*>(data);
     const auto found = graph.selected_expert_boundaries.find(tensor);
-    if (ask) return graph.selected_expert_failed || found != graph.selected_expert_boundaries.end();
+    if (ask) {
+        if (graph.selected_expert_timing && !graph.selected_expert_failed && found != graph.selected_expert_boundaries.end())
+            graph.selected_expert_timing->ask(tensor);
+        return graph.selected_expert_failed || found != graph.selected_expert_boundaries.end();
+    }
     if (graph.selected_expert_failed || found == graph.selected_expert_boundaries.end()) return false;
+    glm_selected_expert_timing::callback callback_timing(graph.selected_expert_timing, tensor);
     // The public scheduler has completed and synchronized this producer range.
     // It never resets its allocator before continuing the dependent nodes.
     try {
@@ -5777,16 +6398,24 @@ static bool glm_selected_expert_callback(ggml_tensor* tensor, bool ask, void* da
             || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
             throw std::runtime_error("GLM selected-expert producer failed before IDs download");
         const auto errors_before_ids = tsg::g_ggml_error_count.load(std::memory_order_acquire);
-        ggml_backend_tensor_get(seam.segment.sel_ids, graph.selected_expert_ids.data(), 0, routes * sizeof(int32_t));
+        {
+            glm_selected_expert_timing::span span(graph.selected_expert_timing, glm_selected_expert_timing::ids);
+            ggml_backend_tensor_get(seam.segment.sel_ids, graph.selected_expert_ids.data(), 0, routes * sizeof(int32_t));
+        }
         glm_test_batched_dispatch_fault(4);
         if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != errors_before_ids
             || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
             throw std::runtime_error("GLM selected expert IDs download failed before cache dispatch");
-        const int cached = tsg::host_moe_cached_experts(seam.segment, nullptr, graph.selected_expert_ids.data(),
-            nullptr, nullptr,
-            !seam.segment.independent_decode_rows
-                && seam.segment.seq_len > TSG_PRECISION_DECODE_COLUMNS
-                ? "glm5-next bulk expert prefill" : "glm5-next selected expert seam", seam.backend);
+        int cached;
+        {
+            glm_selected_expert_timing::span span(graph.selected_expert_timing, glm_selected_expert_timing::helper);
+            cached = tsg::host_moe_cached_experts_with_neighbor(seam.segment, nullptr, graph.selected_expert_ids.data(),
+                nullptr, nullptr,
+                !seam.segment.independent_decode_rows
+                    && seam.segment.seq_len > TSG_PRECISION_DECODE_COLUMNS
+                    ? "glm5-next bulk expert prefill" : "glm5-next selected expert seam", seam.backend,
+                graph.selected_expert_prefetch, graph.causal_neighbor);
+        }
         // A quota or capability refusal after router dispatch is not a safe
         // place to silently change expert arithmetic. Fence this request and
         // retain its state until explicit reset instead of mixing CPU/GPU rows.
@@ -5796,13 +6425,26 @@ static bool glm_selected_expert_callback(ggml_tensor* tensor, bool ask, void* da
             throw std::runtime_error("GLM selected-expert helper failed before final drain");
         // Even the device bridge can leave a final copy queued. Drain the same
         // actual model stream before a consumer or cache eviction observes it.
-        tsg::sync_backend(seam.backend);
+        {
+            glm_selected_expert_timing::span span(graph.selected_expert_timing, glm_selected_expert_timing::drain);
+            tsg::sync_backend(seam.backend);
+        }
         if (found->second + 1 == graph.selected_expert_seams.size()) glm_test_batched_dispatch_fault(5);
         if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != graph.selected_expert_error_epoch
             || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
             throw std::runtime_error("GLM selected-expert final drain failed before seam completion");
         glm_test_batched_dispatch_fault(3);
+        if (graph.causal_neighbor && graph.causal_neighbor->scalar_call()) {
+            tsg_glm_neighbor::WallTimer neighbor_commit(graph.causal_neighbor, true);
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (graph.causal_neighbor->test_fire(3))
+                throw std::runtime_error("Injected causal-route failure after helper drain before metadata commit");
+#endif
+            if (!tsg::host_moe_causal_commit(*graph.causal_neighbor, seam.segment.layer))
+                throw std::runtime_error("Causal-route pending epoch/source changed before completed-row publication");
+        }
         ++graph.selected_expert_completed;
+        callback_timing.completed = true;
         return true;
     } catch (const std::exception& error) {
         tsg::set_last_error(std::string("GLM selected-expert callback failed: ") + error.what());
@@ -5815,11 +6457,220 @@ static bool glm_selected_expert_callback(ggml_tensor* tensor, bool ask, void* da
     return false;
 }
 
+static bool glm_strict_graph_refuse(const char* reason)
+{
+    tsg::set_last_error(std::string("GLM strict layer-major graph refused: ") + reason);
+    return false;
+}
+
+// This is a capability contract for one exact loaded handle, not a fit estimate.
+// The payload cap itself is enforced independently by its graph_budget owner.
+static bool glm_layer_major_profile_supported(const glm_model& m)
+{
+#if !defined(TSG_GGML_USE_CUDA)
+    (void)m; return false;
+#else
+    if (!m.hp.g5n || m.n_gpu != 1 || m.tp != 1 || m.tp_fused || m.n_backends != 2
+        || m.n_sched_backends != 2 || !m.backends[0] || !ggml_backend_is_cuda(m.backends[0])
+        || !m.projection_backends[0] || m.sched_backends[0] != m.projection_backends[0]
+        || m.sched_bufts[0] != ggml_backend_get_default_buffer_type(m.backends[0])
+        || !m.shared_graph_owner || m.graph_cache_cap != 1 || !m.selected_expert_seams
+        || !m.flash_attn || !m.hc_native || m.op_offload || m.has_mtp || m.flash_mtp
+        || m.flash_mtp_shape_plan || m.flash_mtp_prefix_commit || m.prefix_binding
+        || m.kda_snap.valid || m.kda_prefix.valid || m.trace_dump || !m.embd_ovr.empty()
+        || m.strict_recurrent_requested || m.strict_recurrent_projections
+        || m.hp.n_layer != (int)m.layers.size()) return false;
+    if (m.host_token_embedding && !glm_host_token_embedding_ready(m)) return false;
+    int recurrent = 0, mla = 0;
+    int dense_ff = 0, shared_ff = 0;
+    auto matrix = [](const ggml_tensor* t, int64_t a, int64_t b, int64_t c = 1) {
+        return t && !t->view_src && ggml_is_contiguous(t) && t->ne[0] == a
+            && t->ne[1] == b && t->ne[2] == c && t->ne[3] == 1;
+    };
+    auto sensitive = [](const ggml_tensor* t) {
+        return t && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_Q8_0);
+    };
+    auto vector_f32 = [](const ggml_tensor* t, int64_t count) {
+        return t && t->type == GGML_TYPE_F32 && !t->view_src && ggml_is_contiguous(t)
+            && t->ne[0] == count && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+    };
+    const auto& h = m.hp;
+    if (h.n_rot != 0 || h.n_embd_head_k != 256 || h.n_embd_head_v != 256
+        || h.q_lora_rank != 1536 || h.kv_lora_rank != 512 || h.n_kv_row != 512
+        || h.indexer_n_head != 32 || h.indexer_head_size != 128 || h.hc_sinkhorn != 20
+        || h.n_expert_shared != 1 || h.is_recr.size() != m.layers.size()
+        || !matrix(m.tok_embd, h.n_embd, h.n_vocab) || !matrix(m.output, h.n_embd, h.n_vocab)
+        || !m.output_norm || ggml_nelements(m.output_norm) != h.n_embd) return false;
+    for (int il = 0; il < h.n_layer; ++il) {
+        const auto& l = m.layers[(size_t)il]; const auto& w = l.w[0];
+        if (l.device != 0 || l.recurrent != (h.is_recr[(size_t)il] != 0)
+            || l.is_moe != (il >= h.n_dense_lead) || graph_builder::trace_layer(il)) return false;
+        if (!vector_f32(w.attn_norm,h.n_embd) || !vector_f32(w.ffn_norm,h.n_embd)) return false;
+        if (!matrix(w.hc_attn_fn, (int64_t)h.n_embd * h.hc_mult, (2 + h.hc_mult) * h.hc_mult)
+            || !matrix(w.hc_ffn_fn, (int64_t)h.n_embd * h.hc_mult, (2 + h.hc_mult) * h.hc_mult)
+            || !sensitive(w.hc_attn_fn) || !sensitive(w.hc_ffn_fn)) return false;
+        for (const auto* t : {w.hc_attn_scale, w.hc_ffn_scale})
+            if (!t || t->type != GGML_TYPE_F32 || ggml_nelements(t) != 3) return false;
+        for (const auto* t : {w.hc_attn_base, w.hc_ffn_base})
+            if (!t || t->type != GGML_TYPE_F32 || ggml_nelements(t) != (2 + h.hc_mult) * h.hc_mult) return false;
+        if (l.recurrent) {
+            ++recurrent;
+            for (const auto* t : {w.kda_f_a, w.kda_f_b, w.kda_g_a, w.kda_g_b, w.kda_beta})
+                if (!sensitive(t)) return false;
+            if (!matrix(w.kda_wq, h.n_embd, 8192) || !matrix(w.kda_wk, h.n_embd, 8192)
+                || !matrix(w.kda_wv, h.n_embd, 8192) || !matrix(w.kda_wo, 8192, h.n_embd)
+                || !matrix(w.kda_f_a, h.n_embd, 128) || !matrix(w.kda_f_b, 128, 8192)
+                || !matrix(w.kda_g_a, h.n_embd, 128) || !matrix(w.kda_g_b, 128, 8192)
+                || !matrix(w.kda_beta, h.n_embd, h.kda_n_head)
+                || !vector_f32(w.kda_dt_b,8192) || !vector_f32(w.kda_a,64)
+                || !vector_f32(w.kda_o_norm,128)) return false;
+            for (const auto* t : {w.kda_conv_q, w.kda_conv_k, w.kda_conv_v})
+                if (!t || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)
+                    || t->ne[0] != h.d_conv || ggml_nelements(t) != (int64_t)h.d_conv * 8192) return false;
+        } else {
+            ++mla;
+            if (!l.indexer_full || !matrix(w.wq_a, h.n_embd, 1536)
+                || !matrix(w.wq_b, 1536, 16384) || !matrix(w.wkv_a_mqa, h.n_embd, 512)
+                || !matrix(w.wk_b,256,512,64) || !matrix(w.wv_b,512,256,64)
+                || !matrix(w.wo, 16384, h.n_embd) || !vector_f32(w.q_a_norm,1536)
+                || !vector_f32(w.kv_a_norm,512) || !matrix(w.idx_attn_k,h.n_embd,128)
+                || !matrix(w.idx_comp_gate,h.n_embd,128) || !matrix(w.idx_comp_ape,128,4)
+                || !vector_f32(w.idx_k_norm_w,128) || !vector_f32(w.idx_k_norm_b,128)) return false;
+        }
+        if (l.is_moe) {
+            if (!l.cpu_moe || !matrix(w.ffn_gate_inp, h.n_embd, h.n_expert) || !sensitive(w.ffn_gate_inp)
+                || !matrix(w.ffn_gate_exps, h.n_embd, h.n_ff_exp, h.n_expert)
+                || !matrix(w.ffn_up_exps, h.n_embd, h.n_ff_exp, h.n_expert)
+                || !matrix(w.ffn_down_exps, h.n_ff_exp, h.n_embd, h.n_expert)
+                || !w.ffn_gate_shexp || w.ffn_gate_shexp->ne[1] <= 0 || w.ffn_gate_shexp->ne[1] > 2048) return false;
+            const int f = (int)w.ffn_gate_shexp->ne[1];
+            if (f <= 0 || f > 2048 || !matrix(w.ffn_gate_shexp, h.n_embd, f)
+                || !matrix(w.ffn_up_shexp, h.n_embd, f) || !matrix(w.ffn_down_shexp, f, h.n_embd)) return false;
+            shared_ff = std::max(shared_ff, f);
+        } else {
+            // cpu_moe is also set on dense leading layers by the all-CPU-expert
+            // loader policy. Their actual dense matrices stay on CUDA and are
+            // independently checked by the strict source-owner walk.
+            if (!w.ffn_gate || w.ffn_gate->ne[1] <= 0 || w.ffn_gate->ne[1] > 12288) return false;
+            const int f = (int)w.ffn_gate->ne[1];
+            if (f <= 0 || f > 12288 || !matrix(w.ffn_gate, h.n_embd, f)
+                || !matrix(w.ffn_up, h.n_embd, f) || !matrix(w.ffn_down, f, h.n_embd)) return false;
+            dense_ff = std::max(dense_ff, f);
+        }
+    }
+    const layer_major_graph_cap::shape shape{h.n_embd,h.hc_mult,h.n_vocab,h.n_layer,recurrent,mla,
+        h.n_head,h.kda_n_head,h.kda_head_dim,h.d_conv,dense_ff,shared_ff,h.n_ff_exp,h.n_expert,h.n_expert_used,
+        m.n_ctx,m.n_ubatch,h.n_dense_lead,h.indexer_top_k,h.indexer_kpool};
+    return layer_major_graph_cap::valid_shape(shape);
+#endif
+}
+
+// Include sources and view bases, not just graph nodes: preallocated sources
+// otherwise let the scheduler introduce an unqualified CPU/device copy path.
+static bool glm_strict_graph_tensors(glm_model& m, graph_build_result& g, bool allocated)
+{
+    auto* backend = g.allocation_budget.scheduler_backend(m.sched_backends[0]);
+    const auto type = ggml_backend_get_default_buffer_type(m.backends[0]);
+    std::vector<ggml_tensor*> pending;
+    std::unordered_set<ggml_tensor*> seen;
+    for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) pending.push_back(g.gf->nodes[i]);
+    for (int i = 0; i < g.gf->n_leafs; ++i) pending.push_back(g.gf->leafs[i]);
+    while (!pending.empty()) {
+        auto* t = pending.back(); pending.pop_back();
+        if (!t || !seen.insert(t).second) continue;
+        if (!ggml_backend_supports_op(backend, t)) return glm_strict_graph_refuse("unsupported CUDA source/node operation");
+        auto* owner = t;
+        std::size_t delta = 0;
+        std::unordered_set<ggml_tensor*> view_chain;
+        while (owner->view_src) {
+            if (!view_chain.insert(owner).second || owner->view_offs > SIZE_MAX - delta)
+                return glm_strict_graph_refuse("invalid source view chain");
+            delta += owner->view_offs; pending.push_back(owner->view_src); owner = owner->view_src;
+        }
+        auto* buffer = t->buffer ? t->buffer : owner->buffer;
+        if (buffer) {
+            if (ggml_backend_buffer_get_type(buffer) != type || ggml_backend_buft_is_host(type))
+                return glm_strict_graph_refuse("source owner is not the exact CUDA buffer type");
+            const auto base = reinterpret_cast<std::uintptr_t>(ggml_backend_buffer_get_base(buffer));
+            const auto size = ggml_backend_buffer_get_size(buffer);
+            const auto root = reinterpret_cast<std::uintptr_t>(owner->data);
+            const auto span = ggml_nbytes(t);
+            if (!base || !root || root < base || root - base > size || delta > size - (root - base)
+                || span > size - (root - base) - delta || root > UINTPTR_MAX - delta
+                || (t->data && reinterpret_cast<std::uintptr_t>(t->data) != root + delta))
+                return glm_strict_graph_refuse("source/view extent exceeds its physical CUDA owner");
+        } else if (t->data || owner->data || allocated) {
+            return glm_strict_graph_refuse("unowned source or unallocated strict tensor");
+        }
+        if (allocated) {
+            if (ggml_backend_sched_get_tensor_backend(g.sched, t) != backend)
+                return glm_strict_graph_refuse("tensor escaped its exact CUDA scheduler backend");
+        } else ggml_backend_sched_set_tensor_backend(g.sched, t, backend);
+        for (auto* source : t->src) if (source) pending.push_back(source);
+    }
+    return true;
+}
+
+static bool glm_strict_graph_topology(glm_model& m, const graph_build_result& g)
+{
+    if (!g.layer_major_graph_cap_bytes) return true;
+    if (g.layer_major_graph_cap_bytes != m.layer_major_graph_cap_bytes || !m.layer_major_graph_cap_bytes
+        || !layer_major_graph_cap::valid_range(g.layer_begin,g.layer_end,m.hp.n_layer,g.nt,0,g.n_kv,g.n_out,
+            g.kind,g.want_h,g.n_ovr,g.capture_prefix) || g.sparse || g.tp_fused || !g.bd.empty() || !g.traces.empty())
+        return glm_strict_graph_refuse("range/profile provenance mismatch");
+    const auto& layer = m.layers[(size_t)g.layer_begin];
+    int pre = 0, post = 0, comb = 0, fa = 0, gdn = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
+        switch (g.gf->nodes[i]->op) {
+            case GGML_OP_DSV4_HC_PRE: ++pre; break;
+            case GGML_OP_DSV4_HC_POST: ++post; break;
+            case GGML_OP_DSV4_HC_COMB: ++comb; break;
+            case GGML_OP_FLASH_ATTN_EXT: ++fa; break;
+            case GGML_OP_GATED_DELTA_NET: ++gdn; break;
+            default: break;
+        }
+    }
+    if (pre != 2 || post != 2 || comb != 2 || fa != (layer.recurrent ? 0 : 1)
+        || gdn != (layer.recurrent ? 1 : 0) || g.selected_expert_seams.size() != (layer.is_moe ? 1u : 0u))
+        return glm_strict_graph_refuse("actual fused HC/attention/selected-expert topology differs");
+    return true;
+}
+
+static bool glm_host_token_embedding_graph(glm_model& m, const graph_build_result& g)
+{
+    if (g.host_token_embedding != m.host_token_embedding)
+        return glm_strict_graph_refuse("host token embedding cache provenance differs");
+    if (!g.host_token_embedding) return true;
+    if (!glm_host_token_embedding_ready(m) || !m.shared_graph_owner || g.kind != 0 || !g.bd.empty()
+        || g.tp_fused || g.want_h || g.n_ovr || g.capture_prefix || g.nt < 1 || g.nt > 512)
+        return glm_strict_graph_refuse("host token embedding graph is outside its raw input profile");
+    const bool first = g.layer_begin == 0;
+    auto* packed = g.inp.packed_token_embedding;
+    if ((packed != nullptr) != first) return glm_strict_graph_refuse("packed token input is missing or appears after the first layer");
+    if (!first) return true;
+    if (packed->type != GGML_TYPE_Q4_K || packed->ne[0] != 4096 || packed->ne[1] != g.nt
+        || packed->ne[2] != 1 || packed->ne[3] != 1 || packed->nb[1] != 2304 || !ggml_is_contiguous(packed))
+        return glm_strict_graph_refuse("packed token input changes the original raw row geometry");
+    int gathers = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(g.gf); ++i) {
+        auto* node = g.gf->nodes[i];
+        if (node->op == GGML_OP_GET_ROWS && node->src[0] == packed) {
+            if (node->src[1] != g.inp.tokens[0] || node->type != GGML_TYPE_F32
+                || node->ne[0] != 4096 || node->ne[1] != g.nt) return false;
+            ++gathers;
+        }
+    }
+    return gathers == 1 || glm_strict_graph_refuse("original CUDA raw-row GET_ROWS operation is absent");
+}
+
 static bool glm_prepare_selected_expert_graph(glm_model& model, graph_build_result& graph)
 {
-    if (graph.selected_expert_seams.empty()) return true;
+    if (graph.selected_expert_seams.empty() && !graph.layer_major_graph_cap_bytes && !graph.host_token_embedding) return true;
     auto* backend = graph.allocation_budget.scheduler_backend(model.sched_backends[0]);
     if (!backend || model.n_gpu != 1 || model.tp != 1) return false;
+    if ((graph.layer_major_graph_cap_bytes || graph.host_token_embedding)
+        && (!glm_host_token_embedding_graph(model,graph) || !glm_strict_graph_topology(model, graph)
+            || !glm_strict_graph_tensors(model, graph, false))) return false;
     // An externally produced input must never be copied by an earlier CPU split
     // before its callback. Require all consumers/producers on the exact same
     // CUDA alias and reject unsupported nodes before dispatch, without fallback
@@ -5850,6 +6701,16 @@ static bool glm_prepare_selected_expert_graph(glm_model& model, graph_build_resu
 
 static bool glm_check_selected_expert_assignment(glm_model& model, graph_build_result& graph)
 {
+    if (graph.layer_major_graph_cap_bytes || graph.host_token_embedding) {
+        if (!glm_host_token_embedding_graph(model,graph) || !glm_strict_graph_topology(model, graph)
+            || !glm_strict_graph_tensors(model, graph, true)
+            || ggml_backend_sched_get_n_splits(graph.sched) != 1 || ggml_backend_sched_get_n_copies(graph.sched) != 1
+            || graph.allocation_budget.policy_refused()
+            || (graph.layer_major_graph_cap_bytes
+                && graph.allocation_budget.device_payload_bytes() > graph.layer_major_graph_cap_bytes))
+            return glm_strict_graph_refuse("allocated graph escaped its single CUDA span or declared cap");
+        graph.layer_major_graph_cap_verified = true;
+    }
     auto* backend = graph.allocation_budget.scheduler_backend(model.sched_backends[0]);
     for (const auto& seam : graph.selected_expert_seams)
         for (auto* tensor : {seam.segment.moe_in, seam.segment.sel_ids, seam.boundary, seam.segment.moe_out})
@@ -5862,19 +6723,22 @@ static bool glm_check_selected_expert_assignment(glm_model& model, graph_build_r
 static void glm_begin_selected_expert_graph(graph_build_result& graph)
 {
     graph.selected_expert_completed = 0; graph.selected_expert_failed = false;
-    if (!graph.selected_expert_seams.empty())
-        graph.selected_expert_error_epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
+    // KV-only draft graphs have no expert seams but use the same final error
+    // fence. An error from an earlier call must not invalidate their execution.
+    graph.selected_expert_error_epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
 }
 
 static bool glm_finish_selected_expert_graph(glm_model& model, const graph_build_result& graph)
 {
     if (graph.selected_expert_failed || graph.selected_expert_completed != graph.selected_expert_seams.size()) return false;
-    if (!graph.selected_expert_seams.empty()) {
+    if (!graph.selected_expert_seams.empty() || graph.layer_major_graph_cap_bytes || graph.host_token_embedding) {
         if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != graph.selected_expert_error_epoch
             || tsg::g_backend_compute_failed.load(std::memory_order_acquire)) {
             tsg::set_last_error("GLM selected-expert graph completion failed before logits publication");
             return false;
         }
+    }
+    if (!graph.selected_expert_seams.empty()) {
         ++model.selected_expert_graphs;
         model.selected_expert_calls += graph.selected_expert_completed;
     }
@@ -6310,7 +7174,7 @@ static graph_build_result * acquire_batched_graph(glm_model & m, int n, const in
             if (!glm_check_selected_expert_assignment(m, *entry)) return nullptr;
             graph_build_result * raw = entry.get();
             m.graph_cache.push_front(std::move(entry));
-            while ((int) m.graph_cache.size() > m.graph_cache_cap) m.graph_cache.pop_back();
+            glm_enforce_graph_cache_capacity(m);
             if (out_reused) *out_reused = false;
             return raw;
         }
@@ -6329,6 +7193,7 @@ static graph_build_result * acquire_batched_graph(glm_model & m, int n, const in
 static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_ids, const int32_t * tokens,
                                    const int32_t * positions, float * logits_out)
 {
+    m.prefix_window.invalidate();
     if (bd_debug())
     {
         fprintf(stderr, "[glm-bd] enter n=%d", n);
@@ -6499,13 +7364,27 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
 static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_t nt, int64_t p0,
                                           int64_t n_out, bool want_logits, bool * out_reused,
                                           bool want_h = false, int kind = 0, int64_t n_ovr = 0,
-                                          int layer_begin = 0, int layer_end = 0)
+                                          int layer_begin = 0, int layer_end = 0, bool capture_prefix = false,
+                                          bool strict_layer_major = false)
 {
     // 0/0 and 0/n_layer both mean the whole trunk; normalize for the cache key.
     if (layer_end == m.hp.n_layer && layer_begin == 0) layer_end = 0;
-    const int64_t n_kv = plan_n_kv(m, p0 + nt);
+    // KDA has fixed recurrent state and no position-indexed attention input.
+    // Layer-major prefill reuses its same-width graph across all chunks; keying
+    // it on the growing MLA window would allocate an identical graph for every
+    // chunk (and again when crossing the pooled indexer's sparse boundary).
+    bool recurrent_only = m.hp.g5n && kind == 0;
+    for (int il = layer_begin; recurrent_only && il < (layer_end > 0 ? layer_end : m.hp.n_layer); ++il)
+        recurrent_only = m.layers[(size_t) il].recurrent;
+    const int64_t n_kv = plan_n_kv(m, recurrent_only ? nt : p0 + nt);
+    const auto strict_cap = strict_layer_major ? m.layer_major_graph_cap_bytes : std::size_t(0);
+    if (strict_layer_major && (!strict_cap || !layer_major_graph_cap::valid_range(layer_begin,layer_end,m.hp.n_layer,
+            nt,p0,n_kv,n_out,kind,want_h,n_ovr,capture_prefix))) {
+        glm_strict_graph_refuse("actual graph acquisition is outside the immutable range profile");
+        return nullptr;
+    }
     std::vector<int64_t> decode_row_kv;
-    if (m.hp.g5n && nt > 1 && nt <= TSG_PRECISION_DECODE_COLUMNS)
+    if (m.hp.g5n && !recurrent_only && nt > 1 && nt <= TSG_PRECISION_DECODE_COLUMNS)
         for (int64_t r = 0; r < nt; ++r) decode_row_kv.push_back(plan_n_kv(m, p0 + r + 1));
     // The draft block attends densely, so the indexer's sparsity never applies
     // to it and must not enter its cache key.
@@ -6514,7 +7393,7 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
     const int64_t n_select = m.hp.indexer_kpool > 0
         ? (int64_t) m.hp.indexer_top_k + m.hp.indexer_kpool - 1
         : (int64_t) m.hp.indexer_top_k;
-    const bool sparse = kind == 0 && (p0 + nt) > n_select;
+    const bool sparse = kind == 0 && !recurrent_only && (p0 + nt) > n_select;
 
     for (auto it = m.graph_cache.begin(); it != m.graph_cache.end(); ++it)
     {
@@ -6522,8 +7401,17 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         if (e->nt == nt && e->n_kv == n_kv && e->n_out == n_out && e->want_logits == want_logits &&
             e->sparse == sparse && e->slot_id == slot.id && e->want_h == want_h && e->kind == kind &&
             e->n_ovr == n_ovr && e->decode_row_kv == decode_row_kv &&
-            e->layer_begin == layer_begin && e->layer_end == layer_end)
+            e->layer_begin == layer_begin && e->layer_end == layer_end && e->capture_prefix == capture_prefix
+            && e->layer_major_graph_cap_bytes == strict_cap && e->host_token_embedding == m.host_token_embedding)
         {
+            if (m.host_token_embedding && (!e->layer_major_graph_cap_verified
+                || !glm_check_selected_expert_assignment(m,*e))) return nullptr;
+            if (strict_layer_major) {
+                if (!e->layer_major_graph_cap_verified || !glm_check_selected_expert_assignment(m, *e)) return nullptr;
+                ++m.strict_call.reuses;
+                m.strict_call.peak = std::max<uint64_t>(m.strict_call.peak,e->allocation_budget.device_payload_bytes());
+            }
+            glm_mtp_graph_diagnostic(m, "hit", "matching-key", e);
             auto entry = std::move(*it);
             m.graph_cache.erase(it);
             graph_build_result * raw = entry.get();
@@ -6548,9 +7436,13 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         p->n_ovr = n_ovr;
         p->layer_begin = layer_begin;
         p->layer_end = layer_end;
+        p->capture_prefix = capture_prefix;
+        p->layer_major_graph_cap_bytes = strict_cap;
+        p->host_token_embedding = m.host_token_embedding;
         return p;
     };
     auto entry = make_entry();
+    glm_mtp_graph_diagnostic(m, "miss", "missing-key", entry.get());
 
     // Node budget. A GLM layer costs ~110 nodes per rank (MoE alone is ~40, the
     // DSA indexer another ~20 on a full layer), so 256 per layer per rank leaves
@@ -6650,7 +7542,7 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
             {
                 graph_build_result * raw = entry.get();
                 m.graph_cache.push_front(std::move(entry));
-                while ((int) m.graph_cache.size() > m.graph_cache_cap) m.graph_cache.pop_back();
+                glm_enforce_graph_cache_capacity(m);
                 if (out_reused) *out_reused = false;
                 return raw;
             }
@@ -6668,6 +7560,8 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         fprintf(stderr, "[glm] segmented TP graph is unavailable; switching to combined scheduler fallback\n");
         m.tp_fused = false;
         m.tp_comm.reset();
+        for (const auto & graph : m.graph_cache)
+            glm_mtp_graph_diagnostic(m, "trim", "tp-fallback", graph.get());
         m.graph_cache.clear();
         entry = make_entry();
     }
@@ -6682,8 +7576,14 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         if (!entry->ctx) return nullptr;
         entry->gf = ggml_new_graph_custom(entry->ctx, n_nodes, false);
 
+        // Host-row mode without a small graph cap uses this wrapper only to
+        // enforce accounted kind5/all-CUDA ownership. It makes NO fit/credit
+        // claim: ordinary managed graph forecasts remain fully applicable.
+        const auto accounted_limit = strict_cap ? strict_cap : m.host_token_embedding
+            ? (std::numeric_limits<std::size_t>::max)() : 0;
         auto budget_types = entry->allocation_budget.prepare(m.sched_bufts, m.sched_backends, m.n_sched_backends, m.n_gpu,
-            m.shared_graph_owner || !entry->bd.empty() ? 5 : 2);
+            m.flash_mtp && kind == 1 ? 7 : m.shared_graph_owner || !entry->bd.empty() ? 5 : 2,
+            accounted_limit, accounted_limit ? ggml_backend_get_default_buffer_type(m.backends[0]) : nullptr);
         if (!budget_types) return nullptr;
         entry->sched = ggml_backend_sched_new(entry->allocation_budget.scheduler_backends(), budget_types, m.n_sched_backends,
                                               n_nodes, false, m.op_offload);
@@ -6701,13 +7601,24 @@ static graph_build_result * acquire_graph(glm_model & m, glm_slot & slot, int64_
         if (!glm_test_graph_alloc_fault() && ggml_backend_sched_alloc_graph(entry->sched, entry->gf))
         {
             if (!glm_check_selected_expert_assignment(m, *entry)) return nullptr;
+            if (strict_layer_major) {
+                ++m.strict_call.builds;
+                m.strict_call.peak = std::max<uint64_t>(m.strict_call.peak,entry->allocation_budget.device_payload_bytes());
+            }
             graph_build_result * raw = entry.get();
             m.graph_cache.push_front(std::move(entry));
-            while ((int) m.graph_cache.size() > m.graph_cache_cap) m.graph_cache.pop_back();
+            glm_mtp_graph_diagnostic(m, "insert", "allocated", raw);
+            glm_enforce_graph_cache_capacity(m);
             if (out_reused) *out_reused = false;
             return raw;
         }
+        const bool policy_refused = entry->allocation_budget.policy_refused();
+        if (strict_layer_major) {
+            m.strict_call.peak = std::max<uint64_t>(m.strict_call.peak,entry->allocation_budget.device_payload_bytes());
+            if (policy_refused) ++m.strict_call.refusals;
+        }
         entry.reset();   // its compute buffers go back before a slot is freed
+        if (policy_refused) return nullptr; // Per-owner policy cannot be repaired by reclaiming unrelated holders.
         const int32_t reads[1] = { slot.id };
         if (!glm_reclaim_for_graph(m, reads, 1))
         {
@@ -6836,33 +7747,96 @@ static bool execute_fused_tp(glm_model & m, graph_build_result & root)
 /// tokens at `p0` instead of the slot head: `hidden` carries the residual stream
 /// in from the previous range and out to the next one, and the slot head only
 /// advances once the caller has run every layer.
-struct glm_layer_range { int begin = 0; int end = 0; int64_t p0 = 0; float * hidden = nullptr; };
+struct glm_layer_range {
+    int begin = 0; int end = 0; int64_t p0 = 0; float * hidden = nullptr;
+    const tsg::HostMoePrefetchHooks* expert_prefetch = nullptr;
+    bool strict_graph = false;
+    bool device_baton = false; std::size_t baton_offset = 0;
+};
 
 static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bool want_logits, float * logits_out,
                            float * h_out = nullptr, bool all_logits_rows = false,
                            const float * ovr_rows = nullptr, const int64_t * ovr_idx = nullptr, int64_t n_ovr = 0,
-                           const glm_layer_range * layers = nullptr)
+                           const glm_layer_range * layers = nullptr, bool capture_prefix = false)
 {
     glm_slot & slot = *m.active_slot;
     const int64_t p0 = layers ? layers->p0 : slot.n_past;
+    const bool want_h = h_out != nullptr;
+    const int64_t n_out = (want_logits && all_logits_rows) ? nt : 1;
+    glm_flash_forward_timing timing(m, 0, nt, p0, n_out, want_h, want_logits);
     if (p0 + nt > m.n_ctx)
     {
         fprintf(stderr, "[glm] context overflow: %" PRId64 " + %" PRId64 " > %d\n", p0, nt, m.n_ctx);
         return false;
     }
 
-    const bool want_h = h_out != nullptr;
-    const int64_t n_out = (want_logits && all_logits_rows) ? nt : 1;
+    const bool pack_tokens = m.host_token_embedding && (!layers || layers->begin == 0);
+    size_t packed_token_bytes = 0;
+    if (m.host_token_embedding && (nt < 1 || nt > 512 || want_h || n_ovr || capture_prefix)) return false;
+    if (pack_tokens) {
+        auto copy_row = [&](void* destination,const void* source,size_t bytes) noexcept {
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (m.host_embedding_fail_after_packs == 0) {
+                m.host_embedding_fail_after_packs = -1;
+                ++m.host_embedding_pack_failure_count;
+                // Exercise a real strict-prefix mapped read. The helper must
+                // discard the partial pack without any GPU input publication.
+                (void)glm_host_token_embedding_copy(destination,source,bytes / 2);
+                return false;
+            }
+#endif
+            return glm_host_token_embedding_copy(destination,source,bytes);
+        };
+        if (!pack_host_token_embedding_rows(m.host_embedding_layout,
+                static_cast<const uint8_t*>(m.tok_embd->data),m.host_embedding_layout.table_bytes,
+                tokens,(size_t)nt,m.host_embedding_pack.get(),m.host_embedding_pack_bytes,
+                copy_row,&packed_token_bytes))
+            throw std::runtime_error("Host token embedding mapped raw-row read failed; partial pack discarded");
+#if defined(TSG_GGML_TEST_HOOKS)
+        if (m.host_embedding_fail_after_packs > 0) --m.host_embedding_fail_after_packs;
+#endif
+    }
+
+    std::uint64_t prefix_generation = 0;
+    if (capture_prefix) {
+        if (!m.flash_mtp_prefix_commit || !m.prefix_binding || layers || nt != 2
+            || m.tp != 1 || m.n_gpu != 1) return false;
+        prefix_generation = m.prefix_window.begin(slot.id, p0, m.prefix_binding);
+        if (!prefix_generation) return false;
+    } else m.prefix_window.invalidate();
+
+    const bool strict_graph = layers && layers->strict_graph;
+    const auto strict_error_epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
     bool reused = false;
     graph_build_result * gr = acquire_graph(m, slot, nt, p0, n_out, want_logits, &reused, want_h, /*kind=*/0, n_ovr,
-                                            layers ? layers->begin : 0, layers ? layers->end : 0);
+                                            layers ? layers->begin : 0, layers ? layers->end : 0, capture_prefix, strict_graph);
     if (!gr) return false;
+    if ((strict_graph || m.host_token_embedding) && (tsg::g_ggml_error_count.load(std::memory_order_acquire) != strict_error_epoch
+        || tsg::g_backend_compute_failed.load(std::memory_order_acquire))) return false;
+    timing.reused = int(reused);
+    timing.next(glm_flash_forward_timing::input);
+    gr->selected_expert_prefetch = layers ? layers->expert_prefetch : nullptr;
+    struct PrefetchBinding {
+        graph_build_result* graph;
+        ~PrefetchBinding() { graph->selected_expert_prefetch = nullptr; }
+    } prefetch_binding{gr};
     if (layers && ((layers->begin > 0) != (gr->inp.hidden != nullptr)
         || (layers->end > 0 && layers->end < m.hp.n_layer) != (gr->hidden_out != nullptr)))
     {
         fprintf(stderr, "[glm] layer range [%d, %d) graph has the wrong residual inputs/outputs\n", layers->begin, layers->end);
         return false;
     }
+    if ((strict_graph || m.host_token_embedding) && want_logits && (!gr->logits || !logits_out)) return false;
+    struct selected_failure_guard {
+        glm_model& model; glm_slot& slot; graph_build_result& graph;
+        bool armed; bool complete = false;
+        ~selected_failure_guard() noexcept {
+            if (!armed || complete) return;
+            try { ggml_backend_sched_synchronize(graph.sched); } catch (...) {}
+            slot.kda_restore_failed = true; model.kda_snap.valid = false; model.kda_prefix.valid = false;
+            model.prefix_window.invalidate();
+        }
+    } selected_guard{m, slot, *gr, strict_graph || m.host_token_embedding};
     glm_begin_selected_expert_graph(*gr);
 
     const int64_t n_kv = gr->n_kv;
@@ -6872,6 +7846,7 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
         for (auto & peer : gr->tp_peers) exec_graphs.push_back(peer.get());
 
     m.h_tokens.assign(tokens, tokens + nt);
+    if (pack_tokens) std::iota(m.h_tokens.begin(),m.h_tokens.end(),0);
     m.h_pos.resize((size_t) nt);
     m.h_kv_idxs.resize((size_t) nt);
     for (int64_t i = 0; i < nt; i++)
@@ -6883,18 +7858,49 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     for (int64_t i = 0; i < n_out; i++)
         m.h_out_ids[(size_t) i] = (int32_t) (n_out == 1 ? nt - 1 : i);
 
-    // Causal mask over the padded cache window.
+    // Only build masks the allocated graph actually reads. In layer-major
+    // prefill a KDA-only range has none, and previously rebuilt O(nt*n_kv)
+    // host data at every recurrent layer despite never uploading any of it.
     const bool f16_mask = m.flash_attn;
-    if (f16_mask) m.h_mask_f16.assign((size_t) (n_kv * nt), 0);
-    else          m.h_mask_f32.assign((size_t) (n_kv * nt), 0.0f);
-    for (int64_t t = 0; t < nt; t++)
+    bool needs_mask = false, needs_pools = false;
+    if (pack_tokens) {
+        auto* input = gr->inp.packed_token_embedding;
+        if (!input || !input->buffer || packed_token_bytes != (size_t)nt * m.host_embedding_layout.row_bytes
+            || ggml_nbytes(input) != packed_token_bytes)
+            throw std::runtime_error("Host token embedding graph input does not match the completed raw pack");
+        ggml_backend_tensor_set(input,m.host_embedding_pack.get(),0,packed_token_bytes);
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != strict_error_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire)) return false;
+        ++m.host_embedding_calls; m.host_embedding_rows += nt; m.host_embedding_bytes += packed_token_bytes;
+        fprintf(stderr,"[GLM-HOST-TOKEN-EMBEDDING] version=1 mode=raw_q4k_cuda_get_rows source_bytes=356843520"
+            " row_bytes=2304 rows=%" PRId64 " packed_bytes=%zu host_pack_bytes=1179648 device_pack_max_bytes=1179648"
+            " scope=raw_rows_uploaded_not_compute_completion_or_physical_io\n",nt,packed_token_bytes);
+    }
+    for (graph_build_result * xgr : exec_graphs)
+    for (int d = 0; d <= m.n_gpu; d++)
     {
-        const int64_t last = p0 + t;
-        for (int64_t j = 0; j < n_kv; j++)
+        needs_mask |= live(xgr->inp.kq_mask[d]) || live(xgr->inp.lid_mask[d]);
+        needs_pools |= live(xgr->inp.pool_cells[d]) || live(xgr->inp.pool_bias[d])
+            || live(xgr->inp.trail_cells[d]) || live(xgr->inp.trail_vals[d]);
+    }
+    if (needs_mask)
+    {
+        if (f16_mask) m.h_mask_f16.resize((size_t) (n_kv * nt));
+        else          m.h_mask_f32.resize((size_t) (n_kv * nt));
+        for (int64_t t = 0; t < nt; t++)
         {
-            const bool visible = j <= last;
-            if (f16_mask) m.h_mask_f16[(size_t) (t * n_kv + j)] = visible ? 0 : 0xFC00 /* -inf */;
-            else          m.h_mask_f32[(size_t) (t * n_kv + j)] = visible ? 0.0f : -INFINITY;
+            const size_t offset = (size_t) (t * n_kv);
+            const size_t visible = (size_t) std::min(n_kv, p0 + t + 1);
+            if (f16_mask)
+            {
+                std::fill_n(m.h_mask_f16.data() + offset, visible, uint16_t(0));
+                std::fill_n(m.h_mask_f16.data() + offset + visible, (size_t) n_kv - visible, uint16_t(0xFC00));
+            }
+            else
+            {
+                std::fill_n(m.h_mask_f32.data() + offset, visible, 0.0f);
+                std::fill_n(m.h_mask_f32.data() + offset + visible, (size_t) n_kv - visible, -INFINITY);
+            }
         }
     }
 
@@ -6929,8 +7935,12 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     }
     for (graph_build_result * xgr : exec_graphs)
         set_input_i32(xgr->inp.out_ids, m.h_out_ids.data(), (size_t) n_out);
-    if (layers && gr->inp.hidden && live(gr->inp.hidden))
-        ggml_backend_tensor_set(gr->inp.hidden, layers->hidden, 0, ggml_nbytes(gr->inp.hidden));
+    if (layers && gr->inp.hidden && live(gr->inp.hidden)) {
+        if (layers->device_baton) {
+            if (!m.device_baton.transfer(gr->inp.hidden,layers->baton_offset,false))
+                throw std::runtime_error("Layer-major baton refused direct CUDA input copy");
+        } else ggml_backend_tensor_set(gr->inp.hidden, layers->hidden, 0, ggml_nbytes(gr->inp.hidden));
+    }
 
     if (n_ovr > 0)
     {
@@ -6949,7 +7959,7 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     // the identity); a pool is scoreable for a query only when its LAST member
     // is visible, which also drops the query's own trailing pool - those cells
     // ride in through trail_cells/trail_vals instead, unconditionally.
-    if (m.hp.g5n && gr->sparse)
+    if (m.hp.g5n && gr->sparse && needs_pools)
     {
         const int64_t r = m.hp.indexer_kpool;
         const int64_t n_pools = n_kv / r;
@@ -7008,15 +8018,10 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     // _async, not the synchronous entry point: the graph is already allocated
     // above (which the synchronous one asserts against), and the explicit
     // synchronize below is where the logits read waits.
-    struct selected_failure_guard {
-        glm_model& model; glm_slot& slot; graph_build_result& graph;
-        bool armed; bool complete = false;
-        ~selected_failure_guard() noexcept {
-            if (!armed || complete) return;
-            try { ggml_backend_sched_synchronize(graph.sched); } catch (...) {}
-            slot.kda_restore_failed = true; model.kda_snap.valid = false;
-        }
-    } selected_guard{m, slot, *gr, !gr->selected_expert_seams.empty() || m.trace_dump != nullptr || !gr->traces.empty()};
+    selected_guard.armed = selected_guard.armed || capture_prefix || !gr->selected_expert_seams.empty()
+        || m.trace_dump != nullptr || !gr->traces.empty();
+    timing.next(glm_flash_forward_timing::compute);
+    glm_selected_expert_timing selected_timing(m, *gr, nt, p0, layers == nullptr);
     if (gr->tp_fused)
     {
         if (!execute_fused_tp(m, *gr))
@@ -7032,17 +8037,29 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
     }
     if (!gr->tp_fused) ggml_backend_sched_synchronize(gr->sched);
     if (!glm_finish_selected_expert_graph(m, *gr)) return false;
+    selected_timing.finish();
 
+    timing.next(glm_flash_forward_timing::output);
     if (!try_print_traces(m, gr, p0)) return false;
 
     if (want_logits && logits_out && gr->logits)
         ggml_backend_tensor_get(gr->logits, logits_out, 0, (size_t) n_out * m.hp.n_vocab * sizeof(float));
     if (h_out && gr->h_nextn)
         ggml_backend_tensor_get(gr->h_nextn, h_out, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
-    if (layers && gr->hidden_out)
-        ggml_backend_tensor_get(gr->hidden_out, layers->hidden, 0, ggml_nbytes(gr->hidden_out));
+    if (layers && gr->hidden_out) {
+        if (layers->device_baton) {
+            if (!m.device_baton.transfer(gr->hidden_out,layers->baton_offset,true))
+                throw std::runtime_error("Layer-major baton refused direct CUDA output copy");
+        } else ggml_backend_tensor_get(gr->hidden_out, layers->hidden, 0, ggml_nbytes(gr->hidden_out));
+    }
+    if ((capture_prefix || strict_graph || m.host_token_embedding) && (tsg::g_ggml_error_count.load(std::memory_order_acquire) != gr->selected_expert_error_epoch
+        || tsg::g_backend_compute_failed.load(std::memory_order_acquire))) return false;
     if (!layers) slot.n_past += nt;
+    if (capture_prefix && !m.prefix_window.publish(prefix_generation, slot.id, slot.n_past, m.prefix_binding))
+        return false; // The failure guard poisons a partially advanced target.
     selected_guard.complete = true;
+    timing.completed = true;
+    selected_timing.completed = true;
     return true;
 }
 
@@ -7060,11 +8077,33 @@ static bool forward_ubatch(glm_model & m, const int32_t * tokens, int64_t nt, bo
 static bool mtp_forward(glm_model & m, const int32_t * tokens, int64_t nt, const float * h_in,
                         int64_t start_pos, bool want_logits, float * logits_out, float * h_out)
 {
+    glm_flash_forward_timing timing(m, 1, nt, start_pos, 1, h_out != nullptr, want_logits);
     if (!m.has_mtp)
     {
         fprintf(stderr, "[glm] MTP draft step requested but no NextN block is loaded\n");
         return false;
     }
+    if (!m.active_slot || m.active_slot->kda_restore_failed || !tokens || !h_in || nt <= 0)
+        return false;
+    if (m.flash_mtp && (!m.selected_expert_seams
+        || !flash_mtp_window(start_pos, nt, m.n_ctx, m.hp.indexer_top_k))) {
+        tsg::set_last_error("Flash MTP requires configured selected experts and a complete dense-context window");
+        return false;
+    }
+    // A full test-oracle pass can request hidden output without logits. Its
+    // expert width must fit BEFORE attention writes draft KV. Public catch-up
+    // has neither output and remains allowed at the admitted wide width.
+    if (m.flash_mtp_shape_plan && (want_logits || h_out)) {
+        const auto segment = selected_expert_segment(m, m.mtp_layer, 1, false);
+        const auto key = tsg::host_moe_expert_group_key(segment);
+        const auto group = std::find_if(m.selected_expert_group_minima.begin(), m.selected_expert_group_minima.end(),
+            [&](const auto& value) { return value.key == key; });
+        if (group == m.selected_expert_group_minima.end() || nt > group->prefill_rows) {
+            tsg::set_last_error("Flash MTP full expert pass exceeds its immutable per-group width");
+            return false;
+        }
+    }
+    for (int64_t i = 0; i < nt; ++i) if (tokens[i] < 0 || tokens[i] >= m.hp.n_vocab) return false;
     glm_slot & slot = *m.active_slot;
     if (start_pos < 0 || start_pos + nt > m.n_ctx)
     {
@@ -7075,8 +8114,12 @@ static bool mtp_forward(glm_model & m, const int32_t * tokens, int64_t nt, const
 
     bool reused = false;
     graph_build_result * gr = acquire_graph(m, slot, nt, start_pos, /*n_out=*/1, want_logits, &reused,
-                                            /*want_h=*/true, /*kind=*/1);
+                                            /*want_h=*/h_out != nullptr, /*kind=*/1);
     if (!gr) return false;
+    timing.reused = int(reused);
+    timing.next(glm_flash_forward_timing::input);
+
+    glm_begin_selected_expert_graph(*gr);
 
     const int64_t n_kv = gr->n_kv;
 
@@ -7120,17 +8163,35 @@ static bool mtp_forward(glm_model & m, const int32_t * tokens, int64_t nt, const
     }
     if (want_logits) set_input_i32(gr->inp.out_ids, m.h_out_ids.data(), 1);
 
+    struct DraftFailureGuard {
+        glm_model& model; glm_slot& slot; graph_build_result& graph;
+        bool active = false, complete = false;
+        ~DraftFailureGuard() noexcept {
+            if (!active || complete) return;
+            try { ggml_backend_sched_synchronize(graph.sched); } catch (...) {}
+            slot.kda_restore_failed = true; model.kda_snap.valid = false;
+            model.prefix_window.invalidate();
+        }
+    } failure_guard{m, slot, *gr};
+    failure_guard.active = m.flash_mtp;
+    timing.next(glm_flash_forward_timing::compute);
     if (ggml_backend_sched_graph_compute_async(gr->sched, gr->gf) != GGML_STATUS_SUCCESS)
     {
         fprintf(stderr, "[glm] MTP graph compute failed\n");
         return false;
     }
     ggml_backend_sched_synchronize(gr->sched);
+    if (!glm_finish_selected_expert_graph(m, *gr)) return false;
 
+    timing.next(glm_flash_forward_timing::output);
     if (want_logits && logits_out && gr->logits)
         ggml_backend_tensor_get(gr->logits, logits_out, 0, (size_t) m.hp.n_vocab * sizeof(float));
     if (h_out && gr->h_nextn)
         ggml_backend_tensor_get(gr->h_nextn, h_out, 0, (size_t) nt * m.hp.n_embd * sizeof(float));
+    if (m.flash_mtp && (tsg::g_ggml_error_count.load(std::memory_order_acquire) != gr->selected_expert_error_epoch
+        || tsg::g_backend_compute_failed.load(std::memory_order_acquire))) return false;
+    failure_guard.complete = true;
+    timing.completed = true;
     return true;
 }
 
@@ -7144,17 +8205,62 @@ using namespace tsg_glm;
 
 // Version 1 accounts native GLM weights/constants/slots and cached schedulers.
 TSG_EXPORT int TSGgml_GlmUnifiedBudgetVersion() { return 2; }
-TSG_EXPORT int TSGgml_GlmSelectedExpertAdapterVersion() { return 7; }
+TSG_EXPORT int TSGgml_GlmSelectedExpertAdapterVersion() { return 8; }
+TSG_EXPORT int TSGgml_GlmFlashMtpAdapterVersion() { return 1; }
+TSG_EXPORT int TSGgml_GlmFlashMtpPrefixCommitVersion() { return 1; }
+TSG_EXPORT int TSGgml_GlmFlashMtpPrefixCommitEnabled(void* handle) {
+    const auto* m = static_cast<const glm_model*>(handle);
+    return m && m->flash_mtp_prefix_commit ? 1 : 0;
+}
+TSG_EXPORT int TSGgml_GlmFlashMtpShapePlanVersion() { return 1; }
+TSG_EXPORT int TSGgml_GlmFlashMtpShapePlanEnabled(void* handle) {
+    const auto* m = static_cast<const glm_model*>(handle);
+    return m && m->flash_mtp_shape_plan ? 1 : 0;
+}
+static bool glm_trim_original_mapped_residency(glm_model& model) noexcept
+{
+    bool success = true;
+    for (auto& mapping : model.mmap_owners) if (mapping) success = mapping->trim_residency() && success;
+    return success;
+}
 TSG_EXPORT int TSGgml_GlmTrimMappedResidency(void* handle)
 {
     auto* m = static_cast<glm_model*>(handle);
     if (!m) return 0;
     try {
         for (int d = 0; d < m->n_backends; ++d) ggml_backend_synchronize(m->backends[d]);
-        bool success = true;
-        for (auto& mapping : m->mmap_owners) if (mapping) success = mapping->trim_residency() && success;
-        return success ? 1 : 0;
+        return glm_trim_original_mapped_residency(*m) ? 1 : 0;
     } catch (...) { return 0; }
+}
+TSG_EXPORT int TSGgml_GlmTrimMappedResidencyVersion() { return 1; }
+TSG_EXPORT int TSGgml_GlmTrimMappedResidencyChecked(void* handle)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m) return 0; // Harmless capability probe: no controller/owner allocation.
+    if (!tsg::host_moe_file_source_view_requested()) return TSGgml_GlmTrimMappedResidency(handle);
+    auto fatal = [&](const char* reason) noexcept {
+        m->source_view_pressure_failed = true;
+        try { tsg::set_last_error(reason); } catch (...) {}
+        return -1;
+    };
+    // Fresh admission and between-request recovery can have no live KV slot.
+    // Source-view ownership is independent of that healthy empty-slot state.
+    if (m->source_view_pressure_failed || !m->host_token_embedding
+        || (m->active_slot && m->active_slot->kda_restore_failed) || m->tp != 1 || m->n_gpu != 1)
+        return fatal("GLM source-view pressure hint requires its healthy serialized Host owner");
+    try {
+        const auto epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
+        for (int d = 0; d < m->n_backends; ++d) ggml_backend_synchronize(m->backends[d]);
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire))
+            return fatal("GLM source-view pressure backend drain failed");
+        const int result = tsg::host_moe_file_source_view_trim_quiescent();
+        if (result < 0) return fatal("GLM source-view pressure owner refused checked maintenance");
+        // Preserve the original GGUF-mapping hint as well. Its OS result is
+        // advisory; neither hint supplies released-byte or admission credit.
+        (void)glm_trim_original_mapped_residency(*m);
+        return result; // 1=all source ranges accepted, 0=busy/OS-advisory result.
+    } catch (...) { return fatal("GLM source-view pressure checked maintenance threw"); }
 }
 TSG_EXPORT int TSGgml_GlmSelectedExpertGroupCount(void* handle)
 {
@@ -7166,17 +8272,20 @@ TSG_EXPORT int TSGgml_GlmSelectedExpertMinimumBudget(void* handle, int rows, int
     auto* m = static_cast<glm_model*>(handle);
     if (bytes) *bytes = 0;
     if (!m || !bytes || rows < 1 || rows > 3 || !m->hp.g5n || m->tp != 1 || m->n_gpu != 1
-        || m->has_mtp || m->selected_expert_groups <= 0 || m->selected_expert_seams || !m->graph_cache.empty()) return 0;
+        || (m->has_mtp && !m->flash_mtp) || m->selected_expert_groups <= 0 || m->selected_expert_seams || !m->graph_cache.empty()) return 0;
     if (m->hp.n_expert_used < 1 || m->hp.n_expert_used > 64
         || !tsg::host_moe_cache_prefill_fits(m->n_ubatch, m->hp.n_expert_used, true)) return 0;
     for (const auto& slot : m->slots) if (slot.second->n_past != 0) return 0;
     try {
         std::vector<tsg::HostMoePhaseGroupMinimum> groups;
+        std::vector<int> representatives;
         groups.reserve(static_cast<size_t>(m->selected_expert_groups));
-        for (int il = 0; il < m->hp.n_layer; ++il) {
+        for (int il = 0; il < m->hp.n_layer + (m->flash_mtp ? 1 : 0); ++il) {
             const auto& layer = m->layers[il];
             if (!layer.cpu_moe || !layer.w[0].ffn_gate_exps) continue;
-            const auto segment = selected_expert_segment(*m, il, rows, rows > 1);
+            const bool draft_only = m->flash_mtp_shape_plan && il == m->mtp_layer;
+            const int group_rows = draft_only ? 1 : rows, group_prefill = draft_only ? 1 : m->n_ubatch;
+            const auto segment = selected_expert_segment(*m, il, group_rows, group_rows > 1);
             if (segment.n_ff != m->hp.n_ff_exp)
                 throw std::runtime_error("GLM pooled groups require their declared uniform expert geometry");
             const auto key = tsg::host_moe_expert_group_key(segment);
@@ -7184,11 +8293,20 @@ TSG_EXPORT int TSGgml_GlmSelectedExpertMinimumBudget(void* handle, int rows, int
             const size_t expert_bytes = (size_t) ((segment.gate_bytes + segment.up_bytes + segment.down_bytes)
                 / std::max(1, segment.num_experts));
             auto existing = std::find_if(groups.begin(), groups.end(), [&](const auto& group) { return group.key == key; });
-            if (existing != groups.end()) { existing->weight += expert_bytes; continue; }
-            size_t narrow = 0, wide = 0;
-            if (!tsg::host_moe_expert_cache_minimum_phase_plan(segment, rows, m->n_ubatch, m->backends[0], narrow, wide))
+            const tsg::HostMoePhaseGroupMinimum member{key, 0, 0, expert_bytes, group_rows, group_prefill};
+            if (existing != groups.end()) { existing->merge(member); continue; }
+            groups.push_back(member);
+            representatives.push_back(il);
+        }
+        // Measure AFTER merging widths: a pooled key owns one set of variants.
+        // Measuring only the first member, or independently taking byte maxima
+        // of incomparable widths, cannot certify that combined geometry.
+        for (size_t i = 0; i < groups.size(); ++i) {
+            auto& group = groups[i];
+            const auto segment = selected_expert_segment(*m, representatives[i], group.decode_rows, group.decode_rows > 1);
+            if (!tsg::host_moe_expert_cache_minimum_phase_plan(segment, group.decode_rows, group.prefill_rows,
+                    m->backends[0], group.narrow_bytes, group.wide_bytes))
                 throw std::runtime_error("GLM compact expert layout or exact-width graph cannot be planned");
-            groups.push_back({key, narrow, wide, expert_bytes});
         }
         // Only one serialized helper is wide at a time. Its whole union and
         // the other groups' narrow floors define the measured phase minimum.
@@ -7218,7 +8336,15 @@ TSG_EXPORT int TSGgml_GlmConfigureSelectedExpertSeams(void* handle, int enabled)
 {
     auto* m = static_cast<glm_model*>(handle);
     if (!m || (enabled != 0 && enabled != 1) || !m->hp.g5n || m->tp != 1 || m->n_gpu != 1
-        || m->has_mtp || m->selected_expert_groups <= 0 || m->selected_expert_ranges.empty()) return 0;
+        || (m->has_mtp && !m->flash_mtp) || m->selected_expert_groups <= 0 || m->selected_expert_ranges.empty()) return 0;
+    if (m->vmm_expert_weights != tsg::host_moe_vmm_requested()
+        || (m->vmm_expert_weights && (!enabled || !m->host_token_embedding || !m->shared_graph_owner
+            || m->layer_major_graph_cap_bytes || m->has_mtp || m->n_ctx != 2048 || m->n_ubatch != 512
+            || m->selected_expert_groups != 3 || m->selected_expert_planned_rows != 1
+            || !glm_host_token_embedding_ready(*m)))) {
+        tsg::set_last_error("GLM VMM scope does not match the immutable guarded model profile"); return 0;
+    }
+    if ((m->layer_major_graph_cap_bytes || m->host_token_embedding) && enabled != 1) return 0;
     if (enabled && (m->hp.n_expert_used < 1 || m->hp.n_expert_used > 64
         || !tsg::host_moe_cache_prefill_fits(m->n_ubatch, m->hp.n_expert_used, true))) return 0;
     if (enabled && !tsg::host_moe_expert_cache_scope_matches_plan(m->selected_expert_minimum_bytes,
@@ -7241,6 +8367,8 @@ TSG_EXPORT int TSGgml_GlmConfigureSelectedExpertSeams(void* handle, int enabled)
                     throw std::runtime_error("GLM expert source already registered or invalid");
                 m->registered_expert_ranges.push_back(range.pointer);
             }
+            if (m->vmm_expert_weights && !tsg::host_moe_vmm_certify_model(m->backends[0]))
+                throw std::runtime_error("GLM VMM model/backend certificate was refused");
             if (!tsg::host_moe_expert_cache_install_phase_plan(m->selected_expert_group_minima,
                 m->n_ubatch, m->selected_expert_planned_rows, m->backends[0]))
                 throw std::runtime_error("GLM measured group floors cannot be installed in this empty exclusive scope");
@@ -7259,12 +8387,97 @@ TSG_EXPORT int TSGgml_GlmConfigureSelectedExpertSeams(void* handle, int enabled)
     return 0;
 }
 
+static bool glm_causal_profile(const glm_model& m) {
+    if (!m.causal_neighbor.requested() || !glm_causal_environment() || !glm_layer_major_profile_supported(m)
+        || !m.host_token_embedding || m.vmm_expert_weights || m.device_baton_requested || m.layer_major_graph_cap_bytes
+        || m.has_mtp || m.n_ctx != 2048 || m.n_ubatch != 512 || m.hp.n_layer != 45 || m.layers.size() != 45
+        || m.hp.n_embd != 4096 || m.hp.n_ff_exp != 2048 || m.hp.n_expert != 288 || m.hp.n_expert_used != 8
+        || m.selected_expert_groups != 3 || m.selected_expert_planned_rows != 1
+        || m.registered_expert_ranges.size() != 126 || m.slots.size() != 1 || !m.active_slot
+        || m.trace_dump || !m.embd_ovr.empty()) return false;
+    int groups[3]{}; int routed = 0;
+    for (int il = 0; il < 45; ++il) {
+        const auto& layer = m.layers[static_cast<std::size_t>(il)]; const auto& w = layer.w[0];
+        if (!w.ffn_gate_exps) { if (il >= 3) return false; continue; }
+        if (il < 3 || !layer.cpu_moe || !w.ffn_up_exps || !w.ffn_down_exps) return false;
+        const int gate = w.ffn_gate_exps->type, up = w.ffn_up_exps->type, down = w.ffn_down_exps->type;
+        const int group = gate == GGML_TYPE_IQ2_XXS && up == GGML_TYPE_IQ2_XXS && down == GGML_TYPE_IQ3_XXS ? 0
+            : gate == GGML_TYPE_IQ1_S && up == GGML_TYPE_IQ1_S && down == GGML_TYPE_IQ3_XXS ? 1
+            : gate == GGML_TYPE_IQ2_XXS && up == GGML_TYPE_IQ2_XXS && down == GGML_TYPE_IQ4_XS ? 2 : -1;
+        if (group < 0) return false;
+        ++groups[group]; ++routed;
+    }
+    return routed == 42 && groups[0] == 11 && groups[1] == 28 && groups[2] == 3;
+}
+TSG_EXPORT int TSGgml_GlmCausalRouteNeighborVersion() {
+#if defined(_WIN32) && defined(_MSC_VER) && defined(TSG_GGML_USE_CUDA)
+    return 1;
+#else
+    return 0;
+#endif
+}
+TSG_EXPORT int TSGgml_GlmCausalRouteNeighborEnabled() { return tsg_glm_neighbor::option(); }
+TSG_EXPORT int TSGgml_GlmCausalRouteNeighborHostPlan(int profile, std::int64_t* values, int length) {
+    if (!values || length != 8 || profile != 1 || TSGgml_GlmCausalRouteNeighborVersion() != 1
+        || tsg_glm_neighbor::option() != 1) return 0;
+    const auto bytes = static_cast<std::int64_t>(tsg_glm_neighbor::Owner::host_bytes());
+    const std::int64_t fields[] = {1,1,bytes,bytes,42,288,64,8};
+    std::copy(std::begin(fields), std::end(fields), values); return 1;
+}
+TSG_EXPORT int TSGgml_GlmConfigureCausalRouteNeighbor(void* handle, std::uint64_t scope, int profile,
+                                                  std::int64_t expected) {
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m || profile != 1 || expected <= 0 || static_cast<std::uint64_t>(expected) != tsg_glm_neighbor::Owner::host_bytes()
+        || !glm_causal_profile(*m) || m->active_slot->n_past != 0) return 0;
+    tsg_glm_neighbor::Config config{}; config.layers = 42; config.experts = 288; config.routes = 8;
+    std::array<tsg_glm_neighbor::Source, 42> source{};
+    for (int rank = 0; rank < 42; ++rank) {
+        const int il = rank + 3; config.layer_ids[static_cast<std::size_t>(rank)] = static_cast<std::uint16_t>(il);
+        const auto segment = selected_expert_segment(*m, il, 1, false);
+        auto& item = source[static_cast<std::size_t>(rank)]; item.layer = static_cast<std::uint16_t>(il);
+        item.pointer = {segment.gate_data, segment.up_data, segment.down_data};
+        item.type = {segment.gate_type, segment.up_type, segment.down_type};
+        item.bytes = {static_cast<std::uint64_t>(segment.gate_bytes), static_cast<std::uint64_t>(segment.up_bytes),
+                      static_cast<std::uint64_t>(segment.down_bytes)};
+        for (std::size_t p = 0; p < 3; ++p) {
+            if (!item.bytes[p] || item.bytes[p] % 288) return 0;
+            item.stride[p] = item.bytes[p] / 288;
+        }
+    }
+    return tsg::host_moe_causal_configure(m->causal_neighbor, m, scope, profile,
+        static_cast<std::size_t>(expected), config, source.data(), m->backends[0]) ? 1 : 0;
+}
+TSG_EXPORT int TSGgml_GlmCausalRouteNeighborInfo(void* handle, std::int64_t* values, int length) {
+    auto* m = static_cast<glm_model*>(handle);
+    return m && tsg::host_moe_causal_info(m->causal_neighbor, values, length) ? 1 : 0;
+}
+TSG_EXPORT int TSGgml_GlmCloseCausalRouteNeighbor(void* handle) {
+    auto* m = static_cast<glm_model*>(handle);
+    return !m || tsg::host_moe_causal_close(m->causal_neighbor) ? 1 : 0;
+}
+#if defined(TSG_GGML_TEST_HOOKS)
+TSG_EXPORT int TSGgml_GlmTestFailCausalRouteNeighbor(void* handle, int stage) {
+    auto* m = static_cast<glm_model*>(handle);
+    return m && m->causal_neighbor.requested() && (stage == 0 || m->causal_neighbor.ready())
+        && !m->causal_neighbor.active_call()
+        && m->causal_neighbor.test_fault(stage) ? 1 : 0;
+}
+TSG_EXPORT std::int64_t TSGgml_GlmTestCausalRouteNeighborFailureCount(void* handle) {
+    const auto* m = static_cast<const glm_model*>(handle);
+    return m && m->causal_neighbor.requested() ? m->causal_neighbor.test_failure_count() : -1;
+}
+#endif
+
 TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch,
                                       int n_threads, int n_cpu_moe, const char * backend_name, int tp,
                                       int ctx_is_hard_limit, int load_mtp)
 {
     // A stale error from an earlier op must not be reported as this load's reason.
     tsg::clear_last_error();
+    if (glm_host_token_embedding_option() != 0) {
+        tsg::report_load_refusal("[glm] Host token embedding requires exact flag1 and the explicit versioned loader; invalid flags also refuse\n");
+        return nullptr;
+    }
     try
     {
         return glm_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, tp,
@@ -7280,6 +8493,41 @@ TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_c
         tsg::report_load_refusal("[glm] load failed: unknown native exception\n");
         return nullptr;
     }
+}
+
+TSG_EXPORT int TSGgml_GlmHostTokenEmbeddingVersion()
+{
+#if defined(_WIN32) && defined(_MSC_VER) && defined(TSG_GGML_USE_CUDA)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+TSG_EXPORT void* TSGgml_GlmLoadModelWithHostTokenEmbedding(const char* gguf_path, int n_gpu, int n_ctx, int n_ubatch,
+    int n_threads, int n_cpu_moe, const char* backend_name, int tp, int ctx_is_hard_limit, int load_mtp, int enabled)
+{
+    tsg::clear_last_error();
+    if (enabled != 1 || glm_host_token_embedding_option() != 1 || TSGgml_GlmHostTokenEmbeddingVersion() != 1) {
+        tsg::report_load_refusal("[glm] Host token embedding requires explicit loader enabled1 and exact supported flag1\n"); return nullptr;
+    }
+    try {
+        return glm_load(gguf_path,n_gpu,n_ctx,n_ubatch,n_threads,n_cpu_moe,backend_name,tp,
+            ctx_is_hard_limit != 0,load_mtp != 0,true);
+    } catch (const std::exception& error) {
+        tsg::report_load_refusal("[glm] Host token embedding load failed: %s\n",error.what());
+    } catch (...) { tsg::report_load_refusal("[glm] Host token embedding load failed with a non-standard exception\n"); }
+    return nullptr;
+}
+
+TSG_EXPORT int TSGgml_GlmHostTokenEmbeddingInfo(void* handle, int64_t* values, int length)
+{
+    const auto* m = static_cast<const glm_model*>(handle);
+    if (!m || !values || length < 12 || !glm_host_token_embedding_ready(*m)) return 0;
+    const int64_t result[12] = {1,1,(int)GGML_TYPE_Q4_K,4096,154880,356843520,2304,
+        (int64_t)m->host_embedding_pack_bytes,(int64_t)m->host_embedding_device_pack_max,1,1,512};
+    std::copy(std::begin(result),std::end(result),values);
+    return 1;
 }
 
 TSG_EXPORT int TSGgml_GlmVocabSize(void * handle)
@@ -7299,17 +8547,28 @@ TSG_EXPORT int TSGgml_GlmCtxSize(void * handle)
 TSG_EXPORT int TSGgml_GlmConfigureGraphCache(void * handle, int capacity, int trim)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && (m->device_baton_failed || m->device_baton.owned())) return 0;
     if (!m || capacity < 1 || capacity > 32) return 0;
+    if (m->layer_major_graph_cap_bytes && capacity != 1) return 0;
     try {
         for (int d = 0; d < m->n_backends; ++d) ggml_backend_synchronize(m->backends[d]);
-        if (trim == 1) m->graph_cache.clear();
+        if (trim == 1) {
+            for (const auto & graph : m->graph_cache)
+                glm_mtp_graph_diagnostic(*m, "trim", "owner-all", graph.get());
+            m->graph_cache.clear();
+        }
         else if (trim == 2) {
-            for (auto it = m->graph_cache.begin(); it != m->graph_cache.end(); )
-                it = (*it)->bd.empty() && (*it)->nt > 1 ? m->graph_cache.erase(it) : std::next(it);
+            for (auto it = m->graph_cache.begin(); it != m->graph_cache.end(); ) {
+                if ((*it)->bd.empty() && (*it)->nt > 1) {
+                    glm_mtp_graph_diagnostic(*m, "trim", "owner-prefill", it->get());
+                    it = m->graph_cache.erase(it);
+                } else ++it;
+            }
         }
         else if (trim != 0) return 0;
         m->graph_cache_cap = capacity;
-        while ((int) m->graph_cache.size() > capacity) m->graph_cache.pop_back();
+        glm_mtp_graph_diagnostic(*m, "configure", "owner-capacity", nullptr);
+        glm_enforce_graph_cache_capacity(*m);
         return 1;
     } catch (...) { return 0; }
 }
@@ -7321,7 +8580,9 @@ TSG_EXPORT int TSGgml_GlmConfigureGraphCache(void * handle, int capacity, int tr
 TSG_EXPORT int TSGgml_GlmConfigureSharedGraphOwner(void * handle, int enabled)
 {
     auto * m = static_cast<glm_model *>(handle);
+    if (m && (m->device_baton_failed || m->device_baton.owned())) return 0;
     if (!m || m->tp != 1 || m->n_gpu > 1 || (enabled != 0 && enabled != 1)) return 0;
+    if ((m->layer_major_graph_cap_bytes || m->host_token_embedding) && enabled != 1) return 0;
     if (m->shared_graph_owner == (enabled != 0)) return 1;
     if (!m->graph_cache.empty()) return 0;
     try {
@@ -7331,20 +8592,120 @@ TSG_EXPORT int TSGgml_GlmConfigureSharedGraphOwner(void * handle, int enabled)
     } catch (...) { return 0; }
 }
 
+TSG_EXPORT int TSGgml_GlmLayerMajorGraphCapVersion() { return 1; }
+
+TSG_EXPORT int TSGgml_GlmConfigureLayerMajorGraphCap(void* handle, int profile_version, int64_t cap_bytes)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m || m->vmm_expert_weights || cap_bytes <= 0 || !layer_major_graph_cap::valid_limit(profile_version,(uint64_t)cap_bytes)) return 0;
+    if (m->layer_major_graph_cap_bytes) return m->layer_major_graph_cap_bytes == (uint64_t)cap_bytes ? 1 : 0;
+    try {
+        if (!m->graph_cache.empty() || m->slots.size() != 1 || !m->active_slot
+            || m->slots.begin()->second.get() != m->active_slot || m->active_slot->n_past != 0
+            || m->active_slot->kda_restore_failed || !glm_layer_major_profile_supported(*m)) {
+            glm_strict_graph_refuse("loaded handle does not satisfy immutable profile1 configuration"); return 0;
+        }
+        m->layer_major_graph_cap_bytes = (std::size_t)cap_bytes;
+        return 1;
+    } catch (...) { glm_strict_graph_refuse("configuration validation threw"); return 0; }
+}
+
+#if defined(TSG_GGML_TEST_HOOKS)
+TSG_TEST_EXPORT int TSGgml_GlmTestFailStrictLayerMajorAfterLayer(void* handle, int layer)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m || !m->layer_major_graph_cap_bytes || layer < -1 || layer >= m->hp.n_layer) return 0;
+    m->strict_fail_after_layer = layer; return 1;
+}
+TSG_TEST_EXPORT int64_t TSGgml_GlmTestStrictLayerMajorFailureCount(void* handle)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    return m ? m->strict_failure_count : -1;
+}
+TSG_TEST_EXPORT int TSGgml_GlmTestFailHostTokenEmbeddingPack(void* handle, int successful_packs_before_failure)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m || !m->host_token_embedding || successful_packs_before_failure < -1) return 0;
+    m->host_embedding_fail_after_packs = successful_packs_before_failure; return 1;
+}
+TSG_TEST_EXPORT int64_t TSGgml_GlmTestHostTokenEmbeddingPackFailureCount(void* handle)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    return m && m->host_token_embedding ? m->host_embedding_pack_failure_count : -1;
+}
+#endif
+
 TSG_EXPORT int TSGgml_GlmNPast(void * handle)
 {
     glm_model * m = (glm_model *) handle;
     return (m && m->active_slot) ? (int) m->active_slot->n_past : 0;
 }
 
+struct glm_causal_call {
+    glm_model& model;
+    int rows;
+    std::int64_t p0;
+    bool armed = false, complete = false;
+    bool begin() noexcept {
+        if (!model.causal_neighbor.requested()) return true;
+        // Complete immutable tensor/source geometry was certified at Configure.
+        // Runtime checks cover mutable modes/sequence; actual helper source keys
+        // are independently checked for every call without rescanning45 layers.
+        if (!model.active_slot || !model.causal_neighbor.ready() || model.causal_neighbor.model() != &model
+            || !glm_causal_environment() || !model.host_token_embedding || !model.selected_expert_seams
+            || model.slots.size() != 1 || model.n_ctx != 2048 || model.n_ubatch != 512
+            || model.tp != 1 || model.n_gpu != 1 || model.has_mtp || model.vmm_expert_weights
+            || model.device_baton_requested || model.layer_major_graph_cap_bytes || model.graph_cache_cap != 1
+            || model.trace_dump || !model.embd_ovr.empty() || model.prefix_binding || model.kda_snap.valid
+            || rows < 1 || p0 < 0 || p0 > model.n_ctx - rows) return false;
+        armed = tsg::host_moe_causal_begin(model.causal_neighbor, rows == 1, p0, rows, model.active_slot->id);
+        return armed;
+    }
+    bool finish() noexcept {
+        if (!model.causal_neighbor.requested()) return true;
+        if (!armed || !tsg::host_moe_causal_finish(model.causal_neighbor)) return false;
+        complete = true; return true;
+    }
+    ~glm_causal_call() noexcept {
+        if (!armed) return;
+        if (!complete) tsg::host_moe_causal_abort(model.causal_neighbor);
+        std::int64_t info[16]{};
+        const bool readable = tsg::host_moe_causal_info(model.causal_neighbor, info, 16);
+        const auto& stats = model.causal_neighbor.call_stats();
+        std::fprintf(stderr, "[GLM-CAUSAL-ROUTE-NEIGHBOR] profile=1 outcome=%s epoch=%" PRIu64
+            " p0=%" PRId64 " rows=%d queries=%" PRIu64 " committed=%" PRIu64 " matches=%" PRIu64
+            " no_matches=%" PRIu64 " compared_anchors=%" PRIu64 " min_completed_lag=%" PRIu64
+            " history_rows_max=%" PRIu64 " declared_host_bytes=%" PRId64 " owned_slab_bytes=%" PRId64
+            " held_ticket_bytes=%" PRId64 " pending=%" PRId64 " extra_device_bytes=0 certificate=%d"
+            " scope=past_only_source_qualified_host_metadata_not_saved_io_or_speed\n",
+            complete ? "completed" : "failed", model.causal_neighbor.epoch(), p0, rows,
+            stats.queries, stats.committed, stats.matches, stats.no_matches, stats.compared, stats.min_lag,
+            stats.history_max, info[6], info[7], info[8], info[9], readable ? 1 : 0);
+        if (tsg_glm_neighbor::Owner::timing_enabled())
+            std::fprintf(stderr, "[GLM-CAUSAL-ROUTE-NEIGHBOR-CPU] outcome=%s p0=%" PRId64
+                " rows=%d valid=%d prepare_ns=%" PRIu64 " commit_ns=%" PRIu64
+                " slot_checks=%" PRIu64 " victim_checks=%" PRIu64
+                " scope=nested_host_wall_not_cpu_exclusive\n",
+                complete ? "completed" : "failed", p0, rows, complete && readable && stats.timing_valid ? 1 : 0,
+                stats.prepare_ns, stats.commit_ns, stats.slot_checks, stats.victim_checks);
+    }
+};
+
 // Evaluate n_tokens at the active slot's current position; logits_out receives
 // the last token's row when it is non-null.
 TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && !glm_vmm_expert_weights_call(*m)) return 0;
+    // Validate the entire submission before a first chunk can mutate KV/KDA.
+    if (m && m->host_token_embedding && !glm_host_token_embedding_call(*m,tokens,n_tokens)) return 0;
     if (m) m->batched_execution.begin_attempt();
     if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
-
+    glm_host_embedding_failure_guard host_guard{*m,*m->active_slot,m->host_token_embedding,m->active_slot->n_past};
+    glm_causal_call causal_call{*m,n_tokens,m->active_slot->n_past};
+    if (!causal_call.begin()) return 0;
+    const auto call_epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
+    auto run = [&]() -> int {
     const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
     int done = 0;
     // Per-ubatch slice of the queued vision-override rows. Row indices are
@@ -7375,7 +8736,8 @@ TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_to
                 }
             }
         }
-        if (!forward_ubatch(*m, tokens + done, take, last && logits_out != nullptr, logits_out,
+        float* call_logits = m->host_token_embedding ? m->logits.data() : logits_out;
+        if (!forward_ubatch(*m, tokens + done, take, last && logits_out != nullptr, call_logits,
                             nullptr, false,
                             ovr_rows.empty() ? nullptr : ovr_rows.data(),
                             ovr_idx.empty() ? nullptr : ovr_idx.data(),
@@ -7387,7 +8749,21 @@ TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_to
         done += take;
     }
     m->embd_ovr.clear();
+    if (m->host_token_embedding) {
+        if (tsg::g_ggml_error_count.load(std::memory_order_acquire) != call_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire)) return 0;
+        if (!causal_call.finish()) return 0;
+        if (logits_out) std::memcpy(logits_out,m->logits.data(),(size_t)m->hp.n_vocab * sizeof(float));
+    } else if (!causal_call.finish()) return 0;
+    host_guard.complete = true;
     return 1;
+    };
+    if (!m->host_token_embedding) return run();
+    try { return run(); }
+    catch (const std::exception& error) {
+        tsg::set_last_error(std::string("GLM Host token embedding forward failed: ") + error.what());
+    } catch (...) { tsg::set_last_error("GLM Host token embedding forward failed"); }
+    return 0;
 }
 
 /// Layer-major prefill: evaluate `n_tokens` in chunks of at most `chunk_rows`,
@@ -7397,15 +8773,40 @@ TSG_EXPORT int TSGgml_GlmForward(void * handle, const int32_t * tokens, int n_to
 /// order, so KV rows, KDA state and indexer pools advance exactly as in chunk
 /// order. Returns 0 on failure, -1 when this configuration needs the ordinary
 /// TSGgml_GlmForward (vision rows, TP, several devices, traces).
-TSG_EXPORT int TSGgml_GlmForwardLayerMajor(void * handle, const int32_t * tokens, int n_tokens, float * logits_out,
-                                           int chunk_rows)
+static int glm_forward_layer_major(void * handle, const int32_t * tokens, int n_tokens, float * logits_out,
+                                   int chunk_rows, float* h_out)
 {
     glm_model * m = (glm_model *) handle;
-    if (m) m->batched_execution.begin_attempt();
+    if (m && !glm_vmm_expert_weights_call(*m)) return 0;
+    const bool strict = m && m->layer_major_graph_cap_bytes;
+    const bool host_embedding = m && m->host_token_embedding;
+    const bool use_baton = m && m->device_baton_requested && n_tokens > chunk_rows;
+    if (use_baton && (chunk_rows != 512 || h_out || !m->active_slot
+        || m->slots.size() != 1 || m->slots.begin()->second.get() != m->active_slot
+        || !glm_layer_major_profile_supported(*m) || m->layer_major_graph_cap_bytes
+        || m->n_ctx != 2048 || m->n_ubatch != 512 || m->hp.n_embd != 4096
+        || m->hp.hc_mult != 4 || m->hp.n_vocab != 154880 || m->hp.n_layer != 45
+        || m->hp.n_expert != 288 || m->hp.n_ff_exp != 2048)) return 0;
+    if (host_embedding && (!glm_host_token_embedding_call(*m,tokens,n_tokens,h_out != nullptr)
+        || chunk_rows < 1 || chunk_rows > 512)) return 0;
+    if (m && !strict && !use_baton) m->batched_execution.begin_attempt();
     if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0 || chunk_rows <= 0 || !tokens) return 0;
+    if (strict) {
+        if (m->slots.size() != 1 || m->slots.begin()->second.get() != m->active_slot
+            || !glm_layer_major_profile_supported(*m)
+            || !layer_major_graph_cap::valid_call(n_tokens,m->active_slot->n_past,chunk_rows,h_out != nullptr,
+                !m->embd_ovr.empty(),true)) {
+            glm_strict_graph_refuse("actual submitted call is outside immutable profile1"); return 0;
+        }
+        for (int i = 0; i < n_tokens; ++i) if (tokens[i] < 0 || tokens[i] >= m->hp.n_vocab) {
+            glm_strict_graph_refuse("token is outside the loaded vocabulary"); return 0;
+        }
+        if (tsg::g_backend_compute_failed.load(std::memory_order_acquire)) return 0;
+        m->batched_execution.begin_attempt();
+    }
     if (!m->hp.g5n || m->tp != 1 || m->n_gpu > 1 || !m->embd_ovr.empty() || m->trace_dump != nullptr
         || (m->n_ubatch > 0 && chunk_rows > m->n_ubatch))
-        return -1;
+        return strict || host_embedding ? 0 : -1;
     glm_slot & slot = *m->active_slot;
     const int64_t start = slot.n_past;
     if (start + n_tokens > m->n_ctx)
@@ -7413,31 +8814,185 @@ TSG_EXPORT int TSGgml_GlmForwardLayerMajor(void * handle, const int32_t * tokens
         fprintf(stderr, "[glm] context overflow: %" PRId64 " + %d > %d\n", start, n_tokens, m->n_ctx);
         return 0;
     }
+    m->strict_call = {};
+    const auto strict_epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
+    std::size_t bank_bytes = 0;
+    if (use_baton) {
+        if (!tsg_glm::device_baton_bytes(static_cast<std::size_t>(m->hp.n_embd),
+            static_cast<std::size_t>(m->hp.hc_mult),static_cast<std::size_t>(n_tokens),bank_bytes)) return 0;
+        try {
+            if (!m->device_baton.open(ggml_backend_get_default_buffer_type(m->backends[0]),bank_bytes)) {
+                if (!glm_device_baton_close(*m)) m->device_baton_failed = true;
+                return 0; // Preflight refusal, never an ordinary Host fallback.
+            }
+        } catch (...) {
+            if (!glm_device_baton_close(*m)) m->device_baton_failed = true;
+            return 0;
+        }
+    }
+    if (use_baton) m->batched_execution.begin_attempt();
+    struct BatonReport {
+        glm_model& model; bool enabled, completed = false; int submitted; std::size_t bytes;
+        ~BatonReport() noexcept {
+            if (!enabled) return;
+            if (!completed) model.device_baton_failed = true;
+            const auto& bank = model.device_baton;
+            std::fprintf(stderr,"[GLM-LAYER-MAJOR-DEVICE-BATON] profile=1 submitted=%d chunk=512 bank_bytes=%zu"
+                " outcome=%s input_calls=%" PRIu64 " output_calls=%" PRIu64
+                " input_bytes=%" PRIu64 " output_bytes=%" PRIu64 " host_hidden_bytes=0"
+                " live_bank_bytes=%zu held_ticket_bytes=%zu scope=declared_payload_direct_stock_cuda_d2d\n",
+                submitted,bytes,completed ? "completed" : "failed",bank.input_calls,bank.output_calls,
+                bank.input_bytes,bank.output_bytes,bank.physical_bytes(),bank.held_ticket_bytes());
+        }
+    } baton_report{*m,use_baton,false,n_tokens,bank_bytes};
+    glm_host_embedding_failure_guard host_guard{*m,slot,host_embedding,start};
+    glm_causal_call causal_call{*m,n_tokens,start};
+    if (!causal_call.begin()) return 0;
+    struct strict_call_guard {
+        glm_model& model; glm_slot& slot; bool armed; int submitted; bool complete = false;
+        ~strict_call_guard() noexcept {
+            if (!armed) return;
+            if (!complete) {
+                // Includes dense/input/build exceptions, before any graph or
+                // ticket owner can retire after partially advanced KDA/KV state.
+                for (int d = 0; d < model.n_backends; ++d)
+                    try { ggml_backend_synchronize(model.backends[d]); } catch (...) {}
+                slot.kda_restore_failed = true; model.kda_snap.valid = false; model.kda_prefix.valid = false;
+                model.prefix_window.invalidate();
+            }
+            const auto& s = model.strict_call;
+            fprintf(stderr,"[GLM-STRICT-GRAPH-CAP] profile=1 cap_bytes=%zu submitted=%d chunk=512 context=2048 outcome=%s"
+                " graph_builds=%" PRIu64 " graph_reuses=%" PRIu64 " peak_graph_device_bytes=%" PRIu64
+                " cap_refusals=%" PRIu64 " scope=wrapped_declared_payload_not_total_vram\n",
+                model.layer_major_graph_cap_bytes,submitted,complete ? "completed" : "failed",
+                s.builds,s.reuses,s.peak,s.refusals);
+        }
+    } strict_guard{*m,slot,strict,n_tokens};
     try
     {
         const int chunks = (n_tokens + chunk_rows - 1) / chunk_rows;
+        // This optional request owns all worker/source lifetimes. Whole-layer
+        // reads are useful only for broad prefill route unions; ordinary decode
+        // and short requests retain their existing demand-only I/O.
+        std::unique_ptr<tsg::HostMoeLayerPrefetch> expert_prefetch;
+        const char* prefetch_env = std::getenv("TS_HOST_MOE_LAYER_PREFETCH");
+        if (!strict && !host_embedding && prefetch_env && prefetch_env[0] == '1' && prefetch_env[1] == '\0'
+            && n_tokens >= 512 && tsg::host_moe_prefetch_capacity() > 0)
+        {
+            try { expert_prefetch = std::make_unique<tsg::HostMoeLayerPrefetch>(tsg::host_moe_prefetch_acquire); }
+            catch (...) {} // Optional metadata/thread admission cannot fail inference.
+        }
+        struct PrefetchReport {
+            std::unique_ptr<tsg::HostMoeLayerPrefetch>& owner;
+            std::uint64_t useful_before;
+            ~PrefetchReport() {
+                if (!owner) return;
+                owner->stop();
+                tsg::host_moe_prefetch_discard();
+                const auto s = owner->stats();
+                const auto useful = tsg::host_moe_prefetch_hit_bytes() - useful_before;
+                fprintf(stderr, "[glm-layer-prefetch] layers=%" PRIu64 " planned_bytes=%" PRIu64
+                    " read_bytes=%" PRIu64 " hit_bytes=%" PRIu64 " useful_bytes=%" PRIu64 " refused=%" PRIu64
+                    " failures=%" PRIu64 " cancelled_items=%" PRIu64 " peak_retained_bytes=%zu demand_wait_ms=%.3f\n",
+                    s.layers, s.planned_bytes, s.read_bytes, s.hit_bytes, useful, s.refused, s.failures,
+                    s.cancelled_items, s.peak_retained_bytes, s.demand_wait_ns / 1.0e6);
+            }
+        } prefetch_report{expert_prefetch, expert_prefetch ? tsg::host_moe_prefetch_hit_bytes() : 0};
         const size_t row = (size_t) m->hp.n_embd * (size_t) m->hp.hc_mult;
         std::vector<std::vector<float>> hidden((size_t) chunks);
-        for (int c = 0; c < chunks; ++c)
+        if (!use_baton) for (int c = 0; c < chunks; ++c)
             hidden[(size_t) c].resize(row * (size_t) std::min(chunk_rows, n_tokens - c * chunk_rows));
         for (int il = 0; il < m->hp.n_layer; ++il)
         {
+            if (expert_prefetch)
+            {
+                // Resolve source handles outside the expert-cache mutex. The
+                // workers retain the exact registered files, never mmap-address
+                // guesses, even if this request exits while a read is pending.
+                expert_prefetch->discard_prepared();
+                try {
+                    const int next = il + 1;
+                    if (next < m->hp.n_layer && m->hp.n_expert > 0) {
+                        const auto& w = m->layers.at(next).w[0];
+                        if (w.ffn_gate_exps && w.ffn_up_exps && w.ffn_down_exps) {
+                            const auto segment = selected_expert_segment(*m, next, chunk_rows, false);
+                            const void* pointers[] = {segment.gate_data, segment.up_data, segment.down_data};
+                            const std::int64_t totals[] = {segment.gate_bytes, segment.up_bytes, segment.down_bytes};
+                            std::array<std::shared_ptr<tsg::ExpertFileSource>, 3> sources;
+                            if (tsg::host_moe_file_batch_sources(pointers, totals, sources) == 1) {
+                                std::array<std::size_t, 3> stride{};
+                                bool valid = true;
+                                for (int part = 0; part < 3; ++part) {
+                                    if (totals[part] <= 0 || totals[part] % m->hp.n_expert) valid = false;
+                                    else stride[part] = static_cast<std::size_t>(totals[part] / m->hp.n_expert);
+                                }
+                                if (valid) {
+                                    std::vector<tsg::HostMoeLayerPrefetch::Item> items;
+                                    items.reserve(static_cast<std::size_t>(m->hp.n_expert) * 3);
+                                    for (int expert = 0; expert < m->hp.n_expert; ++expert)
+                                        for (int part = 0; part < 3; ++part) {
+                                            auto source = sources[part];
+                                            items.push_back({source->identity(), static_cast<std::uint64_t>(expert) * stride[part],
+                                                stride[part], [source](std::uint64_t offset, void* data, std::size_t bytes) {
+                                                    source->read(offset, data, bytes);
+                                                }});
+                                        }
+                                    expert_prefetch->prepare(std::move(items), tsg::host_moe_prefetch_capacity());
+                                }
+                            }
+                        }
+                    }
+                } catch (...) { expert_prefetch->discard_prepared(); }
+            }
             for (int c = 0; c < chunks; ++c)
             {
                 const int first = c * chunk_rows;
                 const int nt = std::min(chunk_rows, n_tokens - first);
-                glm_layer_range range{ il, il + 1, start + first, hidden[(size_t) c].data() };
+                glm_layer_range range{ il, il + 1, start + first, use_baton ? nullptr : hidden[(size_t) c].data(),
+                    expert_prefetch ? expert_prefetch->hooks() : nullptr, strict, use_baton,
+                    static_cast<std::size_t>(first) * row * sizeof(float) };
                 const bool last = il == m->hp.n_layer - 1 && c == chunks - 1;
-                if (!forward_ubatch(*m, tokens + first, nt, last && logits_out != nullptr, last ? logits_out : nullptr,
-                                    nullptr, false, nullptr, nullptr, 0, &range))
+                float* h_chunk = h_out && il == m->hp.n_layer - 1
+                    ? h_out + static_cast<std::size_t>(first) * m->hp.n_embd : nullptr;
+                float* call_logits = strict || host_embedding ? m->logits.data() : logits_out;
+                if (!forward_ubatch(*m, tokens + first, nt, last && logits_out != nullptr, last ? call_logits : nullptr,
+                                    h_chunk, false, nullptr, nullptr, 0, &range))
                 {
                     // Earlier ranges already advanced KV and KDA state.
                     slot.kda_restore_failed = true;
                     return 0;
                 }
             }
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (strict && m->strict_fail_after_layer == il) {
+                m->strict_fail_after_layer = -1;
+                ++m->strict_failure_count;
+                throw std::runtime_error("Injected strict layer-major failure after completed layer " + std::to_string(il));
+            }
+#endif
         }
+        if ((strict || host_embedding) && (tsg::g_ggml_error_count.load(std::memory_order_acquire) != strict_epoch
+            || tsg::g_backend_compute_failed.load(std::memory_order_acquire))) return 0;
+        if (use_baton) {
+            const auto expected = static_cast<std::uint64_t>(m->hp.n_layer - 1) * bank_bytes;
+            if (m->device_baton.input_bytes != expected || m->device_baton.output_bytes != expected
+                || m->device_baton.input_calls != static_cast<std::uint64_t>((m->hp.n_layer - 1) * chunks)
+                || m->device_baton.output_calls != m->device_baton.input_calls
+                || !glm_device_baton_close(*m)
+                || tsg::g_ggml_error_count.load(std::memory_order_acquire) != strict_epoch
+                || tsg::g_backend_compute_failed.load(std::memory_order_acquire)) return 0;
+            ++m->baton_completed_calls; m->baton_last_bytes = bank_bytes;
+            m->baton_last_input_bytes = m->device_baton.input_bytes;
+            m->baton_last_output_bytes = m->device_baton.output_bytes;
+            m->baton_last_input_calls = m->device_baton.input_calls;
+            m->baton_last_output_calls = m->device_baton.output_calls;
+            baton_report.completed = true;
+        }
+        if (!causal_call.finish()) return 0;
+        if ((strict || host_embedding) && logits_out) std::memcpy(logits_out,m->logits.data(),(size_t)m->hp.n_vocab * sizeof(float));
         slot.n_past = start + n_tokens;
+        strict_guard.complete = true;
+        host_guard.complete = true;
         return 1;
     }
     catch (...)
@@ -7447,6 +9002,22 @@ TSG_EXPORT int TSGgml_GlmForwardLayerMajor(void * handle, const int32_t * tokens
     }
 }
 
+TSG_EXPORT int TSGgml_GlmForwardLayerMajor(void * handle, const int32_t * tokens, int n_tokens, float * logits_out,
+                                           int chunk_rows)
+{
+    return glm_forward_layer_major(handle, tokens, n_tokens, logits_out, chunk_rows, nullptr);
+}
+
+// Draft catch-up needs the normalized hidden state of every prompt row. Keep
+// layer-major expert residency while exporting those rows only at the final
+// trunk layer; the target's logits and recurrence are otherwise unchanged.
+TSG_EXPORT int TSGgml_GlmSpecForwardLayerMajor(void * handle, const int32_t * tokens, int n_tokens,
+                                              float* h_out, float* logits_out, int chunk_rows)
+{
+    if (!h_out) return 0;
+    return glm_forward_layer_major(handle, tokens, n_tokens, logits_out, chunk_rows, h_out);
+}
+
 /// Queue projected vision-embedding rows to override the token embeddings of
 /// image-placeholder positions in the NEXT TSGgml_GlmForward call. `index` is
 /// the first placeholder's position within that call's token array. Cleared
@@ -7454,6 +9025,7 @@ TSG_EXPORT int TSGgml_GlmForwardLayerMajor(void * handle, const int32_t * tokens
 TSG_EXPORT int TSGgml_GlmQueueVisionRows(void * handle, const float * rows, int n_rows, int index)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && m->host_token_embedding) return 0;
     if (!m || !rows || n_rows <= 0 || index < 0) return 0;
     if (!m->hp.g5n)
     {
@@ -7483,6 +9055,8 @@ TSG_EXPORT int TSGgml_GlmForwardBatchedDecode(void * handle, int n, const int32_
                                               float * logits_out)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && !glm_vmm_expert_weights_call(*m)) return 0;
+    if (m && m->host_token_embedding) return 0;
     if (m) m->batched_execution.begin_attempt();
     if (!m || n < 2 || !slot_ids || !tokens || !positions || !logits_out) return 0;
     if (n > MAX_BATCHED_DECODE) return 0;
@@ -7541,14 +9115,18 @@ TSG_EXPORT int TSGgml_GlmLastBatchedExecution(void * handle, std::uint64_t * id,
 TSG_EXPORT int TSGgml_GlmResetChecked(void * handle)
 {
     glm_model * m = (glm_model *) handle;
-    if (!m || !m->active_slot) return 0;
+    if (!m || !m->active_slot || m->device_baton_failed || m->device_baton.owned()) return 0;
     auto & slot = *m->active_slot;
+    m->prefix_window.invalidate();
     slot.kda_restore_failed = true;
     if (m->kda_snap.slot_id == slot.id) m->kda_snap.valid = false;
     try
     {
         if (m->hp.g5n) slot_clear_recurrent(*m, slot);
         slot.n_past = 0;
+        if (m->causal_neighbor.requested() && m->causal_neighbor.configured()
+            && !tsg::host_moe_causal_reset(m->causal_neighbor, true))
+            throw std::runtime_error("Causal-route reset could not recover its checked controller");
         slot.kda_restore_failed = false;
         return 1;
     }
@@ -7587,7 +9165,10 @@ TSG_EXPORT int TSGgml_GlmRewind(void * handle, int n_past)
 TSG_EXPORT int TSGgml_GlmSlotAlloc(void * handle)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && (m->device_baton_failed || m->device_baton.owned())) return -1;
     if (!m) return -1;
+    if (m->causal_neighbor.requested() && (!m->slots.empty()
+        || (m->causal_neighbor.configured() && !tsg::host_moe_causal_reset(m->causal_neighbor, false)))) return -1;
     try
     {
         tsg::g_last_error.reserve(256);
@@ -7677,6 +9258,8 @@ static void glm_slot_copy_sync(glm_model & m)
 TSG_EXPORT int TSGgml_GlmSlotCopyInto(void * handle, int source_id, int destination_id, int expected_n_past)
 {
     auto * m = static_cast<glm_model *>(handle);
+    if (m && (m->device_baton_failed || m->device_baton.owned())) return 0;
+    if (m && m->causal_neighbor.requested()) return 0;
     glm_slot * destination = nullptr;
     bool destructive = false;
     auto refuse = [](const char * message) noexcept {
@@ -7731,6 +9314,7 @@ TSG_EXPORT int TSGgml_GlmSlotCopyInto(void * handle, int source_id, int destinat
         // The old destination head remains unpublished until all copies drain.
         destination->kda_restore_failed = true;
         destructive = true;
+        m->prefix_window.invalidate();
         if (m->kda_snap.slot_id == destination_id) m->kda_snap.valid = false;
         bool copied = false;
         for (int rank = 0; rank < m->tp; ++rank)
@@ -7829,9 +9413,13 @@ TSG_TEST_EXPORT int TSGgml_GlmTestSlotCompare(void * handle, int source_id, int 
 TSG_EXPORT int TSGgml_GlmSetActiveSlot(void * handle, int slot_id)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && (m->device_baton_failed || m->device_baton.owned())) return 0;
     if (!m) return 0;
     auto it = m->slots.find(slot_id);
     if (it == m->slots.end()) return 0;
+    if (m->causal_neighbor.requested() && m->causal_neighbor.configured() && m->active_slot != it->second.get()
+        && !tsg::host_moe_causal_reset(m->causal_neighbor, false)) return 0;
+    if (m->active_slot != it->second.get()) m->prefix_window.invalidate();
     m->active_slot = it->second.get();
     return 1;
 }
@@ -7839,9 +9427,12 @@ TSG_EXPORT int TSGgml_GlmSetActiveSlot(void * handle, int slot_id)
 TSG_EXPORT int TSGgml_GlmSlotFree(void * handle, int slot_id)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && (m->device_baton_failed || m->device_baton.owned())) return 0;
     if (!m) return 0;
     auto it = m->slots.find(slot_id);
     if (it == m->slots.end()) return 0;
+    if (m->causal_neighbor.requested() && m->causal_neighbor.configured()
+        && !tsg::host_moe_causal_reset(m->causal_neighbor, false)) return 0;
     if (m->active_slot == it->second.get())
         m->active_slot = nullptr;
     slot_free(*m, slot_id);
@@ -7902,6 +9493,8 @@ TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int 
                                      float * h_out, float * logits_out, int all_logits_rows)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && !glm_vmm_expert_weights_call(*m)) return 0;
+    if (m && m->host_token_embedding) return 0;
     if (!m || !m->active_slot || m->active_slot->kda_restore_failed || n_tokens <= 0) return 0;
 
     int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
@@ -7910,9 +9503,13 @@ TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int 
     // the decode arithmetic width. Split those windows into bounded graphs,
     // retaining every hidden/logit row and the original rollback snapshot.
     // Prefill has no snapshot at its current position and keeps its ubatch.
-    if (m->hp.g5n && m->kda_snap.valid && m->kda_snap.slot_id == m->active_slot->id &&
-        m->kda_snap.n_past == m->active_slot->n_past)
+    const bool fresh_snapshot = m->hp.g5n && m->kda_snap.valid && m->kda_snap.slot_id == m->active_slot->id &&
+        m->kda_snap.n_past == m->active_slot->n_past;
+    if (fresh_snapshot)
         ub = std::min(ub, (int) TSG_PRECISION_DECODE_COLUMNS);
+    const bool capture_prefix = tsg::GlmVerifiedPrefixWindow::capture_shape(
+        m->flash_mtp_prefix_commit, fresh_snapshot, n_tokens, ub,
+        all_logits_rows != 0, h_out != nullptr, logits_out != nullptr);
     const int64_t n_embd = m->hp.n_embd;
     const int64_t n_vocab = m->hp.n_vocab;
     int done = 0;
@@ -7926,7 +9523,8 @@ TSG_EXPORT int TSGgml_GlmSpecForward(void * handle, const int32_t * tokens, int 
         float * h_chunk = h_out ? h_out + (int64_t) done * n_embd : nullptr;
         float * l_chunk = (want_logits && all_logits_rows != 0) ? logits_out + (int64_t) done * n_vocab
                                                                 : logits_out;
-        if (!forward_ubatch(*m, tokens + done, take, want_logits, l_chunk, h_chunk, all_logits_rows != 0))
+        if (!forward_ubatch(*m, tokens + done, take, want_logits, l_chunk, h_chunk, all_logits_rows != 0,
+            nullptr, nullptr, 0, nullptr, capture_prefix))
             return 0;
         done += take;
     }
@@ -7940,9 +9538,19 @@ TSG_EXPORT int TSGgml_GlmMtpDraftStep(void * handle, int token, const float * h_
                                       float * logits_out, float * h_out)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && !glm_vmm_expert_weights_call(*m)) return 0;
+    if (m && m->host_token_embedding) return 0;
     if (!m || !m->active_slot || !h_prev || pos < 0) return 0;
+    if (m->flash_mtp) {
+        FlashMtpInputWindow input;
+        if (!flash_mtp_map_inputs(pos, 1, m->n_ctx, m->hp.indexer_top_k, false, input)) return 0;
+        pos = (int) input.position;
+    }
     const int32_t tok = token;
-    return mtp_forward(*m, &tok, 1, h_prev, pos, /*want_logits=*/true, logits_out, h_out) ? 1 : 0;
+    try { return mtp_forward(*m, &tok, 1, h_prev, pos, /*want_logits=*/true, logits_out, h_out) ? 1 : 0; }
+    catch (const std::exception& error) { fprintf(stderr, "[glm] MTP draft failed: %s\n", error.what()); }
+    catch (...) { fprintf(stderr, "[glm] MTP draft failed with an unknown exception\n"); }
+    return 0;
 }
 
 /// Replay verified trunk tokens through the draft block so its KV cache tracks
@@ -7951,23 +9559,44 @@ TSG_EXPORT int TSGgml_GlmMtpCatchUp(void * handle, const int32_t * tokens, int n
                                     const float * h_rows, int start_pos)
 {
     glm_model * m = (glm_model *) handle;
+    if (m && !glm_vmm_expert_weights_call(*m)) return 0;
+    if (m && m->host_token_embedding) return 0;
     if (!m || !m->active_slot || !tokens || !h_rows || n_tokens <= 0 || start_pos < 0) return 0;
+    if (m->flash_mtp) {
+        FlashMtpInputWindow input;
+        if (!m->selected_expert_seams || m->active_slot->kda_restore_failed
+            || !flash_mtp_map_inputs(start_pos, n_tokens, m->n_ctx, m->hp.indexer_top_k, true, input)) return 0;
+        // Validate even the omitted synthetic row. No graph or cache mutation
+        // occurs for a one-token first chunk; its real hidden row is paired with
+        // the next token by the runtime's normal chunk carry.
+        for (int i = 0; i < n_tokens; ++i)
+            if (tokens[i] < 0 || tokens[i] >= m->hp.n_vocab) return 0;
+        tokens += input.skip_rows;
+        h_rows += input.skip_rows * m->hp.n_embd;
+        start_pos = (int) input.position;
+        n_tokens = (int) input.rows;
+        if (n_tokens == 0) return 1;
+    }
 
     // A prompt-sized catch-up is chunked like any other pass; the draft block is
     // one layer, but a 1M-token prompt would still build a graph over the whole
     // window otherwise.
     const int ub = m->n_ubatch > 0 ? m->n_ubatch : 512;
     const int64_t n_embd = m->hp.n_embd;
-    int done = 0;
-    while (done < n_tokens)
-    {
-        const int take = std::min(ub, n_tokens - done);
-        if (!mtp_forward(*m, tokens + done, take, h_rows + (int64_t) done * n_embd, start_pos + done,
-                         /*want_logits=*/false, nullptr, nullptr))
-            return 0;
-        done += take;
-    }
-    return 1;
+    try {
+        int done = 0;
+        while (done < n_tokens)
+        {
+            const int take = std::min(ub, n_tokens - done);
+            if (!mtp_forward(*m, tokens + done, take, h_rows + (int64_t) done * n_embd, start_pos + done,
+                             /*want_logits=*/false, nullptr, nullptr))
+                return 0;
+            done += take;
+        }
+        return 1;
+    } catch (const std::exception& error) { fprintf(stderr, "[glm] MTP catch-up failed: %s\n", error.what()); }
+    catch (...) { fprintf(stderr, "[glm] MTP catch-up failed with an unknown exception\n"); }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -7992,6 +9621,53 @@ static thread_local int glm_test_kda_stage = 0, glm_test_kda_kind = 0;
 #ifndef TSG_TEST_EXPORT
 #define TSG_TEST_EXPORT TSG_EXPORT
 #endif
+// Fixture oracle for the public Flash adapter: the caller supplies the
+// reference's already left-shifted token/hidden pairs and draft positions.
+// This bypass exists only in test builds, not in the production API.
+TSG_TEST_EXPORT void TSGgml_GlmTestPriorBackendError()
+{
+    // Simulate a completed earlier operation that logged a backend error.
+    // No active graph or slot is failed by this historical epoch increment.
+    tsg::g_ggml_error_count.fetch_add(1, std::memory_order_acq_rel);
+}
+// A separate fresh oracle model may request the legacy broad expert plan.
+// This test-only choice is unavailable once any plan, graph or KV is live.
+TSG_TEST_EXPORT int TSGgml_GlmTestMtpBroadExpertPlan(void* handle)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m || !m->flash_mtp || m->selected_expert_seams || m->selected_expert_minimum_bytes
+        || !m->graph_cache.empty()) return 0;
+    for (const auto& slot : m->slots) if (slot.second->n_past != 0) return 0;
+    m->flash_mtp_shape_plan = false;
+    return 1;
+}
+TSG_TEST_EXPORT int TSGgml_GlmTestMtpExpertPlan(void* handle, int64_t* values, int count)
+{
+    const auto* m = static_cast<const glm_model*>(handle);
+    if (!m || !m->flash_mtp || !values || count != 5) return 0;
+    const auto key = tsg::host_moe_expert_group_key(selected_expert_segment(*m, m->mtp_layer, 1, false));
+    for (const auto& group : m->selected_expert_group_minima) if (group.key == key) {
+        values[0] = group.decode_rows; values[1] = group.prefill_rows;
+        values[2] = static_cast<int64_t>(group.narrow_bytes); values[3] = static_cast<int64_t>(group.wide_bytes);
+        values[4] = static_cast<int64_t>(m->selected_expert_minimum_bytes); return 1;
+    }
+    return 0;
+}
+TSG_TEST_EXPORT int TSGgml_GlmTestMtpReferenceForward(void * handle, const int32_t * tokens,
+        int n_tokens, const float * h_rows, int draft_position, float * logits_out, float * h_out)
+{
+    glm_model * m = (glm_model *) handle;
+    if (!m || !m->flash_mtp || !m->active_slot || !tokens || !h_rows || n_tokens <= 0 || draft_position < 0)
+        return 0;
+    try {
+        return mtp_forward(*m, tokens, n_tokens, h_rows, draft_position,
+            logits_out != nullptr, logits_out, h_out) ? 1 : 0;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[glm] test MTP reference forward failed: %s\n", error.what());
+    } catch (...) { fprintf(stderr, "[glm] test MTP reference forward failed\n"); }
+    return 0;
+}
+
 TSG_TEST_EXPORT void TSGgml_GlmTestKdaSnapshotFault(int stage, int kind)
 {
     glm_test_kda_stage = stage;
@@ -8015,28 +9691,36 @@ static void glm_test_kda_fault(int stage)
 /// Make sure the snapshot arena mirrors the active slot's state tensors (same
 /// shapes, same buffer types). All slots share one arena because their state
 /// tensors are allocated identically; a shape mismatch (defensive) rebuilds it.
-static bool kda_snapshot_ensure(glm_model & m, glm_slot & slot)
+static bool kda_snapshot_matches(const glm_model & m, const glm_slot & slot,
+                                 const glm_model::kda_snapshot & snap)
 {
-    glm_model::kda_snapshot & snap = m.kda_snap;
     bool fits = !snap.ctxs.empty();
     for (int r = 0; r < m.tp && fits; r++)
     {
-        if (snap.conv[r].size() != slot.kda_conv[r].size() || snap.ssm[r].size() != slot.kda_ssm[r].size())
+        if (snap.conv[r].size() != slot.kda_conv[r].size() || snap.ssm[r].size() != slot.kda_ssm[r].size()
+            || slot.kda_conv[r].size() != slot.kda_ssm[r].size())
         { fits = false; break; }
         for (size_t il = 0; il < slot.kda_conv[r].size() && fits; il++)
         {
             ggml_tensor * a = slot.kda_conv[r][il], * b = snap.conv[r][il];
             ggml_tensor * c = slot.kda_ssm[r][il],  * d = snap.ssm[r][il];
             if ((a == nullptr) != (b == nullptr) || (c == nullptr) != (d == nullptr)) { fits = false; break; }
-            if (a && (!ggml_are_same_shape(a, b) || a->type != b->type
+            if (a && (!a->buffer || !b->buffer || !ggml_are_same_shape(a, b) || a->type != b->type
                       || ggml_backend_buffer_get_type(a->buffer) != ggml_backend_buffer_get_type(b->buffer)))
             { fits = false; break; }
-            if (c && (!ggml_are_same_shape(c, d) || c->type != d->type
+            if (c && (!c->buffer || !d->buffer || !ggml_are_same_shape(c, d) || c->type != d->type
                       || ggml_backend_buffer_get_type(c->buffer) != ggml_backend_buffer_get_type(d->buffer)))
             { fits = false; break; }
         }
     }
-    if (fits) return true;
+    return fits;
+}
+
+static bool kda_snapshot_ensure(glm_model & m, glm_slot & slot, glm_model::kda_snapshot & snap,
+                                bool stable = false)
+{
+    if (kda_snapshot_matches(m, slot, snap)) return true;
+    if (stable && m.prefix_binding) return false; // Cached graphs must never see rebound tensor pointers.
     snap.release();
 
     // Group the mirrors by buffer type (one context + one buffer each), so a
@@ -8087,7 +9771,12 @@ static bool kda_snapshot_ensure(glm_model & m, glm_slot & slot)
     }
     for (size_t g = 0; g < bufts.size(); g++)
     {
-        snap.bufs[g] = ggml_backend_alloc_ctx_tensors_from_buft(snap.ctxs[g], bufts[g]);
+        int rank = m.n_gpu;
+        for (int d = 0; d < m.n_gpu; ++d)
+            if (ggml_backend_get_default_buffer_type(m.backends[d]) == bufts[g]) { rank = d; break; }
+        if (m.flash_mtp && rank == m.n_gpu) { snap.release(); return false; }
+        snap.bufs[g] = tsg::graph_budget_alloc_ctx_tensors_from_buft(snap.ctxs[g], bufts[g], rank,
+            m.flash_mtp ? 7 : 2);
         if (!snap.bufs[g])
         {
             fprintf(stderr, "[glm] KDA snapshot arena allocation failed (%s)\n", ggml_backend_buft_name(bufts[g]));
@@ -8106,6 +9795,27 @@ static void kda_snapshot_sync(glm_model & m)
         if (m.backends[i]) ggml_backend_synchronize(m.backends[i]);
 }
 
+// The serialized model owner calls this before admission. Count physical
+// snapshot arenas, independently of whether their saved state is valid: a
+// capture can fail after allocation and those bytes remain charged and live.
+// Draft graph buffers are different owners and must never enter this total.
+TSG_EXPORT int64_t TSGgml_GlmKdaSnapshotBytes(void * handle)
+{
+    const auto * m = static_cast<const glm_model *>(handle);
+    if (!m) return -1;
+    try {
+        uint64_t bytes = 0;
+        for (const auto* snapshot : { &m->kda_snap, &m->kda_prefix })
+            for (auto buffer : snapshot->bufs) {
+                if (!buffer) continue;
+                const size_t size = ggml_backend_buffer_get_size(buffer);
+                if (size > static_cast<uint64_t>(INT64_MAX) - bytes) return -1;
+                bytes += size;
+            }
+        return static_cast<int64_t>(bytes);
+    } catch (...) { return -1; }
+}
+
 /// Copy the active slot's KDA recurrent state into the snapshot arena and
 /// record the slot's position. Returns 1 on success. On glm-dsa proper (no
 /// recurrent state) only the position is recorded, so a restore is a rewind.
@@ -8116,10 +9826,16 @@ static int glm_kda_state_capture(void * handle)
     glm_slot & slot = *m->active_slot;
     glm_model::kda_snapshot & snap = m->kda_snap;
     snap.valid = false;
+    m->prefix_window.invalidate();
     glm_test_kda_fault(1);
     if (m->hp.g5n)
     {
-        if (!kda_snapshot_ensure(*m, slot)) return 0;
+        if (!kda_snapshot_ensure(*m, slot, snap)) return 0;
+        if (m->flash_mtp_prefix_commit) {
+            if (!kda_snapshot_ensure(*m, slot, m->kda_prefix, true)) return 0;
+            m->prefix_binding = 1;
+        }
+        glm_test_kda_fault(3); // complete allocation must remain owned on a later capture failure
         kda_snapshot_sync(*m);
         for (int r = 0; r < m->tp; r++)
         {
@@ -8147,6 +9863,7 @@ static int glm_kda_state_restore(void * handle)
     if (!m || !m->active_slot) return -1;
     glm_slot & slot = *m->active_slot;
     glm_model::kda_snapshot & snap = m->kda_snap;
+    m->prefix_window.invalidate();
     if (!snap.valid || snap.slot_id != slot.id || snap.n_past > slot.n_past)
     {
         fprintf(stderr, "[glm] KDA state restore refused: no snapshot for slot %d at or before position %" PRId64 "\n",
@@ -8169,8 +9886,10 @@ static int glm_kda_state_restore(void * handle)
                 ggml_tensor * a = slot.kda_conv[r][il], * b = snap.conv[r][il];
                 ggml_tensor * c = slot.kda_ssm[r][il],  * d = snap.ssm[r][il];
                 if ((a == nullptr) != (b == nullptr) || (c == nullptr) != (d == nullptr)) return -1;
-                if (a && !ggml_are_same_shape(a, b)) return -1;
-                if (c && !ggml_are_same_shape(c, d)) return -1;
+                if (a && (!ggml_are_same_shape(a, b) || a->type != b->type
+                    || ggml_backend_buffer_get_type(a->buffer) != ggml_backend_buffer_get_type(b->buffer))) return -1;
+                if (c && (!ggml_are_same_shape(c, d) || c->type != d->type
+                    || ggml_backend_buffer_get_type(c->buffer) != ggml_backend_buffer_get_type(d->buffer))) return -1;
             }
         }
         kda_snapshot_sync(*m);
@@ -8199,6 +9918,7 @@ static int glm_kda_state_restore(void * handle)
 TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
 {
     auto * m = (glm_model *) handle;
+    if (m && m->host_token_embedding) return 0;
     if (!m || !m->active_slot || m->active_slot->kda_restore_failed) return 0;
     try { return glm_kda_state_capture(handle); }
     catch (const std::exception & error)
@@ -8207,6 +9927,7 @@ TSG_EXPORT int TSGgml_GlmKdaStateCapture(void * handle)
     }
     catch (...) { fprintf(stderr, "[glm] KDA capture failed with an unknown exception\n"); }
     m->kda_snap.valid = false;
+    m->prefix_window.invalidate();
     return 0;
 }
 
@@ -8221,11 +9942,105 @@ TSG_EXPORT int TSGgml_GlmKdaStateRestore(void * handle)
     }
     catch (...) { fprintf(stderr, "[glm] KDA restore failed with an unknown exception; reset required\n"); }
     m->kda_snap.valid = false;
+    m->prefix_window.invalidate();
     m->active_slot->kda_restore_failed = true;
     return -1;
 }
 
+// 1: exact first-row state committed, 0: not applicable and no copy attempted,
+// -1: failed/poisoned. This initial adapter deliberately supports only m=0,k=1.
+TSG_EXPORT int TSGgml_GlmCommitVerifiedPrefix(void* handle, int expected_base_position,
+                                             int accepted_drafts, int verify_drafts)
+{
+    auto* m = static_cast<glm_model*>(handle);
+    if (!m || !m->flash_mtp_prefix_commit || !m->active_slot) return 0;
+    auto& slot = *m->active_slot;
+    if (slot.kda_restore_failed) return -1;
+    if (!m->kda_snap.valid || m->kda_snap.slot_id != slot.id || m->kda_snap.n_past != expected_base_position
+        || !m->prefix_window.can_commit(slot.id, expected_base_position, slot.n_past,
+            accepted_drafts, verify_drafts, m->prefix_binding)) return 0;
+    try {
+        if (!kda_snapshot_matches(*m, slot, m->kda_prefix)) return 0;
+        for (int rank = 0; rank < m->tp; ++rank)
+            for (size_t il = 0; il < slot.kda_conv[rank].size(); ++il)
+                for (auto pair : { std::make_pair(m->kda_prefix.conv[rank][il], slot.kda_conv[rank][il]),
+                                   std::make_pair(m->kda_prefix.ssm[rank][il], slot.kda_ssm[rank][il]) })
+                    if (pair.first && (!glm_slot_copy_layout(pair.first, pair.second)
+                        || ggml_backend_buffer_is_host(pair.second->buffer))) return 0;
+
+        const auto epoch = tsg::g_ggml_error_count.load(std::memory_order_acquire);
+        auto healthy = [&] {
+            return tsg::g_ggml_error_count.load(std::memory_order_acquire) == epoch
+                && !tsg::g_backend_compute_failed.load(std::memory_order_acquire);
+        };
+        kda_snapshot_sync(*m);
+        if (!healthy()) throw std::runtime_error("prefix source synchronization failed");
+        // Mark the slot unusable before any copy. The head is published last,
+        // and any partial failure keeps this poison until ResetChecked succeeds.
+        slot.kda_restore_failed = true;
+        for (int rank = 0; rank < m->tp; ++rank)
+            for (size_t il = 0; il < slot.kda_conv[rank].size(); ++il)
+                for (auto pair : { std::make_pair(m->kda_prefix.conv[rank][il], slot.kda_conv[rank][il]),
+                                   std::make_pair(m->kda_prefix.ssm[rank][il], slot.kda_ssm[rank][il]) }) {
+                    if (!pair.first) continue;
+                    // Use the direct device hook. Never fall back to a host
+                    // staging allocation if a backend declines this copy.
+                    if (!pair.second->buffer->iface.cpy_tensor(pair.second->buffer, pair.first, pair.second))
+                        throw std::runtime_error("prefix direct device copy refused");
+                    glm_test_kda_fault(4); // after at least one physical state copy
+                }
+        kda_snapshot_sync(*m);
+        if (!healthy()) throw std::runtime_error("prefix destination synchronization failed");
+        slot.n_past = static_cast<int64_t>(expected_base_position) + 1;
+        slot.kda_restore_failed = false;
+        m->prefix_window.invalidate();
+        return 1;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[glm] prefix state commit failed; reset required: %s\n", error.what());
+    } catch (...) { fprintf(stderr, "[glm] prefix state commit failed; reset required\n"); }
+    try { kda_snapshot_sync(*m); } catch (...) {}
+    m->prefix_window.invalidate();
+    m->kda_snap.valid = false;
+    slot.kda_restore_failed = true;
+    return -1;
+}
+
+TSG_EXPORT int TSGgml_GlmFreeChecked(void * handle)
+{
+    if (!handle) return 1;
+    auto& model = *static_cast<glm_model*>(handle);
+    if (model.causal_neighbor.requested() && !tsg::host_moe_causal_close(model.causal_neighbor)) {
+        std::fprintf(stderr, "[glm] model cleanup refused: causal-route metadata retains checked owner\n");
+        return 0;
+    }
+    if (!tsg::host_moe_causal_model_release_ready()) {
+        std::fprintf(stderr, "[glm] model cleanup refused: another causal-route scope retains checked ownership\n");
+        return 0;
+    }
+    if (!glm_device_baton_close(model)) {
+        model.device_baton_failed = true;
+        std::fprintf(stderr,"[glm] model cleanup refused: layer-major baton retains its physical owner or checked ticket\n");
+        return 0;
+    }
+    if (!tsg::host_moe_file_source_view_model_release_ready()) {
+        fprintf(stderr, "[glm] model cleanup refused: expert source views require checked final close first\n");
+        return 0;
+    }
+    if (!tsg::host_moe_vmm_model_release_ready()) {
+        fprintf(stderr, "[glm] model cleanup refused: VMM expert owners require checked final close first\n");
+        return 0;
+    }
+    // Physical model deletion follows checked source-view/VMM preconditions. Legacy
+    // graph/embedding destructor callbacks still use void release; failed
+    // accounting acknowledgment there is retained by the managed scope, not a
+    // live model handle that could safely be deleted again.
+    delete (glm_model *) handle;
+    return 1;
+}
+
 TSG_EXPORT void TSGgml_GlmFree(void * handle)
 {
-    delete (glm_model *) handle;
+    // Legacy callers cannot receive a status, but must never destroy the model
+    // or its source/backend while a checked VMM owner still requires them.
+    (void) TSGgml_GlmFreeChecked(handle);
 }

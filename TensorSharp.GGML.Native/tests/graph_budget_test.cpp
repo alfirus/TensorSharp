@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <thread>
 #include <vector>
@@ -124,6 +125,8 @@ struct Graph {
     }
     ~Graph() { ggml_free(ctx); }
 };
+
+#include "graph_speculation_budget_fixture.inc"
 
 int main()
 {
@@ -275,5 +278,6 @@ int main()
     }
     ledger.fail_commit = false;
     require(!tsg::graph_budget_gallocr_new(&type.type, 0, false, 4), "expert kind accepted by graph allocator");
+    speculation_context_budget();
     std::puts("PASS graph budget: original buffer ABI, reserve-before-alloc, actual-size rollback, physical-free release, gallocr generations, reuse, concurrent admission, exact attachment and joint arena kind5");
 }

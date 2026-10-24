@@ -2,6 +2,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <utility>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "ggml_ops_host_moe_payload_cache.h"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -29,12 +31,28 @@
 #endif
 
 namespace tsg {
+struct ExpertFileSourceViewRecord;
+struct ExpertFileSourceReadActivity {
+    std::uint64_t view_calls = 0, view_bytes = 0, view_fallbacks = 0, buffered_bytes = 0;
+};
+enum class ExpertFileSourceViewCopy { not_attempted, mapped, failed };
+inline ExpertFileSourceViewCopy file_source_view_try_copy(
+    const std::shared_ptr<ExpertFileSourceViewRecord>& owner, std::uint64_t relative,
+    void* destination, std::size_t bytes) noexcept;
+inline bool file_source_view_test_buffered_failure_requested() noexcept;
+inline void file_source_view_test_record_buffered_failure() noexcept;
 // Exact loader-registered file extent. Never infer file offsets from mmap
 // addresses: views may start at nonzero offsets or belong to different shards.
 class ExpertFileSource {
+    const std::uint64_t identity_ = next_host_moe_payload_source_id();
 #if defined(_WIN32)
     HANDLE file_ = INVALID_HANDLE_VALUE;
     HANDLE direct_file_ = INVALID_HANDLE_VALUE;
+    std::uint64_t readonly_file_bytes_ = 0;
+    const bool buffered_random_access_hint_ = [] {
+        const char* value = std::getenv("TS_HOST_MOE_FILE_RANDOM_ACCESS");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
 #else
     int file_ = -1;
     int direct_file_ = -1;
@@ -42,6 +60,8 @@ class ExpertFileSource {
     std::uint64_t offset_ = 0, bytes_ = 0;
     std::size_t direct_alignment_ = 0;
     mutable std::atomic<bool> direct_disabled_{false};
+    std::shared_ptr<ExpertFileSourceViewRecord> source_view_;
+    std::atomic<bool> source_view_enrolled_{false};
 public:
     ExpertFileSource(const char* utf8_path, std::uint64_t offset, std::uint64_t bytes, bool request_direct = false)
         : offset_(offset), bytes_(bytes)
@@ -55,8 +75,13 @@ public:
         std::vector<wchar_t> path(count);
         if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1, path.data(), count))
             throw std::runtime_error("Cannot decode expert source path");
+        // Explicit experiment: selected experts are sparse, while Windows' normal
+        // buffered handle may infer sequential access and read ahead. Preserve the
+        // normal cache policy unless requested; this never bypasses the file cache.
+        const DWORD buffered_flags = FILE_FLAG_OVERLAPPED
+            | (buffered_random_access_hint_ ? FILE_FLAG_RANDOM_ACCESS : 0);
         file_ = CreateFileW(path.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED, nullptr);
+            buffered_flags, nullptr);
         if (file_ == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open expert file source: " + std::to_string(GetLastError()));
         LARGE_INTEGER size{};
         if (!GetFileSizeEx(file_, &size) || size.QuadPart < 0
@@ -65,6 +90,10 @@ public:
             CloseHandle(file_); file_ = INVALID_HANDLE_VALUE;
             throw std::runtime_error("Expert file extent exceeds its shard");
         }
+        // FILE_SHARE_READ denies write/delete opens for this handle's lifetime.
+        // Repeated size queries can serialize with outstanding reads on this
+        // same file object; retain the extent validated before publication.
+        readonly_file_bytes_ = static_cast<std::uint64_t>(size.QuadPart);
 #if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0602
         if (request_direct) {
             // FILE_STORAGE_INFO reports the largest storage requirement for a
@@ -180,7 +209,33 @@ public:
     ExpertFileSource(const ExpertFileSource&) = delete;
     ExpertFileSource& operator=(const ExpertFileSource&) = delete;
     std::uint64_t bytes() const { return bytes_; }
+    std::uint64_t identity() const { return identity_; }
     std::uint64_t offset() const { return offset_; }
+    // Published sources completed their exact handle open. This observes the
+    // flag supplied to that handle, not whether the OS honored a cache policy.
+    bool random_access_hint(bool direct_read = false) const noexcept {
+#if defined(_WIN32)
+        // The separately verified direct handle always opens with RANDOM_ACCESS.
+        return direct_read ? direct_file_ != INVALID_HANDLE_VALUE : buffered_random_access_hint_;
+#else
+        (void)direct_read; return false; // No Windows random-access hint on POSIX.
+#endif
+    }
+#if defined(_WIN32)
+    // Mapping admissions use this exact registered handle/generation. A duplicate
+    // retains its read-only access and FILE_SHARE_READ restrictions; no pathname
+    // reopen can substitute a renamed/replaced source while a cache view lives.
+    bool readonly_mapping_file_size(std::uint64_t& bytes) const noexcept {
+        if (file_ == INVALID_HANDLE_VALUE || !readonly_file_bytes_) return false;
+        bytes = readonly_file_bytes_; return true;
+    }
+    HANDLE duplicate_readonly_mapping_file() const noexcept {
+        HANDLE duplicate = INVALID_HANDLE_VALUE;
+        if (!DuplicateHandle(GetCurrentProcess(), file_, GetCurrentProcess(), &duplicate,
+            0, FALSE, DUPLICATE_SAME_ACCESS)) return INVALID_HANDLE_VALUE;
+        return duplicate;
+    }
+#endif
     std::size_t direct_alignment() const noexcept {
         return direct_disabled_.load(std::memory_order_relaxed) ? 0 : direct_alignment_;
     }
@@ -235,7 +290,55 @@ public:
         return false;
 #endif
     }
-    void read(std::uint64_t relative, void* destination, std::size_t count) const {
+    // The caller retains this complete shared alias before touching a record;
+    // close cannot free its slab in the alias-lookup/reader-increment interval.
+    std::shared_ptr<ExpertFileSourceViewRecord> source_view_lease() const noexcept {
+        return std::atomic_load_explicit(&source_view_, std::memory_order_acquire);
+    }
+    bool attach_source_view(const std::shared_ptr<ExpertFileSourceViewRecord>& record) noexcept {
+        std::shared_ptr<ExpertFileSourceViewRecord> empty;
+        const bool attached = record && std::atomic_compare_exchange_strong_explicit(&source_view_, &empty, record,
+            std::memory_order_release, std::memory_order_relaxed);
+        if (attached) source_view_enrolled_.store(true, std::memory_order_release);
+        return attached;
+    }
+    bool detach_source_view(const std::shared_ptr<ExpertFileSourceViewRecord>& record) noexcept {
+        auto expected = record;
+        const bool detached = std::atomic_compare_exchange_strong_explicit(&source_view_, &expected,
+            std::shared_ptr<ExpertFileSourceViewRecord>{}, std::memory_order_acq_rel, std::memory_order_acquire)
+            || !expected;
+        if (detached) source_view_enrolled_.store(false, std::memory_order_release);
+        return detached;
+    }
+    void read(std::uint64_t relative, void* destination, std::size_t count,
+        ExpertFileSourceReadActivity* activity = nullptr) const {
+        if (relative > bytes_ || count > bytes_ - relative || (!destination && count))
+            throw std::runtime_error("Expert file read exceeds registered extent");
+        const auto view = source_view_enrolled_.load(std::memory_order_acquire) ? source_view_lease()
+            : std::shared_ptr<ExpertFileSourceViewRecord>{};
+        const auto copied = view && count ? file_source_view_try_copy(view, relative, destination, count)
+            : ExpertFileSourceViewCopy::not_attempted;
+        if (copied != ExpertFileSourceViewCopy::not_attempted && activity) ++activity->view_calls;
+        if (copied == ExpertFileSourceViewCopy::mapped) {
+            if (activity) activity->view_bytes += count;
+            return;
+        }
+        // Copy failure can have changed a strict prefix. The authoritative
+        // original buffered method must overwrite the WHOLE logical task.
+#if defined(TSG_GGML_TEST_HOOKS)
+        if (copied == ExpertFileSourceViewCopy::failed && count > 1 && file_source_view_test_buffered_failure_requested()) {
+            read_buffered(relative, destination, count / 2);
+            file_source_view_test_record_buffered_failure();
+            throw std::runtime_error("Injected buffered fallback failure after actual strict source prefix");
+        }
+#endif
+        read_buffered(relative, destination, count);
+        if (activity) {
+            activity->buffered_bytes += count;
+            if (copied == ExpertFileSourceViewCopy::failed) ++activity->view_fallbacks;
+        }
+    }
+    void read_buffered(std::uint64_t relative, void* destination, std::size_t count) const {
         if (relative > bytes_ || count > bytes_ - relative || (!destination && count))
             throw std::runtime_error("Expert file read exceeds registered extent");
 #if defined(_WIN32)
@@ -284,9 +387,44 @@ struct ExpertReadTask {
     std::uint8_t* direct_destination = nullptr;
     std::size_t direct_bytes = 0;
     bool direct_completed = false;
+    HostMoePayloadCache* payload_cache = nullptr;
+    std::uint64_t cache_offset = 0;
+    std::size_t cache_bytes = 0;
+    bool cache_admit = false;
+    bool cache_direct_upload = false;
+    // Optional immutable mapped tier copies synchronously into this task's
+    // existing arena. It never returns a direct-DMA source or writable lease.
+    void (*immutable_read)(ExpertReadTask&) = nullptr;
+    bool immutable_admit = false; // Separate from ordinary demand's hit/LRU touch.
+    HostMoePayloadCache::Lease payload_lease;
+    std::size_t source_read_bytes = 0; // Completed logical source bytes, excluding RAM hits.
+    ExpertFileSourceReadActivity file_view_activity;
+    const void* upload_data() const { return payload_lease ? payload_lease.data : destination; }
     void prepare() {
+        // Callers retain this lease through the upload fence before preparing
+        // or destroying a task. A cache eviction cannot invalidate queued DMA.
+        payload_lease = {};
+        source_read_bytes = 0;
+        file_view_activity = {};
         if (!source || offset > source->bytes() || bytes > source->bytes() - offset || (!destination && bytes))
             throw std::runtime_error("Expert task logical read exceeds registered extent");
+        if ((payload_cache || immutable_read) && cache_bytes && !direct_bytes) {
+            if (cache_offset > source->bytes() || cache_bytes > source->bytes() - cache_offset
+                || offset < cache_offset || offset - cache_offset > cache_bytes
+                || bytes > cache_bytes - static_cast<std::size_t>(offset - cache_offset))
+                throw std::runtime_error("Expert cache extent does not contain its logical read");
+            if (immutable_read) { immutable_read(*this); return; }
+            const auto loader = [&](std::uint64_t start, void* target, std::size_t count) {
+                source->read(start, target, count, &file_view_activity); source_read_bytes += count;
+            };
+            if (cache_direct_upload)
+                payload_lease = payload_cache->acquire_range(source->identity(), cache_offset, cache_bytes,
+                    static_cast<std::size_t>(offset - cache_offset), destination, bytes, cache_admit, loader);
+            else
+                payload_cache->read_range(source->identity(), cache_offset, cache_bytes,
+                    static_cast<std::size_t>(offset - cache_offset), destination, bytes, cache_admit, loader);
+            return;
+        }
         if (direct_bytes) {
             if (!bytes || offset < direct_offset || offset - direct_offset > direct_bytes
                 || bytes > direct_bytes - static_cast<std::size_t>(offset - direct_offset)
@@ -295,11 +433,20 @@ struct ExpertReadTask {
                 throw std::runtime_error("Expert direct task does not contain its exact logical destination");
         }
         direct_completed = direct_bytes && source->try_read_direct(direct_offset, direct_destination, direct_bytes);
-        if (!direct_completed) source->read(offset, destination, bytes);
+        if (!direct_completed) source->read(offset, destination, bytes, &file_view_activity);
+        else file_view_activity.buffered_bytes = bytes; // Non-view ReadFile; direct mode is excluded from the view profile.
+        source_read_bytes = bytes;
     }
 };
 void read_expert_files(std::vector<ExpertReadTask>& tasks,
     const std::function<void(std::size_t)>& consume);
+// Two bounded windows of the caller-owned arena. Wait each slot's transfer
+// fence before reading; consume a window only after all of its reads succeed.
+// Every producer is joined before return, including callback failure paths.
+void read_expert_file_windows(std::vector<ExpertReadTask>& tasks,
+    const std::vector<std::size_t>& counts,
+    const std::function<void(std::size_t)>& before_slot,
+    const std::function<void(std::size_t)>& consume_window);
 }
 
 namespace tsg {
@@ -406,3 +553,6 @@ void host_moe_for_each_direct_read_window(const std::vector<std::pair<int, int>>
     flush();
 }
 } // namespace tsg
+
+// Inline helper keeps existing standalone header-only Source consumers linkable.
+#include "ggml_ops_file_source_view.h"

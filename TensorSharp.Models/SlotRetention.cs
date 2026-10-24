@@ -48,7 +48,8 @@ namespace TensorSharp.Models
         /// every owner and the native selection as they were.
         /// </summary>
         internal static bool RetainSlot<TStore>(Dictionary<string, int> requests, IDictionary<string, RetainedSlot> retained,
-            string requestId, string key, int length, bool canRewind, ref int primary, ref string active, TStore store)
+            string requestId, string key, int length, bool canRewind, ref int primary, ref string active, TStore store,
+            Func<IDisposable> admitPrimary = null)
             where TStore : ISlotStore
         {
             if (string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key) || length <= 0 || requests == null
@@ -64,7 +65,7 @@ namespace TensorSharp.Models
             int freshPrimary = -1;
             if (ok && wasActive && primary < 0)
             {
-                freshPrimary = store.Alloc();
+                freshPrimary = AllocFreshPrimary(store, admitPrimary);
                 ok = freshPrimary >= 0;
             }
             if (ok && head != length && !store.RewindActive(length))
@@ -125,11 +126,11 @@ namespace TensorSharp.Models
 
         /// <summary>Retain the active primary slot under <paramref name="key"/> and give the primary a fresh slot.</summary>
         internal static bool ConvertPrimarySlot<TStore>(IDictionary<string, RetainedSlot> retained, string key, int length,
-            ref int primary, ref string active, TStore store) where TStore : ISlotStore
+            ref int primary, ref string active, TStore store, Func<IDisposable> admitPrimary = null) where TStore : ISlotStore
         {
             if (string.IsNullOrEmpty(key) || active != null || primary < 0 || retained.ContainsKey(key)) return false;
             if (store.ActiveHead() != length || length <= 0) return false;
-            int fresh = store.Alloc();
+            int fresh = AllocFreshPrimary(store, admitPrimary);
             if (fresh < 0) return false;
             if (!store.Select(fresh))
             {
@@ -139,6 +140,43 @@ namespace TensorSharp.Models
             retained.Add(key, new RetainedSlot(primary, length));
             primary = fresh;
             return true;
+        }
+
+        // Admission is needed only for a new physical primary, never for the
+        // already-owned slot being donated. Restore the native allocation owner
+        // before publishing the new slot; its physical child remains charged
+        // after the temporary reservation closes. A refused admission preserves
+        // every current owner and selection, just like a refused native alloc.
+        private static int AllocFreshPrimary<TStore>(TStore store, Func<IDisposable> admitPrimary)
+            where TStore : ISlotStore
+        {
+            if (admitPrimary == null) return store.Alloc();
+            int fresh = -1;
+            try
+            {
+                using var allocation = admitPrimary();
+                if (allocation == null) return -1;
+                fresh = store.Alloc();
+                return fresh;
+            }
+            catch (Exception failure)
+            {
+                // Scope restoration can throw after allocation succeeded. The
+                // fresh slot has not been selected or published yet.
+                if (fresh >= 0)
+                {
+                    bool freed;
+                    try { freed = store.Free(fresh); }
+                    catch (Exception cleanup)
+                    {
+                        throw new InvalidOperationException($"Fresh primary slot {fresh} could not be freed after failed admission. Its payload and budget ownership remain with the store.",
+                            new AggregateException(failure, cleanup));
+                    }
+                    if (!freed)
+                        throw new InvalidOperationException($"Fresh primary slot {fresh} could not be freed after failed admission. Its payload and budget ownership remain with the store.", failure);
+                }
+                throw;
+            }
         }
 
         /// <summary>Free the listed retained slots (unknown keys ignored). A slot the native side refuses to

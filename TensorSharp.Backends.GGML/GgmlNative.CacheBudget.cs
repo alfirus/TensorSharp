@@ -15,6 +15,10 @@ internal static partial class GgmlNative
     [LibraryImport(DllName, EntryPoint = "TSGgml_AttachSharedCacheBudgetWithHost")]
     internal static partial int AttachSharedCacheBudgetWithHost(IntPtr context, IntPtr reserve, IntPtr commit, IntPtr release, int includeGraphBuffers);
 
+    [LibraryImport(DllName, EntryPoint = "TSGgml_AttachSharedCacheBudgetWithCheckedRelease")]
+    internal static partial int AttachSharedCacheBudgetWithCheckedRelease(IntPtr context, IntPtr reserve, IntPtr commit,
+        IntPtr release, IntPtr releaseChecked, int includeGraphBuffers, int includeHostBuffers);
+
     [LibraryImport(DllName, EntryPoint = "TSGgml_DetachSharedCacheBudget")]
     internal static partial int DetachSharedCacheBudget(IntPtr context);
 

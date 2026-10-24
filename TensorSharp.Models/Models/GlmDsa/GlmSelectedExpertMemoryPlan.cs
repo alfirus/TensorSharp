@@ -54,7 +54,7 @@ internal sealed record GlmSelectedExpertMemoryPlan(int PrefillRows, int CpuExper
         {
             // Native installs this complete immutable phase floor once. Actual
             // requests may use smaller widths without replacing that plan.
-            long minimum = ForecastMinimum(geometry, options.MaximumRunningRequests, rows);
+            long minimum = ForecastMinimum(geometry, options.EnableGlmFlashMtp ? 3 : options.MaximumRunningRequests, rows);
             if (capacity < minimum) continue;
             long totalReserve = checked(reserve + capacity);
             cpu = geometry.SelectCpuExpertLayers(deviceCeiling, totalReserve, visionBytes);
@@ -76,10 +76,14 @@ internal sealed record GlmSelectedExpertMemoryPlan(int PrefillRows, int CpuExper
             throw new NotSupportedException("Incomplete GLM selected-expert metadata geometry.");
         if (prefillRows > maximumRouteElements / geometry.UsedExperts)
             throw new ArgumentOutOfRangeException(nameof(prefillRows), "GLM prefill exceeds its fixed selected-route scratch.");
-        var layouts = geometry.ExpertLayerLayouts.OfType<GlmUnifiedExpertLayout>().ToArray();
-        if (layouts.Length == 0 || layouts.Any(l => !l.SupportsSelectedTier
-            || l.Gate.BytesPerExpert <= 0 || l.Up.BytesPerExpert <= 0 || l.Down.BytesPerExpert <= 0
-            || l.Gate.TensorTailBytes < 0 || l.Up.TensorTailBytes < 0 || l.Down.TensorTailBytes < 0))
+        var members = geometry.ExpertLayerLayouts.OfType<GlmUnifiedExpertLayout>()
+            .Select(l => (Layout: l, DecodeRows: decodeRows, PrefillRows: prefillRows))
+            .Concat(geometry.Mtp == null ? [] : new[] { (Layout: geometry.Mtp.ExpertLayout,
+                DecodeRows: geometry.Mtp.ShapeSpecificPlan ? 1 : decodeRows,
+                PrefillRows: geometry.Mtp.ShapeSpecificPlan ? 1 : prefillRows) }).ToArray();
+        if (members.Length == 0 || members.Any(m => !m.Layout.SupportsSelectedTier
+            || m.Layout.Gate.BytesPerExpert <= 0 || m.Layout.Up.BytesPerExpert <= 0 || m.Layout.Down.BytesPerExpert <= 0
+            || m.Layout.Gate.TensorTailBytes < 0 || m.Layout.Up.TensorTailBytes < 0 || m.Layout.Down.TensorTailBytes < 0))
             throw new NotSupportedException("GLM selected-expert planning requires complete quantized gate/up/down layouts.");
         checked
         {
@@ -92,39 +96,37 @@ internal sealed record GlmSelectedExpertMemoryPlan(int PrefillRows, int CpuExper
             // group plus the other groups' narrow floors, not all-wide at once.
             // This is still not physical credit; native measures every layout
             // and shared callbacks independently admit each real owner.
-            var groups = layouts.GroupBy(l => l.Types).ToArray();
-            long rows = prefillRows > 8 ? Math.Max(decodeRows, prefillRows) : decodeRows;
-            long union = Math.Min(geometry.ExpertCount, rows * geometry.UsedExperts);
-            long narrowUnion = Math.Min(geometry.ExpertCount, (long)decodeRows * geometry.UsedExperts);
-            // Native GLM retains every compact prefill width through eight,
-            // even when the admitted independent decode width is only one.
-            // A short prefill may execute smaller microgroups to fit its live
-            // expert table, so this does not increase the required weight union
-            // above. It does increase the simultaneously owned graph scratch.
-            long narrowRows = Math.Max(decodeRows, Math.Min(prefillRows, 8));
-            long narrowRetainedRows = narrowRows * (narrowRows + 1) / 2;
-            // All narrow variants 1..N and one wide variant share the quantized
-            // weight leaves. Sum every allocating F32/I32 tensor even when the
-            // allocator aliases or reuses it: input, ids/routes, gate/up, both
-            // optional clamps, SiLU/product, down/CONT/weighted, K-1 ADDs, output.
-            long elementsPerRow = geometry.Hidden + 2L * geometry.UsedExperts
-                + 6L * geometry.ExpertFf * geometry.UsedExperts
-                + 4L * geometry.Hidden * geometry.UsedExperts;
-            long narrowScratch = 4L * narrowRetainedRows * elementsPerRow;
-            long wideScratch = narrowScratch + 4L * (prefillRows > 8 ? prefillRows : 0) * elementsPerRow;
-            // Unchanged ggml CUDA uses 128-byte alignment, quantized 512-row
-            // tail padding (retained separately above), and this native graph
-            // has at most 256 tensor descriptors per variant. Include a full
-            // alignment unit for each descriptor, the three shared weights,
-            // and the native per-group 1 MiB workspace allowance. No flash
-            // attention tensor or F32 weight materialization occurs here.
-            long narrowAlignment = 128L * (3 + 256 * narrowRows);
-            long wideAlignment = narrowAlignment + (prefillRows > 8 ? 128L * 256 : 0);
+            var groups = members.GroupBy(m => m.Layout.Types).ToArray();
             long totalNarrow = 0, largestExpansion = 0;
             foreach (var group in groups)
             {
-                long expertBytes = group.Max(l => l.BytesPerExpert);
-                long tail = group.Max(l => l.TensorTailBytes);
+                // Measure the final merged shape. A shared trunk/draft key retains
+                // all trunk variants; independent byte maxima of incomparable
+                // member shapes would not cover their combined union and scratch.
+                int groupDecode = group.Max(m => m.DecodeRows), groupPrefill = group.Max(m => m.PrefillRows);
+                long rows = groupPrefill > 8 ? Math.Max(groupDecode, groupPrefill) : groupDecode;
+                long union = Math.Min(geometry.ExpertCount, rows * geometry.UsedExperts);
+                long narrowUnion = Math.Min(geometry.ExpertCount, (long)groupDecode * geometry.UsedExperts);
+                // Trunk groups retain compact prefill widths through eight. A
+                // draft-only group retains only its admitted scalar variant.
+                // Short prefill can use smaller microgroups without expanding
+                // the protected union; retained graph scratch still sums widths.
+                long narrowRows = Math.Max(groupDecode, Math.Min(groupPrefill, 8));
+                long narrowRetainedRows = narrowRows * (narrowRows + 1) / 2;
+                // Sum allocating F32/I32 tensors even when the allocator aliases
+                // them: inputs, routes, gate/up, clamps, product, down and output.
+                long elementsPerRow = geometry.Hidden + 2L * geometry.UsedExperts
+                    + 6L * geometry.ExpertFf * geometry.UsedExperts
+                    + 4L * geometry.Hidden * geometry.UsedExperts;
+                long narrowScratch = 4L * narrowRetainedRows * elementsPerRow;
+                long wideScratch = narrowScratch + 4L * (groupPrefill > 8 ? groupPrefill : 0) * elementsPerRow;
+                // Unchanged CUDA uses 128-byte alignment and quantized tail
+                // padding. Include each of at most 256 descriptors per variant,
+                // three weight leaves and the native 1 MiB workspace allowance.
+                long narrowAlignment = 128L * (3 + 256 * narrowRows);
+                long wideAlignment = narrowAlignment + (groupPrefill > 8 ? 128L * 256 : 0);
+                long expertBytes = group.Max(m => m.Layout.BytesPerExpert);
+                long tail = group.Max(m => m.Layout.TensorTailBytes);
                 long narrow = narrowUnion * expertBytes + tail + narrowScratch + narrowAlignment + (1L << 20);
                 long wide = union * expertBytes + tail + wideScratch + wideAlignment + (1L << 20);
                 totalNarrow += narrow;

@@ -30,6 +30,13 @@ public sealed record UnifiedMemoryModelOptions
     public long MaximumHostBytes { get; init; } = long.MaxValue;
     public long MaximumDeviceBytes { get; init; } = long.MaxValue;
     public long MaximumExpertCacheBytes { get; init; } = long.MaxValue;
+    /// <summary>Opt-in retained GLM expert source bytes in RAM. Zero disables
+    /// this tier. Its shared reservation can shrink under execution pressure.</summary>
+    public long MaximumHostExpertCacheBytes { get; init; }
+    /// <summary>Experimental native Flash MTP. Requires one primary request,
+    /// a context at most 2048, text only, no retained prefixes and the matching
+    /// native draft/verification allocation adapter. Disabled by default.</summary>
+    public bool EnableGlmFlashMtp { get; init; }
     public bool EnableAsyncExpertPrefill { get; init; } = false;
     /// <summary>Prompt tokens per prefill Forward when routed experts stream
     /// from file. The model runs the forward layer-major in chunks of the
@@ -137,6 +144,8 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
         UnifiedMemoryModelOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        bool hostTokenEmbedding = GlmUnifiedHostTokenEmbeddingPlan.Resolve(
+            Environment.GetEnvironmentVariable(GlmUnifiedHostTokenEmbeddingPlan.EnvironmentVariable));
         ValidateOptions(options);
         if (backend != BackendType.GgmlCuda)
             throw new NotSupportedException("--unified-memory requires a qualified architecture on ggml_cuda.");
@@ -144,19 +153,26 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_NODE_ID"))
             || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TENSORSHARP_TP_PEERS")))
             throw new NotSupportedException("--unified-memory has no qualified tensor/layer-parallel adapter.");
-        if (SpeculationOptions.FromEnvironment().Enabled
+        var speculation = SpeculationOptions.FromEnvironment();
+        if ((speculation.Enabled && !options.EnableGlmFlashMtp)
             || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_SPEC_DRAFT_MODEL")))
             throw new NotSupportedException("--unified-memory currently requires speculative execution and draft loading to be disabled.");
+        if (options.EnableGlmFlashMtp)
+            GlmUnifiedMemoryModelSession.ValidateFlashMtpLoadOptions(options, speculation, mmprojPath,
+                Environment.GetEnvironmentVariable("TS_GLM_FLASH_MTP"));
         if (MoeCpuOffloadConfig.IsExplicitlySet)
             throw new NotSupportedException("--unified-memory selects expert placement from its shared budget; remove explicit CPU MoE placement overrides.");
         string? fileReadMode = Environment.GetEnvironmentVariable("TS_HOST_MOE_FILE_READ");
         if (fileReadMode != null && fileReadMode != "1")
             throw new NotSupportedException("--unified-memory requires bounded expert file staging, including its CPU fallback; remove TS_HOST_MOE_FILE_READ or set it to 1.");
-        GgmlBasicOps.RequireSharedExpertCacheBudgetKind();
         Qwen4ExpUnifiedGeometry geometry;
         using (var file = GgufFile.OpenForMemoryPlanning(path))
         {
             string? architecture = file.GetString("general.architecture");
+            if (hostTokenEmbedding && architecture is not ("glm5next" or "glm5-next"))
+                throw new NotSupportedException("Host token embedding is available only for the qualified GLM5Next adapter.");
+            ValidateSpeculativeArchitecture(architecture, options);
+            GgmlBasicOps.RequireSharedExpertCacheBudgetKind();
             if (architecture is "glm5next" or "glm5-next")
                 return GlmUnifiedMemoryModelSession.Create(path, mmprojPath, backend, options);
             if (architecture != "qwen4exp")
@@ -227,6 +243,12 @@ public sealed partial class UnifiedMemoryModelSession : IUnifiedMemoryModelSessi
             catch (Exception cleanup) { throw new UnifiedMemoryModelLoadException(session, new AggregateException(creation, cleanup)); }
             throw;
         }
+    }
+
+    internal static void ValidateSpeculativeArchitecture(string? architecture, UnifiedMemoryModelOptions options)
+    {
+        if (options.EnableGlmFlashMtp && architecture is not ("glm5next" or "glm5-next"))
+            throw new NotSupportedException("Experimental unified Flash MTP is available only for the GLM5Next architecture.");
     }
 
     internal static long SelectExpertCacheBytes(long available, long dense, long execution, long source,

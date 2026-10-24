@@ -6,6 +6,7 @@
 // on a refusal, and never change the native selection they found unless the move
 // itself requires it; memory takes retained slots back oldest first.
 using TensorSharp.Models;
+using TensorSharp.Memory;
 
 namespace InferenceWeb.Tests;
 
@@ -303,6 +304,166 @@ public sealed class GlmSlotRetentionTests
         Assert.Empty(retained);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FreshPrimaryAdmissionOwnsOnlyTheNewSlotAndItsChildOutlivesTheScope(bool convert)
+    {
+        var budget = new MemoryBudget([new("device", 256)]);
+        using var original = budget.Reserve([new("device", 64)]); original.Commit();
+        BudgetReservation? freshRoot = null, freshChild = null;
+        bool ownerActive = false, restored = false;
+        var store = new Slots(active: 0, (0, 40));
+        store.BeforeAlloc = () => Assert.True(ownerActive);
+        store.AfterAlloc = _ =>
+        {
+            freshChild = freshRoot!.TryTake([new("device", 64)])!;
+            freshChild.Commit();
+        };
+        store.AfterFree = _ => freshChild!.Dispose();
+        var requests = new Dictionary<string, int> { ["req"] = 0 };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = convert ? 0 : -1; string active = convert ? null : "req";
+        IDisposable Admit()
+        {
+            freshRoot = budget.Reserve([new("device", 100)]);
+            return OwnedAllocationScope.Enter(freshRoot, () =>
+            {
+                ownerActive = true;
+                return new Scope(() =>
+                {
+                    // Restore the native owner before closing its root. The
+                    // original terminal slot has independent ownership.
+                    Assert.Equal(100, Assert.Single(freshRoot.OwnedCharges).Bytes);
+                    Assert.Equal(64, Assert.Single(original.OwnedCharges).Bytes);
+                    ownerActive = false; restored = true;
+                });
+            });
+        }
+        Assert.True(RetainOrConvert(convert, requests, retained, ref primary, ref active, store, Admit));
+        Assert.True(restored); Assert.False(ownerActive);
+        Assert.Equal(0, retained["payload"].Slot);
+        Assert.Equal(primary, store.Active);
+        Assert.Equal(new MemoryPoolSnapshot("device", 256, 0, 128), Assert.Single(budget.Snapshot()));
+        Assert.Equal(64, Assert.Single(freshRoot!.OwnedCharges).Bytes);
+        store.Active = 0;
+        Assert.True(store.Free(primary));
+        Assert.Equal(new MemoryPoolSnapshot("device", 256, 0, 64), Assert.Single(budget.Snapshot()));
+        Assert.Equal(40, store.Heads[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RefusedFreshPrimaryAdmissionDoesNotAllocateOrChangeTheCurrentOwners(bool convert)
+    {
+        var store = new Slots(active: 0, (0, 40));
+        var requests = new Dictionary<string, int> { ["req"] = 0 };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = convert ? 0 : -1; string active = convert ? null : "req";
+        int admissions = 0;
+        Assert.False(RetainOrConvert(convert, requests, retained, ref primary, ref active, store,
+            () => { admissions++; return null; }));
+        Assert.Equal(1, admissions); Assert.Equal(0, store.Allocs);
+        Assert.Equal(convert ? 0 : -1, primary); Assert.Equal(convert ? null : "req", active);
+        Assert.Equal(0, requests["req"]); Assert.Empty(retained);
+        Assert.Equal(0, store.Active); Assert.Equal(40, store.Heads[0]);
+    }
+
+    [Fact]
+    public void DonationWithoutANewPhysicalPrimaryDoesNotInvokeAdmission()
+    {
+        var store = new Slots(active: 1, (0, 0), (1, 40), (2, 45));
+        var requests = new Dictionary<string, int> { ["req"] = 1, ["idle"] = 2 };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = 0; string active = "req";
+        IDisposable Never() => throw new InvalidOperationException("No allocation is needed.");
+        Assert.True(SlotRetention.RetainSlot(requests, retained, "idle", "idle-payload", 45, false,
+            ref primary, ref active, store, Never));
+        Assert.Equal(1, store.Active);
+        Assert.True(SlotRetention.RetainSlot(requests, retained, "req", "payload", 40, false,
+            ref primary, ref active, store, Never));
+        Assert.Equal(0, store.Allocs); Assert.Equal(0, primary); Assert.Null(active);
+        Assert.False(SlotRetention.ConvertPrimarySlot(retained, "invalid-head", 40,
+            ref primary, ref active, store, Never));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NativeFreshPrimaryRefusalClosesAdmissionAndLeavesTerminalStateIntact(bool convert)
+    {
+        var store = new Slots(active: 0, (0, 40)) { AllocFails = true };
+        var requests = new Dictionary<string, int> { ["req"] = 0 };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = convert ? 0 : -1; string active = convert ? null : "req";
+        var scope = new Scope();
+        Assert.False(RetainOrConvert(convert, requests, retained, ref primary, ref active, store, () => scope));
+        Assert.Equal(1, scope.Disposals); Assert.Equal(1, store.Allocs);
+        Assert.Equal(convert ? 0 : -1, primary); Assert.Equal(convert ? null : "req", active);
+        Assert.Equal(0, requests["req"]); Assert.Empty(retained);
+        Assert.Equal(0, store.Active); Assert.Equal(40, store.Heads[0]);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AdmissionExitFailureFreesTheUnpublishedPrimaryAndPreservesTerminalState(bool convert)
+    {
+        var store = new Slots(active: 0, (0, 40));
+        var requests = new Dictionary<string, int> { ["req"] = 0 };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = convert ? 0 : -1; string active = convert ? null : "req";
+        var failure = new InvalidOperationException("injected scope restoration failure");
+        var scope = new Scope(() => throw failure);
+        Assert.Same(failure, Assert.Throws<InvalidOperationException>(() =>
+            RetainOrConvert(convert, requests, retained, ref primary, ref active, store, () => scope)));
+        Assert.Equal(1, scope.Disposals); Assert.Equal(1, store.Allocs);
+        Assert.Equal(new[] { 0 }, store.Heads.Keys);
+        Assert.Equal(convert ? 0 : -1, primary); Assert.Equal(convert ? null : "req", active);
+        Assert.Equal(0, requests["req"]); Assert.Empty(retained);
+        Assert.Equal(0, store.Active); Assert.Equal(40, store.Heads[0]);
+    }
+
+    [Fact]
+    public void NativeAllocationExceptionClosesAdmissionWithoutChangingThePrimary()
+    {
+        var failure = new OutOfMemoryException("injected native allocation failure");
+        var store = new Slots(active: 0, (0, 40)) { BeforeAlloc = () => throw failure };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = 0; string active = null;
+        var scope = new Scope();
+        Assert.Same(failure, Assert.Throws<OutOfMemoryException>(() => SlotRetention.ConvertPrimarySlot(
+            retained, "payload", 40, ref primary, ref active, store, () => scope)));
+        Assert.Equal(1, scope.Disposals); Assert.Equal(0, primary);
+        Assert.Equal(0, store.Active); Assert.Equal(40, store.Heads[0]); Assert.Empty(retained);
+    }
+
+    [Fact]
+    public void ConvertSelectionRefusalReleasesTheNewPhysicalOwnerAfterAdmissionCloses()
+    {
+        var store = new Slots(active: 0, (0, 40)) { RefuseFreshSelection = true };
+        var retained = new Dictionary<string, SlotRetention.RetainedSlot>();
+        int primary = 0; string active = null;
+        var scope = new Scope();
+        store.AfterFree = _ => Assert.Equal(1, scope.Disposals);
+        Assert.False(SlotRetention.ConvertPrimarySlot(retained, "payload", 40, ref primary, ref active, store, () => scope));
+        Assert.Equal(1, scope.Disposals); Assert.Equal(new[] { 0 }, store.Heads.Keys);
+        Assert.Equal(0, primary); Assert.Equal(0, store.Active); Assert.Empty(retained);
+    }
+
+    private static bool RetainOrConvert(bool convert, Dictionary<string, int> requests,
+        IDictionary<string, SlotRetention.RetainedSlot> retained, ref int primary, ref string active,
+        Slots store, Func<IDisposable?> admission)
+        => convert ? SlotRetention.ConvertPrimarySlot(retained, "payload", 40, ref primary, ref active, store, admission)
+            : SlotRetention.RetainSlot(requests, retained, "req", "payload", 40, false, ref primary, ref active, store, admission);
+
+    private sealed class Scope(Action? dispose = null) : IDisposable
+    {
+        public int Disposals;
+        public void Dispose() { Disposals++; dispose?.Invoke(); }
+    }
+
     private sealed class Slots : SlotRetention.ISlotStore
     {
         public readonly Dictionary<int, int> Heads;
@@ -317,6 +478,10 @@ public sealed class GlmSlotRetentionTests
         /// move that frees the slot it still has selected is caught.</summary>
         public bool FreeActive;
         public int Allocs;
+        public Action? BeforeAlloc;
+        public Action<int>? AfterAlloc;
+        public Action<int>? AfterFree;
+        public bool RefuseFreshSelection;
         /// <summary>Every reclaimable list pushed, in order.</summary>
         public readonly List<int[]> Pushes = new();
         /// <summary>Slots the native side freed for a graph, waiting to be taken.</summary>
@@ -332,20 +497,27 @@ public sealed class GlmSlotRetentionTests
         public int Alloc()
         {
             Allocs++;
+            BeforeAlloc?.Invoke();
             if (AllocFails || Heads.Count >= Capacity) return -1;
             Heads[_next] = 0;
+            AfterAlloc?.Invoke(_next);
             return _next++;
         }
 
         public bool Select(int slot)
         {
-            if (!Heads.ContainsKey(slot)) return false;
+            if (!Heads.ContainsKey(slot) || (RefuseFreshSelection && slot >= 100)) return false;
             Active = slot;
             return true;
         }
 
         // Like the native side: the active slot cannot be freed (a fresh primary is never selected before it is freed).
-        public bool Free(int slot) => (FreeActive || slot != Active) && !RefuseFree.Contains(slot) && Heads.Remove(slot);
+        public bool Free(int slot)
+        {
+            if ((!FreeActive && slot == Active) || RefuseFree.Contains(slot) || !Heads.Remove(slot)) return false;
+            AfterFree?.Invoke(slot);
+            return true;
+        }
         public int ActiveHead() => Heads[Active];
 
         public bool RewindActive(int tokens)
