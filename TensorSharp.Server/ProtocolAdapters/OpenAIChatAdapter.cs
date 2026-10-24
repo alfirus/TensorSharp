@@ -269,12 +269,14 @@ public sealed partial class OpenAIChatAdapter
         }
 
         var effectiveTools = skillPlan?.Tools ?? openaiTools;
-        TensorSharp.Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar = null;
+        TensorSharp.Runtime.Grammar.IToolCallGrammar? toolGrammar = null;
         try
         {
             ValidateClientToolChoice(body, openaiTools);
             if (IsDeepSeek41(_svc.Architecture))
                 toolGrammar = PrepareDeepSeek41ToolGrammar(body, openaiTools, effectiveTools, responseFormat);
+            else if (IsMiniMaxM3(_svc.Architecture))
+                toolGrammar = PrepareMiniMaxM3ToolGrammar(body, openaiTools, responseFormat);
         }
         catch (Exception ex) when (ex is NotSupportedException or JsonException or ArgumentException)
         {
@@ -489,7 +491,7 @@ public sealed partial class OpenAIChatAdapter
         StructuredOutputFormat? responseFormat,
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
-        TensorSharp.Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar,
+        TensorSharp.Runtime.Grammar.IToolCallGrammar? toolGrammar,
         KnowledgeProtocolRequest knowledge)
     {
         // Only the strict json_schema path must buffer the whole response so it
@@ -522,7 +524,7 @@ public sealed partial class OpenAIChatAdapter
         }
 
         samplingConfig = WithStructuredOutputConstraint(samplingConfig, responseFormat, openaiThink);
-        samplingConfig = WithDeepSeek41ToolGrammar(samplingConfig, toolGrammar, openaiThink);
+        samplingConfig = WithToolCallGrammar(samplingConfig, toolGrammar, openaiThink);
 
         // With the constraint in place and before it has seen a token: a reply it shapes
         // from token 0 needs no parser for stray reasoning, and the pipeline primes none.
@@ -778,7 +780,7 @@ public sealed partial class OpenAIChatAdapter
         StructuredOutputFormat? responseFormat,
         SkillRequestPlan? skillPlan,
         ILogger skillLogger,
-        Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar,
+        Runtime.Grammar.IToolCallGrammar? toolGrammar,
         KnowledgeProtocolRequest knowledge)
     {
         if (!HostedModelGuard.TryEnsureHostedModelLoaded(_svc, modelName,
@@ -790,7 +792,7 @@ public sealed partial class OpenAIChatAdapter
         }
 
         samplingConfig = WithStructuredOutputConstraint(samplingConfig, responseFormat, openaiThink);
-        samplingConfig = WithDeepSeek41ToolGrammar(samplingConfig, toolGrammar, openaiThink);
+        samplingConfig = WithToolCallGrammar(samplingConfig, toolGrammar, openaiThink);
         // Before generation: a delayed grammar is active once its trigger has been generated.
         bool replyNeedsParser = OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate, samplingConfig);
 
