@@ -242,6 +242,40 @@ Muse-Glimmer 的融合整模型内核与它的 DFlash 块级草稿模型各有�
 | `TS_DFLASH_CONV` | DFlash2 草稿器 | `0` 去掉分组动态卷积（同上，仅用于归因分析） | 开 | 未注册 | 否 |
 | `TS_DFLASH_SELECTOR_DEBUG` | DFlash2 草稿器（逐算子路径） | `1` 打印前几个 block 的候选格归因：一元项分布、转移项分布，以及这次游走是否离开了一元 argmax | 关 | 未注册 | 否 |
 | `TS_Q35_VERIFY_SNAPSHOTS` | Qwen 3.5 / 3.8 投机验证 | `0` 回退为先保存验证前的递归状态副本、再对已接受前缀重新前向，而不是每行保留一份快照 | 开 | 未注册 | 否 |
+| `TS_QAB_BOUND` | Qwen 3.5 / 3.8 批量解码（CUDA） | `0` 使 N>=2 解码退回到 arena 自有的 KV/状态平面（加入时拷贝、退出时回写、窗口变化时重新填充）。默认让每个槽位直接绑定其 holder 自身常驻的 K/V 与递归状态副本，即单序列解码使用的同一缓冲区 | 开 | 未注册 | 否 |
+| `TS_Q35_DEVICE_MASK` | Qwen 3.5 / 3.8 预填充验证（CUDA） | `0` 改为在主机上填充因果掩码并上传（窗口 x 分块个 half，21K 上下文下 4K 分块约 170 MB），而不是在图内生成 | 开 | 未注册 | 否 |
+| `TS_Q35_VERIFY_PACK` | Qwen 3.5 / 3.8 验证（CUDA、Metal） | `0` 让每个持久验证图使用未打包缓冲区，而不是按生命周期打包的 gallocr 缓冲区 | 开 | 未注册 | 否 |
+| `TS_Q35_VERIFY_PERSIST_KV_STRIDE` | Qwen 3.5 / 3.8 投机验证 | 持久验证图的注意力窗口步长（行）；步长越大，重建/重新捕获越少 | `2048` | 未注册 | 否 |
+| `TS_Q35_GPU_STATE_COMMIT` | Qwen 3.5 / 3.8 投机验证（CUDA、Metal） | `0` 通过主机提交已接受的递归状态快照，而不是设备内拷贝 | 开 | 未注册 | 否 |
+| `TS_Q35_VERIFY_LOG` | Qwen 3.5 / 3.8 | `1` 打印每次融合验证/预填充调用（起点、行数、logits、捕获、状态链接、耗时） | 关 | 未注册 | 否 |
+| `TS_QWEN35_DEVICE_HOLDER_COPY` | Qwen 3.5 / 3.8 前缀缓存（CUDA） | `0` 使检查点、克隆和 KV 扩容经主机内存拷贝 K/V，而不是设备到设备 | 开 | 未注册 | 否 |
+| `TS_QWEN35_DEVICE_RETAIN_RESERVE_MB` | Qwen 3.5 / 3.8 前缀缓存（CUDA） | 空闲保留 holder 的设备 K/V 必须留出的空闲显存；低于该值时最久未用者被降级到主机 | `max(4 GiB, 显存/8)` | 未注册 | 否 |
+| `TS_QWEN35_IDLE_KV_SYNC` | Qwen 3.5 / 3.8 前缀缓存（CUDA） | `0` 停止在显存吃紧之前于后台把空闲保留 holder 的设备 K/V 下载到主机，之后的降级会重新在请求关键路径上同步（每 GB 约 150 ms，而非约 5 ms） | 开 | 未注册 | 否 |
+| `TS_PREFIX_RELEASE_DEBUG` | Qwen 3.5 / 3.8 前缀缓存 | `1` 记录保留/规划/整理决策、降级（`[prefix-demote]`）及其主机同步（`[prefix-sync]`） | 关 | 未注册 | 否 |
+| `TS_GGML_HOST_POOL_MB` | GGML CUDA 主机内存分配 | 保留任意大小已释放主机块以供复用的字节预算（新映射首次访问会产生缺页）；`0` 仅保留按数量限制的小块池 | `min(8 GiB, 内存/16)` | 未注册 | 否 |
+| `TS_QWEN35_BATCHED_SPEC` | Qwen 3.5 / 3.8 批量推测解码（CUDA，DFlash 草稿模型） | `0` 让并发解码请求在批量解码中每步只解一个 token，而不是在一次前向中验证每个请求的草稿窗口 | 开 | 未注册 | 否 |
+| `TS_QWEN35_BATCHED_SPEC_WINDOW` | Qwen 3.5 / 3.8 批量推测解码 | 每个请求最宽的验证窗口（锚点加草稿），2..8；当每个请求经置信度筛选后的草稿都不超过四行时，该步只验证四行 | `8` | 未注册 | 否 |
+| `TS_QWEN35_SOLO_SPEC_DRAFT` | Qwen 3.5 / 3.8 推测解码（单个请求） | 单个请求每步验证最多使用的草稿数 | `3` | 未注册 | 否 |
+| `TS_QWEN35_BATCHED_DRAFT` | Qwen 3.5 / 3.8 批量推测解码 | `0` 为每个请求单独运行 DFlash 草稿图，而不是把所有请求的草稿块放进一个图 | 开 | 未注册 | 否 |
+| `TS_BATCHED_SPEC_LOG` | 批量推测解码 | `1` 打印每个批量步骤保留的 token 数以及草稿 / 验证 / 提交 / 草稿模型提交的毫秒数（`[batched-spec]`） | 关 | 未注册 | 否 |
+| `TS_SCHED_STEP_LOG` | 连续批处理执行器 | `1` 每步打印一行：距上一步的空闲间隔、服务路径耗时毫秒数，以及每个序列的预填充/解码 token 数（`[step]`） | 关 | 未注册 | 否 |
+| `TS_GPU_LOCK_YIELD_MS` | 连续批处理执行器 | 当请求线程已在等待模型 GPU 锁（提示的媒体准备）时，执行步骤在自己获取该锁之前最多等待的毫秒数；`0` 表示步骤优先获取 | `100` | 未注册 | 否 |
+| `TS_QWEN35_BACKGROUND_CAPTURE` | Qwen 3.5 / 3.8 前缀缓存（CUDA） | `0` 让主机路径的前缀检查点同步下载请求的 K/V 行，而不是在后台流中直接写入检查点 | 开 | 未注册 | 否 |
+| `TS_QWEN35_DEVICE_STATE_HANDOFF` | Qwen 3.5 / 3.8 每请求缓存（CUDA） | `0` 让验证器的循环状态在每次易手时经主机内存搬运（每次切换持有者下载 151 MB、每次恢复再上传、位置 0 上传主机零值），而不是在设备上直接移入/移出各请求自己的设备副本 | 开 | 未注册 | 否 |
+| `TS_PREFIX_ASYNC_SAVE` | 前缀检查点持久化 | `0` 在引擎工作线程上写共享前缀检查点文件（导出、写入并 fsync），而不是在后台写；后台保存需要 32 GB 主机内存 | 开 | 未注册 | 否 |
+| `TS_SCHED_PREFILL_FCFS` | 连续批处理调度器 | `1` 在没有解码进行时按先到先得把步骤预算分给提示，而不是平均分配 | 关 | 未注册 | 否 |
+| `TS_SCHED_MIXED_PREFILL_TOKENS` / `TS_SCHED_MIXED_PREFILL_FCFS` | 连续批处理调度器 | 同时有解码的步骤里所有预填充序列合计可携带的提示 token 数（`0`：只受每序列分块上限约束）；FCFS 把这份预算留给最早的提示。变量未设置时模型可自行给出上限（Qwen 3.5 / 3.8 直连 CUDA 引擎：`1024`） | 模型给出的上限，否则无 / 关 | 未注册 | 否 |
+| `TS_SCHED_MIXED_STEP` / `TS_Q35_MIXED_STEP` | Qwen 3.5 / 3.8 直连 CUDA 引擎 | `0` 把同一步的提示分块与批量投机验证分成两次前向，而不是一次混合前向 | 开 | 未注册 | 否 |
+| `TS_Q35_MIXED_FP4_VERIFY` | Qwen 3.5 / 3.8 直连 CUDA 引擎 | `0` 让不超过 8 行的验证窗口和提示尾部单独走 q8_1 GEMV（8 位激活），而不是随混合前向走 FP4 GEMM（更宽的批量验证一直如此） | 开 | 未注册 | 否 |
+| `TS_Q35_NATIVE` | `--backend cuda` 上的 Qwen 3.5 / 3.8 稠密 NVFP4 | `0` 保留托管路径而不用直连 CUDA 引擎；没有 sm_12x 或未用 nvcc 编出其内核时引擎也会让位 | 开 | 未注册 | 否 |
+| `TS_Q35_HOST_CACHE_MB` | Qwen 3.5 / 3.8 直连 CUDA 引擎 | 移出显存的保留前缀槽位所用的锁页主机内存（`0` 关闭主机层） | `min(可用内存 / 2, 32 GiB)` | 未注册 | 否 |
+| `TS_Q35_UBATCH` | Qwen 3.5 / 3.8 直连 CUDA 引擎 | 每次前向的行数（提示分块的微批） | `2048` | 未注册 | 否 |
+| `TS_Q35_ATTN_PREFILL` / `TS_Q35_GEMM_SPLITK` | Qwen 3.5 / 3.8 直连 CUDA 引擎 | 诊断用：`0` 恢复旧的预填充注意力内核 / 让每个 FP4 GEMM 只做一遍 K（求和顺序与行数无关） | 开 / 开 | 未注册 | 否 |
+| `TS_QWEN_VISION_MERGED` | Qwen 3.5 / 3.8 视觉编码器 | `0` 在融合编码器图之后以独立算子运行 post-LN 空间合并器，而不是放在图内（两者结果逐位一致） | 开 | 未注册 | 否 |
+| `TS_QWEN_VISION_F16` | Qwen 3.5 / 3.8 视觉编码器（CUDA） | `1` 让合并编码器使用 F16 线性权重（F32 累加）：常驻权重内存减半，相对 F32 的相对 L2 约 0.002-0.003，未测得加速 | 关 | 未注册 | 否 |
+| `TS_QWEN_VISION_DUMP` | Qwen 3.5 / 3.8 视觉编码器 | 将每张图像的投影嵌入（int32 个数 + float32 值）写入该目录，供 `eng/validation/compare-vision-embeddings.py` 比较 | 未设置 | 未注册 | 否 |
+| `TS_QWEN_VISION_ATTN` | Qwen 3.5 / 3.8 视觉编码器（CUDA sm_80+） | 视觉注意力内核：`mma`（张量核心，F16 操作数，F32 分数/softmax/输出；相对精确 F32 的精度与分解路径相同，编码器耗时约减半）、`ggml`（分解的 TF32 矩阵乘 + softmax）、`f32`（精确 F32 内核，较慢） | `mma` | 未注册 | 否 |
+| `TS_QWEN_VISION_F32` | Qwen 3.5 / 3.8 视觉编码器（CUDA） | `1` 选择精确 F32 注意力内核（等同 `TS_QWEN_VISION_ATTN=f32`） | 关 | 未注册 | 否 |
 | `TS_SPEC_ADAPTIVE` | 投机解码（所有草稿器） | `0` 关闭成本调节器，于是起草不再与普通 baseline 做对比、也永远不会被暂停。用于 A/B 测量：调节器每一轮的 baseline 步骤都是普通 decode，它们并不免费 | 开 | 未注册 | 否 |
 | `TS_GGML_LOG_DEBUG` | GGML 后端 | `1` 把 ggml 的 DEBUG 日志通道透传出来而不是丢弃。它承载 CUDA 后端的 "CUDA graph warmup complete" / "reset" 这两行，而这是唯一能看出一张图是否真的被 CUDA graph 捕获的途径 | 关 | 未注册 | 否 |
 

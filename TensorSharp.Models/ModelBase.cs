@@ -892,7 +892,9 @@ namespace TensorSharp.Models
             // Mlx stays excluded: its Fill goes through MlxNative.Full, whose
             // behaviour for block-quantized KV dtypes is unverified on this
             // machine, and no Mlx-specific failure of this kind has been observed.
-            if (tensor != null && _backend != BackendType.Mlx)
+            // A fresh anonymous mapping is zero already; filling it only page-faults every
+            // page (~1 GB/s) for the same bytes.
+            if (tensor != null && _backend != BackendType.Mlx && !tensor.Storage.TakeAllocationZeroGuarantee())
                 Ops.Fill(tensor, 0f);
         }
 
@@ -2131,13 +2133,7 @@ namespace TensorSharp.Models
             byte* dst = (byte*)destination.Storage.PtrAtElement(0);
             long perHead = rows * rowBytes;
             for (long h = 0; h < heads; h++)
-            {
-                Buffer.MemoryCopy(
-                    src + h * sourceCap * rowBytes,
-                    dst + h * destCap * rowBytes,
-                    destination.Storage.ByteLength - h * destCap * rowBytes,
-                    perHead);
-            }
+                HostMemory.Copy(src + h * sourceCap * rowBytes, dst + h * destCap * rowBytes, perHead);
         }
 
         /// <summary>A capacity that holds <paramref name="rows"/> with one 256-row
@@ -2263,6 +2259,18 @@ namespace TensorSharp.Models
             if (DistributedControlGroup?.NodeCount > 1 && DistributedControlGroup.GlobalRankOffset == 0)
                 _distributedDriver = true;
         }
+
+        /// <summary>A prompt chunk: the same forward, flagged so a model can tell a
+        /// one-token prompt tail from a decode token (<see cref="ForwardIsPrompt"/>).</summary>
+        public float[] ForwardPrompt(int[] tokens)
+        {
+            _forwardIsPrompt = true;
+            try { return Forward(tokens); }
+            finally { _forwardIsPrompt = false; }
+        }
+
+        private bool _forwardIsPrompt;
+        protected bool ForwardIsPrompt => _forwardIsPrompt;
 
         public float[] Forward(int[] tokens)
         {
@@ -2593,6 +2601,15 @@ namespace TensorSharp.Models
         /// command buffer and aborts the process.
         /// </summary>
         public object GpuComputeLock { get; } = new object();
+
+        /// <summary>
+        /// The lock a request's media preparation (image / audio decoding and the encoder forward)
+        /// holds. <see cref="GpuComputeLock"/> by default, so encoders and engine steps never drive
+        /// a shared backend at once. A model whose encoder runs on a device stream of its own,
+        /// beside an engine that owns its stream (so the two cannot race one command queue),
+        /// returns a separate lock: preparation then overlaps engine steps instead of stalling them.
+        /// </summary>
+        public virtual object MediaPreparationLock => GpuComputeLock;
 
         /// <summary>
         /// Release <see cref="GpuComputeLock"/>, briefly yield, then re-acquire.
