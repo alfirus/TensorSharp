@@ -713,6 +713,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cpu ggml-base Threads::Threads)
     add_test(NAME deepseek41-moe-tensor-parallel COMMAND GgmlOpsDsv41TpTest)
     add_test(NAME deepseek41-tp-failure-recovery COMMAND GgmlOpsDsv41TpTest --failure-only)
+    add_test(NAME deepseek41-distributed-moe-numerical COMMAND GgmlOpsDsv41TpTest --distributed-only)
+    set_tests_properties(deepseek41-distributed-moe-numerical PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND NOT WIN32)
         target_compile_definitions(GgmlOpsDsv41TpTest PRIVATE TSG_GGML_USE_CUDA=1)
         target_sources(GgmlOpsDsv41TpTest PRIVATE ggml_ops_dsv4_fused.cu ggml_ops_matmul_precision.cu
@@ -1005,6 +1007,11 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsDsv4UbatchPlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek4-ubatch-plan COMMAND GgmlOpsDsv4UbatchPlanTest)
     set_tests_properties(deepseek4-ubatch-plan PROPERTIES TIMEOUT 60)
+
+    add_executable(GgmlOpsLayerPartitionTest tests/layer_partition_test.cpp)
+    target_include_directories(GgmlOpsLayerPartitionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME distributed-layer-byte-partition COMMAND GgmlOpsLayerPartitionTest)
+    set_tests_properties(distributed-layer-byte-partition PROPERTIES TIMEOUT 60)
     # Explicit per-width routed-expert layer timing behind the automatic ubatch
     # (see the source header). Never registered as a CTest.
     add_executable(GgmlOpsDsv4MoeWidthBench tests/dsv4_moe_width_bench.cpp)
