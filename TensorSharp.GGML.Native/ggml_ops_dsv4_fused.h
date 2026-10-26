@@ -75,6 +75,10 @@ enum tsg_dsv4_fused_kind : int32_t
     // blocks, i3 index precision, f0 kq scale. The CPU backend runs the
     // node's own callback; CUDA runs desc.cuda_compute.
     TSG_MSA_ATTENTION           = 27,
+    // Exact DeepSeek host-expert cache dispatched on the layer's CUDA stream.
+    // Uses the same hooks as TP: CPU owns complete fallback; CUDA keeps
+    // activations/routes/output resident and copies only selected IDs/status.
+    TSG_DSV41_CACHED_MOE        = 28,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"
@@ -85,7 +89,7 @@ struct tsg_dsv4_fused_desc
     int32_t  kind = 0;
     int32_t  i0 = 0, i1 = 0, i2 = 0, i3 = 0;
     float    f0 = 0.0f, f1 = 0.0f;
-    // TSG_DSV41_TP_MOE only. Function pointers keep the fused backend free of
+    // TSG_DSV41_TP_MOE / TSG_DSV41_CACHED_MOE. Function pointers keep the fused backend free of
     // a link dependency on the TP executor. Neither hook lets an exception out
     // (one a rank graph throws included): the executor records the failure
     // and turns dst into NaNs.
@@ -107,6 +111,13 @@ void tsg_dsv4_fused_cpu(struct ggml_tensor * dst, int ith, int nth, void * userd
 // NVIDIA BF16 GEMM requires Ampere or newer. Check the backend's physical
 // device, including virtual-backend mappings, without assuming device zero.
 bool tsg_dsv4_cuda_supports_native_bf16(ggml_backend_t cuda_backend);
+
+// Cache-bridge validation only: flag is one I32 value on cuda_backend. Enqueue
+// an exact finite scan on its stream; the caller reads the scalar alongside
+// selected IDs, then synchronizes before using either host result.
+void tsg_dsv4_cuda_expert_finite_scan(ggml_backend_t cuda_backend,
+    const ggml_tensor * first, const ggml_tensor * second, ggml_tensor * flag);
+void tsg_dsv4_cuda_expert_poison(ggml_backend_t cuda_backend, ggml_tensor * output) noexcept;
 
 // Create a fused-op backend bound to `cuda_backend`'s device and stream.
 // The returned backend claims GGML_OP_CUSTOM nodes carrying a

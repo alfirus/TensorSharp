@@ -27,11 +27,13 @@ using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
-    public partial class DeepSeek4Model : ModelBase, IBatchedPagedModel
+    public partial class DeepSeek4Model : ModelBase, IBatchedPagedModel, IGreedyForwardModel
     {
         private IntPtr _handle;
         private DeepSeek4CpuExecutor _cpuExec;
         private DeepSeek4CudaExecutor _cudaExec;
+        private DeepSeek41PipelineExecutor _pipelineExec;
+        protected bool IsPipelineExecutor => _pipelineExec != null;
         // The executor's sequence slots: the native executor's or the direct-CUDA engine's.
         // Null on the pure-C# executor, which serves one sequence.
         private IDsv4SlotExecutor _slotExecutor;
@@ -134,7 +136,26 @@ namespace TensorSharp.Models
             if (ubatchWarning != null)
                 Console.Error.WriteLine(ubatchWarning);
 
-            if (backend == BackendType.Cuda)
+            string pipelinePeer = Environment.GetEnvironmentVariable("TS_DSV41_PIPELINE_PEER");
+            if (!string.IsNullOrWhiteSpace(pipelinePeer))
+            {
+                try
+                {
+                    if (!isV41 || backend != BackendType.GgmlCuda || tpDegree != 1
+                        || tpGroup != null || ResolveDsparkPath(draftModelPath) != null
+                        || MoeCpuOffloadConfig.IsExplicitlySet)
+                        throw new NotSupportedException("The experimental DeepSeek pipeline requires deepseek41, ggml_cuda, " +
+                            "local --layer-split, no --tp peers and no draft model. " +
+                            "Stage placement chooses its minimum host-expert offload; remove explicit CPU-MoE overrides.");
+                    _pipelineExec = new DeepSeek41PipelineExecutor(ggufPath,
+                        ResolveNativeGpuCount(layerSplitDegree), maxContext, nUbatch > 0 ? nUbatch : 256, ParseEnvInt("TS_DSV4_THREADS", 16),
+                        pipelinePeer, Environment.GetEnvironmentVariable("TS_DSV41_PIPELINE_MANIFEST"));
+                    _nativeUBatch = _pipelineExec.UBatch;
+                    _truncateAlign = 0;
+                }
+                catch { base.Dispose(); throw; }
+            }
+            else if (backend == BackendType.Cuda)
             {
                 // Direct-CUDA whole-model executor: quantized weights resident in
                 // device memory, layer-split across the visible GPUs, driver-API
@@ -416,7 +437,7 @@ namespace TensorSharp.Models
         public override string KVStateFingerprint =>
             $"deepseek4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|D={Config.KeyLength}" +
             $"|hidden={Config.HiddenSize}|experts={Config.NumExperts}x{Config.NumExpertsUsed}|swa={Config.SlidingWindow}" +
-            $"|exec={(_cudaExec != null ? "cuda" : _cpuExec != null ? "cpu" : "native")}|align={_truncateAlign}" +
+            $"|exec={(_pipelineExec != null ? $"pipeline-v{DeepSeek41PipelineExecutor.Version}-cut{DeepSeek41PipelineExecutor.Cut}" : _cudaExec != null ? "cuda" : _cpuExec != null ? "cpu" : "native")}|align={_truncateAlign}" +
             $"|dspark={DraftBlockSize}|dtype={_kvCacheDtype.ToShortString()}";
 
         /// <summary>
@@ -453,7 +474,11 @@ namespace TensorSharp.Models
             lock (_sync)
             {
                 var logits = new float[Config.VocabSize];
-                if (_cudaExec != null)
+                if (_pipelineExec != null)
+                {
+                    _pipelineExec.Forward(tokens, logits);
+                }
+                else if (_cudaExec != null)
                 {
                     _cudaExec.Forward(tokens, logits);
                 }
@@ -469,11 +494,26 @@ namespace TensorSharp.Models
             }
         }
 
+        public bool TryForwardGreedyToken(int token, out int nextToken)
+        {
+            nextToken = default;
+            lock (_sync)
+            {
+                if (_pipelineExec == null || !_pipelineExec.GreedyTransportEnabled) return false;
+                if (TryGetBackendFailure(out string detail))
+                    throw new InvalidOperationException("DeepSeek pipeline backend failed; restart the host. " + detail);
+                nextToken = _pipelineExec.ForwardGreedy(token);
+                return true;
+            }
+        }
+
         protected override void ResetKVCacheCore()
         {
             lock (_sync)
             {
-                if (_cudaExec != null)
+                if (_pipelineExec != null)
+                    _pipelineExec.Reset();
+                else if (_cudaExec != null)
                     _cudaExec.Reset();
                 else if (_cpuExec != null)
                     _cpuExec.Reset();
@@ -509,6 +549,8 @@ namespace TensorSharp.Models
             lock (_sync)
             {
                 _slotExecutor = null;
+                _pipelineExec?.Dispose();
+                _pipelineExec = null;
                 if (_cudaExec != null)
                 {
                     _cudaExec.Dispose();

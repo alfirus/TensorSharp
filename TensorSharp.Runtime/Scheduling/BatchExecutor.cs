@@ -1757,7 +1757,29 @@ namespace TensorSharp.Runtime.Scheduling
                     }
 
                     var swForward = Stopwatch.StartNew();
-                    float[] logits = _model.Forward(inputTokens);
+                    // A throwing remote operation may already have advanced
+                    // its caches. Discard old predictions/continuations and
+                    // never retry that input through the full-logit path.
+                    seq.PendingDeviceToken = null;
+                    seq.LastLogits = null;
+                    _liveCacheValid = false;
+                    if (!work.IsPrefill && inputTokens.Length == 1
+                        && seq.GetOrCreateSampler().IsPlainGreedyArgmax
+                        && _model is IGreedyForwardModel greedy
+                        && greedy.TryForwardGreedyToken(inputTokens[0], out int nextToken))
+                    {
+                        if (nextToken < 0 || nextToken >= _model.Config.VocabSize)
+                            throw new InvalidOperationException("Greedy forward returned a token outside the model vocabulary.");
+                        seq.PendingDeviceToken = nextToken;
+                        seq.PendingDevicePosition = checked(prevComputed + inputTokens.Length);
+                    }
+                    else
+                    {
+                        float[] logits = _model.Forward(inputTokens);
+                        // Borrow until this sequence's next forward; inactive
+                        // sequences need their own copy of the shared buffer.
+                        seq.LastLogits = output.ScheduledWork.Count > 1 ? (float[])logits.Clone() : logits;
+                    }
                     swForward.Stop();
 
                     // Forward writes the shared linear cache, not the model's
@@ -1765,25 +1787,6 @@ namespace TensorSharp.Runtime.Scheduling
                     // a paged step, its newly-advanced tail is now linear-only
                     // and must be restored/migrated before another batch.
                     seq.KvStateInPagedStorage = false;
-
-                    // Sampling happens at the *start* of the next step (see
-                    // SampleFromLogits at the top of this branch), and
-                    // BatchExecutor calls _model.Forward only once per step.
-                    // The model's `_logitsBuffer` is overwritten on the next
-                    // Forward, but we always sample before that next Forward
-                    // fires — so a defensive 1 MB clone per token (Gemma 4
-                    // vocab = 262144 ├ù 4 bytes) is wasted memcpy and GC
-                    // pressure (~20 ┬Ás / token). Borrow the model's buffer
-                    // directly; the contract is: callers must consume
-                    // LastLogits before this sequence's next forward.
-                    //
-                    // Exception: when a sequence is multi-step inactive
-                    // (ownership-swapped or preempted), another sequence's
-                    // forward could clobber our buffer. Clone in that case.
-                    if (output.ScheduledWork.Count > 1)
-                        seq.LastLogits = (float[])logits.Clone();
-                    else
-                        seq.LastLogits = logits;
 
                     seq.AdvanceComputedTokens(inputTokens.Length);
                     _ownerTokensInModel += inputTokens.Length;

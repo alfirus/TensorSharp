@@ -11,9 +11,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
     std::int64_t*, std::int64_t*, std::int64_t*);
+extern "C" int TSGgml_HostMoeExpertHostCacheStats(std::int64_t*,std::int64_t*,std::int64_t*,std::int64_t*,std::int64_t*);
 
 // This standalone target compiles the production cache implementation with
 // small bridge stubs; it never loads a model or depends on modified ggml code.
@@ -77,6 +82,16 @@ namespace
                 "Could not read expert-cache engagement counters");
             require(reserved >= 0 && budget >= 0 && reserved <= budget,
                 "Expert-cache allocations exceeded the explicit byte ceiling");
+        }
+    };
+    struct HostStats
+    {
+        std::int64_t reserved=0,budget=0,hits=0,sources=0,evictions=0;
+        HostStats()
+        {
+            require(TSGgml_HostMoeExpertHostCacheStats(&reserved,&budget,&hits,&sources,&evictions)==1,
+                "Could not read exclusive host cache statistics");
+            require(reserved>=0 && reserved<=budget,"Anonymous host cache exceeded its explicit byte cap");
         }
     };
 
@@ -163,6 +178,7 @@ namespace
 
     struct FullResidentGraph
     {
+        ggml_backend_t backend = nullptr;
         ggml_context* context = nullptr;
         ggml_gallocr_t allocator = nullptr;
         ggml_cgraph* graph = nullptr;
@@ -171,8 +187,9 @@ namespace
         ggml_tensor* routes = nullptr;
         ggml_tensor* output = nullptr;
 
-        explicit FullResidentGraph(const Weights& weights)
+        explicit FullResidentGraph(const Weights& weights, bool deepseek = false, ggml_backend_t device = nullptr)
         {
+            backend = device != nullptr ? device : g_backend;
             context = ggml_init({ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false), nullptr, true});
             require(context != nullptr, "Could not allocate reference tensor metadata");
             auto* gate = ggml_new_tensor_3d(context, weights.types[0], hidden, ff, experts);
@@ -190,7 +207,12 @@ namespace
             ggml_set_output(routes);
             auto* g = ggml_mul_mat_id(context, gate, x, ids);
             auto* u = ggml_mul_mat_id(context, up, x, ids);
-            auto* h = ggml_mul(context, ggml_silu(context, g), u);
+            if (deepseek && weights.segment.clamp_limit > 1e-6f)
+            {
+                g = ggml_clamp(context, g, -INFINITY, weights.segment.clamp_limit);
+                u = ggml_clamp(context, u, -weights.segment.clamp_limit, weights.segment.clamp_limit);
+            }
+            auto* h = deepseek ? ggml_swiglu_split(context, g, u) : ggml_mul(context, ggml_silu(context, g), u);
             auto* parts = ggml_mul_mat_id(context, down, h, ids);
             ggml_set_output(parts);
             auto* weighted = ggml_mul(context, parts, routes);
@@ -202,7 +224,7 @@ namespace
             ggml_set_output(output);
             graph = ggml_new_graph_custom(context, 64, false);
             ggml_build_forward_expand(graph, output);
-            allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+            allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
             require(allocator != nullptr && ggml_gallocr_alloc_graph(allocator, graph),
                 "Could not allocate full-resident reference graph");
             ggml_backend_tensor_set(gate, weights.quantized[0].data(), 0, weights.quantized[0].size());
@@ -222,7 +244,7 @@ namespace
             ggml_backend_tensor_set(x, activation.data(), 0, sizeof(activation));
             ggml_backend_tensor_set(ids, selected.data(), 0, sizeof(selected));
             ggml_backend_tensor_set(routes, probabilities.data(), 0, sizeof(probabilities));
-            require(ggml_backend_graph_compute(g_backend, graph) == GGML_STATUS_SUCCESS,
+            require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS,
                 "Full-resident reference expert graph failed");
             std::array<float, hidden> result{};
             ggml_backend_tensor_get(output, result.data(), 0, sizeof(result));
@@ -404,6 +426,329 @@ namespace
         require(released.reserved == 0 && released.calls == 0 && released.hits == 0 && released.misses == 0,
             "Explicit expert-cache teardown retained device allocations or old counters");
     }
+
+    void deepseek_cuda_checks(Weights& weights)
+    {
+        constexpr std::size_t budget = std::size_t(2) << 20;
+        ggml_backend_t primary = g_backend;
+        const int second_device = ggml_backend_cuda_get_device_count() > 1 ? 1 : 0;
+        ggml_backend_t secondary = ggml_backend_cuda_init(second_device);
+        ggml_backend_t bridge_cpu = ggml_backend_cpu_init();
+        if (secondary == nullptr || bridge_cpu == nullptr)
+        {
+            if (secondary != nullptr) ggml_backend_free(secondary);
+            if (bridge_cpu != nullptr) ggml_backend_free(bridge_cpu);
+            throw std::runtime_error("Could not initialize independent cache-test backends");
+        }
+        try
+        {
+            // An independent DeepSeek backend must work even when the global
+            // operation bridge points at a CPU backend.
+            g_backend = bridge_cpu;
+            auto hm = weights.segment;
+            hm.clamp_limit = 0.1f;
+            weights.segment.clamp_limit = hm.clamp_limit;
+            {
+                FullResidentGraph primary_reference(weights, true, primary);
+                FullResidentGraph secondary_reference(weights, true, secondary);
+                std::array<float, hidden> x{}, actual{};
+                std::array<std::int32_t, used> ids{0, 1};
+                std::array<float, used> routes{0.6f, 0.4f};
+                for (int i = 0; i < hidden; ++i) x[i] = 4.0f * std::sin(0.13f * i);
+                actual.fill(-123.0f);
+                const auto sentinel = actual;
+                const auto run = [&](const tsg::HostMoeSegment& segment, ggml_backend_t backend,
+                                     std::size_t bytes = std::size_t(2) << 20, std::size_t layers = 1) {
+                    return tsg::host_moe_cached_experts(segment, x.data(), ids.data(), routes.data(), actual.data(),
+                        "deepseek41 native", backend, bytes, layers);
+                };
+                require(run(hm, nullptr) == 0 && actual == sentinel,
+                    "DeepSeek cache inferred a backend from the global bridge");
+                require(run(hm, primary, 0) == 0 && run(hm, primary, budget, 0) == 0 && actual == sentinel,
+                    "DeepSeek cache engaged without an explicit reserved budget/layer count");
+                require(run(hm, bridge_cpu) == 0 && actual == sentinel,
+                    "DeepSeek cache incorrectly engaged a CPU backend");
+                auto invalid = hm;
+                invalid.clamp_limit = std::numeric_limits<float>::quiet_NaN();
+                require(run(invalid, primary) == 0 && actual == sentinel,
+                    "Invalid clamp metadata changed output instead of declining the cache");
+                require(run(hm, primary) == 1, "Explicit DeepSeek cache backend did not engage");
+                const auto expected = primary_reference.compute(x, ids, routes);
+                require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+                    "DeepSeek cached clamp/SwiGLU differs from an independent full-resident graph");
+                const Stats first;
+                require(first.reserved > 0 && first.reserved <= static_cast<std::int64_t>(budget),
+                    "First DeepSeek backend exceeded its reserved ceiling");
+                require(run(hm, secondary) == 1, "Second independent DeepSeek backend did not engage");
+                const auto expected_second = secondary_reference.compute(x, ids, routes);
+                require(std::memcmp(actual.data(), expected_second.data(), sizeof(actual)) == 0,
+                    "Second DeepSeek backend used another device's weights or activations");
+                const Stats both;
+                require(both.reserved > first.reserved && both.reserved <= static_cast<std::int64_t>(budget * 2),
+                    "Independent backend allocations were combined into one device's budget");
+                for (int iteration = 0; iteration < 48; ++iteration)
+                {
+                    ids = {(iteration * 3) % experts, (iteration * 3 + 1) % experts};
+                    if (iteration % 7 == 0) ids[1] = ids[0];
+                    require(run(hm, primary) == 1, "DeepSeek compact expert eviction declined unexpectedly");
+                    const auto reference = primary_reference.compute(x, ids, routes);
+                    require(std::memcmp(actual.data(), reference.data(), sizeof(actual)) == 0,
+                        "DeepSeek expert eviction/remapping changed router-order arithmetic");
+                    require(Stats().reserved <= static_cast<std::int64_t>(budget * 2),
+                        "DeepSeek eviction exceeded the sum of independent backend ceilings");
+                }
+                ids = {0, 1};
+                const Stats before_other;
+                require(run(hm, secondary) == 1, "Secondary backend entry disappeared during primary eviction");
+                const Stats after_other;
+                require(after_other.misses == before_other.misses && after_other.hits >= before_other.hits + used,
+                    "One backend evicted another backend's reserved expert slots");
+                // The same source pointers with a different clamp must never
+                // replay the earlier graph. Re-entering the old clamp tests
+                // invalidation as well as the new-key miss.
+                weights.segment.clamp_limit = 0.35f;
+                FullResidentGraph changed_reference(weights, true, primary);
+                auto changed = hm;
+                changed.clamp_limit = weights.segment.clamp_limit;
+                require(run(changed, primary) == 1, "Changed DeepSeek clamp did not rebuild the cache entry");
+                const auto changed_expected = changed_reference.compute(x, ids, routes);
+                require(std::memcmp(actual.data(), changed_expected.data(), sizeof(actual)) == 0,
+                    "DeepSeek cache key omitted the clamp limit");
+                require(run(hm, primary) == 1, "Original DeepSeek clamp could not be restored after eviction");
+                const auto restored_expected = primary_reference.compute(x, ids, routes);
+                require(std::memcmp(actual.data(), restored_expected.data(), sizeof(actual)) == 0,
+                    "DeepSeek clamp restoration reused a graph with different clipping");
+                // A Qwen call over the exact same pointers uses a different
+                // arithmetic graph and an independent opt-in budget domain.
+                auto qwen = hm;
+                qwen.clamp_limit = 0;
+                weights.segment.clamp_limit = 0;
+                FullResidentGraph qwen_reference(weights, false, primary);
+                const Stats before_qwen;
+                require(tsg::host_moe_cached_experts(qwen, x.data(), ids.data(), routes.data(), actual.data(),
+                    "qwen4exp fused token span", primary) == 1, "Existing Qwen explicit backend call declined");
+                require(Stats().misses >= before_qwen.misses + used,
+                    "Qwen reused another model family's cached arithmetic graph");
+                const auto qwen_expected = qwen_reference.compute(x, ids, routes);
+                require(std::memcmp(actual.data(), qwen_expected.data(), sizeof(actual)) == 0,
+                    "Existing Qwen unclamped arithmetic changed under DeepSeek cache support");
+                const Stats before_shrink;
+                require(run(hm, primary, std::size_t(1) << 20) == 0,
+                    "A workspace-only DeepSeek quota unexpectedly fit routed experts");
+                require(Stats().reserved < before_shrink.reserved,
+                    "A reduced DeepSeek quota retained an allocation above its explicit ceiling");
+                require(run(hm, primary) == 1,
+                    "DeepSeek cache could not recover after a bounded quota fallback");
+                tsg::host_moe_expert_cache_release_backend(primary);
+                const Stats primary_released;
+                require(primary_released.reserved > 0 && primary_released.reserved <= static_cast<std::int64_t>(budget),
+                    "Backend-specific release freed another backend's cache or retained its own slots");
+                const Stats secondary_before;
+                require(run(hm, secondary) == 1 && Stats().misses == secondary_before.misses,
+                    "Backend-specific release invalidated an independent live backend");
+                tsg::host_moe_expert_cache_release_backend(secondary);
+                require(Stats().reserved == 0, "Backend-specific release retained cache allocations");
+            }
+            tsg::host_moe_expert_cache_release();
+            ggml_backend_free(secondary);
+            ggml_backend_free(bridge_cpu);
+            g_backend = primary;
+            std::printf("PASS: DeepSeek clamp, family/backend isolation, eviction and lifetime (secondary CUDA device %d)\n", second_device);
+        }
+        catch (...)
+        {
+            tsg::host_moe_expert_cache_release_backend(primary);
+            tsg::host_moe_expert_cache_release_backend(secondary);
+            ggml_backend_free(secondary);
+            ggml_backend_free(bridge_cpu);
+            g_backend = primary;
+            throw;
+        }
+    }
+
+#if !defined(_WIN32)
+    // Keep the writer and the production read-only descriptor open throughout
+    // truncation/restoration, matching a model shard changed after load.
+    struct PreadWeightsFile
+    {
+        std::string path;
+        int writer = -1;
+        std::array<std::uint64_t, 3> offsets{};
+        std::shared_ptr<tsg_dsv41_pread::file> source;
+
+        explicit PreadWeightsFile(const Weights& weights)
+        {
+            char name[] = "/tmp/tensorsharp-expert-pread-XXXXXX";
+            writer = ::mkstemp(name);
+            require(writer >= 0, "Could not create selected-expert source fixture");
+            path = name;
+            try
+            {
+                std::uint64_t next = 4096;
+                for (int part = 0; part < 3; ++part)
+                {
+                    offsets[part] = next;
+                    write(weights.quantized[part].data(), weights.quantized[part].size(), next);
+                    next += weights.quantized[part].size() + 4096;
+                }
+                source = tsg_dsv41_pread::file::open(path);
+            }
+            catch (...)
+            {
+                ::close(writer); writer = -1;
+                ::unlink(path.c_str());
+                throw;
+            }
+        }
+
+        ~PreadWeightsFile()
+        {
+            if (writer >= 0) ::close(writer);
+            if (!path.empty()) ::unlink(path.c_str());
+        }
+
+        void write(const std::uint8_t* bytes, std::size_t count, std::uint64_t offset)
+        {
+            while (count != 0)
+            {
+                const auto n = ::pwrite(writer, bytes, count, static_cast<off_t>(offset));
+                if (n < 0 && errno == EINTR) continue;
+                require(n > 0, "Could not write selected-expert source fixture");
+                bytes += n; count -= static_cast<std::size_t>(n); offset += static_cast<std::uint64_t>(n);
+            }
+        }
+    };
+
+    void pread_cuda_checks(Weights& weights)
+    {
+        require(std::all_of(weights.types.begin(), weights.types.end(),
+            [](ggml_type type) { return type == GGML_TYPE_MXFP4; }),
+            "The later-wave selected-expert fixture requires MXFP4 weights");
+        PreadWeightsFile file(weights);
+        auto hm = weights.segment;
+        hm.clamp_limit = 0.1f;
+        weights.segment.clamp_limit = hm.clamp_limit;
+        for (int part = 0; part < 3; ++part)
+            hm.expert_files[part] = {file.source, file.offsets[part], weights.quantized[part].size()};
+        const auto stride = weights.quantized[0].size() / experts;
+        require(stride == 34816 && weights.quantized[1].size() / experts == stride
+            && weights.quantized[2].size() / experts == stride,
+            "Selected-expert fixture no longer forces separate 64KiB staging waves");
+        // Exactly two slots before graph overhead: 2.5 experts of payload room
+        // leaves ample small-graph scratch, but cannot admit a third slot.
+        const std::size_t budget = (std::size_t(1) << 20) + 3 * stride * used + (3 * stride) / 2;
+        std::array<float, hidden> x{}, actual{};
+        std::array<std::int32_t, used> ids{0, 1};
+        std::array<float, used> routes{0.6f, 0.4f};
+        for (int i = 0; i < hidden; ++i) x[i] = 4.0f * std::sin(0.13f * i);
+        FullResidentGraph reference(weights, true, g_backend);
+        const auto run = [&] {
+            return tsg::host_moe_cached_experts(hm, x.data(), ids.data(), routes.data(), actual.data(),
+                "deepseek41 native", g_backend, budget, 1);
+        };
+        require(run() == 1, "File-backed selected-expert cache did not engage");
+        auto expected = reference.compute(x, ids, routes);
+        require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+            "File-backed quantized bytes/clamp differ from the full-resident graph");
+        const Stats resident;
+        require(resident.misses == used, "File-backed fixture did not populate exactly two initial slots");
+
+        // Expert0 is the least recently used slot. The duplicate fresh ID takes
+        // only that slot; with 34KiB per part, gate and up upload in earlier
+        // waves before the down read encounters the deliberately shortened EOF.
+        ids = {2, 2};
+        const auto truncated_size = file.offsets[2] + 3 * stride - 1;
+        require(::ftruncate(file.writer, static_cast<off_t>(truncated_size)) == 0,
+            "Could not truncate a fresh expert's down source range");
+        actual.fill(-123.0f);
+        const auto sentinel = actual;
+        require(run() == -1, "Later-wave source EOF did not fail the selected-expert cache");
+        require(actual == sentinel, "Failed selected-expert upload exposed a partial result");
+
+        // The former tag must have been cleared before gate/up were replaced.
+        // Its original down bytes are before EOF and remain available to reload.
+        ids = {0, 1};
+        const Stats failed;
+        require(run() == 1, "Cache could not reload the old victim after a later-wave source EOF");
+        const Stats reloaded;
+        require(reloaded.misses == failed.misses + 1 && reloaded.hits >= failed.hits + 1,
+            "Failed replacement retained a stale victim tag or evicted the protected expert");
+        expected = reference.compute(x, ids, routes);
+        require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+            "Reloading the old victim used partially overwritten expert bytes");
+
+        file.write(weights.quantized[2].data(), weights.quantized[2].size(), file.offsets[2]);
+        ids = {2, 2};
+        require(run() == 1, "Restored persistent source could not retry the failed fresh expert");
+        expected = reference.compute(x, ids, routes);
+        require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+            "Retry after source restoration retained failed-upload bytes or tags");
+        tsg::host_moe_expert_cache_release();
+        require(Stats().reserved == 0, "File-backed expert test retained cache allocations");
+        std::puts("PASS: MXFP4 file-backed clamp parity, later-wave EOF, victim-tag reload and restored-source retry");
+    }
+
+    void host_cache_cuda_checks(Weights & weights)
+    {
+        PreadWeightsFile file(weights);
+        auto hm=weights.segment;
+        hm.clamp_limit=weights.segment.clamp_limit=0.1f;
+        for (int p=0;p<3;++p) hm.expert_files[p]={file.source,file.offsets[p],weights.quantized[p].size()};
+        const auto stride=weights.quantized[0].size()/experts;
+        const std::size_t gpu_budget=(std::size_t(1)<<20)+3*stride*used+(3*stride)/2;
+        std::array<float,hidden> x{},actual{};
+        std::array<std::int32_t,used> ids{0,1};
+        std::array<float,used> routes{0.6f,0.4f};
+        for (int i=0;i<hidden;++i) x[i]=4.0f*std::sin(0.13f*i);
+        FullResidentGraph reference(weights,true,g_backend);
+        auto run=[&] {return tsg::host_moe_cached_experts(hm,x.data(),ids.data(),routes.data(),actual.data(),
+            "deepseek41 native",g_backend,gpu_budget,1);};
+        auto parity=[&] {
+            const auto expected=reference.compute(x,ids,routes);
+            require(std::memcmp(actual.data(),expected.data(),sizeof(actual))==0,
+                "Exclusive quantized host cache changed routed clamp output bits");
+            (void)HostStats();
+        };
+        auto restore=[&] {for (int p=0;p<3;++p) file.write(weights.quantized[p].data(),weights.quantized[p].size(),file.offsets[p]);};
+        require(run()==1,"Initial exclusive host cache GPU fill failed");parity();
+        require(HostStats().reserved==0,"Host tier duplicated initial GPU-resident experts");
+        ids={2,2};require(run()==1,"GPU victim could not move to host cache");parity();
+        require(HostStats().reserved==std::int64_t(3*stride),"Exactly one GPU victim was not retained as raw host bytes");
+        require(::ftruncate(file.writer,0)==0,"Could not truncate host-hit source");
+        const HostStats before_host;
+        ids={0,1};require(run()==1,"Host cache hit incorrectly attempted to read truncated source");parity();
+        const HostStats after_host;
+        require(after_host.hits==before_host.hits+1 && after_host.sources==before_host.sources,
+            "Exclusive host hit did not bypass source reads");
+        require(after_host.reserved==std::int64_t(3*stride),"Host hit duplicated the exchanged GPU victim");
+        restore();
+        for (int expert=2;expert<experts;++expert)
+        {
+            ids={expert,expert};require(run()==1,"Bounded host cache eviction failed");parity();
+        }
+        require(HostStats().evictions>0,"One MiB host cap did not force LRU payload eviction");
+        require(::ftruncate(file.writer,0)==0,"Could not truncate cold source after host eviction");
+        ids={0,0};actual.fill(-123.0f);const auto sentinel=actual;
+        const HostStats before_source;
+        require(run()==-1 && actual==sentinel,"Missing both tiers did not preserve output on source EOF");
+        const HostStats after_source;
+        require(after_source.sources==before_source.sources+1,"Failed source attempt was not counted per expert");
+        ids={14,15};
+        require(run()==1,"Failed source replacement lost the original GPU victim's host bytes");parity();
+        require(HostStats().sources==after_source.sources,"Old victim recovery unexpectedly read source");
+        restore();ids={0,0};require(run()==1,"Restored source could not retry exclusive cache miss");parity();
+        tsg::host_moe_expert_cache_on_drop(hm.gate_data);
+        require(HostStats().reserved==0 && Stats().reserved==0,"Source release retained GPU or host expert payloads");
+        ids={0,1};require(run()==1,"Entry reload after source release failed");
+        ids={2,2};require(run()==1 && HostStats().reserved>0,"Reload did not create a host victim");
+        tsg::host_moe_expert_cache_release_backend(g_backend);
+        require(HostStats().reserved==0 && Stats().reserved==0,"Backend release retained host expert payloads");
+        require(HostStats().hits>0,"Backend release unexpectedly reset monotonic host statistics");
+        tsg::host_moe_expert_cache_release();
+        require(HostStats().sources==0 && HostStats().hits==0,"Global release did not reset host statistics");
+        std::puts("PASS: exclusive raw host victims, no-source host hits, strict LRU cap, EOF recovery and lifetime");
+    }
+#endif
 #endif
 }
 
@@ -424,23 +769,46 @@ int main(int argc, char** argv)
             return 0;
         }
         Weights weights;
-        bool cpu_only = false, prefetch = false;
+        bool cpu_only = false, prefetch = false, deepseek = false, pread = false,host_cache=false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
+            else if (std::strcmp(argv[arg], "--deepseek") == 0) deepseek = true;
+            else if (std::strcmp(argv[arg], "--pread") == 0) pread = true;
+            else if (std::strcmp(argv[arg], "--host-cache") == 0) {host_cache=true;pread=true;}
             else if (std::strcmp(argv[arg], "--quantization") == 0 && arg + 1 < argc)
             {
                 ggml_type type = GGML_TYPE_COUNT;
                 ++arg;
                 if (std::strcmp(argv[arg], "iq1_m") == 0) type = GGML_TYPE_IQ1_M;
                 else if (std::strcmp(argv[arg], "iq2_xxs") == 0) type = GGML_TYPE_IQ2_XXS;
+                else if (std::strcmp(argv[arg], "mxfp4") == 0) type = GGML_TYPE_MXFP4;
                 require(type != GGML_TYPE_COUNT, "Unsupported expert-cache parity quantization");
-                weights.types = {type, type, GGML_TYPE_IQ4_NL};
+                weights.types = {type, type, type == GGML_TYPE_MXFP4 ? type : GGML_TYPE_IQ4_NL};
             }
             else throw std::runtime_error("Unsupported expert-cache test argument");
         }
+        if (pread)
+        {
+            require(!cpu_only && !prefetch, "--pread requires CUDA and a separate run from --prefetch");
+            deepseek = true;
+            weights.types = {GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4};
+        }
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
+        set_environment("TS_DSV41_EXPERT_CACHE_MB", deepseek ? "2" : "0");
+        set_environment("TS_DSV41_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
+        set_environment("TS_DSV41_EXPERT_CACHE_DIAGNOSTICS", "1");
+        set_environment("TS_DSV41_EXPERT_CACHE_PREAD", pread ? "1" : "0");
+        set_environment("TS_DSV41_EXPERT_HOST_CACHE_MB",host_cache ? "1" : "0");
+        if (pread) set_environment("TS_DSV41_EXPERT_CACHE_PREAD_STAGING_KB",host_cache ? "65536" : "64");
+#if defined(_WIN32) || !defined(TSG_GGML_USE_CUDA)
+        if (pread)
+        {
+            std::fprintf(stderr, "SKIP: selected-expert pread CUDA fixture requires Linux/POSIX and a CUDA build\n");
+            return 77;
+        }
+#endif
         weights.fill(0.5f);
 #ifdef TSG_GGML_USE_CUDA
         if (!cpu_only)
@@ -452,6 +820,23 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+#if !defined(_WIN32)
+            if (pread)
+            {
+                if (host_cache) host_cache_cuda_checks(weights);
+                else pread_cuda_checks(weights);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+#endif
+            if (deepseek)
+            {
+                deepseek_cuda_checks(weights);
+                require(prefetch == (tsg::g_test_prefetch_calls > 0),
+                    "DeepSeek opt-in raw expert prefetch did not match its requested mode");
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
             cuda_checks(weights);
             require(prefetch == (tsg::g_test_prefetch_calls > 0),
                 "Opt-in raw expert prefetch did not match its requested mode");
@@ -462,6 +847,7 @@ int main(int argc, char** argv)
         }
 #else
         (void)cpu_only;
+        (void)deepseek;
 #endif
         g_backend = ggml_backend_cpu_init();
         require(g_backend != nullptr, "Could not initialize CPU backend");

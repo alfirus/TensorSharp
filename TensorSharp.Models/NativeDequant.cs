@@ -24,6 +24,13 @@ namespace TensorSharp.Models
         private static bool UseManaged(int ggmlType)
             => PreferManaged && ManagedQuantizedOps.SupportsDequantization((GgmlTensorType)ggmlType);
 
+        private static void RefuseStorageOnlyType(int ggmlType)
+        {
+            if ((GgmlTensorType)ggmlType is GgmlTensorType.MXFP8 or GgmlTensorType.MXFP8_Unsloth)
+                throw new NotSupportedException("MXFP8 header sizing is supported, but generic dequantization is not. " +
+                    "Use the TensorSharp-owned DeepSeek V4.1 Engram loader; unchanged upstream ggml does not implement this type.");
+        }
+
         // One notice for the whole process: once the native library is missing it is
         // missing for every tensor, and the load loop hits these catches thousands of times.
         private static int _managedFallbackWarned;
@@ -40,6 +47,7 @@ namespace TensorSharp.Models
 
         public static void DequantizeToFloat32(int ggmlType, byte[] src, int srcOffset, float[] dst, int dstOffset, long numElements)
         {
+            RefuseStorageOnlyType(ggmlType);
             if (UseManaged(ggmlType))
             {
                 ManagedQuantizedOps.DequantizeToFloat32(ggmlType, src, srcOffset, dst, dstOffset, numElements);
@@ -58,6 +66,7 @@ namespace TensorSharp.Models
 
         public static void DequantizeToFloat32(int ggmlType, IntPtr src, float[] dst, int dstOffset, long numElements)
         {
+            RefuseStorageOnlyType(ggmlType);
             if (UseManaged(ggmlType))
             {
                 ManagedQuantizedOps.DequantizeToFloat32(ggmlType, src, dst, dstOffset, numElements);
@@ -76,6 +85,7 @@ namespace TensorSharp.Models
 
         public static void DequantizeToFloat32Native(int ggmlType, IntPtr src, IntPtr dst, long numElements)
         {
+            RefuseStorageOnlyType(ggmlType);
             if (UseManaged(ggmlType))
             {
                 ManagedQuantizedOps.DequantizeToFloat32Native(ggmlType, src, dst, numElements);
@@ -94,6 +104,7 @@ namespace TensorSharp.Models
 
         public static long RowSize(int ggmlType, long ne)
         {
+            RefuseStorageOnlyType(ggmlType);
             if (UseManaged(ggmlType))
                 return ManagedQuantizedOps.RowSize(ggmlType, ne);
             try

@@ -42,6 +42,7 @@
 #include "ggml-quants.h"
 #include "ggml_ops_flash_attn_guard.h"
 #include "ggml_ops_bonsai.h"
+#include "dsv41_expert_pread.h"
 
 #if defined(_WIN32)
 #define TSG_EXPORT extern "C" __declspec(dllexport)
@@ -710,6 +711,7 @@ namespace tsg
     // --- Error helpers ---
 
     void set_last_error(const std::string& message);
+    void configure_ggml_logging();
     void clear_last_error();
 
     // A whole-model loader declining a load (not enough VRAM, a --tp layout the
@@ -888,15 +890,21 @@ namespace tsg
         // Optional on-GPU reference chain (TS_HOST_MOE_VERIFY=1).
         ggml_tensor* verify_gpu = nullptr;
 
-        // --- host expert weights (never uploaded) ---
+        // --- canonical host expert weights (an optional compact cache may copy selected experts) ---
         void* gate_data = nullptr;  int gate_type = 0;  std::int64_t gate_ne0 = 0, gate_ne1 = 0, gate_bytes = 0;
         void* up_data = nullptr;    int up_type = 0;    std::int64_t up_ne0 = 0,   up_ne1 = 0,   up_bytes = 0;
         void* down_data = nullptr;  int down_type = 0;  std::int64_t down_ne0 = 0, down_ne1 = 0, down_bytes = 0;
+        // Optional exact on-disk ranges. DeepSeek's opt-in bounded pread tier
+        // reads quantized cache misses directly, without faulting the mmap.
+        tsg_dsv41_pread::file_range expert_files[3];
         const float* gate_bias = nullptr;
         const float* up_bias = nullptr;
         const float* down_bias = nullptr;
 
         int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
+        // Optional DeepSeek SwiGLU clipping, before SiLU: gate has an upper
+        // bound; up is symmetric. Zero preserves existing unclamped families.
+        float clamp_limit = 0.0f;
         float oai_alpha = 1.702f;
         float oai_limit = 7.0f;
 
@@ -1287,15 +1295,24 @@ namespace tsg
     // Unsupported input returns false without writing any output row.
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                      const float* weights, float* out);
-    // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,
+    // Opt-in Qwen4Exp/DeepSeek V4.1 CUDA expert tier: 1 computed, 0 unsupported/disabled,
     // -1 execution failed. Owns bounded compact quantized slots and graphs.
     // x/weights both null reads hm.moe_in/hm.weights through CUDA row copies;
     // IDs stay on the host. out null writes hm.moe_out directly on CUDA;
-    // otherwise the complete result is downloaded into out.
+    // otherwise the complete result is downloaded into out. The default backend
+    // preserves existing Qwen callers. DeepSeek requires the explicit backend,
+    // an opted-in TS_DSV41_EXPERT_CACHE_MB ceiling, budget bytes per backend,
+    // and the actual cache-bearing layer count assigned to that backend.
     int host_moe_cached_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                               const float* weights, float* out, const char* kernel_name);
+                               const float* weights, float* out, const char* kernel_name,
+                               ggml_backend_t backend = nullptr,
+                               std::size_t budget_per_device = 0, std::size_t layer_count = 0);
     void host_moe_expert_cache_on_drop(const void* ptr);
+    // Independent whole-model backends must retire their entries before backend
+    // destruction, while queued output copies can still be synchronized safely.
+    void host_moe_expert_cache_release_backend(ggml_backend_t backend);
     void host_moe_expert_cache_release();
+    void host_moe_expert_host_cache_stats(std::int64_t *,std::int64_t *,std::int64_t *,std::int64_t *,std::int64_t *);
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);
     void host_moe_decode_release();

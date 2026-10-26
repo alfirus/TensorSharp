@@ -32,6 +32,21 @@ namespace TensorSharp.GGML
             int nGpu, int nCtx, int nUbatch, int nThreads, string dsparkPath,
             int nCpuMoe, string backendName, int tensorParallelRanks);
 
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_Dsv41LoadStage(string ggufPath, int nGpu, int nCtx,
+            int nUbatch, int nThreads, string backendName, int firstLayer, int endLayer);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv41StageInfo(IntPtr handle,
+            out int first, out int end, out int hidden, out int hc);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static unsafe partial int TSGgml_Dsv41StageForward(IntPtr handle, int* tokens, int nTokens,
+            float* hiddenIn, float* preIn, float* hiddenOut, float* preOut, float* logitsOut, int allLogits);
+
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Dsv4DsparkBlockSize(IntPtr handle);
@@ -153,6 +168,40 @@ namespace TensorSharp.GGML
             string dsparkPath = null, int nCpuMoe = CpuMoeNone, string backendName = null, int tensorParallelRanks = 0)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, dsparkPath ?? string.Empty,
                 nCpuMoe, backendName ?? string.Empty, tensorParallelRanks);
+
+        /// <summary>Load only a self-contained, half-open V4.1 layer range for a
+        /// pipeline. Requires an explicit positive microbatch and exact prefill;
+        /// spills the minimum local expert layers to CPU if VRAM requires it.</summary>
+        public static IntPtr LoadStage(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
+            string backendName, int firstLayer, int endLayer)
+            => TSGgml_Dsv41LoadStage(ggufPath, nGpu, nCtx, nUbatch, nThreads, backendName, firstLayer, endLayer);
+
+        public static bool StageInfo(IntPtr handle, out int first, out int end, out int hidden, out int hc)
+            => TSGgml_Dsv41StageInfo(handle, out first, out end, out hidden, out hc) != 0;
+
+        /// <summary>Advance one stage by one common microbatch. Buffers use
+        /// token-major F32 hidden[hc,hidden] and pre[hc]. Reset every stage after
+        /// any failure before continuing the distributed sequence.</summary>
+        public static unsafe bool StageForward(IntPtr handle, int[] tokens, float[] hiddenIn, float[] preIn,
+            float[] hiddenOut, float[] preOut, float[] logitsOut, bool allLogits = false)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            if (!StageInfo(handle, out int first, out int end, out int hidden, out int hc) || tokens.Length == 0)
+                return false;
+            long preCount = (long)tokens.Length * hc, hiddenCount = preCount * hidden;
+            if ((hiddenIn != null && hiddenIn.LongLength < hiddenCount) ||
+                (preIn != null && preIn.LongLength < preCount) ||
+                (hiddenOut != null && hiddenOut.LongLength < hiddenCount) ||
+                (preOut != null && preOut.LongLength < preCount) ||
+                (first > 0 && (hiddenIn == null || preIn == null)))
+                throw new ArgumentException("Pipeline activation buffer is missing or too small.");
+            long logitsCount = (long)(allLogits ? tokens.Length : 1) * VocabSize(handle);
+            if (logitsOut != null && logitsOut.LongLength < logitsCount)
+                throw new ArgumentException("Pipeline logits buffer is too small.", nameof(logitsOut));
+            fixed (int* t = tokens)
+            fixed (float* hi = hiddenIn, pi = preIn, ho = hiddenOut, po = preOut, lo = logitsOut)
+                return TSGgml_Dsv41StageForward(handle, t, tokens.Length, hi, pi, ho, po, lo, allLogits ? 1 : 0) == 0;
+        }
 
         /// <summary>Tokens the DSpark drafter proposes per block, or 0 when no
         /// drafter is loaded.</summary>

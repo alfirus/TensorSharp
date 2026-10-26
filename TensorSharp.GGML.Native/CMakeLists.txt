@@ -660,6 +660,27 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_executable(GgmlOpsDsv41EngramTest tests/dsv41_engram_test.cpp)
     add_test(NAME deepseek41-engram-hash-lookup COMMAND GgmlOpsDsv41EngramTest)
+    add_executable(GgmlOpsDsv41Mxfp8Test tests/dsv41_mxfp8_test.cpp)
+    add_test(NAME deepseek41-mxfp8-engram COMMAND GgmlOpsDsv41Mxfp8Test)
+    add_executable(GgmlOpsDsv41ExpertPreadTest tests/dsv41_expert_pread_test.cpp)
+    target_link_libraries(GgmlOpsDsv41ExpertPreadTest PRIVATE Threads::Threads)
+    add_test(NAME deepseek41-expert-pread COMMAND GgmlOpsDsv41ExpertPreadTest)
+    set_tests_properties(deepseek41-expert-pread PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_executable(GgmlOpsDsv41ExpertCacheBridgeTest tests/dsv41_expert_cache_bridge_test.cpp)
+    target_include_directories(GgmlOpsDsv41ExpertCacheBridgeTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsDsv41ExpertCacheBridgeTest PRIVATE ggml-cpu ggml-base Threads::Threads)
+    add_test(NAME deepseek41-expert-cache-cpu-bridge COMMAND GgmlOpsDsv41ExpertCacheBridgeTest)
+    set_tests_properties(deepseek41-expert-cache-cpu-bridge PROPERTIES TIMEOUT 30)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND NOT WIN32)
+        add_executable(GgmlOpsDsv41ExpertCacheDeviceBridgeTest tests/dsv41_expert_cache_device_bridge_test.cpp)
+        target_include_directories(GgmlOpsDsv41ExpertCacheDeviceBridgeTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_compile_definitions(GgmlOpsDsv41ExpertCacheDeviceBridgeTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsDsv41ExpertCacheDeviceBridgeTest PRIVATE GgmlOps ggml-cpu ggml-cuda ggml-base)
+        add_test(NAME deepseek41-expert-cache-cuda-device-bridge COMMAND GgmlOpsDsv41ExpertCacheDeviceBridgeTest)
+        set_tests_properties(deepseek41-expert-cache-cuda-device-bridge PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+    endif()
     add_executable(GgmlOpsMuseSparkTpSplitTest tests/muse_spark_tp_split_test.cpp ggml_ops_muse_spark_tp.cpp)
     target_include_directories(GgmlOpsMuseSparkTpSplitTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsMuseSparkTpSplitTest PRIVATE ggml-base)
@@ -792,6 +813,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq2_xxs)
         add_test(NAME host-moe-expert-cache-cuda-prefetch-parity
             COMMAND GgmlOpsHostMoeExpertCacheTest --prefetch)
+        add_test(NAME host-moe-expert-cache-cuda-deepseek-pread
+            COMMAND GgmlOpsHostMoeExpertCacheTest --pread)
+        add_test(NAME host-moe-expert-cache-cuda-deepseek-host-victims
+            COMMAND GgmlOpsHostMoeExpertCacheTest --host-cache)
         add_test(NAME host-moe-expert-cache-cuda-iq1-m-prefetch-parity
             COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --prefetch)
         add_test(NAME host-moe-expert-cache-cuda-iq2-xxs-prefetch-parity
@@ -800,6 +825,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             host-moe-expert-cache-cuda-iq1-m-parity host-moe-expert-cache-cuda-iq2-xxs-parity
             host-moe-expert-cache-cuda-prefetch-parity host-moe-expert-cache-cuda-iq1-m-prefetch-parity
             host-moe-expert-cache-cuda-iq2-xxs-prefetch-parity
+            host-moe-expert-cache-cuda-deepseek-pread
+            host-moe-expert-cache-cuda-deepseek-host-victims
             PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
     endif()
 

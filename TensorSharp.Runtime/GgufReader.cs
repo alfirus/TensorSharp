@@ -39,6 +39,11 @@ namespace TensorSharp.Runtime
         NVFP4 = 40,
         Q1_0 = 41,
         Q2_0 = 42,
+        // Published llama.cpp/Unsloth on-disk formats. The pinned upstream
+        // ggml checkout does not implement these IDs: metadata sizing and raw
+        // reads do not imply native ggml kernel/dequantization support.
+        MXFP8 = 43,
+        MXFP8_Unsloth = 67,
         // PrismML Bonsai2 on-disk formats; transcoded by TensorSharp, never
         // passed to upstream ggml as ggml_type values.
         PQ2_0 = 142, PTQ1_0 = 143,
@@ -728,6 +733,8 @@ namespace TensorSharp.Runtime
 
         public long GetTensorByteCount(GgufTensorInfo tensorInfo)
         {
+            if (tensorInfo.Type is GgmlTensorType.MXFP8 or GgmlTensorType.MXFP8_Unsloth)
+                return GetMxfp8TensorByteCount(tensorInfo);
             long ne0 = (long)tensorInfo.Shape[0];
             long rows = 1;
             for (int i = 1; i < tensorInfo.Shape.Length; i++)
@@ -735,6 +742,31 @@ namespace TensorSharp.Runtime
 
             long rowBytes = GetRowBytes(tensorInfo.Type, ne0);
             return rowBytes * rows;
+        }
+
+        private static long GetMxfp8TensorByteCount(GgufTensorInfo info)
+        {
+            if (info.Shape == null || info.Shape.Length == 0)
+                throw new InvalidDataException($"MXFP8 tensor {info.Name} needs a nonempty shape.");
+            try
+            {
+                long rowElements = checked((long)info.Shape[0]);
+                if (rowElements <= 0 || rowElements % 32 != 0)
+                    throw new InvalidDataException($"MXFP8 tensor {info.Name} requires positive rows aligned to 32 values.");
+                long bytes = checked(rowElements / 32 * 33);
+                for (int i = 1; i < info.Shape.Length; i++)
+                {
+                    long rows = checked((long)info.Shape[i]);
+                    if (rows <= 0)
+                        throw new InvalidDataException($"MXFP8 tensor {info.Name} has a nonpositive dimension.");
+                    bytes = checked(bytes * rows);
+                }
+                return bytes;
+            }
+            catch (OverflowException error)
+            {
+                throw new InvalidDataException($"MXFP8 tensor {info.Name} exceeds the supported byte range.", error);
+            }
         }
 
         private static long GetRowBytes(GgmlTensorType type, long ne0)
@@ -765,6 +797,8 @@ namespace TensorSharp.Runtime
                 case GgmlTensorType.Q8_1:
                 case GgmlTensorType.IQ4_NL:
                 case GgmlTensorType.MXFP4:
+                case GgmlTensorType.MXFP8:
+                case GgmlTensorType.MXFP8_Unsloth:
                     return 32;
                 case GgmlTensorType.NVFP4:
                 case GgmlTensorType.Q2_0:
@@ -809,6 +843,8 @@ namespace TensorSharp.Runtime
                 case GgmlTensorType.TQ1_0: return 2 + 256 / 64 + (256 - 4 * 256 / 64) / 5; // 54
                 case GgmlTensorType.TQ2_0: return 2 + 256 / 4;                 // 66
                 case GgmlTensorType.MXFP4: return 1 + 32 / 2;                  // 17
+                case GgmlTensorType.MXFP8:
+                case GgmlTensorType.MXFP8_Unsloth: return 1 + 32;              // 33
                 case GgmlTensorType.NVFP4: return 4 + 64 / 2;               // 36
                 case GgmlTensorType.Q1_0: return 2 + 128 / 8;               // 18
                 case GgmlTensorType.Q2_0: return 2 + 64 / 4;                // 18

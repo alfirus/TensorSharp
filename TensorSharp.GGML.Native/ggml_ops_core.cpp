@@ -248,7 +248,7 @@ namespace tsg
         std::fflush(stderr);
     }
 
-    static void configure_ggml_logging()
+    void configure_ggml_logging()
     {
         ggml_log_set(filtered_ggml_log, nullptr);
     }

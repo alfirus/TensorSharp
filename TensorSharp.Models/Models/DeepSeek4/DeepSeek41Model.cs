@@ -50,6 +50,8 @@ namespace TensorSharp.Models
         {
             lock (NativeSync)
             {
+                if (IsPipelineExecutor)
+                    throw new NotSupportedException("The experimental DeepSeek pipeline supports text only; remove --mmproj.");
                 if (_vision != IntPtr.Zero)
                     throw new InvalidOperationException("The V4.1 vision companion is already loaded.");
                 if (NativeHandle == IntPtr.Zero)

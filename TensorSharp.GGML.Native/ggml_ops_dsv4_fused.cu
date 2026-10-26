@@ -47,12 +47,55 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 bool tsg_dsv4_cuda_supports_native_bf16(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) return false;
     const auto * context = static_cast<const ggml_backend_cuda_context *>(backend->context);
     const int cc = ggml_cuda_info().devices[context->device].cc;
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE;
+}
+
+static __global__ void tsg_dsv4_expert_nonfinite(const float * values, int64_t count, int32_t * flag) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += int64_t(gridDim.x) * blockDim.x)
+        if (!isfinite(values[i])) atomicExch(flag, 1);
+}
+
+static void tsg_dsv4_expert_cuda_check(cudaError_t status, const char * operation) {
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string("DeepSeek expert device bridge ") + operation + ": " + cudaGetErrorString(status));
+}
+
+void tsg_dsv4_cuda_expert_finite_scan(ggml_backend_t backend, const ggml_tensor * first,
+                                    const ggml_tensor * second, ggml_tensor * flag) {
+    if (!backend || !ggml_backend_is_cuda(backend) || !first || !flag || flag->type != GGML_TYPE_I32 ||
+        ggml_nelements(flag) != 1 || !flag->data)
+        throw std::runtime_error("DeepSeek expert device finite-scan metadata is invalid");
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    tsg_dsv4_expert_cuda_check(cudaSetDevice(context->device), "select device");
+    auto stream = context->stream(context->device, 0);
+    tsg_dsv4_expert_cuda_check(cudaMemsetAsync(flag->data, 0, sizeof(int32_t), stream), "clear finite status");
+    for (const auto * tensor : {first, second}) {
+        if (!tensor) continue;
+        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) || !tensor->data)
+            throw std::runtime_error("DeepSeek expert device finite-scan tensor is invalid");
+        const auto count = ggml_nelements(tensor);
+        if (count <= 0) throw std::runtime_error("DeepSeek expert device finite-scan tensor is empty");
+        const int blocks = int(std::min<int64_t>((count + 255) / 256, 256));
+        tsg_dsv4_expert_nonfinite<<<blocks, 256, 0, stream>>>(static_cast<const float *>(tensor->data), count,
+            static_cast<int32_t *>(flag->data));
+        tsg_dsv4_expert_cuda_check(cudaGetLastError(), "finite scan");
+    }
+}
+
+void tsg_dsv4_cuda_expert_poison(ggml_backend_t backend, ggml_tensor * output) noexcept {
+    if (!backend || !ggml_backend_is_cuda(backend) || !output || !output->data) return;
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (cudaSetDevice(context->device) != cudaSuccess) return;
+    // All-one F32 bits are NaN. Ordering on the paired stream also drains any
+    // earlier partial helper copies before downstream nodes can see this row.
+    (void)cudaMemsetAsync(output->data, 0xff, ggml_nbytes(output), context->stream(context->device, 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,10 +1141,10 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
                  d->kind == TSG_ATTN_F32_SOFTMAX || d->kind == TSG_ATTN_MASK_COMPACT ||
                  d->kind == TSG_ATTN_VISION_F32)
             tsg_attention_cuda_compute(node, c->cuda_backend);
-        else if (d->kind == TSG_DSV41_TP_MOE)
+        else if (d->kind == TSG_DSV41_TP_MOE || d->kind == TSG_DSV41_CACHED_MOE)
         {
-            // Enqueues every rank's work behind this stream and makes this
-            // stream wait for the gathered output; nothing waits on the host.
+            // TP enqueues its rank exchange; the optional cache bridge uses
+            // this same owning stream with bounded ID/finite-status readback.
             GGML_ASSERT(d->device_launch != nullptr);
             d->device_launch(d->object, node, (void *) stream, c->device);
             CUDA_CHECK(cudaSetDevice(c->device));

@@ -61,6 +61,9 @@
     <ReferenceNativeSymbol Include="TSGgml_Dsv41AttachVision" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41ForwardVision" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41VisionEncode" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv41LoadStage" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv41StageForward" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv41StageInfo" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41VisionFree" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41VisionInfo" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv41VisionLoad" SymbolType="Function" />
@@ -185,6 +188,7 @@
     <ReferenceNativeSymbol Include="TSGgml_HasBackendFailure" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HasResidentDeviceCopy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertCacheStats" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_HostMoeExpertHostCacheStats" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_HostReadBarrier" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexReductionF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_IndexSelectF32" SymbolType="Function" />

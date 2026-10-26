@@ -85,7 +85,7 @@ namespace TensorSharp.Models
 
         /// <summary>Trunk position tracked by the executor (the base class's
         /// counter is not used by the DSV4 executors).</summary>
-        public new int CacheSeqLen => _cudaExec != null
+        public new int CacheSeqLen => _pipelineExec != null ? _pipelineExec.NPast : _cudaExec != null
             ? _cudaExec.NPast
             : (_handle != IntPtr.Zero ? GgmlDeepSeek4Native.NPast(_handle) : base.CacheSeqLen);
 
