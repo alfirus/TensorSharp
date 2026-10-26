@@ -35,6 +35,7 @@
 // skipping it everywhere is mathematically identical.
 // ---------------------------------------------------------------------------
 
+#include "ggml_ops_cuda_launch_policy.h"
 #include "ggml_ops_internal.h"
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_matmul_precision.h"
@@ -2267,6 +2268,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     // Vulkan path was never exercised at all.
     int n_gpu = 0;
     const bool cpu_only = backend_name && (strcmp(backend_name, "CPU") == 0 || strcmp(backend_name, "cpu") == 0);
+    if (!cpu_only && !tsg::configure_cuda_launch_policy())
+        throw std::runtime_error("Failed to configure the CUDA launch policy");
     if (cpu_only)
     {
         // One logical device reuses the scheduler and placement code while
