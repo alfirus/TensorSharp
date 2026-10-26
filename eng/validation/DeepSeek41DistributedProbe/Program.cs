@@ -17,18 +17,20 @@ try
     if (args.Length % 2 != 0) throw new ArgumentException("Every option requires a value.");
     for (int i = 0; i < args.Length; i += 2)
         if (!options.TryAdd(args[i], args[i + 1])) throw new ArgumentException("Duplicate option: " + args[i]);
-    var allowed = new HashSet<string> { "--model", "--tokens", "--output", "--weights-id", "--tp",
+    var allowed = new HashSet<string> { "--model", "--tokens", "--text", "--output", "--weights-id", "--tp", "--layer-split",
         "--tp-node-id", "--tp-peers", "--chunk", "--decode-count", "--backend" };
     foreach (string key in options.Keys)
         if (!allowed.Contains(key)) throw new ArgumentException("Unknown option: " + key);
-    foreach (string key in new[] { "--model", "--tokens", "--output", "--weights-id" })
+    foreach (string key in new[] { "--model", "--output", "--weights-id" })
         if (!options.ContainsKey(key) || string.IsNullOrWhiteSpace(options[key]))
             throw new ArgumentException("Required option: " + key);
+    if (options.ContainsKey("--tokens") == options.ContainsKey("--text"))
+        throw new ArgumentException("Specify exactly one of --tokens TOKENS.json or --text UTF8_TEXT_FILE.");
 }
 catch (ArgumentException error)
 {
     Console.Error.WriteLine(error.Message);
-    Console.Error.WriteLine("Usage: DeepSeek41DistributedProbe --model MODEL.gguf --tokens TOKENS.json " +
+    Console.Error.WriteLine("Usage: DeepSeek41DistributedProbe --model MODEL.gguf (--tokens TOKENS.json | --text UTF8_TEXT_FILE) " +
         "--weights-id IMMUTABLE_ID --output FRESH_DIRECTORY [--tp 2 --tp-node-id 0 --tp-peers HOST:PORT,HOST:PORT] " +
         "[--chunk 3 --decode-count 4 --backend ggml_cuda]");
     return 2;
@@ -59,12 +61,32 @@ try
 {
     int chunk = int.Parse(options.GetValueOrDefault("--chunk", "3"));
     int decodeCount = int.Parse(options.GetValueOrDefault("--decode-count", "4"));
-    int[] tokens = JsonSerializer.Deserialize<int[]>(File.ReadAllText(options["--tokens"]))
-        ?? throw new ArgumentException("Token file must contain a JSON array.");
+    int[] tokens;
+    byte[] tokenSource;
+    if (options.TryGetValue("--text", out string? textPath))
+    {
+        // Real checkpoint vocabularies often reserve the small IDs used by the
+        // synthetic fixture. Tokenize actual text for meaningful real-weight
+        // comparisons instead of reusing those fixture IDs across families.
+        using var header = GgufFile.OpenWithoutSiblingShards(options["--model"]);
+        var tokenizer = ModelBase.CreateTokenizerFromGguf(header);
+        byte[] textBytes = File.ReadAllBytes(textPath);
+        tokens = tokenizer.Encode(System.Text.Encoding.UTF8.GetString(textBytes), false).ToArray();
+        tokenSource = JsonSerializer.SerializeToUtf8Bytes(tokens);
+        File.WriteAllBytes(Path.Combine(output, "tokens.json"), tokenSource);
+        report["text_sha256"] = Convert.ToHexStringLower(SHA256.HashData(textBytes));
+        report["text"] = System.Text.Encoding.UTF8.GetString(textBytes);
+    }
+    else
+    {
+        tokenSource = File.ReadAllBytes(options["--tokens"]);
+        tokens = JsonSerializer.Deserialize<int[]>(tokenSource)
+            ?? throw new ArgumentException("Token file must contain a JSON array.");
+    }
     if (chunk < 1 || decodeCount < 1 || tokens.Length < decodeCount + 2 || tokens.Any(x => x < 0))
         throw new ArgumentException("Need positive chunk/decode-count and at least decode-count + 2 nonnegative tokens.");
     report["tokens"] = tokens;
-    report["tokens_sha256"] = Convert.ToHexStringLower(SHA256.HashData(File.ReadAllBytes(options["--tokens"])));
+    report["tokens_sha256"] = Convert.ToHexStringLower(SHA256.HashData(tokenSource));
     BackendType backend = options.GetValueOrDefault("--backend", "ggml_cuda") switch
     {
         "ggml_cuda" => BackendType.GgmlCuda,
@@ -86,22 +108,35 @@ try
         configured_threads = MoeCpuOffloadConfig.CpuThreads
     };
     report["requested_kv_cache_dtype"] = Environment.GetEnvironmentVariable("KV_CACHE_DTYPE");
-    string[] parallelArgs = options.Where(pair => pair.Key is "--tp" or "--tp-node-id" or "--tp-peers")
+    string[] parallelArgs = options.Where(pair => pair.Key is "--tp" or "--layer-split" or "--tp-node-id" or "--tp-peers")
         .SelectMany(pair => new[] { pair.Key, pair.Value }).ToArray();
     var parallel = ModelParallelismOptions.Parse(parallelArgs);
     if (parallel.Distributed is { } distributed)
     {
-        ModelBase.ValidateDistributedTensorParallelism(options["--model"], backend);
-        unownedGroup = new DistributedTensorParallelGroup(
-            ModelBase.CreateGgmlLocalTpGroup(backend, distributed.LocalDegree),
-            distributed.NodeId, distributed.PeerEndpoints);
+        if (parallel.IsLayerSplit)
+        {
+            ModelBase.ValidateDistributedLayerSplit(options["--model"], backend);
+            unownedGroup = new DistributedLayerSplitGroup(
+                ModelBase.CreateGgmlLocalLayerSplitGroup(backend, distributed.LocalDegree),
+                distributed.NodeId, distributed.PeerEndpoints);
+        }
+        else
+        {
+            ModelBase.ValidateDistributedTensorParallelism(options["--model"], backend);
+            unownedGroup = new DistributedTensorParallelGroup(
+                ModelBase.CreateGgmlLocalTpGroup(backend, distributed.LocalDegree),
+                distributed.NodeId, distributed.PeerEndpoints);
+        }
     }
     var timer = Stopwatch.StartNew();
-    model = ModelBase.Create(options["--model"], backend, parallel.TpDegree, unownedGroup!);
+    model = ModelBase.Create(options["--model"], backend, parallel.TpDegree, unownedGroup!,
+        layerSplitDegree: parallel.LayerSplitDegree);
     ITensorParallelGroup? group = unownedGroup;
     unownedGroup = null; // ModelBase owns the supplied group from this point.
     report["load_seconds"] = timer.Elapsed.TotalSeconds;
-    report["topology"] = new { local_degree = parallel.TpDegree, global_degree = group?.GlobalDegree ?? parallel.TpDegree,
+    int localDegree = parallel.IsLayerSplit ? parallel.LayerSplitDegree : parallel.TpDegree;
+    report["topology"] = new { mode = parallel.IsLayerSplit ? "layer_split" : "tensor_parallel",
+        local_degree = localDegree, global_degree = group?.GlobalDegree ?? localDegree,
         rank_offset = group?.GlobalRankOffset ?? 0, node_count = group?.NodeCount ?? 1 };
     report["vocab_size"] = model.Config.VocabSize;
     if (tokens.Any(x => x >= model.Config.VocabSize)) throw new ArgumentException("Token exceeds model vocabulary.");

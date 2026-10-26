@@ -39,6 +39,16 @@ namespace TensorSharp.GGML
         [return: MarshalAs(UnmanagedType.I1)]
         public delegate bool CrossNodeAllReduce(IntPtr user, IntPtr data, int count);
 
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public delegate bool LayerTransfer(IntPtr user, int peer, int send, IntPtr data, int bytes);
+
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_Dsv4LoadModelLayerDistributed(string ggufPath,
+            int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe, string backendName,
+            int node, int nodes, IntPtr transfer, IntPtr user);
+
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial IntPtr TSGgml_Dsv4LoadModelDistributed(string ggufPath,
@@ -179,6 +189,18 @@ namespace TensorSharp.GGML
                 nThreads, nCpuMoe, backendName ?? string.Empty, globalRanks, rankOffset,
                 Marshal.GetFunctionPointerForDelegate(crossNode), IntPtr.Zero);
             GC.KeepAlive(crossNode);
+            return handle;
+        }
+
+        public static IntPtr LoadModelLayerDistributed(string ggufPath, int localDegree,
+            int node, int nodes, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
+            string backendName, LayerTransfer transfer)
+        {
+            ArgumentNullException.ThrowIfNull(transfer);
+            IntPtr handle = TSGgml_Dsv4LoadModelLayerDistributed(ggufPath, localDegree, nCtx,
+                nUbatch, nThreads, nCpuMoe, backendName, node, nodes,
+                Marshal.GetFunctionPointerForDelegate(transfer), IntPtr.Zero);
+            GC.KeepAlive(transfer);
             return handle;
         }
 

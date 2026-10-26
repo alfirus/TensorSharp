@@ -96,6 +96,13 @@ namespace TensorSharp.Models.Architecture
         /// whole-layer placement. LayerSplit architectures support it inherently.</summary>
         public bool SupportsLayerSplit { get; init; }
 
+        /// <summary>The executor loads and runs only its node's whole layers and
+        /// exchanges every required stage boundary tensor through ILayerSplitGroup.</summary>
+        public bool SupportsDistributedLayerSplit { get; init; }
+
+        public IReadOnlyList<BackendType> DistributedLayerSplitBackends { get; init; } =
+            new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan };
+
         /// <summary>Optional native partial-TP mode, for an otherwise layer-split
         /// executor. True only when its explicit native settings enable real sharding
         /// for the requested degree and backend.</summary>

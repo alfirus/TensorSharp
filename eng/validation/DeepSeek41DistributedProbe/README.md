@@ -1,12 +1,29 @@
 # DeepSeek V4.1 fixed-token distributed validation
 
-This probe uses TensorSharp's existing tensor-parallel groups, TCP transport and
+This probe uses TensorSharp's tensor-parallel or distributed layer-split groups, TCP transport and
 driver/worker controls. Every driver forward writes its actual input tokens,
 elapsed time and complete finite F32 logit vector. It exercises a full prefill,
 teacher-forced decode, reset, chunked prefill, refill and another reset/prefill.
 Teacher forcing keeps inputs identical after a greedy near-tie. Its timings are
 diagnostics, not a throughput benchmark. A worker returning from its loop is
 recorded separately from a completed driver numerical run.
+
+For whole-layer placement, replace `--tp N` with `--layer-split N` on **both**
+nodes; retain the same `--tp-node-id` and `--tp-peers` arguments. `N` is the GPU
+count per node, including an explicit `--layer-split 1`. Run a matching local
+`--layer-split N` control and compare every saved logit vector. The same probe
+accepts other supported model families, such as Mistral 3, with a verified
+checkpoint identity and valid token IDs. Fixture inputs demonstrate numerical
+execution only; run real text/structured-output serving tests separately.
+For real checkpoints, `--text UTF8_TEXT_FILE` can replace `--tokens TOKENS.json`;
+the probe uses that model's tokenizer and saves the exact IDs and text SHA256.
+Do not reuse a synthetic fixture's small token IDs for another vocabulary: they
+can denote unused special tokens and yield an uninformative zero-vector case.
+
+Retain native per-device ownership diagnostics: seeing two visible devices
+alone does not establish that both execute model layers. When local controls
+need CPU expert offload while distributed stages fit on GPUs, report the
+comparison as a capacity configuration change, not isolated network scaling.
 
 Build on both nodes from identical source, against an unchanged upstream ggml
 checkout. Save `git -C ExternalProjects/ggml rev-parse HEAD` and

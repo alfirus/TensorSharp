@@ -396,7 +396,8 @@ class SourceIdentityTests(unittest.TestCase):
     def test_tar_snapshot_identifies_sources_without_claiming_git_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("TensorSharp.GGML.Native/ops.cpp", "TensorSharp.Models/Model.cs",
+            for name in ("TensorSharp.GGML.Native/ops.cpp", "TensorSharp.GGML.Native/pipeline.inc",
+                         "TensorSharp.Core/LayerSplitPlan.cs", "TensorSharp.Models/Model.cs",
                          "TensorSharp.Models/bin/generated.cs", "TensorSharp.Models/obj/generated.cs",
                          "TensorSharp.GGML.Native/build/debug.cu", "Directory.Build.props"):
                 path = root / name
@@ -409,11 +410,14 @@ class SourceIdentityTests(unittest.TestCase):
                 self.assertIsNone(first["revision"])
                 self.assertEqual(first["declared_base_revision"], "declared-base")
                 files = {name for group in first["groups"].values() for name in group["files"]}
-                self.assertEqual(files, {"TensorSharp.GGML.Native/ops.cpp", "TensorSharp.Models/Model.cs", "Directory.Build.props"})
+                self.assertEqual(files, {"TensorSharp.GGML.Native/ops.cpp", "TensorSharp.GGML.Native/pipeline.inc",
+                                         "TensorSharp.Core/LayerSplitPlan.cs", "TensorSharp.Models/Model.cs", "Directory.Build.props"})
                 (root / "TensorSharp.Models/bin/generated.cs").write_text("new generated output")
                 self.assertEqual(first["groups"], runner.source_identity(root)["groups"])
                 (root / "TensorSharp.Models/Model.cs").write_text("changed source")
                 self.assertNotEqual(first["groups"]["managed_sources"], runner.source_identity(root)["groups"]["managed_sources"])
+                (root / "TensorSharp.GGML.Native/pipeline.inc").write_text("changed native pipeline")
+                self.assertNotEqual(first["groups"]["native_sources"], runner.source_identity(root)["groups"]["native_sources"])
 
 
 class CgroupMemoryTests(unittest.TestCase):

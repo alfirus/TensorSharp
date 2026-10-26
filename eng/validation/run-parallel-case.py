@@ -206,7 +206,7 @@ def companion_paths(arguments, directory=None):
 def source_identity(repo):
     """Bind tracked and new source files; generated/ignored build outputs are excluded."""
     native = "TensorSharp.GGML.Native"
-    managed = ("TensorSharp.Runtime", "TensorSharp.Models", "TensorSharp.Backends.GGML",
+    managed = ("TensorSharp.Core", "TensorSharp.Runtime", "TensorSharp.Models", "TensorSharp.Backends.GGML",
                "TensorSharp.Distributed", "TensorSharp.Cli", "TensorSharp.Chat", "TensorSharp.Server",
                "TensorSharp.Server.Host", "benchmarks/AgentTurnBench")
     build = ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "global.json")
@@ -223,7 +223,7 @@ def source_identity(repo):
                 children[:] = [name for name in children if name not in excluded and not name.startswith("build-")]
                 names.extend(str((Path(directory) / name).relative_to(repo)) for name in files)
         revision = None
-    suffixes = {".cs", ".csproj", ".props", ".targets", ".cpp", ".c", ".h", ".hpp", ".cu", ".cuh", ".cmake", ".sh", ".m", ".mm", ".metal"}
+    suffixes = {".cs", ".csproj", ".props", ".targets", ".cpp", ".c", ".h", ".hpp", ".inc", ".cu", ".cuh", ".cmake", ".sh", ".m", ".mm", ".metal"}
     groups = {"native_sources": {}, "managed_sources": {}, "shared_build_inputs": {}}
     for name in sorted(set(names) - {""}):
         path = repo / name
@@ -396,6 +396,9 @@ def main():
                                                "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE",
                                                "TENSORSHARP_TP_DEVICES", "TENSORSHARP_LAYER_SPLIT_DEVICES",
                                                "TENSORSHARP_TP_NODE_ID", "TENSORSHARP_TP_PEERS",
+                                               "TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS", "TENSORSHARP_TP_RECV_TIMEOUT_SECONDS",
+                                               "TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS", "TENSORSHARP_TP_SOCKET_BUFFER_BYTES",
+                                               "TS_PREFILL_WARMUP",
                                                "TS_GLM_NATIVE", "TS_GLM_TP_SHARD",
                                                "TS_DSV41_TP_HOST_TOKENS", "TS_DSV4_UBATCH", "TS_DSV4_THREADS",
                                                "TS_DSV4_VRAM_RESERVE_MB", "TS_DSV4_LOAD_THREADS", "TS_DSV4_LOAD_CHUNK_MB",

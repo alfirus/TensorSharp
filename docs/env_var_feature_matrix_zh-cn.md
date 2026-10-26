@@ -380,10 +380,12 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | 支持按层切分的架构 | 本地整层放置的 GPU 数，等价于 `--layer-split N`；与 TP 参数互斥 | `1` | 未注册 | 否 |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器 | 逗号分隔的设备序号，例如 `0,2`；独立于 `TENSORSHARP_TP_DEVICES`；原生 GLM/DeepSeek 使用 `CUDA_VISIBLE_DEVICES` | `0..N-1` | 未注册 | 否 |
 | `TENSORSHARP_TP_DEVICES` | GGML 后端上的本地 TP | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`）。Muse Spark 的原生 `--tp` 使用前 N 张 CUDA GPU，设置了该变量时拒绝加载；那里请用 `CUDA_VISIBLE_DEVICES` | `0..tp-1` | 未注册 | 否 |
-| `TENSORSHARP_TP_NODE_ID` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 多节点分布式 TP 中本节点的 0 起始编号；必须与 `TENSORSHARP_TP_PEERS` 一起设置 | 未设置（关闭） | 未注册 | 否 |
-| `TENSORSHARP_TP_PEERS` | 全部自回归模型；`cuda`、`ggml_cuda`、`ggml_vulkan` 后端 | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔）；必须与 `TENSORSHARP_TP_NODE_ID` 一起设置 | 未设置（关闭） | 未注册 | 否 |
-| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 仅分布式 TP | 各节点向 peer 重试连接多久后放弃 | `120` 秒 | 未注册 | 否 |
-| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | 仅分布式 TP | peer 套接字的单次接收超时；卡住的 peer 会让集合通信失败而不是一直挂起 | `300` 秒 | 未注册 | 否 |
+| `TENSORSHARP_TP_NODE_ID` | 支持分布式 TP 或层切分的架构和后端 | 本节点的 0 起始编号；必须与 `TENSORSHARP_TP_PEERS` 一起设置 | 未设置（关闭） | 未注册 | 否 |
+| `TENSORSHARP_TP_PEERS` | 支持分布式 TP 或层切分的架构和后端 | 所有节点的 `host:port` 列表（逗号分隔）；必须与 `TENSORSHARP_TP_NODE_ID` 一起设置；IPv6 使用 `[address]:port` | 未设置（关闭） | 未注册 | 否 |
+| `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 分布式 TP 和层切分 | 连接重试、入站连接与网格握手的总期限 | `120` 秒 | 未注册 | 否 |
+| `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | 分布式 TP 和层切分 | peer 套接字读写无数据超时；心跳可保持空闲控制等待 | `300` 秒 | 未注册 | 否 |
+| `TENSORSHARP_TP_OPERATION_TIMEOUT_SECONDS` | 分布式 TP 和层切分 | 完整数据帧的期限，包含仅收到心跳和分段传输的时间；空闲控制等待和加载屏障除外 | 接收超时 | 未注册 | 否 |
+| `TENSORSHARP_TP_SOCKET_BUFFER_BYTES` | 分布式 TP 和层切分 | 可选的套接字收发缓冲区大小，至少 4096 字节；应根据实际网络测量调优 | 操作系统默认值 | 未注册 | 否 |
 | `TENSORSHARP_TP_DISABLE_P2P` | 本地 TP，`cuda` 后端 | `1` 表示所有跨 GPU 传输一律经主机中转，不使用 CUDA 点对点 DMA（与 A16 vGPU 等无 P2P 硬件一致） | 关闭（通过 DMA 自检的设备对使用 P2P） | 未注册 | 否 |
 | `TENSORSHARP_TP_HOST_ALLREDUCE` | 本地 TP，`cuda` 后端 | `1` 表示本地 AllReduce 走主机内存（设备→主机、求和、主机→设备）而非设备到设备路径——诊断兜底 | 关闭（设备到设备） | 未注册 | 否 |
 | `TS_GGML_TP_PARALLEL` | 本地 TP，GGML 后端 | `0` 表示顺序而非并发地驱动各 rank（诊断用） | 开启（并发 rank 工作线程） | 未注册 | 否 |

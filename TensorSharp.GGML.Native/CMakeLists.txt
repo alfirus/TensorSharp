@@ -1007,6 +1007,11 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsDsv4UbatchPlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek4-ubatch-plan COMMAND GgmlOpsDsv4UbatchPlanTest)
     set_tests_properties(deepseek4-ubatch-plan PROPERTIES TIMEOUT 60)
+
+    add_executable(GgmlOpsLayerPartitionTest tests/layer_partition_test.cpp)
+    target_include_directories(GgmlOpsLayerPartitionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME distributed-layer-byte-partition COMMAND GgmlOpsLayerPartitionTest)
+    set_tests_properties(distributed-layer-byte-partition PROPERTIES TIMEOUT 60)
     # Explicit per-width routed-expert layer timing behind the automatic ubatch
     # (see the source header). Never registered as a CTest.
     add_executable(GgmlOpsDsv4MoeWidthBench tests/dsv4_moe_width_bench.cpp)

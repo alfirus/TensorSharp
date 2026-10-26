@@ -153,7 +153,59 @@ public sealed class DeepSeek41DistributedTests : IDisposable
         }
     }
 
-    private sealed class Group(int local, int global, int offset, int nodes, Action<float[], int>? reduce = null)
+    [Theory]
+    [InlineData(1, 2, 0)]
+    [InlineData(2, 2, 1)]
+    [InlineData(3, 3, 2)]
+    public void LayerPipelineUsesItsOwnPlacementWithoutTensorParallelSharding(int local, int nodes, int node)
+    {
+        var layers = new LayerGroup(local, nodes, node);
+        DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.GgmlCuda, 1, layers);
+        DeepSeek41Architecture.ValidateLoad("not-opened.gguf", BackendType.GgmlCuda, null, layers, 1);
+        ITensorParallelGroup group = layers;
+        Assert.Equal(1, ModelBase.ResolveTensorParallelSupport(DeepSeek41Architecture.Descriptor,
+            BackendType.GgmlCuda, 1, ref group, out int split, local));
+        Assert.Equal(local, split);
+        Assert.Same(layers, group);
+        Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.Cuda, 1, layers));
+        Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateTensorParallelGroup(BackendType.GgmlCuda, 2, layers));
+    }
+
+    [Fact]
+    public void LayerFailureAbortsTransportWithoutFreeingLiveDeviceAllocations()
+    {
+        var model = (DeepSeek4Model)RuntimeHelpers.GetUninitializedObject(typeof(DeepSeek4Model));
+        var layers = new LayerGroup(2, 2, 0);
+        const BindingFlags instance = BindingFlags.Instance | BindingFlags.NonPublic;
+        typeof(DeepSeek4Model).GetField("_sync", instance)!.SetValue(model, new object());
+        typeof(ModelBase).GetField("<LayerSplitGroup>k__BackingField", instance)!.SetValue(model, layers);
+        MethodInfo forward = typeof(DeepSeek4Model).GetMethod("ForwardCore", instance)!;
+        var original = Assert.Throws<TargetInvocationException>(() => forward.Invoke(model, new object[] { new[] { 1 } }));
+        Assert.IsType<NullReferenceException>(original.InnerException);
+        Assert.Equal(1, layers.AbortCount);
+        Assert.Same(original.InnerException, layers.Failure);
+        Assert.Equal(0, layers.DisposeCount);
+        var reset = typeof(DeepSeek4Model).GetMethod("ResetKVCacheCore", instance)!;
+        var repeated = Assert.Throws<TargetInvocationException>(() => reset.Invoke(model, null));
+        Assert.Contains("restart every node", Assert.IsType<InvalidOperationException>(repeated.InnerException).Message);
+        Assert.Equal(1, layers.AbortCount);
+        Assert.Equal(0, layers.DisposeCount);
+    }
+
+    private sealed class LayerGroup(int local, int nodes, int node)
+        : Group(local, checked(local * nodes), checked(local * node), nodes), ILayerSplitGroup, IDistributedExecutionGroup
+    {
+        public int NodeId => node;
+        public int AbortCount { get; private set; }
+        public Exception? Failure { get; private set; }
+        public void Abort(Exception failure) { AbortCount++; Failure = failure; }
+        public void Send(float[] buffer, int count, int destination) => throw new NotSupportedException();
+        public void Receive(float[] buffer, int count, int source) => throw new NotSupportedException();
+    }
+
+    private class Group(int local, int global, int offset, int nodes, Action<float[], int>? reduce = null)
         : ITensorParallelGroup, INestedTensorParallelGroup
     {
         public int Degree => local;

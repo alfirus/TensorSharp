@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash（`deepseek41`）
 
-> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。下面的历史命令与测量早于这项默认值变更；多 GPU 启动请加 `--layer-split N`。按层切分仅限单节点。
+> **多 GPU 模式选择：** 整层放置使用 `--layer-split N`，支持的张量并行使用 `--tp N`。未配置两种模式时默认单设备。在 `ggml_cuda` 上再加 `--tp-node-id` 与 `--tp-peers` 可跨节点运行，N 为每个节点的本地 GPU 数。配置及限制见[多节点推理](../multi-node-inference.md)（英文）。下面的历史测量保留原有拓扑，不构成新增分布式按层切分路径的验证。
 
 [← 返回模型索引](README_zh-cn.md) | [English](deepseek41.md)
 

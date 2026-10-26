@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash (`deepseek41`)
 
-> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. Layer split is single-node only.
+> **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Add `--tp-node-id` and `--tp-peers` to span nodes on `ggml_cuda`; N is the local GPU count. See [multi-node setup and limitations](../multi-node-inference.md). Older measurements below retain their original topology and do not validate the new distributed layer path.
 
 [← back to model index](README.md) | [中文](deepseek41_zh-cn.md)
 

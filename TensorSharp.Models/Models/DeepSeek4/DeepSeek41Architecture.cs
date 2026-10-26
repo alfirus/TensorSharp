@@ -20,6 +20,8 @@ namespace TensorSharp.Models
             MultiGpu = MultiGpuMode.TensorParallel,
             DistributedTensorParallelBackends = new[] { BackendType.GgmlCuda },
             SupportsLayerSplit = true,
+            SupportsDistributedLayerSplit = true,
+            DistributedLayerSplitBackends = new[] { BackendType.GgmlCuda },
             MultiGpuLimitation = "DeepSeek V4.1 uses native routed-MoE tensor parallelism; attention and shared experts retain local layer placement.",
             SupportsNativeTensorParallel = (degree, backend) => backend == BackendType.GgmlCuda &&
                 degree is >= 2 and <= 8,
@@ -184,6 +186,13 @@ namespace TensorSharp.Models
         {
             ResolveTensorParallelRanks(tpDegree);
             if (group == null) return;
+            if (group is ILayerSplitGroup layer)
+            {
+                if (backend != BackendType.GgmlCuda || tpDegree != 1 || layer.NodeCount < 2 ||
+                    layer.Degree is < 1 or > 8 || layer.NodeId < 0 || layer.NodeId >= layer.NodeCount)
+                    throw new NotSupportedException("DeepSeek distributed layer split requires ggml_cuda, --tp 1 and 1..8 GPUs per node.");
+                return;
+            }
             if (backend != BackendType.GgmlCuda)
                 throw new NotSupportedException("DeepSeek V4.1 distributed tensor parallelism requires --backend ggml_cuda.");
             if (group.NodeCount < 2 || group is not INestedTensorParallelGroup)

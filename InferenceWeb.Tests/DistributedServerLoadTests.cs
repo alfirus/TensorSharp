@@ -86,13 +86,39 @@ public sealed class DistributedServerLoadTests : IDisposable
         Environment.SetEnvironmentVariable("TENSORSHARP_TP_PEERS", "127.0.0.1:9500,127.0.0.1:9501");
     }
 
+    [Fact]
+    public void DefaultServerFactoryPreservesLayerModeAndLocalDegree()
+    {
+        string architecture = "distributed-server-layer-" + Guid.NewGuid().ToString("N");
+        ModelCreateContext observed = null;
+        var stop = new InvalidOperationException("Captured layer context before native construction");
+        ModelArchitectureRegistry.Register(new ModelArchitectureDescriptor
+        {
+            Id = architecture,
+            Aliases = [architecture],
+            SupportsLayerSplit = true,
+            SupportsDistributedLayerSplit = true,
+            ApplyNativeTunables = context => { observed = context; throw stop; },
+            Factory = _ => throw new InvalidOperationException("must not construct"),
+        });
+        SyntheticGguf.Write(_path, [new SyntheticGguf.Str { Key = "general.architecture", V = architecture }], []);
+        var group = new LayerProbeGroup();
+        using var lifecycle = new ModelLifecycleService(null);
+        lifecycle.TensorParallelGroupFactory = _ => group;
+        Assert.Same(stop, Assert.Throws<InvalidOperationException>(() => lifecycle.LoadModel(_path, null, "ggml_cuda")));
+        Assert.Equal(1, observed.TpDegree);
+        Assert.Equal(2, observed.LayerSplitDegree);
+        Assert.Same(group, observed.TpGroup);
+        Assert.True(group.Disposed);
+    }
+
     private sealed class ProbeModel(string path) : ModelBase(path, BackendType.Cpu)
     {
         protected override float[] ForwardCore(int[] tokens) => [];
         protected override void ResetKVCacheCore() { }
     }
 
-    private sealed class DegreeProbeGroup : ITensorParallelGroup
+    private class DegreeProbeGroup : ITensorParallelGroup
     {
         public bool Disposed { get; private set; }
         public int Degree => 2;
@@ -107,5 +133,12 @@ public sealed class DistributedServerLoadTests : IDisposable
         public void BroadcastControl(int op, int[] payload) => throw new NotSupportedException();
         public (int op, int[] payload) ReceiveControl() => throw new NotSupportedException();
         public void Dispose() => Disposed = true;
+    }
+
+    private sealed class LayerProbeGroup : DegreeProbeGroup, ILayerSplitGroup
+    {
+        public int NodeId => 0;
+        public void Send(float[] buffer, int count, int destination) => throw new NotSupportedException();
+        public void Receive(float[] buffer, int count, int source) => throw new NotSupportedException();
     }
 }

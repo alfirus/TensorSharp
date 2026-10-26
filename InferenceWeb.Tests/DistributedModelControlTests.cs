@@ -61,6 +61,21 @@ public sealed class DistributedModelControlTests : IDisposable
     }
 
     [Fact]
+    public void FailedTruncationAbortsTheClusterAndPreventsSubsequentForward()
+    {
+        var group = new ControlGroup(0);
+        var failure = new InvalidOperationException("truncate failed after modifying local cache");
+        using var driver = new ControlModel(_path, group) { TruncateFailure = failure };
+        driver.BeginDistributedDriver();
+        Assert.Same(failure, Assert.Throws<InvalidOperationException>(() => driver.TryTruncateKVCache(4)));
+        Assert.Same(failure, group.AbortFailure);
+        Assert.Empty(group.Messages);
+        Assert.Throws<InvalidOperationException>(() => driver.Forward([1017]));
+        Assert.Equal(new[] { "truncate:4" }, driver.Executed);
+        Assert.Empty(group.Messages);
+    }
+
+    [Fact]
     public void WorkerPropagatesProtocolFailureAndDriverCannotEnterWorkerLoop()
     {
         var group = new ControlGroup(1);
@@ -94,6 +109,7 @@ public sealed class DistributedModelControlTests : IDisposable
     {
         public List<string> Executed { get; } = [];
         public Exception ForwardFailure { get; init; }
+        public Exception TruncateFailure { get; init; }
         public bool TruncateAllowed { get; set; } = true;
         public override bool SupportsKVCacheTruncation => true;
         protected override float[] ForwardCore(int[] tokens)
@@ -108,7 +124,11 @@ public sealed class DistributedModelControlTests : IDisposable
             return [1f];
         }
         protected override void ResetKVCacheCore() => Executed.Add("reset");
-        protected override void TruncateKVCacheCore(int tokenCount) => Executed.Add("truncate:" + tokenCount);
+        protected override void TruncateKVCacheCore(int tokenCount)
+        {
+            Executed.Add("truncate:" + tokenCount);
+            if (TruncateFailure != null) throw TruncateFailure;
+        }
         protected override bool TryTruncateKVCacheCore(int tokenCount)
         {
             if (!TruncateAllowed) return false;
@@ -117,8 +137,10 @@ public sealed class DistributedModelControlTests : IDisposable
         }
     }
 
-    private sealed class ControlGroup(int rankOffset) : ITensorParallelGroup
+    private sealed class ControlGroup(int rankOffset) : ITensorParallelGroup, IDistributedExecutionGroup
     {
+        public Exception AbortFailure { get; private set; }
+        public void Abort(Exception failure) => AbortFailure = failure;
         public Queue<(int op, int[] payload)> Messages { get; } = [];
         public int Degree => 1;
         public bool IsActive => true;
