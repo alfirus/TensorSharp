@@ -246,6 +246,10 @@ namespace TensorSharp.Distributed
         /// </summary>
         public void AllReduce(float[] buffer, int length)
         {
+            ArgumentNullException.ThrowIfNull(buffer);
+            if ((uint)length > (uint)buffer.Length || length > int.MaxValue / sizeof(float))
+                throw new ArgumentOutOfRangeException(nameof(length));
+            ObjectDisposedException.ThrowIf(_disposed, this);
             _arBuffer = buffer;
             _arLength = length;
             _arError = null;
@@ -290,6 +294,7 @@ namespace TensorSharp.Distributed
                     if (msgType != MsgAllReduceContribute)
                         throw new InvalidOperationException(
                             $"Expected AllReduceContribute from rank {r}, got message type 0x{msgType:X2}.");
+                    ValidateCollectivePayload(payload, byteCount, r);
 
                     fixed (float* bufPtr = buffer)
                     fixed (byte* payPtr = payload)
@@ -317,6 +322,7 @@ namespace TensorSharp.Distributed
                 if (msgType != MsgAllReduceResult)
                     throw new InvalidOperationException(
                         $"Expected AllReduceResult from rank 0, got message type 0x{msgType:X2}.");
+                ValidateCollectivePayload(payload, byteCount, 0);
 
                 fixed (float* bufPtr = buffer)
                     System.Runtime.InteropServices.Marshal.Copy(payload, 0, (IntPtr)bufPtr, byteCount);
@@ -333,6 +339,18 @@ namespace TensorSharp.Distributed
         {
             if (_allReduceSendBuf.Length >= byteCount) return;
             _allReduceSendBuf = new byte[byteCount];
+        }
+
+        private static void ValidateCollectivePayload(byte[] payload, int expectedBytes, int rank)
+        {
+            // A disagreement about the shard/activation shape must fail before
+            // the unsafe sum or Marshal.Copy reads beyond the received data.
+            // A larger stale prefill buffer consumed by a decode collective
+            // would otherwise quietly corrupt logits as well.
+            if (payload.Length != expectedBytes)
+                throw new InvalidOperationException(
+                    $"Collective shape mismatch from rank {rank}: expected {expectedBytes} bytes, received {payload.Length}. " +
+                    "All nodes must execute the same operation with the same tensor shape.");
         }
 
         /// <summary>

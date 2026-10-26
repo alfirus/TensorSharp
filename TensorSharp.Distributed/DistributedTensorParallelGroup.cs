@@ -108,7 +108,7 @@ namespace TensorSharp.Distributed
             _localGroup.AllReduce(tensors);
 
             // Phase 2: Copy rank-0 GPU data to host buffer.
-            int elementCount = (int)tensors[0].Storage.ElementCount;
+            int elementCount = checked((int)tensors[0].ElementCount());
             EnsureBuffers(elementCount);
 
             var hostData = tensors[0].GetElementsAsFloat(elementCount);
@@ -142,6 +142,8 @@ namespace TensorSharp.Distributed
         public void CrossNodeAllReduce(float[] buffer, int count)
         {
             ArgumentNullException.ThrowIfNull(buffer);
+            if ((uint)count > (uint)buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(count));
             if (count > 0)
                 _tcp.AllReduce(buffer, count);
         }

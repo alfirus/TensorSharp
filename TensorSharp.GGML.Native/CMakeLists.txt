@@ -713,6 +713,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cpu ggml-base Threads::Threads)
     add_test(NAME deepseek41-moe-tensor-parallel COMMAND GgmlOpsDsv41TpTest)
     add_test(NAME deepseek41-tp-failure-recovery COMMAND GgmlOpsDsv41TpTest --failure-only)
+    add_test(NAME deepseek41-distributed-moe-numerical COMMAND GgmlOpsDsv41TpTest --distributed-only)
+    set_tests_properties(deepseek41-distributed-moe-numerical PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND NOT WIN32)
         target_compile_definitions(GgmlOpsDsv41TpTest PRIVATE TSG_GGML_USE_CUDA=1)
         target_sources(GgmlOpsDsv41TpTest PRIVATE ggml_ops_dsv4_fused.cu ggml_ops_matmul_precision.cu

@@ -32,6 +32,19 @@ namespace TensorSharp.GGML
             int nGpu, int nCtx, int nUbatch, int nThreads, string dsparkPath,
             int nCpuMoe, string backendName, int tensorParallelRanks);
 
+        /// <summary>Sum a host F32 buffer across nodes. A null pointer and
+        /// count -1 request terminal transport abort after a rank failure.
+        /// Callbacks must return false on abort or error and never throw.</summary>
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        [return: MarshalAs(UnmanagedType.I1)]
+        public delegate bool CrossNodeAllReduce(IntPtr user, IntPtr data, int count);
+
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial IntPtr TSGgml_Dsv4LoadModelDistributed(string ggufPath,
+            int nGpu, int nCtx, int nUbatch, int nThreads, int nCpuMoe, string backendName,
+            int globalRanks, int rankOffset, IntPtr crossNode, IntPtr user);
+
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Dsv4DsparkBlockSize(IntPtr handle);
@@ -153,6 +166,21 @@ namespace TensorSharp.GGML
             string dsparkPath = null, int nCpuMoe = CpuMoeNone, string backendName = null, int tensorParallelRanks = 0)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, dsparkPath ?? string.Empty,
                 nCpuMoe, backendName ?? string.Empty, tensorParallelRanks);
+
+        /// <summary>Load this node's strips of the existing V4.1 native TP
+        /// executor. The owner must retain <paramref name="crossNode"/> until
+        /// the returned native handle is freed.</summary>
+        public static IntPtr LoadModelDistributed(string ggufPath, int localRanks, int globalRanks,
+            int rankOffset, int nCtx, int nUbatch, int nThreads, int nCpuMoe,
+            string backendName, CrossNodeAllReduce crossNode)
+        {
+            ArgumentNullException.ThrowIfNull(crossNode);
+            IntPtr handle = TSGgml_Dsv4LoadModelDistributed(ggufPath, localRanks, nCtx, nUbatch,
+                nThreads, nCpuMoe, backendName ?? string.Empty, globalRanks, rankOffset,
+                Marshal.GetFunctionPointerForDelegate(crossNode), IntPtr.Zero);
+            GC.KeepAlive(crossNode);
+            return handle;
+        }
 
         /// <summary>Tokens the DSpark drafter proposes per block, or 0 when no
         /// drafter is loaded.</summary>

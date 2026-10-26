@@ -2343,6 +2343,8 @@ namespace TensorSharp.Models
         {
             if (_tpGroup == null || _tpGroup.NodeCount <= 1)
                 return;
+            if (!IsDistributedWorker)
+                throw new InvalidOperationException("The distributed worker loop can only run on a worker node (global rank offset > 0).");
 
             Console.WriteLine(
                 $"[TP worker] ready — mirroring driver forward passes (global rank offset {_tpGroup.GlobalRankOffset}).");
@@ -2369,6 +2371,10 @@ namespace TensorSharp.Models
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[TP worker] loop ended: {ex.Message}");
+                // A failed worker must fail its host as well. Returning success
+                // here hid native/network failures from benchmark launchers and
+                // left the driver waiting for a missing collective contribution.
+                throw;
             }
         }
 
@@ -2944,6 +2950,9 @@ namespace TensorSharp.Models
                     "Remove --tp-node-id/--tp-peers; its native or single-device executor cannot consume cross-node collectives.");
             if (backend is not (BackendType.Cuda or BackendType.GgmlCuda or BackendType.GgmlVulkan))
                 throw new NotSupportedException($"Distributed tensor parallelism requires a multi-device GPU backend; {backend} cannot honor --tp-node-id/--tp-peers.");
+            if (architecture.DistributedTensorParallelBackends is { } supported && !supported.Contains(backend))
+                throw new NotSupportedException($"Architecture '{architecture.Id}' does not implement distributed tensor parallelism on {backend}. " +
+                    $"Use one of its distributed backends: {string.Join(", ", supported)}.");
         }
 
         /// <summary>

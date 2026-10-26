@@ -106,6 +106,11 @@ namespace TensorSharp.Models.Architecture
         /// executors that own local ranks must set this to false.</summary>
         public bool SupportsDistributedTensorParallel { get; init; } = true;
 
+        /// <summary>Optional backend restriction for cross-node collectives.
+        /// Checked before the host creates GPU ranks or connects to peers;
+        /// null permits the shared distributed GPU backends.</summary>
+        public IReadOnlyList<BackendType> DistributedTensorParallelBackends { get; init; }
+
         /// <summary>Backends implementing this architecture's whole-layer placement.</summary>
         public IReadOnlyList<BackendType> LayerSplitBackends { get; init; } =
             new[] { BackendType.GgmlCuda, BackendType.GgmlVulkan };

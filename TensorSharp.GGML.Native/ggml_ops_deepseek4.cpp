@@ -2251,11 +2251,24 @@ static bool dsv4_backend_matches(const char * reg_name, const char * want)
 
 static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, int n_ubatch, int n_threads,
                               const char * dspark_path, int n_cpu_moe_req, const char * backend_name,
-                              int tp_ranks)
+                              int tp_ranks, int tp_global_ranks = 0, int tp_rank_offset = 0,
+                              tsg_dsv41_tp::cross_node_all_reduce cross_node = nullptr, void * cross_node_user = nullptr)
 {
     auto t_start = std::chrono::steady_clock::now();
-    if (tp_ranks < 0 || tp_ranks == 1 || tp_ranks > 8)
-        throw std::runtime_error("DeepSeek V4.1 tensor parallelism requires 0 (disabled) or 2..8 ranks");
+    const bool distributed_tp = cross_node != nullptr;
+    if (!tp_global_ranks) tp_global_ranks = tp_ranks;
+    if (tp_ranks < 0 || (!distributed_tp && tp_ranks == 1) || tp_ranks > 8 ||
+        (distributed_tp && (tp_ranks < 1 || tp_global_ranks <= tp_ranks || tp_global_ranks > 16 ||
+            tp_rank_offset < 0 || tp_rank_offset > tp_global_ranks - tp_ranks)) ||
+        (!distributed_tp && (tp_global_ranks != tp_ranks || tp_rank_offset != 0)))
+        throw std::runtime_error("DeepSeek V4.1 tensor parallelism requires 2..8 local ranks, or 1..8 local / 2..16 global distributed ranks");
+    if (distributed_tp && dspark_path && *dspark_path)
+        throw std::runtime_error("Distributed DeepSeek V4.1 TP does not support DSpark control operations");
+    if (distributed_tp && n_cpu_moe_req < 0)
+        throw std::runtime_error("Distributed DeepSeek V4.1 TP requires an explicit CPU-MoE layer count shared by every node");
+    // Automatic per-node memory choices can produce different collective
+    // shapes. Distributed ranks use a common deterministic width instead.
+    if (distributed_tp && n_ubatch <= 0) n_ubatch = 256;
 
     std::unique_ptr<dsv4_model> m(new dsv4_model());
     bool engram_random_advice = false, engram_random_override = false;
@@ -2479,8 +2492,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                     rn ? rn : "selected");
         }
     }
-    if (tp_ranks && (!hp.v41 || cpu_only || tp_ranks < 2 || tp_ranks != n_gpu))
-        throw std::runtime_error("DeepSeek tensor parallelism requires deepseek41 and must equal its selected GPU count (2..8)");
+    if (tp_ranks && (!hp.v41 || cpu_only || (!distributed_tp && tp_ranks < 2) || tp_ranks != n_gpu))
+        throw std::runtime_error("DeepSeek tensor parallelism requires deepseek41 and must equal its selected local GPU count");
     auto key = [&](const char * suffix) { return arch + "." + suffix; };
     bool ok = true;
     ok &= gguf_get_u32_key(g0, key("block_count").c_str(), &hp.n_layer);
@@ -2793,13 +2806,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 const auto & gate = sources.at(prefix + "ffn_gate_exps.weight");
                 const auto & up = sources.at(prefix + "ffn_up_exps.weight");
                 const auto & down = sources.at(prefix + "ffn_down_exps.weight");
-                const auto strips = tsg_dsv41_tp::split_weights(down.ne[0], down.type, tp_ranks, il);
-                const auto output_strips = tsg_dsv41_tp::split_outputs(down.ne[1], tp_ranks, il);
+                const auto strips = tsg_dsv41_tp::split_weights(down.ne[0], down.type, tp_global_ranks, il);
+                const auto output_strips = tsg_dsv41_tp::split_outputs(down.ne[1], tp_global_ranks, il);
                 for (int d = 0; d < tp_ranks; ++d)
-                    tp_bytes[il][d] = strips[d].count *
+                    tp_bytes[il][d] = strips[tp_rank_offset + d].count *
                         (ggml_row_size(gate.type, gate.ne[0]) * gate.ne[2] +
                          ggml_row_size(up.type, up.ne[0]) * up.ne[2]) +
-                        ggml_row_size(down.type, down.ne[0]) * output_strips[d].count * down.ne[2];
+                        ggml_row_size(down.type, down.ne[0]) * output_strips[tp_rank_offset + d].count * down.ne[2];
             }
         }
         std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
@@ -3062,9 +3075,11 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         std::vector<ggml_backend_dev_t> devices;
         for (int d = 0; d < tp_ranks; ++d) devices.push_back(ggml_backend_get_device(m->backends[d]));
         m->moe_tp = std::make_unique<tsg_dsv41_tp::executor>(devices, hp.n_expert_used,
-            dsv4_warm_pread() ? dsv4_load_thread_count() : 0);
-        fprintf(stderr, "[dsv41] routed-MoE tensor parallelism: %d ranks, sharded gate/up/down weights; "
-                "attention and shared experts use layer placement; exact F32 activation/output gathers\n", tp_ranks);
+            dsv4_warm_pread() ? dsv4_load_thread_count() : 0,
+            tp_global_ranks, tp_rank_offset, cross_node, cross_node_user);
+        fprintf(stderr, "[dsv41] routed-MoE tensor parallelism: %d local / %d global ranks, offset %d; sharded gate/up/down weights; "
+                "attention and shared experts use local layer placement; exact F32 activation/output gathers%s\n",
+                tp_ranks, tp_global_ranks, tp_rank_offset, distributed_tp ? " through the existing cross-node transport" : "");
         // The strip uploads read every routed expert through the page cache and
         // never read it again, while the host-mapped Engram tables are read
         // after them and on every token. Same rule as the ordinary upload (see
@@ -7227,6 +7242,26 @@ TSG_EXPORT void * TSGgml_Dsv4LoadModel(const char * gguf_path, int n_gpu, int n_
     catch (const std::exception & e)
     {
         tsg::report_load_refusal("[dsv4] load failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+// Uses the same native TP executor and the application's existing distributed
+// group. The callback is retained by that model until this handle is freed.
+TSG_EXPORT void * TSGgml_Dsv4LoadModelDistributed(const char * gguf_path, int n_gpu, int n_ctx,
+    int n_ubatch, int n_threads, int n_cpu_moe, const char * backend_name,
+    int global_ranks, int rank_offset, tsg_dsv41_tp::cross_node_all_reduce cross_node, void * cross_node_user)
+{
+    tsg::clear_last_error();
+    try
+    {
+        if (!cross_node) throw std::runtime_error("Distributed DeepSeek V4.1 TP needs a cross-node collective");
+        return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, nullptr,
+            n_cpu_moe, backend_name, n_gpu, global_ranks, rank_offset, cross_node, cross_node_user);
+    }
+    catch (const std::exception & e)
+    {
+        tsg::report_load_refusal("[dsv41-tp] distributed load failed: %s\n", e.what());
         return nullptr;
     }
 }

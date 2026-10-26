@@ -137,7 +137,6 @@ public sealed class ExplicitModelParallelismTests : IDisposable
     [InlineData("glm-dsa")]
     [InlineData("glm5next")]
     [InlineData("deepseek4")]
-    [InlineData("deepseek41")]
     [InlineData("qwen-image")]
     [InlineData("diffusion-gemma")]
     public void DistributedPreflightRejectsExecutorsWithoutCrossNodeCollectives(string architecture)
